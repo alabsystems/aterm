@@ -13,13 +13,21 @@
 //!
 //! Nothing in a release reads it: this process's folder (`super::folder`) and
 //! `aterm db fleet` take it only under the dev seam [`SEAM`] ([`under_seam`]).
+//!
+//! It also holds the Fleet display's scenes ([`scene`]): whole band projections, chosen by the
+//! value of [`SEAM`] ([`scene_under_seam`]), that a painter is built and judged on before a fold
+//! fills one from the tables.
 
+use super::band::{
+    AccountClass, AccountMark, AgentClass, AgentMark, Band, History, MachineColumn, Provider,
+    SLOTS, Service, Services, Slot, Sum, WHOLE_X10, next_minute_change,
+};
 use super::fold::{Inputs, Source};
 use super::read::{
     Access, AccountWord, AgentSeen, Answer, Answered, Harness, Latest, Limits, Load, Look,
     MachineSeen, OutSrc, Pressure, Read, State, Tally, Task, TurnFacts, WaitTally, Work, WorkTally,
 };
-use crate::alab::account_names::Names;
+use super::rows::Reach;
 use crate::alab::journal::event::{Event, SIGNIN_ENDED, SIGNIN_IN};
 use crate::alab::journal::seen::{Claimed, Seen, SignedIn};
 use crate::alab::sighted::{Obs, ObsState};
@@ -27,10 +35,12 @@ use crate::alab::view::{Account, LabView, Machine, MachineNickname, Preference};
 use crate::typed::keys;
 use aterm_digest::Sha256;
 use aterm_json::json;
+use aterm_types::needs::NeedWord;
 use aterm_types::network_state::{
     HistoryState, MachineIdentity, NetworkObservation, NetworkStateSnapshot, PeerObservation,
     Reachability,
 };
+use aterm_types::update_standing::{UpdateFact, UpdateStanding};
 use std::sync::Arc;
 
 /// The registry's machines.
@@ -62,6 +72,8 @@ pub const RETIRED_UUID: &str = "13000000a1b2c3d4e5f60718293a4b5c";
 /// The dev seam that holds the fleet tables to this fixture's lab in place of this Mac's: debug
 /// and dev-seams builds only, for `lab instance` and the galleries, which hold no registry and
 /// no fleet.
+/// Its value chooses the Fleet display's scene ([`Scene::of`]); the tables' lab is the same
+/// under every value.
 pub const SEAM: &str = "ATERM_DEV_FLEET_FIXTURE";
 
 /// The fixture's [`inputs`] as of `now_ms` where the dev seam [`SEAM`] is set, in a build that
@@ -249,7 +261,8 @@ pub fn name_accounts(lab: &mut LabView) {
         .values()
         .map(|account| {
             let email = account.identity.clone().or_else(|| account.login.clone());
-            let names = Names {
+            let names = aterm_file::AccountNames {
+                realm: account.realm.clone().unwrap_or_default(),
                 slug: slugs.remove(&account.pk).unwrap_or_default(),
                 name: account
                     .realm
@@ -651,6 +664,13 @@ pub fn inputs(now_ms: u64) -> Inputs {
                 turns: (!turn.older).then(|| u32::try_from(g % 40).unwrap_or(u32::MAX)),
                 tools: (!turn.older && harness != Harness::Agy && harness != Harness::Muse)
                     .then(|| u32::try_from(g * 3 % 400).unwrap_or(u32::MAX)),
+                // Its need where its row says one; no aterm sends the activity word yet.
+                need: (!turn.older).then(|| match state {
+                    State::Stuck => Some(NeedWord::Stalled),
+                    State::Waiting => Some(NeedWord::Question),
+                    _ => None,
+                }),
+                activity: None,
                 work: Work::of(state, &turn),
                 answer_at_ms: (b % 6 != 5).then(|| now_ms - 1_000 - span(b) * 7),
                 rate: None,
@@ -675,6 +695,15 @@ pub fn inputs(now_ms: u64) -> Inputs {
             }),
             // This Mac's own answer reads no grant (`Answered::drive`).
             drive: (!older && b != 0).then_some(b % 4 != 0),
+            // An aterm before the look says no standing either.
+            update: (!older).then(|| {
+                UpdateFact::of(match b % 5 {
+                    1 => UpdateStanding::Downloaded,
+                    2 => UpdateStanding::NotInstalling,
+                    3 => UpdateStanding::Off,
+                    _ => UpdateStanding::Current,
+                })
+            }),
             sessions: u32::try_from(count + b % 3).ok(),
             tally: (b % 10 != 9).then_some(tally),
             work: (b % 10 != 9).then_some(work),
@@ -707,6 +736,7 @@ pub fn inputs(now_ms: u64) -> Inputs {
             look: Look::UNREAD,
             access: None,
             drive: None,
+            update: None,
             sessions: Some(1),
             tally: Some(Tally::default()),
             work: Some(WorkTally::default()),
@@ -750,4 +780,473 @@ pub fn inputs(now_ms: u64) -> Inputs {
             at_ms: read_at_ms,
         },
     }
+}
+
+/// A whole Fleet display projection, made of nothing real, that a painter is built and judged
+/// on before any fold fills one ([`scene`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scene {
+    /// The fleet the design's boards draw: [`SCENE_MACHINES`] machines, [`SCENE_ACCOUNTS`] AI
+    /// accounts that can be used and [`SCENE_AGENTS`] agents, with eight days of history.
+    Design,
+    /// Twice that fleet.
+    Double,
+    /// A first day: no history, and most values not read.
+    DayOne,
+    /// The design's fleet with holes in its history.
+    Gappy,
+}
+
+impl Scene {
+    /// Every scene.
+    pub const ALL: [Self; 4] = [Self::Design, Self::Double, Self::DayOne, Self::Gappy];
+
+    /// The word that chooses it as the value of [`SEAM`].
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Design => "design",
+            Self::Double => "double",
+            Self::DayOne => "day-one",
+            Self::Gappy => "gappy",
+        }
+    }
+
+    /// The scene `value` names. Any other value, `1` for one, is the design's.
+    pub fn of(value: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|scene| scene.word() == value)
+            .unwrap_or(Self::Design)
+    }
+}
+
+/// The numbers of the design scene's member machines.
+const SCENE_NUMBERS: [u32; 72] = [
+    1, 2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 16, 18, 19, 20, 21, 22, 25, 26, 27, 28, 29, 31, 32, 34,
+    35, 36, 37, 39, 40, 41, 42, 43, 45, 46, 47, 48, 49, 50, 51, 52, 54, 55, 56, 59, 60, 61, 62, 63,
+    64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 80, 81, 82, 83, 84, 85, 86, 164, 176,
+];
+/// Of them, the ones that do not answer.
+const SCENE_MACHINES_SILENT: [u32; 7] = [8, 27, 45, 62, 71, 83, 176];
+/// The ones nothing read.
+const SCENE_MACHINES_UNREAD: [u32; 2] = [1, 60];
+/// The ones on an old build that is not updating.
+const SCENE_MACHINES_OLD: [u32; 4] = [19, 31, 48, 66];
+/// The ones at a limit, each with how many of its resources are.
+const SCENE_MACHINES_AT_LIMIT: [(u32, u8); 5] = [(12, 1), (34, 2), (47, 1), (64, 1), (70, 1)];
+/// The scene's busiest machine and its next.
+const SCENE_MACHINES_BUSY: [u32; 2] = [37, 16];
+/// The machine the scene is read from.
+const SCENE_OWN: u32 = 3;
+
+/// The design scene's member machines.
+pub const SCENE_MACHINES: usize = SCENE_NUMBERS.len();
+/// Of them, the ones that answer.
+pub const SCENE_MACHINES_UP: usize =
+    SCENE_MACHINES - SCENE_MACHINES_SILENT.len() - SCENE_MACHINES_UNREAD.len();
+/// The answering machines that run an agent: every sixth runs none.
+pub const SCENE_MACHINES_RUNNING: usize = SCENE_MACHINES_UP - SCENE_MACHINES_UP / 6;
+/// The design scene's AI accounts that can be used.
+pub const SCENE_ACCOUNTS: usize = 127;
+/// Of them, the ones in use: one on each machine that runs an agent.
+pub const SCENE_ACCOUNTS_IN_USE: usize = SCENE_MACHINES_RUNNING;
+/// The ones at their limit.
+pub const SCENE_ACCOUNTS_AT_LIMIT: usize = 21;
+/// The ones nothing read, each placed on a machine that does not answer.
+pub const SCENE_ACCOUNTS_UNREAD: usize = 5;
+/// The idle ones.
+pub const SCENE_ACCOUNTS_IDLE: usize =
+    SCENE_ACCOUNTS - SCENE_ACCOUNTS_IN_USE - SCENE_ACCOUNTS_AT_LIMIT - SCENE_ACCOUNTS_UNREAD;
+/// The registry's accounts that cannot be used.
+pub const SCENE_ACCOUNTS_CANNOT_BE_USED: u32 = 26;
+/// The design scene's agents.
+pub const SCENE_AGENTS: usize = 180;
+/// Of them, the ones writing output.
+pub const SCENE_AGENTS_OUTPUT: usize = 89;
+/// The ones running with no output.
+pub const SCENE_AGENTS_JOB: usize = 23;
+/// The idle ones.
+pub const SCENE_AGENTS_IDLE: usize = 46;
+/// The ones paused at their account's limit.
+pub const SCENE_AGENTS_PAUSED: usize = 11;
+/// The ones in error.
+pub const SCENE_AGENTS_ERROR: usize = 11;
+/// How many accounts of each provider the scene has, by the realm they are named for; they sum
+/// to [`SCENE_ACCOUNTS`].
+const SCENE_PROVIDERS: [(Provider, &str, usize); 5] = [
+    (Provider::Anthropic, "claude", 69),
+    (Provider::OpenAi, "codex", 42),
+    (Provider::Google, "google", 11),
+    (Provider::Meta, "meta", 4),
+    (Provider::Xai, "grok", 1),
+];
+/// The history slot from which the scene's fleet runs its newer build.
+pub const SCENE_BUILD_SLOT: usize = 34;
+
+/// One machine of a scene while it is dealt its agents: how many of each fact it runs.
+#[derive(Clone, Copy, Default)]
+struct Dealt {
+    running: usize,
+    idle: usize,
+    paused: usize,
+    error: usize,
+    at_limit: usize,
+}
+
+/// A scene machine's cores busy of cores in hundredths of a core, and its memory used of
+/// memory in MiB, by its number.
+fn scene_capacity(number: u32, limits: u8) -> ((u64, u64), (u64, u64)) {
+    let n = u64::from(number);
+    let cores = [10, 12, 14, 16, 18][usize::try_from(n % 5).unwrap_or(0)];
+    let gib = [32, 64, 96, 128][usize::try_from(n % 4).unwrap_or(0)];
+    let cpu_pct = if limits > 1 { 98 } else { 4 + n * 37 % 84 };
+    let memory_pct = if limits > 0 { 97 } else { 14 + n * 53 % 60 };
+    (
+        (cores * cpu_pct, cores * 100),
+        (gib * 1024 * memory_pct / 100, gib * 1024),
+    )
+}
+
+/// The cores and memory sums of the machines of `machines` that are up.
+fn scene_sums(machines: &[MachineColumn]) -> (Option<Sum>, Option<Sum>) {
+    let (mut cores, mut memory) = (None, None);
+    for machine in machines {
+        if machine.reach == Reach::Up
+            && let Some(number) = machine.number
+        {
+            let (c, m) = scene_capacity(number % 300, machine.limits.unwrap_or(0));
+            Sum::gather(&mut cores, c.0, c.1);
+            Sum::gather(&mut memory, m.0, m.1);
+        }
+    }
+    (cores, memory)
+}
+
+/// One copy of the design's fleet, its machine numbers raised by `300 * copy`. `made` counts
+/// the accounts of each provider made so far, so no two accounts of a scene share a label.
+fn scene_fleet(
+    copy: u32,
+    made: &mut [usize; Provider::COUNT],
+) -> (Vec<MachineColumn>, Vec<AccountMark>) {
+    let reach_of = |n: u32| {
+        if SCENE_MACHINES_SILENT.contains(&n) {
+            Reach::Silent
+        } else if SCENE_MACHINES_UNREAD.contains(&n) {
+            Reach::Unread
+        } else {
+            Reach::Up
+        }
+    };
+    // The answering machines in number order; every sixth runs no agent.
+    let up: Vec<u32> = SCENE_NUMBERS
+        .into_iter()
+        .filter(|n| reach_of(*n) == Reach::Up)
+        .collect();
+    let quiet: Vec<u32> = up.iter().copied().skip(5).step_by(6).collect();
+    let run: Vec<u32> = up.iter().copied().filter(|n| !quiet.contains(n)).collect();
+    let others: Vec<u32> = run
+        .iter()
+        .copied()
+        .filter(|n| !SCENE_MACHINES_BUSY.contains(n))
+        .collect();
+    let mut dealt: std::collections::BTreeMap<u32, Dealt> = std::collections::BTreeMap::new();
+    let mut deal = |n: u32, f: &dyn Fn(&mut Dealt)| f(dealt.entry(n).or_default());
+    let other = |i: usize| others[i % others.len()];
+
+    // Running agents: one on every machine that runs any, ten and six on the two busiest, and
+    // the rest dealt over the others.
+    for n in &run {
+        deal(*n, &|d| d.running += 1);
+    }
+    let (busiest, next) = (SCENE_MACHINES_BUSY[0], SCENE_MACHINES_BUSY[1]);
+    deal(busiest, &|d| d.running += 9);
+    deal(next, &|d| d.running += 5);
+    for e in 0..SCENE_AGENTS_OUTPUT + SCENE_AGENTS_JOB - run.len() - 14 {
+        deal(other(e * 7 % 31), &|d| d.running += 1);
+    }
+    // Idle agents: one or two on every other quiet machine, the rest on machines that run.
+    let mut quiet_idle = 0;
+    for (q, n) in quiet.iter().enumerate() {
+        if q % 2 == 1 {
+            let k = 1 + q / 2 % 2;
+            deal(*n, &|d| d.idle += k);
+            quiet_idle += k;
+        }
+    }
+    deal(busiest, &|d| d.idle += 3);
+    deal(next, &|d| d.idle += 2);
+    for e in 0..SCENE_AGENTS_IDLE - quiet_idle - 5 {
+        deal(other(e * 11), &|d| d.idle += 1);
+    }
+    // Paused agents, each on a machine that holds an account at its limit; and errors.
+    deal(busiest, &|d| {
+        d.paused += 2;
+        d.at_limit += 2;
+        d.error += 1;
+    });
+    deal(next, &|d| d.error += 1);
+    for e in 0..SCENE_AGENTS_PAUSED - 2 {
+        deal(other(e * 5 + 2), &|d| {
+            d.paused += 1;
+            d.at_limit += 1;
+        });
+    }
+    for e in 0..SCENE_AGENTS_ERROR - 2 {
+        deal(other(e * 13 + 7), &|d| d.error += 1);
+    }
+    // Accounts at their limit: the ones above, four in the pool, and the rest on other machines.
+    let placed = SCENE_AGENTS_PAUSED - 2 + 2;
+    for e in 0..SCENE_ACCOUNTS_AT_LIMIT - placed - 4 {
+        deal(other(e * 17 + 3), &|d| d.at_limit += 1);
+    }
+
+    let mut account = |class: AccountClass| {
+        let a = made.iter().sum::<usize>();
+        // The providers, dealt so that each has its count in every whole scene.
+        let mut at = a % SCENE_ACCOUNTS * 77 % SCENE_ACCOUNTS;
+        let of = SCENE_PROVIDERS
+            .into_iter()
+            .find(|row| {
+                let here = at < row.2;
+                if !here {
+                    at -= row.2;
+                }
+                here
+            })
+            .unwrap_or(SCENE_PROVIDERS[0]);
+        made[of.0.index()] += 1;
+        let share = |n: usize| u16::try_from(n).ok().filter(|n| *n <= WHOLE_X10);
+        AccountMark {
+            label: format!(
+                "{}-{:02}",
+                keys::provider_word(of.1).unwrap_or(of.1),
+                made[of.0.index()]
+            ),
+            provider: of.0,
+            class,
+            left_x10: match class {
+                AccountClass::InUse => share(80 + a * 137 % 900),
+                AccountClass::Idle if a % 5 != 4 => share(200 + a * 61 % 780),
+                AccountClass::AtLimit => Some(0),
+                AccountClass::Idle | AccountClass::Unread => None,
+            },
+        }
+    };
+
+    let mut running = 0;
+    let mut silent = 0;
+    let mut machines = Vec::with_capacity(SCENE_MACHINES);
+    for n in SCENE_NUMBERS {
+        let reach = reach_of(n);
+        let d = dealt.get(&n).copied().unwrap_or_default();
+        let limits = SCENE_MACHINES_AT_LIMIT
+            .iter()
+            .find(|(m, _)| *m == n)
+            .map_or(0, |(_, k)| *k);
+        let mut accounts = Vec::new();
+        if d.running > 0 {
+            accounts.push(account(AccountClass::InUse));
+        }
+        for _ in 0..d.at_limit {
+            accounts.push(account(AccountClass::AtLimit));
+        }
+        let up_at = up.iter().position(|m| *m == n);
+        if up_at.is_some_and(|p| p.is_multiple_of(3)) {
+            accounts.push(account(AccountClass::Idle));
+        }
+        if reach == Reach::Silent {
+            if silent < SCENE_ACCOUNTS_UNREAD {
+                accounts.push(account(AccountClass::Unread));
+            }
+            silent += 1;
+        }
+        let in_use = accounts
+            .iter()
+            .find(|a| a.class == AccountClass::InUse)
+            .map(|a| a.provider);
+        let limited = accounts
+            .iter()
+            .find(|a| a.class == AccountClass::AtLimit)
+            .map(|a| a.provider);
+        let first = accounts.first().map(|a| a.provider);
+        let agents = (reach == Reach::Up).then(|| {
+            let mut agents = Vec::new();
+            let mut push = |class, provider, k: usize| {
+                agents.extend(std::iter::repeat_n(AgentMark { class, provider }, k));
+            };
+            push(AgentClass::Error, in_use.or(first), d.error);
+            push(AgentClass::Paused, limited, d.paused);
+            // Of the scene's running agents, the jobs are spread evenly.
+            let jobs = (running..running + d.running)
+                .filter(|g| spread(*g, SCENE_AGENTS_JOB, SCENE_AGENTS_OUTPUT + SCENE_AGENTS_JOB))
+                .count();
+            running += d.running;
+            push(AgentClass::Output, in_use, d.running - jobs);
+            push(AgentClass::Job, in_use, jobs);
+            push(AgentClass::Idle, in_use.or(first), d.idle);
+            agents
+        });
+        let number = n + 300 * copy;
+        let (cores, _) = scene_capacity(n, limits);
+        let load = if limits > 0 {
+            97
+        } else {
+            cores.0 * 100 / cores.1
+        };
+        machines.push(MachineColumn {
+            number: Some(number),
+            label: format!("m{number}"),
+            reach,
+            load_x100: if reach == Reach::Up {
+                u8::try_from(load).ok()
+            } else {
+                None
+            },
+            limits: (reach == Reach::Up).then_some(limits),
+            old_build: SCENE_MACHINES_OLD.contains(&n),
+            accounts,
+            agents,
+        });
+    }
+    let mut pool = Vec::new();
+    let on_machines = up.iter().step_by(3).count();
+    for _ in 0..SCENE_ACCOUNTS_IDLE - on_machines {
+        pool.push(account(AccountClass::Idle));
+    }
+    for _ in 0..4 {
+        pool.push(account(AccountClass::AtLimit));
+    }
+    (machines, pool)
+}
+
+/// The projection of `machines` and `pool` as of `now_ms`, with every lane counted from them.
+fn scene_band(machines: Vec<MachineColumn>, pool: Vec<AccountMark>, now_ms: u64) -> Band {
+    let (mut machine_lane, account_lane, agent_lane) = Band::lanes_of(&machines, &pool);
+    (machine_lane.cores_x100, machine_lane.memory_mb) = scene_sums(&machines);
+    let own = machines
+        .iter()
+        .position(|machine| machine.number == Some(SCENE_OWN));
+    Band {
+        machines,
+        own,
+        pool,
+        machine_lane,
+        account_lane,
+        agent_lane,
+        history: History::unsampled(now_ms),
+        services: Services {
+            accounts: Service::Up,
+            secrets: Service::Up,
+        },
+        next_change_ms: None,
+    }
+}
+
+/// Eight days of `band`'s own sums: each slot is the newest one scaled by a daily wave, and the
+/// newest is what the lanes state now. The fleet moves to its newer build at
+/// [`SCENE_BUILD_SLOT`].
+fn scene_history(band: &Band) -> History {
+    let mut history = History::unsampled(band.history.end_ms);
+    let read = band.machine_lane.members - band.agent_lane.machines_unread;
+    let agents = (read > 0).then_some(Sum {
+        used: u64::from(band.agent_lane.running()),
+        of: u64::from(band.agent_lane.agents),
+        members: read,
+    });
+    for (i, slot) in history.slots.iter_mut().enumerate() {
+        let wave = [0, 2, 5, 7, 6, 4, 2, 1][i % 8];
+        let x1000 = if i + 1 == SLOTS {
+            1000
+        } else {
+            700 + 40 * wave
+        };
+        let scaled = |sum: Option<Sum>| {
+            sum.map(|sum| Sum {
+                used: sum.used * x1000 / 1000,
+                ..sum
+            })
+        };
+        *slot = Some(Slot {
+            cores_x100: scaled(band.machine_lane.cores_x100),
+            left_x10: scaled(band.account_lane.left_x10),
+            agents: scaled(agents),
+            build: Some(
+                if i < SCENE_BUILD_SLOT {
+                    "0.202.0"
+                } else {
+                    "0.203.0"
+                }
+                .to_owned(),
+            ),
+        });
+    }
+    history
+}
+
+/// The projection of `scene` as of `now_ms`. It is deterministic, and every scene passes
+/// [`Band::check`].
+pub fn scene(scene: Scene, now_ms: u64) -> Band {
+    let copies = if scene == Scene::Double { 2 } else { 1 };
+    let mut made = [0; Provider::COUNT];
+    let (mut machines, mut pool) = (Vec::new(), Vec::new());
+    for copy in 0..copies {
+        let (m, p) = scene_fleet(copy, &mut made);
+        machines.extend(m);
+        pool.extend(p);
+    }
+    if scene == Scene::DayOne {
+        // Three machines in four were never read (this machine reads itself), and so were the
+        // accounts placed on them and three in four of the pool. A machine never read has no
+        // build to judge.
+        for (i, machine) in machines.iter_mut().enumerate() {
+            let own = machine.number == Some(SCENE_OWN);
+            if machine.reach == Reach::Up && !i.is_multiple_of(4) && !own {
+                machine.reach = Reach::Unread;
+            }
+            if machine.reach != Reach::Up {
+                machine.load_x100 = None;
+                machine.limits = None;
+                machine.agents = None;
+                machine.old_build &= machine.reach != Reach::Unread;
+                for account in &mut machine.accounts {
+                    account.class = AccountClass::Unread;
+                    account.left_x10 = None;
+                }
+            }
+        }
+        for (i, account) in pool.iter_mut().enumerate() {
+            if !i.is_multiple_of(4) {
+                account.class = AccountClass::Unread;
+                account.left_x10 = None;
+            }
+        }
+    }
+    let mut band = scene_band(machines, pool, now_ms);
+    if scene == Scene::DayOne {
+        band.services = Services {
+            accounts: Service::Unread,
+            secrets: Service::Unread,
+        };
+        return band;
+    }
+    band.account_lane.cannot_be_used = Some(SCENE_ACCOUNTS_CANNOT_BE_USED * copies);
+    // The one duration the scene prints is the time to the next refresh, in whole minutes.
+    let refresh_ms = now_ms + 55 * 60_000 + 20_000;
+    band.account_lane.next_refresh_ms = Some(refresh_ms);
+    band.next_change_ms = next_minute_change(now_ms, refresh_ms);
+    band.history = scene_history(&band);
+    if scene == Scene::Gappy {
+        for (i, slot) in band.history.slots.iter_mut().enumerate() {
+            if i % 7 == 3 || (20..29).contains(&i) {
+                *slot = None;
+            }
+        }
+    }
+    band
+}
+
+/// The scene the dev seam [`SEAM`] chooses by its value, as of `now_ms`, in a build that
+/// compiles seams; `None` in every shipped binary.
+pub fn scene_under_seam(now_ms: u64) -> Option<Band> {
+    aterm_types::dev_seam!(SEAM).map(|value| scene(Scene::of(&value.to_string_lossy()), now_ms))
 }

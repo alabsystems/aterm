@@ -189,7 +189,7 @@ fn a_stamp_distinguishes_missing_paths_from_failed_observations() {
     assert!(stamp_if_present(&path.join("cannot-be-a-child")).is_err());
 }
 
-/// A digest of what a glance saw is kept only where its file had settled ([`SETTLED_NS`]) when
+/// A digest of what a glance saw is kept only where its file had settled ([`SETTLED`]) when
 /// the glance began, not merely by the ask: a glance's `lstat` can be older than the ask, and a
 /// change between them in one tick of a coarse clock would leave its witness standing. A file
 /// a glance began to look at a second after its last change is read again at each ask through
@@ -252,7 +252,7 @@ fn a_glance_fed_digest_is_kept_only_where_its_file_had_settled_when_the_glance_b
 /// bytes rewritten in place at the same length, the file opened to others, another file renamed
 /// over it at the same length, the file removed), as is a file swapped in for the read that
 /// gave the digest, at its path or through its parent directory, and a file changed within
-/// [`SETTLED_NS`] of the ask. A digest one reader kept never answers a reader that refuses the
+/// [`SETTLED`] of the ask. A digest one reader kept never answers a reader that refuses the
 /// file.
 /// NEGATIVE CONTROLS (2026-11-08): a digest kept by its path alone, and one kept by the file's
 /// device, inode and length, each answer the rewrite in place with the digest they kept; one

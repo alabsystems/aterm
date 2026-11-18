@@ -135,8 +135,8 @@ const R1_RESET: Duration = Duration::from_secs(3 * 60);
 /// pool's grace, [`RESET_GRACE_S`]): the host's wait for `lab-a` ends before `lab-b`'s own reset
 /// however its notice's minute rounds it, so the move back is the one path.
 const R3_PAST_A: Duration = Duration::from_secs(150);
-/// How often the instance's upkeep looks (aterm-gui's `WAKE_FALLBACK`), ms: a sync or a sign-in
-/// it books comes within it.
+/// The longest the instance's accounts' keeper waits at a time for a wall deadline (aterm-gui's
+/// `accounts_keeper::LOOK_EVERY`), ms: a sync or a sign-in it books comes within it.
 const UPKEEP_EVERY_MS: i64 = 60_000;
 /// How far ahead `lab-a`'s R4 limit resets.
 const R4_RESET: Duration = Duration::from_secs(3 * 60);
@@ -148,8 +148,9 @@ fn r4_look() -> Duration {
 }
 /// A wait for something that must happen: a minute in which nothing it watches moved.
 const HANG: Duration = lp::HANG;
-/// How long a scheduled host act may take past its instant: the host's upkeep looks once a
-/// minute (aterm-gui's `WAKE_FALLBACK`), and a minute more is the hang detector.
+/// How long a scheduled host act may take past its instant: the host's accounts' keeper looks
+/// within a minute of a wall deadline (aterm-gui's `accounts_keeper::LOOK_EVERY`), and a minute
+/// more is the hang detector.
 const UPKEEP_LOOK: Duration = Duration::from_secs(120);
 /// The five-hour window's figure each row's answers carry, as a fraction, before R2.
 const BASELINE_5H: &str = "0.10";
@@ -904,16 +905,19 @@ pub struct Listed {
     pub sign_in: String,
 }
 
-/// The row `label` of an `aterm harness accounts --json` listing, where it lists one.
+/// The row of the Claude account at `email` in an `aterm harness accounts --json` listing, where
+/// it lists one: the row whose `ac` is that account's key, as the report names a row with an
+/// address.
 #[must_use]
-pub fn listed(listing: &str, label: &str) -> Option<Listed> {
+pub fn listed(listing: &str, email: &str) -> Option<Listed> {
+    let ac = aterm_db::typed::keys::account_pk("claude", email).ok()?;
     let j = J::parse(listing.trim()).ok()?;
     let J::Arr(rows) = j.get("accounts")? else {
         return None;
     };
     let row = rows
         .iter()
-        .find(|r| r.get("label").and_then(J::as_str) == Some(label))?;
+        .find(|r| r.get("ac").and_then(J::as_str) == Some(ac.as_str()))?;
     let s = |k: &str| row.get(k).and_then(J::as_str).unwrap_or("").to_string();
     Some(Listed {
         auth: s("auth"),
@@ -936,6 +940,8 @@ pub struct Displacement<'a> {
     pub from: &'a str,
     /// The row it names now.
     pub to: &'a str,
+    /// `to`'s address, by whose account the instance's listing names its row ([`listed`]).
+    pub to_email: &'a str,
     /// `to`'s credential, as the stub logs it.
     pub auth: &'a str,
     /// The prompts the next turn's history must hold.
@@ -963,7 +969,7 @@ pub fn judge_r5(ev: &Ev, leg: &Leg, d: Displacement<'_>) -> Judged {
     let mut missing = Vec::new();
     let from_s = leg.from / 1000 - 1;
     let through_s = leg.to / 1000;
-    let before = listed(&leg.before, d.to);
+    let before = listed(&leg.before, d.to_email);
     let was_out = before.as_ref().is_some_and(|r| r.auth == "signed-out");
     let had_failed = before.as_ref().is_some_and(|r| failing(&r.sign_in));
     let displaced = booked_after(&ev.ledger, d.from, "displaced", from_s, |r| {
@@ -995,7 +1001,7 @@ pub fn judge_r5(ev: &Ev, leg: &Leg, d: Displacement<'_>) -> Judged {
     if let Some(s) = any_restart(&ev.journal, (leg.from, leg.to)) {
         missing.push(format!("restarted: `{}`", clip(&s.line, 80)));
     }
-    let after = listed(&leg.listing, d.to);
+    let after = listed(&leg.listing, d.to_email);
     match &after {
         None => missing.push(format!("the instance's listing has no row {}", d.to)),
         Some(row) => {
@@ -3088,6 +3094,7 @@ fn judge_run(
         let r5a = Displacement {
             from: LABEL_A,
             to: LABEL_B,
+            to_email: EMAIL_B,
             auth: AUTH_B,
             prompts: &[P1, P5],
         };
@@ -3098,6 +3105,7 @@ fn judge_run(
         let r5b = Displacement {
             from: LABEL_B,
             to: LABEL_A,
+            to_email: EMAIL_A,
             auth: AUTH_A,
             prompts: &[P1, P6],
         };

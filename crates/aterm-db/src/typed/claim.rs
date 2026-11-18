@@ -763,6 +763,37 @@ pub(crate) fn project(
     operations: impl Iterator<Item = impl std::borrow::Borrow<Op>>,
     causal: &Index,
 ) -> Projection {
+    judged(collection, cells, operations, causal, None)
+}
+
+/// [`project`], and how each of the collection's claimed columns settled there
+/// ([`Settlement`]): what a page asks, before a Write, what a value staged in such a column will
+/// read as once written.
+pub(crate) fn settled(
+    collection: &Collection,
+    cells: &Cells,
+    operations: impl Iterator<Item = impl std::borrow::Borrow<Op>>,
+    causal: &Index,
+) -> (Projection, Settlements) {
+    let mut settlements = Settlements::new();
+    let projected = judged(
+        collection,
+        cells,
+        operations,
+        causal,
+        Some(&mut settlements),
+    );
+    (projected, settlements)
+}
+
+/// [`project`]'s work, each claimed column's [`Settlement`] kept in `keep` where one is given.
+fn judged(
+    collection: &Collection,
+    cells: &Cells,
+    operations: impl Iterator<Item = impl std::borrow::Borrow<Op>>,
+    causal: &Index,
+    mut keep: Option<&mut Settlements>,
+) -> Projection {
     #[cfg(test)]
     count(&PROJECTS, collection);
     let operations: Vec<_> = operations.collect();
@@ -774,28 +805,59 @@ pub(crate) fn project(
     let mut tenures = Tenures::new();
     for column in collection.columns {
         let Some(rule) = column.claim else { continue };
-        let mut groups = BTreeMap::<String, Vec<(String, Option<BTreeSet<Digest>>)>>::new();
-        let mut reserved = BTreeSet::<String>::new();
-        for (pk, row) in &mut projected.rows {
-            let Some(field) = row.fields.get(column.name) else {
-                continue;
-            };
-            for candidate in field.candidates() {
-                if let Some(value) = candidate.value.x.as_str() {
-                    reserved.insert(value.to_owned());
+        let mut rows = BTreeMap::<String, Entry<Digest>>::new();
+        for (pk, row) in &projected.rows {
+            let live = row.live();
+            // Whether a write of this row now begins a tenure the read knows: asked only of a
+            // settlement kept for a page.
+            let fresh = || {
+                keep.is_some() && {
+                    let current = causal.activity.current(pk);
+                    current.live
+                        && current
+                            .epochs
+                            .as_ref()
+                            .is_some_and(|epochs| !epochs.is_empty())
                 }
-            }
-            if !row.live() {
-                continue;
-            }
-            if field.conflicted() {
-                row.claims.insert(column.name.into(), None);
-                continue;
-            }
-            let Some(value) = field.value().and_then(Value::as_str) else {
+            };
+            let Some(field) = row.fields.get(column.name) else {
+                if keep.is_some() {
+                    rows.insert(
+                        pk.clone(),
+                        Entry {
+                            held: Vec::new(),
+                            live,
+                            value: None,
+                            conflicted: false,
+                            starts: None,
+                            fresh: fresh(),
+                        },
+                    );
+                }
                 continue;
             };
-            reserved.insert(value.to_owned());
+            let held = field
+                .candidates()
+                .iter()
+                .filter_map(|candidate| candidate.value.x.as_str().map(str::to_owned))
+                .collect();
+            let conflicted = field.conflicted();
+            let value = field
+                .value()
+                .and_then(Value::as_str)
+                .filter(|_| !conflicted);
+            let mut entry = Entry {
+                held,
+                live,
+                value: value.map(str::to_owned),
+                conflicted,
+                starts: None,
+                fresh: fresh(),
+            };
+            let Some(value) = value.filter(|_| live) else {
+                rows.insert(pk.clone(), entry);
+                continue;
+            };
             let coordinate = (collection.name.to_owned(), format!("{pk}.{}", column.name));
             let origins = cells
                 .get(&coordinate)
@@ -845,46 +907,315 @@ pub(crate) fn project(
             {
                 starts = None;
             }
-            if starts.as_ref().is_some_and(BTreeSet::is_empty) {
-                row.claims.insert(column.name.into(), None);
-                continue;
-            }
-            groups
-                .entry(value.to_owned())
-                .or_default()
-                .push((pk.clone(), starts));
+            entry.starts = starts;
+            rows.insert(pk.clone(), entry);
         }
-        for (value, contenders) in groups {
-            if contenders.len() < 2 {
-                continue;
-            }
-            let winner = winner(&contenders, &causal);
-            for (pk, _) in contenders {
-                if winner.as_deref() == Some(pk.as_str()) {
-                    projected
-                        .rows
-                        .get_mut(&pk)
-                        .unwrap()
-                        .claims
-                        .insert(column.name.into(), Some(Value::String(value.clone())));
-                    continue;
-                }
-                let effective = match (rule, winner.as_ref()) {
-                    (ClaimRule::Label, Some(_)) => {
-                        clash(&value, &pk, &mut reserved).map(Value::String)
-                    }
-                    _ => None,
-                };
-                projected
-                    .rows
-                    .get_mut(&pk)
-                    .unwrap()
-                    .claims
-                    .insert(column.name.into(), effective);
-            }
+        for (pk, reads) in settle(rule, &rows, |later, earlier| {
+            causal.observes(later, earlier)
+        }) {
+            projected
+                .rows
+                .get_mut(&pk)
+                .unwrap()
+                .claims
+                .insert(column.name.into(), reads.map(Value::String));
+        }
+        if let Some(keep) = keep.as_deref_mut() {
+            keep.insert(column.name, Settlement::of(rule, rows, &causal));
         }
     }
     projected
+}
+
+/// Where one row stands in a claimed column, as [`settle`] weighs it. `S` names when a claim
+/// began: an operation of the read ([`Digest`]), or, for a page asking what a Write will do,
+/// that Write ([`Start`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Entry<S> {
+    /// The value of each candidate its cell holds: no clash label takes one, live or not.
+    held: Vec<String>,
+    live: bool,
+    /// The one value its cell holds; `None` where it holds none, or a conflict.
+    value: Option<String>,
+    conflicted: bool,
+    /// Where it is live and claims `value`: the operations its uninterrupted tenure of `value`
+    /// began at, `None` where they cannot be known, none where it began nowhere.
+    starts: Option<BTreeSet<S>>,
+    /// Whether a write of a new value here now begins a tenure the read knows: the row's
+    /// activity is live, in periods the read knows. Kept only for a [`Settlement`].
+    fresh: bool,
+}
+
+/// What a row's [`Entry`] claims.
+enum Standing<'a, S> {
+    /// Nothing: it is not live, or its cell holds no value.
+    Out,
+    /// No value: its cell is conflicted, or its tenure began nowhere.
+    Withheld,
+    /// This value, from these tenure starts.
+    Claims(&'a str, &'a Option<BTreeSet<S>>),
+}
+
+impl<S> Entry<S> {
+    fn standing(&self) -> Standing<'_, S> {
+        if !self.live {
+            return Standing::Out;
+        }
+        if self.conflicted {
+            return Standing::Withheld;
+        }
+        match &self.value {
+            None => Standing::Out,
+            Some(_) if self.starts.as_ref().is_some_and(BTreeSet::is_empty) => Standing::Withheld,
+            Some(value) => Standing::Claims(value, &self.starts),
+        }
+    }
+}
+
+/// Settle one claimed column under `rule`: of the live rows that claim one value, the one whose
+/// claim began first keeps it, by [`winner`]; under [`ClaimRule::Label`] each other reads as a
+/// clash label of its own ([`clash`]), drawn after every value a row's cell holds and every
+/// clash label drawn before it, values in order and rows in key order; under
+/// [`ClaimRule::One`], or where no claim can be put first, they read as no value. What each row
+/// reads as, where its claim is not simply its value: one that contends, and one withheld.
+fn settle<S: Ord + Copy>(
+    rule: ClaimRule,
+    rows: &BTreeMap<String, Entry<S>>,
+    observes: impl Fn(&S, &S) -> bool,
+) -> BTreeMap<String, Option<String>> {
+    let mut out = BTreeMap::new();
+    let mut groups = BTreeMap::<&str, Vec<(String, Option<BTreeSet<S>>)>>::new();
+    let mut reserved = BTreeSet::<String>::new();
+    for (pk, entry) in rows {
+        reserved.extend(entry.held.iter().cloned());
+        if entry.live
+            && !entry.conflicted
+            && let Some(value) = &entry.value
+        {
+            reserved.insert(value.clone());
+        }
+        match entry.standing() {
+            Standing::Out => {}
+            Standing::Withheld => {
+                out.insert(pk.clone(), None);
+            }
+            Standing::Claims(value, starts) => {
+                groups
+                    .entry(value)
+                    .or_default()
+                    .push((pk.clone(), starts.clone()));
+            }
+        }
+    }
+    for (value, contenders) in groups {
+        if contenders.len() < 2 {
+            continue;
+        }
+        let winner = winner(&contenders, &observes);
+        for (pk, _) in contenders {
+            if winner.as_deref() == Some(pk.as_str()) {
+                out.insert(pk, Some(value.to_owned()));
+                continue;
+            }
+            let effective = match (rule, winner.as_ref()) {
+                (ClaimRule::Label, Some(_)) => clash(value, &pk, &mut reserved),
+                _ => None,
+            };
+            out.insert(pk, effective);
+        }
+    }
+    out
+}
+
+/// When a claim weighed by a [`Settlement`] began: an operation the read holds, or a record of
+/// the Write a page asks about, by its place among the records the save appends
+/// ([`crate::att::Compiled::appended`]). Each record observes every operation the read holds
+/// and every record appended before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Start {
+    Read(Digest),
+    Written(usize),
+}
+
+/// Each claimed column's [`Settlement`] in one collection's read, by column name.
+pub type Settlements = BTreeMap<&'static str, Settlement>;
+
+/// How one claimed column of a read settled: each row as the read's own settling weighed it
+/// (the values its cell holds, whether it is live, the value it claims and when that claim
+/// began), and, of the claims to one value, which observed which. A page asks it, before a
+/// Write, what each row will read as once the Write lands on this read ([`Self::written`]), and
+/// it answers by the read's own settling ([`settle`], [`winner`], [`clash`]) of the rows the
+/// Write leaves, so no copy of the rule is kept elsewhere. The Write appends its rows in
+/// records, in order, each one operation that observes every operation the read holds and every
+/// record before it: a claim a record begins comes after every claim here and every claim an
+/// earlier record begins, and the claims one record begins tie on its one digest, so the
+/// smaller key keeps the value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Settlement {
+    rule: ClaimRule,
+    rows: BTreeMap<String, Entry<Start>>,
+    /// Of the claims to one value, each pair `(later, earlier)` where the later observed the
+    /// earlier.
+    observed: BTreeSet<(Digest, Digest)>,
+}
+
+/// One row of a Write, as [`Settlement::written`] weighs it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Staged {
+    /// The value staged in the claimed column, as the save writes it ([`super::grid::read`]):
+    /// `Value::Null` for a cleared cell; `None` where the column is not staged in this row.
+    pub value: Option<Value>,
+    /// Whether the row is live once written, where the Write stages its lifecycle (a retire,
+    /// an end, a restore).
+    pub live: Option<bool>,
+    /// The record of the Write that carries the row's changes, by its place among the records
+    /// the save appends ([`crate::att::Compiled::appended`]): a row's changes all go in one.
+    pub record: usize,
+}
+
+/// What a row that claims a value reads as in its column.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reading {
+    /// The value its cell holds, which it claims.
+    pub claims: String,
+    /// What it reads as: the value itself where it keeps it, its clash label where another row
+    /// keeps it ([`ClaimRule::Label`]), `None` where its claim is withheld.
+    pub reads: Option<String>,
+    /// The other live rows that claim the same value, by key.
+    pub with: Vec<String>,
+}
+
+impl Settlement {
+    fn of(rule: ClaimRule, rows: BTreeMap<String, Entry<Digest>>, causal: &Causality<'_>) -> Self {
+        let mut groups = BTreeMap::<&str, BTreeSet<Digest>>::new();
+        for entry in rows.values() {
+            if let Standing::Claims(value, Some(starts)) = entry.standing() {
+                groups.entry(value).or_default().extend(starts);
+            }
+        }
+        let mut observed = BTreeSet::new();
+        for starts in groups.values() {
+            for later in starts {
+                for earlier in starts {
+                    if later != earlier && causal.observes(later, earlier) {
+                        observed.insert((*later, *earlier));
+                    }
+                }
+            }
+        }
+        let rows = rows
+            .into_iter()
+            .map(|(pk, entry)| {
+                let starts = entry
+                    .starts
+                    .map(|starts| starts.into_iter().map(Start::Read).collect());
+                (
+                    pk,
+                    Entry {
+                        held: entry.held,
+                        live: entry.live,
+                        value: entry.value,
+                        conflicted: entry.conflicted,
+                        starts,
+                        fresh: entry.fresh,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            rule,
+            rows,
+            observed,
+        }
+    }
+
+    /// The column's rule.
+    pub const fn rule(&self) -> ClaimRule {
+        self.rule
+    }
+
+    /// What each live row that claims a value reads as in the read, by key.
+    pub fn reads(&self) -> BTreeMap<String, Reading> {
+        self.readings(&self.rows)
+    }
+
+    /// What each live row that claims a value will read as once a Write of `staged` (by row
+    /// key) lands on this read, by key. A key the read does not hold is a row the Write is born
+    /// in, live from it. A value staged anew begins a tenure at the record of the Write that
+    /// carries it ([`Staged::record`]), where the row's activity is known; the value a row holds
+    /// staged again keeps its tenure; a row the Write restores claims its value from that
+    /// record; a row it retires or ends claims nothing, though the values its cell holds stay
+    /// held.
+    pub fn written(&self, staged: &BTreeMap<String, Staged>) -> BTreeMap<String, Reading> {
+        let mut rows = self.rows.clone();
+        for (pk, change) in staged {
+            let entry = rows.entry(pk.clone()).or_insert_with(|| Entry {
+                held: Vec::new(),
+                live: true,
+                value: None,
+                conflicted: false,
+                starts: None,
+                fresh: true,
+            });
+            let restored = change.live == Some(true) && !entry.live;
+            if let Some(live) = change.live {
+                entry.live = live;
+            }
+            let begun = Start::Written(change.record);
+            if restored {
+                entry.fresh = true;
+                entry.starts = Some(BTreeSet::from([begun]));
+            }
+            if let Some(value) = &change.value {
+                let value = value.as_str().map(str::to_owned);
+                if restored || entry.conflicted || entry.value != value {
+                    entry.starts = entry.fresh.then(|| BTreeSet::from([begun]));
+                }
+                entry.held = value.iter().cloned().collect();
+                entry.value = value;
+                entry.conflicted = false;
+            }
+        }
+        self.readings(&rows)
+    }
+
+    fn readings(&self, rows: &BTreeMap<String, Entry<Start>>) -> BTreeMap<String, Reading> {
+        let settled = settle(self.rule, rows, |later, earlier| match (later, earlier) {
+            (Start::Written(_), Start::Read(_)) => true,
+            (Start::Written(later), Start::Written(earlier)) => later > earlier,
+            (Start::Read(later), Start::Read(earlier)) => {
+                self.observed.contains(&(*later, *earlier))
+            }
+            (Start::Read(_), Start::Written(_)) => false,
+        });
+        let mut claims = BTreeMap::<&str, Vec<&str>>::new();
+        for (pk, entry) in rows {
+            if let Standing::Claims(value, _) = entry.standing() {
+                claims.entry(value).or_default().push(pk);
+            }
+        }
+        let mut out = BTreeMap::new();
+        for (value, pks) in &claims {
+            for pk in pks {
+                out.insert(
+                    (*pk).to_owned(),
+                    Reading {
+                        claims: (*value).to_owned(),
+                        reads: settled
+                            .get(*pk)
+                            .cloned()
+                            .unwrap_or_else(|| Some((*value).to_owned())),
+                        with: pks
+                            .iter()
+                            .filter(|other| *other != pk)
+                            .map(|other| (*other).to_owned())
+                            .collect(),
+                    },
+                );
+            }
+        }
+        out
+    }
 }
 
 /// Repeating a value inherits its uninterrupted tenure. Leaving and returning starts anew.
@@ -1073,9 +1404,9 @@ fn tenure_inner(
         .flatten()
 }
 
-fn winner(
-    contenders: &[(String, Option<BTreeSet<Digest>>)],
-    causal: &Causality<'_>,
+fn winner<S: Ord + Copy>(
+    contenders: &[(String, Option<BTreeSet<S>>)],
+    observes: impl Fn(&S, &S) -> bool,
 ) -> Option<String> {
     let mut claims = Vec::new();
     for (pk, starts) in contenders {
@@ -1088,7 +1419,7 @@ fn winner(
         .filter(|(id, _)| {
             !claims
                 .iter()
-                .any(|(other, _)| other != id && causal.observes(id, other))
+                .any(|(other, _)| other != id && observes(id, other))
         })
         .min()
         .map(|(_, pk)| (*pk).clone())
@@ -1128,6 +1459,9 @@ fn matches_value(value: &Value, wanted: &str) -> bool {
 #[cfg(test)]
 #[path = "claim_model_tests.rs"]
 mod model_tests;
+#[cfg(test)]
+#[path = "claim_settlement_tests.rs"]
+mod settlement_tests;
 #[cfg(test)]
 #[path = "claim_tests.rs"]
 mod tests;

@@ -78,16 +78,17 @@ fn a_note_is_plain_words_and_cuts_its_classes() {
 }
 
 /// A RUNNER COMMAND CARRIES ITS START'S NOTE ONLY WHILE THAT START IS BEING MADE: built inside
-/// [`noting`] it has exactly [`START_NOTE_ENV`] set to the note's word; built before, after, or
-/// under a note with nothing to say, it sets no variable at all.
+/// [`noting`] its [`START_NOTE_ENV`] entry is the note's word; built before, after, or under a
+/// note with nothing to say, it has no start-note entry.
 /// NEGATIVE CONTROL: a `noting` that does not restore the thread's note leaves the nested empty
-/// note in place, so the command the outer start then builds carries no variable (`[]`).
+/// note in place, so the command the outer start then builds carries no start note (`[]`).
 #[test]
-fn a_runner_built_while_noting_carries_the_note_and_no_other() {
+fn a_runner_built_while_noting_carries_only_its_current_start_note() {
     let exe = std::path::Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
     let envs = |command: &aterm_uds::spawnfd::Command| -> Vec<(String, Option<String>)> {
         command
             .get_envs()
+            .filter(|(key, _)| *key == START_NOTE_ENV)
             .map(|(key, value)| {
                 (
                     key.to_string_lossy().into_owned(),
@@ -111,7 +112,7 @@ fn a_runner_built_while_noting_carries_the_note_and_no_other() {
     };
     let inside = noting(&note, || {
         let nested = noting(&StartNote::default(), build);
-        assert_eq!(envs(&nested), [], "a note with nothing to say sets nothing");
+        assert_eq!(envs(&nested), [], "an empty nested note sets no start note");
         build()
     });
     assert_eq!(

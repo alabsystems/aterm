@@ -246,7 +246,6 @@ pub(super) fn finish(home: &Path, record: &Path, receipt: &Receipt) -> Option<Re
         || receipt.retained
         || receipt.pending.is_some()
         || receipt.owners.is_empty()
-        || receipt.owners_unknown
         || !scope(home, &receipt.root)
         || !scope(home, &creating.directory)
         || creating.directory.parent() != Some(parent)

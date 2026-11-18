@@ -58,8 +58,8 @@
 //!   download ([`super::headless_fetch::run_stoppable`]), keeps grok from starting after it,
 //!   ends the automatic rung, and is seen before the need goes up.
 //! - **Then one owner need, and aterm opens no page**: the page and the code become one need
-//!   ([`NEED_OWNER`], [`need_words`]), short enough that the menu row shows the code for the
-//!   label `adopt-default` gives; printed in the caller's terminal as a link and published on its
+//!   ([`NEED_OWNER`], [`need_words`]), short enough that the menu row shows the code after every
+//!   setup's first words; printed in the caller's terminal as a link and published on its
 //!   session ([`Owner`]). Where a renewal can approve Grok's page headlessly
 //!   ([`Cli::renews_headlessly`]) it leads with the once-ever step that makes the next sign-in
 //!   automatic ([`Setup`]: one sign-in in aterm's browser window, after installing a browser that
@@ -86,6 +86,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::account_names::Word;
 use super::accounts_step::Step;
 use super::login_drive::{self, Approval, Approver, Drove, Handoff, Outcome};
 use super::wake_deadline::WakeDeadline;
@@ -295,7 +296,7 @@ pub fn mark_refused(file: &Path) -> io::Result<()> {
 /// Where this gate places a login: `auth.json` in the home grok reads (`GROK_HOME`, else
 /// `<home>/.grok`).
 /// # Errors
-/// [`LOGIN_FILE_ENV`] is set (a pooled login, which `aterm harness accounts login <label> --cli
+/// [`LOGIN_FILE_ENV`] is set (a pooled login, which `aterm harness accounts login <account> --cli
 /// grok` signs in: [`Cli::sign_in_verb`]), `GROK_HOME` is relative, or no home is known.
 pub fn target(
     var: &dyn Fn(&str) -> Option<OsString>,
@@ -306,7 +307,7 @@ pub fn target(
             "{LOGIN_FILE_ENV} names {}, a pooled login, which `{}` signs in; this gate signs in \
              only Grok Build's own home",
             PathBuf::from(file).display(),
-            Step::sign_in(Cli::Grok, Step::CHOSEN_LABEL, true)
+            Step::sign_in(Cli::Grok, super::account_names::Word::chosen(), true)
         ));
     }
     if set(var, HOME_ENV).is_some_and(|d| !Path::new(&d).is_absolute()) {
@@ -416,10 +417,6 @@ fn write_record(state: &Path, record: &Record) -> io::Result<()> {
     super::atomic_write::write_atomic_mode(&state.join(RECORD_FILE), &record.line(), Some(0o600))
 }
 
-/// The label `accounts adopt-default` gives the default home's row in the once-ever setup
-/// where the roster has none ([`Setup::Adopt`]): the label the first `accounts add` gives it.
-pub const ADOPT_LABEL: &str = super::cli::ACCOUNTS_OWN_LABEL;
-
 /// The once-ever step that makes every later Grok Build sign-in on this machine automatic: the
 /// need leads with it ([`need_words`], [`needs_you_line`]) where a renewal can approve Grok's
 /// page headlessly ([`Cli::renews_headlessly`], [`Ladder::need_setup`]). Each is a person's own
@@ -433,27 +430,28 @@ pub const ADOPT_LABEL: &str = super::cli::ACCOUNTS_OWN_LABEL;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Setup {
     /// The row has an email and `accounts browser` opens a window here: one sign-in in aterm's
-    /// own browser window (`aterm harness accounts browser <label> --cli grok`, which keeps the
-    /// row's profile signed in to x.ai).
-    Window(String),
+    /// own browser window (`aterm harness accounts browser <account> --cli grok`, which keeps the
+    /// row's profile signed in to x.ai), the row named by its account's word ([`Ladder::word`]).
+    Window(Word),
     /// The row has an email and `accounts browser` opens no window here (no desk to open one
     /// on, or none installed and the pinned one's fetch failed or cannot run): such a browser
     /// installed first, then that sign-in.
-    Chromium(String),
+    Chromium(Word),
     /// The row names no email, which the window and the mailbox both need: add it first, then the
-    /// sign-in in aterm's window (after installing a browser that opens one where not `window`).
+    /// sign-in in aterm's window (after installing a browser that opens one where not `window`),
+    /// which names the account the email makes as a person chooses it ([`Word::chosen`]), since
+    /// no word names it before.
     Email {
         /// The row's label.
         label: String,
         /// Whether `accounts browser` opens a window here.
         window: bool,
     },
-    /// No row signs the default home in: adopt it under `label` (one the roster does not list,
-    /// [`adopt_label`]), with its email, first; then the sign-in in aterm's window (after
-    /// installing a browser that opens one where not `window`).
+    /// No row signs the default home in: adopt it as the x.ai account a person names by its
+    /// provider word and address first (`accounts adopt-default <account>`, [`Word::chosen`]);
+    /// then the sign-in in aterm's window (after installing a browser that opens one where not
+    /// `window`), of that account ([`Word::chosen`]).
     Adopt {
-        /// The label to adopt the default home under.
-        label: String,
         /// Whether `accounts browser` opens a window here.
         window: bool,
     },
@@ -461,24 +459,26 @@ pub enum Setup {
 
 impl Setup {
     /// Its first words in the attention entry: short, so the menu row (72 bytes, an ellipsis
-    /// where it is cut) still shows the code after it for the label `adopt-default` gives.
+    /// where it is cut) still shows the code after it. The
+    /// window's words name no account: its word is a slug (up to 39 bytes) or a key (19), which
+    /// would push the code past the row, and [`Setup::exact`] types it after the code.
     fn short(&self) -> String {
         match self {
-            Setup::Window(label) => format!("once: sign {label} in at the desk"),
-            Setup::Chromium(label) => format!("once: a window browser, then sign {label} in"),
+            Setup::Window(_) => "once: sign the row in at the desk".to_owned(),
+            Setup::Chromium(_) => "once: a window browser, then sign the row in".to_owned(),
             Setup::Email { label, .. } => format!("once: an email on {label}'s grok row"),
-            Setup::Adopt { label, .. } => format!("once: adopt the default home as {label}"),
+            Setup::Adopt { .. } => "once: adopt the default home".to_owned(),
         }
     }
 
     /// The command or file the short words name, after the page in the attention entry.
     fn exact(&self) -> String {
         match self {
-            Setup::Window(label) | Setup::Chromium(label) => {
-                Step::Browser(Cli::Grok, label.clone()).to_string()
+            Setup::Window(word) | Setup::Chromium(word) => {
+                Step::Browser(Cli::Grok, word.clone()).to_string()
             }
             Setup::Email { .. } => "email = \"…\" in Grok Build's roster".to_owned(),
-            Setup::Adopt { label, .. } => Step::AdoptDefault(Cli::Grok, label.clone()).to_string(),
+            Setup::Adopt { .. } => Step::AdoptDefault(Cli::Grok).to_string(),
         }
     }
 
@@ -487,8 +487,8 @@ impl Setup {
     fn sentence(&self) -> String {
         /// The sign-in in aterm's window: run where one opens here, else after installing a
         /// browser that opens one.
-        fn sign_in(label: &str, window: bool) -> String {
-            let step = Step::Browser(Cli::Grok, label.to_owned());
+        fn sign_in(word: &Word, window: bool) -> String {
+            let step = Step::Browser(Cli::Grok, word.clone());
             if window {
                 format!("run `{step}` at this machine's desk and sign in there")
             } else {
@@ -499,16 +499,16 @@ impl Setup {
             }
         }
         match self {
-            Setup::Window(label) => sign_in(label, true),
-            Setup::Chromium(label) => sign_in(label, false),
+            Setup::Window(word) => sign_in(word, true),
+            Setup::Chromium(word) => sign_in(word, false),
             Setup::Email { label, window } => format!(
                 "add `email = \"…\"` to {label}'s row in Grok Build's roster, then {}",
-                sign_in(label, *window)
+                sign_in(&Word::chosen(), *window)
             ),
-            Setup::Adopt { label, window } => format!(
-                "run `{}` with your x.ai email, then {}",
-                Step::AdoptDefault(Cli::Grok, label.clone()),
-                sign_in(label, *window)
+            Setup::Adopt { window } => format!(
+                "run `{}` naming your x.ai account by its provider word and address, then {}",
+                Step::AdoptDefault(Cli::Grok),
+                sign_in(&Word::chosen(), *window)
             ),
         }
     }
@@ -528,8 +528,8 @@ fn cut(mut text: String, max: usize) -> String {
 
 /// The one need's words (`meta set attention owner=signin:grok kind=ask`). With a `setup`: the
 /// once-ever setup first, in short words ([`Setup`]), then the code and the page as the
-/// immediate alternative, then the setup's exact command or file: `once: sign main in at the
-/// desk; or code WMRT-8KQZ at <page> (aterm harness accounts browser main --cli grok)`. With
+/// immediate alternative, then the setup's exact command or file: `once: sign the row in at the
+/// desk; or code WMRT-8KQZ at <page> (aterm harness accounts browser <word> --cli grok)`. With
 /// none (no setup makes a sign-in automatic, [`Cli::renews_headlessly`]): `approve code
 /// WMRT-8KQZ at <page>`. Where that passes the attention cap
 /// ([`aterm_types::control_verbs::META_ATTENTION_KEYED_MAX`]), the page's host, then without
@@ -580,25 +580,13 @@ pub fn needs_you_line(setup: Option<&Setup>, url: &str, code: Option<&str>) -> S
     }
 }
 
-/// The label the once-ever setup adopts the default home under ([`Setup::Adopt`]): the first of
-/// [`ADOPT_LABEL`], [`LEDGER_ACCOUNT`] and `grok-home` that `roster` does not list (`accounts
-/// adopt-default` refuses a listed one), else `<label>`.
-#[must_use]
-pub fn adopt_label(roster: &super::accounts::Roster) -> String {
-    [ADOPT_LABEL, LEDGER_ACCOUNT, "grok-home"]
-        .into_iter()
-        .find(|label| roster.row(label).is_none())
-        .unwrap_or("<label>")
-        .to_owned()
-}
-
 /// Which row signs the default home in ([`pick_row`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowFrom {
     /// Grok Build's roster's row whose login is the default home (no `dir` once the renewals'
     /// bindings are applied: `accounts adopt-default --cli grok`).
     Default,
-    /// The pool's active row (`accounts use <label> --cli grok`), where no row is the default
+    /// The pool's active row (`accounts use <account> --cli grok`), where no row is the default
     /// home's: the account the person runs on.
     Active,
     /// No row: the default home's own key, [`LEDGER_ACCOUNT`] (its browser profile
@@ -691,9 +679,10 @@ pub struct Ladder {
     /// failed lately ([`super::browser_window::window_route`]). The setup names it, else the
     /// mailbox first; so does the way out of an automatic refusal ([`refused_way_out`]).
     pub window: bool,
-    /// The label the setup adopts the default home under where no row signs it in
-    /// ([`adopt_label`]).
-    pub adopt: String,
+    /// The word a step that signs the row's browser profile in names it by, among Grok Build's
+    /// roster ([`super::account_names::word_of_row`]); `None` where no row signs the default home
+    /// in or the row has no address, which `accounts browser` refuses until it has one.
+    pub word: Option<Word>,
 }
 
 impl Ladder {
@@ -710,7 +699,7 @@ impl Ladder {
             mailbox_filed: false,
             browser: Browser::Missing(why.to_owned()),
             window: false,
-            adopt: ADOPT_LABEL.to_owned(),
+            word: None,
         }
     }
 
@@ -732,20 +721,25 @@ impl Ladder {
         Cli::Grok.renews_headlessly().then(|| self.setup())
     }
 
+    /// The word a step that signs the row's browser profile in names it by ([`Ladder::word`]),
+    /// else the account a person names ([`Word::chosen`]): a row whose email is no address.
+    fn word_or_chosen(&self) -> Word {
+        self.word.clone().unwrap_or_else(Word::chosen)
+    }
+
     /// The once-ever setup for this ladder's row ([`Setup`]).
     #[must_use]
     pub fn setup(&self) -> Setup {
         match (&self.from, &self.email) {
             (RowFrom::None, _) => Setup::Adopt {
-                label: self.adopt.clone(),
                 window: self.window,
             },
             (_, None) => Setup::Email {
                 label: self.label.clone(),
                 window: self.window,
             },
-            (_, Some(_)) if self.window => Setup::Window(self.label.clone()),
-            (_, Some(_)) => Setup::Chromium(self.label.clone()),
+            (_, Some(_)) if self.window => Setup::Window(self.word_or_chosen()),
+            (_, Some(_)) => Setup::Chromium(self.word_or_chosen()),
         }
     }
 
@@ -873,11 +867,11 @@ struct RowRead {
     label: String,
     from: RowFrom,
     email: Option<String>,
+    word: Option<Word>,
     profile: bool,
     mailbox: bool,
     mailbox_unready: Option<String>,
     mailbox_filed: bool,
-    adopt: String,
     approver: super::headless_oauth::VendorApprover,
 }
 
@@ -920,10 +914,19 @@ impl LiveAuto {
             .ok()
             .and_then(|(state, _)| state.active);
         let (label, from, email) = pick_row(&roster, active.as_deref());
+        // The row picked, else the default home's own key with no email ([`LEDGER_ACCOUNT`]).
+        let row = roster
+            .row(&label)
+            .cloned()
+            .unwrap_or_else(|| super::accounts::Row {
+                label: label.clone(),
+                ..super::accounts::Row::default()
+            });
+        let lab = super::alab_roster::current();
+        let word = super::account_names::word_of_row(Cli::Grok, &row, &roster.rows, lab.as_deref());
         let mut approver = super::headless_oauth::VendorApprover::new(
             Cli::Grok,
-            &label,
-            email.as_deref(),
+            (&row, word.as_ref()),
             &store.shared_dir(),
             self.home.as_deref(),
         );
@@ -948,10 +951,10 @@ impl LiveAuto {
             label,
             from,
             email,
+            word,
             profile,
             mailbox,
             mailbox_unready,
-            adopt: adopt_label(&roster),
             approver,
         })
     }
@@ -1013,7 +1016,7 @@ impl Auto for LiveAuto {
             mailbox_filed: read.mailbox_filed,
             browser,
             window: super::browser_window::window_route(home).reachable(),
-            adopt: read.adopt,
+            word: read.word,
         }
     }
 
@@ -1448,7 +1451,7 @@ pub(super) fn run(
             why: format!(
                 "{}; {}",
                 unsigned_why(&drove.outcome),
-                refused_way_out(&led.label, led.window)
+                refused_way_out(&led.word.clone().unwrap_or_else(Word::chosen), led.window)
             ),
             word,
         },
@@ -1611,8 +1614,9 @@ struct Led {
     lead: Lead,
     /// The rungs' results in the ladder's words ([`ledger_line`]).
     rungs: String,
-    /// The ladder's row, which the way out of an automatic refusal names.
-    label: String,
+    /// The word the way out of an automatic refusal names the ladder's row by
+    /// ([`Ladder::word`]).
+    word: Option<Word>,
     /// `accounts browser` opens a window here ([`Ladder::window`]), so the way out of an
     /// automatic refusal may name it as the next command ([`refused_way_out`]).
     window: bool,
@@ -1620,22 +1624,20 @@ struct Led {
     refused_by_rung: bool,
 }
 
-/// The way out of an automatic refusal for the row `label`, after its reason: nothing was
-/// placed, and the next launch from a terminal asks the person to approve the code; or the row's
-/// browser profile signed in again as its account, with `accounts browser` named as the command
-/// only where it opens a window here (`window`), else after installing a Chromium that opens one.
+/// The way out of an automatic refusal for the row its account's `word` names, after its
+/// reason: nothing was placed, and the next launch from a terminal asks the person to approve the
+/// code; or the row's browser profile signed in again as its account, with `accounts browser`
+/// named as the command only where it opens a window here (`window`), else after installing a
+/// Chromium that opens one.
 #[must_use]
-pub fn refused_way_out(label: &str, window: bool) -> String {
+pub fn refused_way_out(word: &Word, window: bool) -> String {
+    let step = Step::Browser(Cli::Grok, word.clone());
     let again = if window {
-        format!(
-            "or sign {label}'s browser profile in again as its account: `{}`",
-            Step::Browser(Cli::Grok, label.to_owned())
-        )
+        format!("or sign the row's browser profile in again as its account: `{step}`")
     } else {
         format!(
             "or install a Chromium that opens a window (Google Chrome for Testing or Chromium) \
-             and sign {label}'s browser profile in again as its account: `aterm harness \
-             accounts browser {label} --cli grok`"
+             and sign the row's browser profile in again as its account: `{step}`"
         )
     };
     format!(
@@ -1895,7 +1897,7 @@ fn lead(
             return Led {
                 lead: Lead::NotRun(why),
                 rungs: String::new(),
-                label: String::new(),
+                word: None,
                 window: false,
                 refused_by_rung: false,
             };
@@ -1912,7 +1914,7 @@ fn lead(
         return Led {
             lead: Lead::Stopped(None),
             rungs: rungs_line(&ladder, skipped(), false),
-            label: ladder.label.clone(),
+            word: ladder.word.clone(),
             window: ladder.window,
             refused_by_rung: false,
         };
@@ -1968,7 +1970,7 @@ fn lead(
             ));
     Led {
         rungs: rungs_line(&ladder, &headless, approver.need.raised),
-        label: ladder.label.clone(),
+        word: ladder.word.clone(),
         window: ladder.window,
         refused_by_rung,
         lead: ended,

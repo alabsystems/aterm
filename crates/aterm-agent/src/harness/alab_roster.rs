@@ -15,8 +15,9 @@
 //!   the sync keeps every row already on this Mac whatever the lab says of it ([`retain`]) and
 //!   adds only accounts this Mac prefers, and the default login's account under its lab label;
 //!   nothing here drops, refuses or signs out a row.
-//! - [`asked_row`]: an account asked for by name (`accounts add <lab label|account key>`), which
-//!   joins this Mac's roster for that request and writes no preference.
+//! - [`asked_row`]: an account asked for by name (`accounts add <account>`: its slug, its key, or
+//!   its provider word and address), which joins this Mac's roster for that request and writes no
+//!   preference.
 //! - [`names_this_mac`]: where it holds, the harness reads no sheet: the upkeep's triggers
 //!   ([`sync_due`], [`fleet_digest`]), the mailbox labels ([`mailbox_labels`]) and the mail
 //!   routes ([`mail_targets`], [`mailbox_of`]) come from the lab.
@@ -30,6 +31,9 @@
 //! - [`holdings`]: what this Mac runs that it does not prefer, from what its login places hold
 //!   ([`observe::sweep::places_of`]), which the journal publishes as `place` rows; [`Lab::places`] is what every Mac's rows say, and
 //!   [`Lab::holders`] reads them beside the preferences ("which Macs hold A"), never as a limit.
+//!
+//! Traced by the accounts keeper: what this file reads of the file system itself, it reads
+//! through `aterm_uds::trace::fs` (census `traced-reads`).
 
 #[cfg(any(test, debug_assertions))]
 use super::account_sync_error::SyncError;
@@ -173,6 +177,17 @@ pub struct Lab {
     pub bound: std::collections::BTreeMap<String, MachineKey>,
     /// Every account of a pooled CLI, live or not.
     pub accounts: Vec<LabAccount>,
+    /// Every account's names, by key, of every realm (agy's and Muse's included, which
+    /// [`Self::accounts`] leaves out): its slug, its name and its addresses, as LabView reads
+    /// them. How a surface shows an account and what a word names
+    /// (`super::account_names::resolve`).
+    pub names: std::collections::BTreeMap<String, aterm_file::AccountNames>,
+    /// Each account key, of every realm (agy's and Muse's included, which [`Self::accounts`]
+    /// leaves out), whose lab row may not be signed in: retired, or of a status other than
+    /// `pending` or `active` (paused, broken, banned), as [`LabAccount::joinable`] says of a
+    /// pooled one. No verb lists a row for such an account ([`Self::bars`]), so a sign-in nobody
+    /// may try is never set up.
+    pub barred: std::collections::BTreeSet<String>,
     /// Each address with an `alias_of` link, lower-cased, to the live addresses its auth codes
     /// arrive at, nearest first ([`mail_targets`]).
     pub aliases: std::collections::BTreeMap<String, Vec<String>>,
@@ -302,6 +317,17 @@ impl Lab {
     /// `cli`'s accounts.
     pub fn of(&self, cli: Cli) -> impl Iterator<Item = &LabAccount> {
         self.accounts.iter().filter(move |a| a.cli == cli)
+    }
+
+    /// Whether the lab bars account `pk` from a sign-in ([`Self::barred`], or a pooled account
+    /// that is not [`LabAccount::joinable`]), so no verb lists a row for it.
+    #[must_use]
+    pub fn bars(&self, pk: &str) -> bool {
+        self.barred.contains(pk)
+            || self
+                .accounts
+                .iter()
+                .any(|account| account.pk == pk && !account.joinable)
     }
 
     /// The one account of `cli` that `row` is; `None` for a row the lab does not know, or one
@@ -536,6 +562,23 @@ pub trait Source: Send + Sync {
         Err("no lab registry is held here")
     }
 
+    /// Whether `held` is what [`Self::reveal_bound`] of `parts` under `expected` would hand over
+    /// now, in their order. Answered under the binding check of the reveal, with no value
+    /// handed on, nothing derived from one kept and nothing journalled, for the holder of a
+    /// revealed bundle that asks whether it is still the registry's.
+    ///
+    /// # Errors
+    /// As [`Self::reveal_bound`], in value-free words.
+    fn same_bound(
+        &self,
+        expected: &LabMailbox,
+        parts: &[Part],
+        held: &[&[u8]],
+    ) -> Result<bool, &'static str> {
+        let _ = (expected, parts, held);
+        Err("bound registry reveal is unavailable")
+    }
+
     /// Whether [`Self::reveal`] of `part` of `mailbox` would hand a sign-in a value now, and
     /// what that value holds ([`Standing`]): answered with no value handed on and nothing
     /// journalled, for a caller that only decides whether a sign-in can start. It answers as
@@ -570,6 +613,19 @@ thread_local! {
     static GUARD_OVERRIDE: std::cell::RefCell<Option<ReceiptGuard>> = const { std::cell::RefCell::new(None) };
     static PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TURNED_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Each change of this thread's [`OVERRIDE`] ([`TestSourceOverride`]), which a read of the
+    /// override records, as the installed source's reads record the shared files they read: a
+    /// trace that read the test's lab moves when the test sets another.
+    static OVERRIDE_MOVES: aterm_uds::trace::Generation = aterm_uds::trace::Generation::new("alab_roster/test_source");
+}
+
+/// This thread's test source ([`TestSourceOverride`]), its generation recorded in the trace scope
+/// armed on this thread.
+#[cfg(test)]
+fn overridden() -> Option<SourceSnapshot> {
+    let source = OVERRIDE.with(|cell| cell.borrow().clone())?;
+    OVERRIDE_MOVES.with(aterm_uds::trace::Generation::record);
+    Some(source)
 }
 
 /// Whether the lab this process may hold could not be read yet: a Mac the
@@ -626,7 +682,7 @@ pub fn snapshot() -> SourceSnapshot {
         if TURNED_OFF.with(std::cell::Cell::get) {
             return SourceSnapshot::Disabled;
         }
-        if let Some(source) = OVERRIDE.with(|cell| cell.borrow().clone()) {
+        if let Some(source) = overridden() {
             return source;
         }
         if PENDING.with(std::cell::Cell::get) {
@@ -646,7 +702,7 @@ pub fn capture() -> SourceCapture {
         if TURNED_OFF.with(std::cell::Cell::get) || PENDING.with(std::cell::Cell::get) {
             return SourceCapture::observed(snapshot());
         }
-        if let Some(source) = OVERRIDE.with(|cell| cell.borrow().clone()) {
+        if let Some(source) = overridden() {
             return SourceCapture::guarded(
                 source.clone(),
                 GUARD_OVERRIDE
@@ -694,6 +750,7 @@ pub(crate) struct TestSourceOverride(Option<SourceSnapshot>, Option<ReceiptGuard
 #[cfg(test)]
 impl TestSourceOverride {
     pub(crate) fn new(source: SourceSnapshot) -> Self {
+        OVERRIDE_MOVES.with(aterm_uds::trace::Generation::bump);
         Self(
             OVERRIDE.with(|cell| cell.replace(Some(source))),
             GUARD_OVERRIDE.with(|cell| cell.take()),
@@ -706,6 +763,7 @@ impl TestSourceOverride {
     }
 
     pub(crate) fn set(&self, source: SourceSnapshot) {
+        OVERRIDE_MOVES.with(aterm_uds::trace::Generation::bump);
         OVERRIDE.with(|cell| *cell.borrow_mut() = Some(source));
     }
 }
@@ -713,6 +771,7 @@ impl TestSourceOverride {
 #[cfg(test)]
 impl Drop for TestSourceOverride {
     fn drop(&mut self) {
+        OVERRIDE_MOVES.with(aterm_uds::trace::Generation::bump);
         OVERRIDE.with(|cell| *cell.borrow_mut() = self.0.take());
         GUARD_OVERRIDE.with(|cell| *cell.borrow_mut() = self.1.take());
     }
@@ -791,6 +850,50 @@ pub fn usable(mailbox: &str, part: Part) -> Result<Standing, &'static str> {
         .get()
         .ok_or("no lab registry is held here")?
         .usable(mailbox, part)
+}
+
+/// Whether `held` is what [`reveal_bound`] of `parts` under `expected` would hand over now
+/// ([`Source::same_bound`]): nothing is revealed and nothing journalled.
+///
+/// # Errors
+/// As [`reveal_bound`], in value-free words.
+pub fn same_bound(
+    expected: &LabMailbox,
+    parts: &[Part],
+    held: &[&[u8]],
+) -> Result<bool, &'static str> {
+    #[cfg(test)]
+    if let Some(result) = MAIL.with(|cell| {
+        cell.borrow().as_ref().map(|(mail, secrets)| {
+            LOOKS.with(|n| n.set(n.get() + 1));
+            if mail
+                .iter()
+                .filter(|m| m.pk == expected.pk)
+                .collect::<Vec<_>>()
+                .as_slice()
+                != [expected]
+            {
+                return Err("registry mailbox binding changed");
+            }
+            let mut same = parts.len() == held.len();
+            for (at, part) in parts.iter().enumerate() {
+                let value = secrets
+                    .get(&(expected.pk.clone(), *part))
+                    .ok_or("not set in the registry")?;
+                same &= held.get(at).is_some_and(|held| value.as_bytes() == *held);
+            }
+            Ok(same)
+        })
+    }) {
+        return result;
+    }
+    if turned_off() {
+        return Err("the lab roster is turned off here");
+    }
+    INSTALLED
+        .get()
+        .ok_or("no lab registry is held here")?
+        .same_bound(expected, parts, held)
 }
 
 /// Reveal a credential only under the exact mailbox metadata the consumer admitted.
@@ -1095,20 +1198,21 @@ pub(super) fn chosen_captured(
     Ok(fleet)
 }
 
-/// The roster row `name` asks for (§0, §7: "any account asked for by name"): the one account of
-/// `cli` the lab this process holds calls `name` (its label, legacy label or account key `ac-…`;
-/// an address is never a name), under its lab label, with its address, provider identity,
-/// browser and vendor keys and its derived order. `accounts add` writes it to this Mac's roster
-/// and no preference anywhere, and every later sync keeps it, as it keeps every row a Mac has.
-/// `None` where no lab names this Mac or no account of `cli` has that name, so `name` is a new
-/// label as it always was.
+/// The roster row `word` asks for (§0, §7: "any account asked for by name"): the one account of
+/// `cli`'s pool the lab this process holds names by `word` (its slug, its key, its provider word
+/// and address, or an address that names one account of the pool;
+/// [`super::account_names::resolve`] over the lab's names, [`Lab::names`]), under its lab label,
+/// which every later sync keys it by, with its address, provider identity, browser and vendor
+/// keys and its derived order. A label, the lab's or one a Mac called its row before, names nothing.
+/// `accounts add` writes it to this Mac's roster and no preference anywhere, and every later sync
+/// keeps it, as it keeps every row a Mac has. `None` where no lab names this Mac, or `word` names
+/// no account of the lab, or one the lab holds no pooled account of `cli` for.
 ///
 /// # Errors
-/// Several accounts have that name (a label is unique only as a finding), or the account may
-/// not be signed in (paused, broken, banned or retired), so a sign-in nobody may try is never
-/// set up.
-pub fn asked_row(cli: Cli, name: &str) -> Option<Result<Row, String>> {
-    asked_row_from(&snapshot(), cli, name)
+/// `word` names several accounts, or one of another pool, or the account may not be signed in
+/// (paused, broken, banned or retired), so a sign-in nobody may try is never set up.
+pub fn asked_row(cli: Cli, word: &str) -> Option<Result<Row, String>> {
+    asked_row_from(&snapshot(), cli, word)
 }
 
 #[cfg_attr(
@@ -1122,34 +1226,30 @@ pub fn asked_row(cli: Cli, name: &str) -> Option<Result<Row, String>> {
 pub(super) fn asked_row_from(
     source: &SourceSnapshot,
     cli: Cli,
-    name: &str,
+    word: &str,
 ) -> Option<Result<Row, String>> {
+    use super::account_names::{self, Candidates};
     let lab = source.lab()?;
     lab.me.as_ref()?;
-    let name = name.trim();
-    let mut found = lab.of(cli).filter(|account| {
-        account.pk == name || account.label == name || account.legacy_label.as_deref() == Some(name)
-    });
-    let account = match (found.next(), found.next()) {
-        (None, _) => return None,
-        (Some(account), None) => account,
-        (Some(_), Some(_)) => {
-            return Some(Err(format!(
-                "several {} accounts of the lab are called `{}`: name one by its account key",
-                cli.connector().product,
-                super::one_line(name, 64)
-            )));
-        }
+    let candidates = Candidates {
+        lab: Some(&lab),
+        ..Candidates::default()
     };
+    let named = match account_names::resolve(cli, word.trim(), &candidates) {
+        Ok(named) => named,
+        Err(why) if why == aterm_file::no_account(word.trim()) => return None,
+        Err(why) => return Some(Err(why)),
+    };
+    let account = lab.of(cli).find(|account| account.pk == named.pk)?;
+    let shown = named.shown();
     if !account.joinable {
         return Some(Err(format!(
-            "the lab's `{}` may not be signed in (it is paused, retired or barred), so it joins \
-             no roster",
-            account.label
+            "the lab's {shown} may not be signed in (it is paused, retired or barred), so it joins \
+             no roster"
         )));
     }
     if let Some(why) = accounts::label_refusal(&account.label) {
-        return Some(Err(format!("the lab's label `{}` {why}", account.label)));
+        return Some(Err(format!("the lab's {shown} has a label that {why}")));
     }
     Some(Ok(Row {
         label: account.label.clone(),
@@ -1396,7 +1496,7 @@ pub(super) fn order_rows(
     aterm_spec_anchor::spec_unmodeled(
         machine = "AlabCells",
         action = "Ask",
-        reason = "A person asking for an account by name is `accounts add <lab label|account key>` ([`asked_row`]), which writes a roster row and no preference: the conformance test writes that row into the roster the sync starts from, and `an_account_asked_for_by_name_joins_with_no_preference` holds `asked_row` to it."
+        reason = "A person asking for an account by name is `accounts add <account>` ([`asked_row`]), which writes a roster row and no preference: the conformance test writes that row into the roster the sync starts from, and `an_account_asked_for_by_name_joins_with_no_preference` holds `asked_row` to it."
     )
 )]
 #[cfg_attr(

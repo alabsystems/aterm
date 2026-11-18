@@ -26,7 +26,7 @@ fn scoped_detached_workers_retain_admission_until_unstarted_work_drops() {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let store = accounts::Store::at(tmp.path());
         let signin = store.signin_now().unwrap().unwrap();
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         let permit = AutoRenewPermit::claim(&guard, "owned", Instant::now(), true).unwrap();
         let queued = Mutex::new(Vec::<Box<dyn FnOnce() + Send>>::new());
         let spawn = |work| {
@@ -86,7 +86,14 @@ fn cancelled_upkeep_and_rotation_do_not_read_or_prepare_account_state() {
     let state = tmp.path().join("not-created-state");
     let roster = tmp.path().join("not-created-config/accounts.toml");
     assert_eq!(
-        upkeep_live_scoped(scope.clone(), &home, &state, &roster, 1, UpkeepStep::Renew),
+        upkeep_live_scoped(
+            scope.clone(),
+            &home,
+            &state,
+            &roster,
+            trace::Now::at(1),
+            UpkeepStep::Renew
+        ),
         Upkept::Off
     );
     assert!(!auto_renew_next_account_interactive_for_scoped(
@@ -115,7 +122,7 @@ fn scoped_permits_restore_only_cancelled_or_unstarted_retry_claims() {
         for mode in 0..4 {
             let at = Instant::now();
             let before = at - std::time::Duration::from_secs(1_801);
-            let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+            let guard = AutoRenewGuard::default().shared();
             guard
                 .lock()
                 .unwrap()
@@ -228,7 +235,7 @@ fn issuer_unavailability_restores_retry_without_closing_local_scope_and_completi
     for completed in [false, true] {
         let at = Instant::now();
         let before = at - std::time::Duration::from_secs(1_801);
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         guard
             .lock()
             .unwrap()
@@ -277,7 +284,7 @@ fn uncertain_capture_wait_retains_the_original_signin_permit_and_staging() {
         let signin = store.signin_now().unwrap().unwrap();
         let staging = store.claim_staging_dir("work").unwrap();
         let retained_staging = Staging(staging.clone());
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         let permit = AutoRenewPermit::claim(&guard, "work", Instant::now(), true).unwrap();
         let recovery = Arc::new((Mutex::new(false), Condvar::new()));
         let recover_wait = recovery.clone();

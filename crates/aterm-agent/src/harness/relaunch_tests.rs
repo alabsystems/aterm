@@ -6115,6 +6115,72 @@ fn the_line_budget_drops_the_tap_then_the_wrapper_then_the_plan() {
     );
 }
 
+/// A LINE REFUSED FOR AN ACCOUNT WITH NO STORED LOGIN HERE NAMES THE ACCOUNT AS A LEDGER ROW DOES
+/// (SF-07H decision 3): by its key with its slug beside it, as the lab this process holds names
+/// it, never by an address or a roster label; with no lab, by its key alone.
+/// NEGATIVE CONTROL (2026-11-16, by hand, then restored): with the detail naming `serve.key`,
+/// the slug is missing under the lab.
+#[test]
+fn a_refused_token_line_names_the_account_by_its_key_and_slug() {
+    const KEY: &str = "ac-fedcba9876543210";
+    let aterm = Path::new(at!("/Applications/aterm.app/Contents/MacOS/aterm"));
+    let build = Path::new("/s/store/claude/7/bin/claude");
+    let tap = super::super::tap::settings_value(aterm).expect("a tap value");
+    let serve = TokenServe {
+        aterm: aterm.to_path_buf(),
+        key: KEY.to_owned(),
+        build: build.to_path_buf(),
+        entry: accounts::TokenEntry::parse(&format!("aterm-claude-token-{KEY}")).expect("an entry"),
+        stored: false,
+    };
+    let argv = words(&["claude", "--verbose"]);
+    let cd = format!("/d{}", "d".repeat(upgrade::MAX_LINE));
+    let detail = || match line_tap_selected(
+        Dialect::Zsh,
+        None,
+        Some(&cd),
+        build,
+        &argv,
+        Some(LOGIN_ID),
+        None,
+        &[],
+        Some(&token_route::TOKEN_STATE_ENV),
+        None,
+        Some(&tap),
+        false,
+        Some(&serve),
+    ) {
+        Err(NoPlan::Refused { detail, .. }) => detail,
+        Err(_) => panic!("another refusal"),
+        Ok(kept) => panic!("a line: {}", kept.line),
+    };
+    let mut lab = super::super::alab_roster::Lab::default();
+    lab.names.insert(
+        KEY.to_owned(),
+        aterm_file::AccountNames {
+            realm: "claude".to_owned(),
+            slug: "claude-ada-x".to_owned(),
+            name: Some("claude ada@x.example".to_owned()),
+            email: Some("ada@x.example".to_owned()),
+            login: None,
+            live: true,
+        },
+    );
+    let named = super::super::alab_roster::with_lab(lab, detail);
+    assert!(
+        named.contains(&format!(
+            "{KEY} (claude-ada-x) has no stored login on this Mac"
+        )),
+        "{named}"
+    );
+    assert!(!named.contains("ada@x.example"), "{named}");
+    let bare = detail();
+    assert!(
+        bare.contains(&format!("{KEY} has no stored login on this Mac")),
+        "{bare}"
+    );
+}
+
 /// A SERVED LINE SPENDS NO BYTES ON TOKEN STATE (§5.4): the tapped, served line keeps its tap
 /// for a longer line than one that also unsets the descriptor and the marker would, by those
 /// words' length. CONTROL: a served line that unsets them too ([`budget_stages_unsetting`])
@@ -6150,11 +6216,12 @@ fn budget_stages_unsetting(stored: bool, served_unset: Option<&[&str]>) -> (Vec<
     let aterm = Path::new(at!("/Applications/aterm.app/Contents/MacOS/aterm"));
     let build = Path::new("/s/store/claude/7/bin/claude");
     let tap = super::super::tap::settings_value(aterm).expect("a tap value");
+    let account = "ac-fedcba9876543210";
     let serve = TokenServe {
         aterm: aterm.to_path_buf(),
-        named: "work".to_owned(),
+        key: account.to_owned(),
         build: build.to_path_buf(),
-        entry: accounts::TokenEntry::parse("aterm-claude-token-ac-fedcba9876543210")
+        entry: accounts::TokenEntry::parse(&format!("aterm-claude-token-{account}"))
             .expect("an entry"),
         stored,
     };
@@ -6201,7 +6268,9 @@ fn budget_stages_unsetting(stored: bool, served_unset: Option<&[&str]>) -> (Vec<
         let stage = match selected(&cd) {
             Ok(kept) => {
                 let tapped = kept.line.contains("--settings");
-                let wrapped = kept.line.contains("'token-run' 'work' '--' '/s/store");
+                let wrapped = kept
+                    .line
+                    .contains("'token-run' 'ac-fedcba9876543210' '--' '/s/store");
                 assert_eq!(wrapped, kept.served.is_some(), "{}", kept.line);
                 if served_unset.is_none() {
                     assert_eq!(
@@ -6282,10 +6351,11 @@ fn a_token_command_captures_the_build_its_wrapper_execs() {
         std::fs::write(file, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let entry = accounts::TokenEntry::parse("aterm-claude-token-ac-0123456789abcdef").unwrap();
+    let account = "ac-0123456789abcdef";
+    let entry = accounts::TokenEntry::parse(&format!("aterm-claude-token-{account}")).unwrap();
     let serve = TokenServe {
         aterm: aterm.clone(),
-        named: "work".into(),
+        key: account.into(),
         build: build.clone(),
         entry,
         stored: true,

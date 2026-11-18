@@ -1983,7 +1983,7 @@ fn build(facts: &FactMenuFacts, room: usize, report: bool) -> Vec<MenuRow> {
             sentence_rows(
                 &mut out,
                 &format!(
-                    "Add one: aterm harness accounts add --cli {} <label>",
+                    "Add one: aterm harness accounts add --cli {} <account>",
                     cli.id()
                 ),
                 room,
@@ -2265,14 +2265,17 @@ pub(crate) fn details_report(facts: &FactMenuFacts) -> String {
             None => "No next event scheduled".to_owned(),
         });
     }
-    // The command takes a roster label; an account with none here has no older days it prints.
-    let older = ctx
-        .card()
-        .and_then(|card| card.who.label().map(str::to_owned))
-        .or_else(|| facts.account_row.clone());
-    if let Some(label) = older {
+    // The command takes the account's word (its slug, else its key: `AccountCard::word`), never
+    // a roster label, in the card's pool; an account with none (an outside login, a row with no
+    // address, a card not read yet) has no older days it prints.
+    if let Some(word) = ctx.card().and_then(|card| card.word.as_ref()) {
+        let pool = facts
+            .cli
+            .filter(|cli| *cli != Cli::Claude)
+            .map(|cli| format!(" --cli {}", cli.id()))
+            .unwrap_or_default();
         lines.push(format!(
-            "Older days: aterm harness accounts history {label}"
+            "Older days: aterm harness accounts history {word}{pool}"
         ));
     }
     lines.join("\n")

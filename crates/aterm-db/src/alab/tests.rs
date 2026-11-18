@@ -772,7 +772,8 @@ fn account_cell(pk: &str, col: &str, value: &CellValue) -> Change {
 #[test]
 fn one_address_is_three_accounts_slugged_claude_oai_and_google_and_an_automatic_owner_write_is_inert()
  {
-    use super::account_names::{self, Found};
+    use super::account_names;
+    use aterm_file::account::{Found, named};
     let lab = Lab::new(&[Role::Writer, Role::Writer]);
     let first = Registry::at(lab.paths[0].clone());
     let scope = first.open().unwrap();
@@ -865,20 +866,12 @@ fn one_address_is_three_accounts_slugged_claude_oai_and_google_and_an_automatic_
         ]
     );
     for word in ["claude-fb-alpha", claude.as_str()] {
-        assert_eq!(
-            account_names::named(&names, word),
-            Found::One(claude.as_str()),
-            "{word}"
-        );
+        assert_eq!(named(&names, word), Found::One(claude.as_str()), "{word}");
     }
     for word in [format!("oai {ada}"), format!("oai:{ada}")] {
-        assert_eq!(
-            account_names::named(&names, &word),
-            Found::One(codex.as_str()),
-            "{word}"
-        );
+        assert_eq!(named(&names, &word), Found::One(codex.as_str()), "{word}");
     }
-    let Found::Many(mut all) = account_names::named(&names, ada) else {
+    let Found::Many(mut all) = named(&names, ada) else {
         panic!("the address names every account it signs in");
     };
     all.sort_unstable();
@@ -886,7 +879,7 @@ fn one_address_is_three_accounts_slugged_claude_oai_and_google_and_an_automatic_
     keys_of.sort_unstable();
     assert_eq!(all, keys_of);
     for word in ["claude-fb", "fb-alpha"] {
-        assert_eq!(account_names::named(&names, word), Found::None, "{word}");
+        assert_eq!(named(&names, word), Found::None, "{word}");
     }
 
     let rows = view.project(&ACCOUNT);
@@ -915,11 +908,8 @@ fn one_address_is_three_accounts_slugged_claude_oai_and_google_and_an_automatic_
         .unwrap();
     let names = account_names::of(&first.view().unwrap());
     assert_eq!(names[claude].slug, "claude-m2-work");
-    assert_eq!(
-        account_names::named(&names, "claude-m2-work"),
-        Found::One(claude.as_str())
-    );
-    assert_eq!(account_names::named(&names, "claude-fb-alpha"), Found::None);
+    assert_eq!(named(&names, "claude-m2-work"), Found::One(claude.as_str()));
+    assert_eq!(named(&names, "claude-fb-alpha"), Found::None);
 }
 
 /// A Mac's facts row counts only at its own machine key: at another key it is inert.

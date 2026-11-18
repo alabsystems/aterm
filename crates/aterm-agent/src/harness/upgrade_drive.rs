@@ -6319,6 +6319,45 @@ impl St {
                         .is_some_and(|now| squash(&now) != self.relaunched_start))
     }
 
+    /// Whether anything of this in-flight restart can still act: its agent
+    /// ([`Self::agent_exit_by`]: running, or a live pid not proven another's), the process its
+    /// relaunch started ([`Self::relaunched_gone`]), or the shell its line is typed at. Another
+    /// tab's record is a claim on the conversation only while this holds
+    /// ([`super::relaunch::other_tab_claim`]). A retirement not issued keeps its own hold
+    /// ([`Self::close_overtaken`] closes none).
+    ///
+    /// A live pid the record names by pid alone (its shell; an agent or a relaunch an earlier
+    /// build recorded no start for) holds the claim unless it is proven another process: one
+    /// born after `saved_s`, the second this record was last written (its file's), is, because
+    /// the record named a process that already ran (pids are reused, as after a reboot). A
+    /// start unread, or `saved_s` unknown, proves nothing and the pid holds.
+    /// `alive` and `start_of` are the kernel's answers for a pid.
+    pub(super) fn claim_lives(
+        &self,
+        saved_s: Option<u64>,
+        alive: impl Fn(u32) -> bool,
+        start_of: impl Fn(u32) -> Option<String>,
+    ) -> bool {
+        if self.native_retired_unissued {
+            return true;
+        }
+        let born_since = |pid: u32| {
+            saved_s
+                .zip(start_of(pid).and_then(|start| super::unix_time::parse_lstart(&start)))
+                .is_some_and(|(saved, born)| born > saved)
+        };
+        let agent = match self.agent_exit_by(&alive, &start_of) {
+            super::relaunch::AgentExit::Gone => false,
+            super::relaunch::AgentExit::Runs => true,
+            super::relaunch::AgentExit::Unproven => !born_since(self.pid),
+        };
+        let relaunched = self.relaunched_pid != 0
+            && !self.relaunched_gone(&alive, &start_of)
+            && !(self.relaunched_start.is_empty() && born_since(self.relaunched_pid));
+        let shell = self.shell != 0 && alive(self.shell) && !born_since(self.shell);
+        agent || relaunched || shell
+    }
+
     /// Bind the agent process `pid`, born at `start` ([`kernel_start`]'s spelling): the writer of
     /// [`Self::pid`] beside its start, so a record names its agent by identity. A stamp of an
     /// exit ([`Self::exited_at`]) spoke of the agent bound before, so it goes with another one.
@@ -11527,11 +11566,13 @@ fn visit_build(
              landed",
         );
     }
+    if let Some(st) = prior.as_mut().filter(|st| st.in_flight() && st.tab != tab)
+        && let Some(wait) = super::relaunch::other_tab_claim(opts, &r, st, &sf.session_id)
+    {
+        return wait;
+    }
     if let Some(mut st) = prior.clone().filter(St::in_flight) {
         r.to = format!("{}({})", st.to, st.source);
-        if st.tab != tab {
-            return said(r, "wait:conversation-in-other-tab");
-        }
         // The live process holding the conversation is the agent the restart waits on only by
         // its pid and kernel start: one born at another time at that pid is another process
         // (a reboot reuses pids), never the exit to wait for.

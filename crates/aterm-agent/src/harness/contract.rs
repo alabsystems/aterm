@@ -391,7 +391,7 @@ const VENDOR_MAX: usize = 64;
 /// Whether `v` is a vendor version a claim may announce: 1 to [`VENDOR_MAX`] bytes of ASCII
 /// alphanumerics and `.`, `-`, `+`, `_`.
 #[must_use]
-pub(super) fn vendor_ok(v: &str) -> bool {
+pub fn vendor_ok(v: &str) -> bool {
     !v.is_empty()
         && v.len() <= VENDOR_MAX
         && v.bytes()
@@ -409,6 +409,10 @@ pub struct Claim {
     pub contract: u32,
     /// The duties it takes: under contract 4, the grant ([`grant`]).
     pub scopes: Scopes,
+    /// The validated requested scope words in lexical order, including unknown and ungranted
+    /// words under contract 4. The grant may hold less of this set, down to nothing. A claim
+    /// placed again for its holder asks this set again, independent of the original word order.
+    pub claimed: String,
     /// Its own version (`version=`), when it named one.
     pub version: Option<ClaimVersion>,
     /// The vendor build its child runs (`vendor=`), when it named one.
@@ -420,6 +424,32 @@ pub struct Claim {
 }
 
 impl Claim {
+    /// Whether these claims name the same present authority. Requested words are retained for
+    /// later re-granting, but only the current grant authorizes a duty. Every other claim field
+    /// remains part of its authority, including the named child and versions.
+    #[must_use]
+    pub fn same_authority(&self, other: &Self) -> bool {
+        let Self {
+            row,
+            pid,
+            contract,
+            scopes,
+            claimed: _,
+            version,
+            vendor,
+            login,
+            child,
+        } = self;
+        row == &other.row
+            && pid == &other.pid
+            && contract == &other.contract
+            && scopes == &other.scopes
+            && version == &other.version
+            && vendor == &other.vendor
+            && login == &other.login
+            && child == &other.child
+    }
+
     /// `grok-alab 0.1.0 (grok 1.0.70)`, as the harness's own `--version` spells it, with
     /// `unknown` for what the claim did not name.
     #[must_use]
@@ -543,6 +573,14 @@ fn versions_ok(named: &Named<'_>) -> Result<Option<ClaimVersion>, &'static str> 
     }
 }
 
+/// Canonicalize an already validated request. Its parser has refused malformed or repeated
+/// words; this neither grants nor drops a word, including ones a later build may understand.
+fn requested_words(scope: &str) -> String {
+    let mut words: Vec<_> = scope.split(',').collect();
+    words.sort_unstable();
+    words.join(",")
+}
+
 /// Contract 3, served for a row whose id is a seed id, whatever the row's source (a seed, a
 /// development link over one, a verified record over one): every scope word known to contract 3
 /// and allowed by the row, none twice, the set non-empty; `child=` is not a contract 3 word. A row
@@ -594,6 +632,7 @@ fn read_v3<'a>(
         pid,
         contract: SCOPED,
         scopes: Scopes::of(&scopes),
+        claimed: requested_words(scope),
         version,
         vendor: named.vendor.map(str::to_string),
         login: named.login.map(str::to_string),
@@ -608,10 +647,10 @@ fn scope_word_shaped(word: &str) -> bool {
         && bytes.all(|b| b.is_ascii_lowercase() || b == b'-')
 }
 
-/// Contract 4: `version=` required; each raw scope word well-formed and named once, the known
-/// ones kept and the rest dropped, none refused for the row's `allows`, and the set granted by
-/// the row's source ([`grant`]), possibly empty; a malformed `child=` refused; a holder no row
-/// proves [`Words::Unregistered`].
+/// Contract 4: `version=` required; each requested scope word well-formed and named once, all
+/// preserved in the request, none refused for the row's `allows`. The known words are granted
+/// by the row's source ([`grant`]), possibly as an empty set; a malformed `child=` is refused;
+/// a holder no row proves [`Words::Unregistered`].
 fn read_v4<'a>(rostered: Option<(&'static Row, u32)>, named: &Named<'_>) -> Words<'a> {
     let Some(scope) = named.scope else {
         return Words::Refused("a contract 4 claim names its scope=");
@@ -649,6 +688,7 @@ fn read_v4<'a>(rostered: Option<(&'static Row, u32)>, named: &Named<'_>) -> Word
         pid,
         contract: UNIVERSAL,
         scopes: grant(row, &claimed),
+        claimed: requested_words(scope),
         version,
         vendor: named.vendor.map(str::to_string),
         login: named.login.map(str::to_string),

@@ -319,14 +319,24 @@ fn foreign_writer(descriptor: &Descriptor, user: &Sid) -> io::Result<Option<Stri
 }
 
 /// [`super::open_admitted`] on Windows: `path` opened to read as itself (`links` [`Links::Follow`]:
-/// through a link), judged on the open handle under `admit`.
+/// through a link), judged on the open handle under `admit`. With a trace scope armed it records
+/// what the Unix arm records: the file's stamp before the open
+/// (`aterm_uds::trace::fs::opening`), and an open, a query or an access list's read that failed as
+/// a retry where no stamp decides it (`aterm_uds::trace::fs::failed`). A refusal records nothing
+/// more: the stamp holds what it is refused by, the file's kind and attributes, a digest of its
+/// owner and access list, its change time and its names (`aterm_uds::trace::Meta` on Windows), so
+/// the list narrowed or a second name removed moves it.
 pub(crate) fn open_admitted(
     path: &Path,
     admit: Admit,
     links: Links,
 ) -> Result<Option<(File, Meta)>, Unread> {
     let refused = |why: String| Unread::Refused(Error::new(format!("{}: {why}", path.display())));
-    let failed = |e: io::Error| Unread::Failed(Error::new(format!("{}: {e}", path.display())));
+    let failed = |e: io::Error| {
+        aterm_uds::trace::fs::failed(path, &e);
+        Unread::Failed(Error::new(format!("{}: {e}", path.display())))
+    };
+    aterm_uds::trace::fs::opening(path);
     super::look_afresh();
     #[cfg(test)]
     super::count_read(path);
@@ -388,10 +398,13 @@ pub(crate) fn open_admitted(
 }
 
 /// [`super::has_private_nonempty`] on Windows: a plain file of at most `max` bytes, not empty,
-/// owner-only and of one link, judged on the name opened as itself.
+/// owner-only and of one link, judged on the name opened as itself. With a trace scope armed, the
+/// stamp the trace's own look at `path` shows is recorded first (`fsx::record_look`), as the
+/// Unix arm's traced `lstat` records it.
 #[must_use]
 pub fn has_private_nonempty(path: &Path, max: usize) -> bool {
     let limit = u64::try_from(max).unwrap_or(u64::MAX);
+    super::record_look(path);
     let Ok(file) = open_look(path, READ_CONTROL) else {
         return false;
     };
@@ -503,10 +516,17 @@ pub(crate) fn open_read(path: &Path) -> io::Result<File> {
 /// the one there opened as itself, judged ([`lock_metadata`]) and made owner-only in place where
 /// its list is not ([`aterm_dirfd::fchmod`] through its handle), its handle kept out of children.
 ///
+/// With a trace scope armed, a lock file it makes, and a list it narrows ([`narrow_lock`]), record a
+/// write, as the Unix arm's do; a lock taken in one that was there records nothing.
+///
 /// # Errors
 /// The make, open or narrowing fails (an elevated process makes and narrows none), or the file
 /// fails [`lock_metadata`].
 pub(crate) fn open_lock(path: &Path) -> crate::Result<File> {
+    if aterm_uds::trace::armed() && aterm_uds::trace::unrecorded(|| super::file_id(path)).is_none()
+    {
+        super::wrote();
+    }
     let at = |e: io::Error| Error::new(format!("{}: {e}", path.display()));
     let open = || {
         OpenOptions::new()
@@ -569,13 +589,15 @@ pub(crate) fn lock_wide(file: &File, path: &Path) -> crate::Result<Option<String
 
 /// [`super::narrow_lock`] on Windows: the lock file `file` opened at `path`, which passed
 /// [`lock_metadata`], made owner-only through its handle ([`aterm_dirfd::fchmod`]), so the file
-/// those checks judged is the one changed. An elevated process narrows none.
+/// those checks judged is the one changed. An elevated process narrows none. With a trace scope
+/// armed, the change records a write.
 ///
 /// # Errors
 /// The process is elevated, or the change fails.
 pub(crate) fn narrow_lock(file: &File, path: &Path) -> crate::Result<()> {
     let at = |e: io::Error| Error::new(format!("{}: {e}", path.display()));
     refuse_elevated().map_err(at)?;
+    super::wrote();
     aterm_dirfd::fchmod(file, aterm_dirfd::Mode::RUSR | aterm_dirfd::Mode::WUSR)
         .map_err(|e| at(e.into()))
 }
@@ -611,9 +633,12 @@ pub(crate) fn owner_only(file: &File) -> io::Result<bool> {
 /// what a Unix `0600` file made with `O_CREAT | O_EXCL | O_NOFOLLOW` is. A name that is there, a
 /// link included, is `AlreadyExists`.
 ///
+/// With a trace scope armed, it records a write.
+///
 /// # Errors
 /// The process is elevated, the descriptor cannot be made, or the creation fails.
 pub(crate) fn create_private_file_new(path: &Path) -> io::Result<File> {
+    super::wrote();
     let descriptor = aterm_uds::private_file::new_file_descriptor()?;
     acl::create_file(path, &descriptor)
 }
@@ -800,33 +825,48 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> Result<(), Moved> {
 
 /// [`super::ensure_private_dir`] on Windows: aterm-uds' owner-only folder, made with its protected
 /// list at its creation (its parents as `create_dir_all` makes them) or narrowed in place where
-/// it is the user's and its list is not.
+/// it is the user's and its list is not. With a trace scope armed, what it decides by is recorded
+/// as `fsx::private_dir_settled` records it, and a folder it will make or narrow (one missing,
+/// or the user's under a list that is not private) as a write, as the Unix arm records them.
 ///
 /// # Errors
 /// As [`aterm_uds::private_file::ensure_private_dir`].
 pub fn ensure_private_dir(dir: &Path) -> crate::Result<()> {
+    if aterm_uds::trace::armed()
+        && super::private_dir_settled(dir).is_err()
+        && matches!(
+            aterm_uds::private_file::judge_private_dir(dir),
+            Ok(aterm_uds::private_file::PrivateDir::Missing
+                | aterm_uds::private_file::PrivateDir::Open(_))
+        )
+    {
+        super::wrote();
+    }
     aterm_uds::private_file::ensure_private_dir(dir)
         .map(drop)
         .map_err(|e| naming(dir, &e))
 }
 
-/// [`super::private_dir_settled`] on Windows: `dir` is the user's folder under a protected list of
-/// the user and SYSTEM alone, as [`ensure_private_dir`] leaves it.
+/// [`super::private_dir_settled`]'s verdict on Windows, with nothing recorded: `dir` is the user's
+/// folder under a protected list of the user and SYSTEM alone, as [`ensure_private_dir`] leaves
+/// it.
 ///
 /// # Errors
 /// `dir` is missing, a reparse point, no folder, another account's, or its list is not private.
-pub(crate) fn private_dir_settled(dir: &Path) -> crate::Result<()> {
+pub(crate) fn private_dir_settled_now(dir: &Path) -> crate::Result<()> {
     aterm_uds::private_file::check_private_dir(dir).map_err(|e| naming(dir, &e))
 }
 
 /// [`super::create_private_dir_new`] on Windows: a new folder at `dir`, the user's under a
 /// protected list of the user and SYSTEM alone from its creation (what is made in it inherits
-/// that list). A taken name is `AlreadyExists`; an elevated process makes none.
+/// that list). A taken name is `AlreadyExists`; an elevated process makes none. With a trace scope
+/// armed, it records a write.
 ///
 /// # Errors
 /// The process is elevated, the token's user cannot be read, or the creation fails.
 pub(crate) fn create_private_dir_new(dir: &Path) -> io::Result<()> {
     refuse_elevated()?;
+    super::wrote();
     let descriptor = acl::owner_only_descriptor(&user()?, acl::Inherit::ToChildren)?;
     acl::create_dir(dir, &descriptor)
 }

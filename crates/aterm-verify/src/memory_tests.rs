@@ -64,6 +64,7 @@ fn pooled_lint_claim_reads_its_recorded_width_and_retains_the_peak_margin() {
         );
         let planned = |ctx: &crate::Ctx| {
             crate::plan::plan(ctx)
+                .expect("complete graph and plan")
                 .into_iter()
                 .find(|stage| stage.id == StageId::Tippy)
                 .unwrap()

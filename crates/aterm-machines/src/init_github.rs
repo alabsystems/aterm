@@ -179,6 +179,22 @@ pub fn run_initial_repositories_captured(
     native::run_captured(sys, ctx, mode, work, steps, inputs, Box::new(current))
 }
 
+/// Observe unborn checkouts through the captured credential route without acquiring or
+/// repairing anything. A complete empty-origin observation can discharge an otherwise
+/// proposed acquisition. The existing alignment lease retains its digest-only evidence.
+///
+/// # Errors
+/// The account or default source is not admitted, or the caller authority changed before
+/// readback.
+pub fn observe_empty_repositories_captured(
+    sys: &dyn System,
+    ctx: &Ctx,
+    inputs: InitialRepositoryInputs,
+    current: impl Fn() -> Result<bool, String> + Send + Sync + 'static,
+) -> Result<Option<RepositoryReadback>, String> {
+    native::observe_empty_captured(sys, ctx, inputs, Box::new(current))
+}
+
 /// Reconciles repositories after the selected secrets stage has synchronized.
 ///
 /// # Errors

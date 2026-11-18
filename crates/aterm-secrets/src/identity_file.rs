@@ -180,7 +180,13 @@ fn unsealed(path: &Path, bytes: &SecretBytes) -> crate::Result<Option<SecretByte
     match aterm_uds::dpapi::unseal(&blob, ENTROPY) {
         Ok(opened) => Ok(Some(SecretBytes::from(opened.expose()))),
         Err(Unsealed::NotOpenable(_)) => Ok(None),
-        Err(Unsealed::Failed(e)) => Err(at(&e.to_string())),
+        // A failure no stamp of the file decides: asked again, or in another session, DPAPI may
+        // open it, so a trace scope armed around the read records a retry.
+        Err(Unsealed::Failed(e)) => {
+            let failed = at(&e.to_string());
+            aterm_uds::trace::retry(failed.to_string());
+            Err(failed)
+        }
     }
 }
 

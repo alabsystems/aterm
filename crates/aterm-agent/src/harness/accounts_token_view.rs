@@ -27,12 +27,14 @@
 //! Nothing here reads, holds or prints a token: the vault's standings are value-free.
 
 pub use super::account_card::{ENDING_S, LoginHalf, LoginHere};
-use super::accounts::{self, Cli, Store, TokenEntry};
+use super::account_names::{self, Candidates, Named, Word};
+use super::accounts::{self, Cli, Row, Store, TokenEntry};
 use super::accounts_step::Step;
 use super::accounts_tokens::{
     self as tokens, InVault, Offered, SessionLogin, TokenNote, TokenRow, TokenState, TokenVault,
     date,
 };
+use super::alab_roster::Lab;
 use super::token_steps::{self, Since, Stopped, Tried};
 use aterm_json::{Map, Value};
 use aterm_secrets::claude_token::{Key, Lookup, SOON_SECS, Standing};
@@ -47,8 +49,18 @@ pub struct Covered {
     pub key: Key,
     /// The row's claims email, else the login record's.
     pub email: String,
-    /// The roster row's label, where one names it.
+    /// The roster row's label, where one names it: the local key a surface finds the row by,
+    /// which no surface prints.
     pub label: Option<String>,
+    /// How the surfaces name it: the account the resolver names by the same words, with the lab's
+    /// slug and name, else its name made here ([`account_names::names_of_row`],
+    /// [`account_names::names_of_login`]); its key alone where it has no address
+    /// ([`named_by_key`]).
+    pub named: Named<'static>,
+    /// The word its step names it by: its slug, else its key, the key where a roster row here
+    /// is labelled with its slug and holds another account ([`Named::word_among`]), so the step
+    /// is one the verb takes.
+    pub word: Word,
     /// A session on this Mac is logged into it.
     pub logged_in: bool,
     /// Its stored login here.
@@ -77,8 +89,13 @@ pub struct AccountToken {
     pub key: String,
     /// Its email.
     pub email: String,
-    /// The roster row's label, where one names it.
+    /// The roster row's label, where one names it: the local key a surface finds the row by,
+    /// which no surface prints.
     pub label: Option<String>,
+    /// How the surfaces name it ([`Covered::named`]).
+    pub named: Named<'static>,
+    /// The word its step names it by ([`Covered::word`]).
+    pub word: Word,
     /// Its token's state here (§5.1).
     pub state: TokenState,
     /// What the vault holds of its token, value-free.
@@ -99,10 +116,16 @@ pub struct AccountToken {
 }
 
 impl AccountToken {
-    /// How the surfaces name it: its row's label, else its email.
+    /// How a message to a person names it: its name and slug ([`Named::shown`]).
     #[must_use]
-    pub fn named(&self) -> &str {
-        self.label.as_deref().unwrap_or(&self.email)
+    pub fn shown(&self) -> String {
+        self.named.shown()
+    }
+
+    /// The word a step names it by ([`Covered::word`]).
+    #[must_use]
+    pub fn word(&self) -> Word {
+        self.word.clone()
     }
 
     /// The vault entry's name.
@@ -278,7 +301,7 @@ impl AccountToken {
     #[must_use]
     pub fn offer_line(&self) -> Option<String> {
         let offer = self.offer.as_ref()?;
-        let named = self.named();
+        let named = self.shown();
         Some(match offer.step {
             Step::Token { replace: true, .. } => {
                 format!("{named}'s vault token is {}: replace it", self.state.word())
@@ -342,7 +365,7 @@ impl AccountToken {
                 LoginHere::Absent => parts.push("no login here".to_owned()),
             }
         }
-        let mut line = format!("  {} ({}): {}", self.named(), self.email, parts.join("; "));
+        let mut line = format!("  {}: {}", self.shown(), parts.join("; "));
         if let Some(offer) = &self.offer {
             line.push_str(&format!("\n    offer: run `{}`", offer.step));
         } else if self.not_yet() && self.state == TokenState::None {
@@ -355,7 +378,11 @@ impl AccountToken {
         let mut o = Map::new();
         o.insert("key".into(), Value::from(self.key.clone()));
         o.insert("email".into(), Value::from(self.email.clone()));
-        o.insert("label".into(), Value::from(self.label.clone()));
+        o.insert(
+            "slug".into(),
+            Value::from(Some(self.named.names.slug.clone()).filter(|slug| !slug.is_empty())),
+        );
+        o.insert("name".into(), Value::from(self.named.names.name.clone()));
         o.insert("logged_in".into(), Value::from(self.logged_in));
         o.insert("state".into(), Value::from(self.state.word()));
         o.insert("state_words".into(), Value::from(self.state.words()));
@@ -471,10 +498,9 @@ pub fn account(
         login.word(),
         since_word(login.half().and_then(LoginHalf::since)),
     );
-    let named = covered.label.as_deref().unwrap_or(&covered.email);
     let offer = covered
         .logged_in
-        .then(|| state.offer(named, pending != Some(false)))
+        .then(|| state.offer(&covered.word, pending != Some(false)))
         .flatten()
         .map(|step| Offer {
             pair,
@@ -485,6 +511,8 @@ pub fn account(
         key: covered.key.as_str().to_owned(),
         email: covered.email,
         label: covered.label,
+        named: covered.named,
+        word: covered.word,
         state,
         standing,
         row,
@@ -502,6 +530,8 @@ pub struct Places<'a> {
     pub store: &'a Store,
     /// Its roster.
     pub roster: Option<&'a Path>,
+    /// The lab, where this process holds one: the accounts' slugs and names.
+    pub lab: Option<&'a Lab>,
     /// The accounts the sessions on this Mac are logged into.
     pub logins: &'a [SessionLogin],
     /// The clock (unix seconds).
@@ -515,15 +545,38 @@ pub struct Places<'a> {
     pub enrolled: &'a dyn Fn(&accounts::Roster) -> std::collections::BTreeSet<String>,
 }
 
+/// The word the step of the account `named` names among the roster's `rows` and the lab
+/// ([`Named::word_among`]).
+fn word_among(named: &Named<'_>, rows: &[Row], lab: Option<&Lab>) -> Word {
+    named.word_among(
+        Cli::Claude,
+        &Candidates {
+            roster: rows,
+            logins: &[],
+            lab,
+            held: &[],
+        },
+    )
+}
+
 /// The accounts the surfaces cover (§5.9, §5.10): each roster row that names an email and that the
 /// lab keys, then each account a session here is logged into that no row names; each once, by key.
 #[must_use]
 pub fn covered(places: &Places<'_>) -> Vec<Covered> {
+    covered_in(places).0
+}
+
+/// [`covered`], with the roster's rows it read.
+fn covered_in(places: &Places<'_>) -> (Vec<Covered>, Vec<Row>) {
     let mut out: Vec<Covered> = Vec::new();
     let records = places
         .store
         .read_account_records(places.roster, places.now)
         .ok();
+    let rows: Vec<Row> = records
+        .as_ref()
+        .map(|records| records.roster.rows.clone())
+        .unwrap_or_default();
     let logged_in = |email: &str| {
         places
             .logins
@@ -564,10 +617,21 @@ pub fn covered(places: &Places<'_>) -> Vec<Covered> {
                 here || logged_in,
                 places.now,
             );
+            let named = account_names::names_of_row(Cli::Claude, row, places.lab).map_or_else(
+                || named_by_key(&key),
+                |(pk, names)| Named {
+                    pk,
+                    row: None,
+                    names,
+                },
+            );
+            let word = word_among(&named, &rows, places.lab);
             out.push(Covered {
                 key,
                 email: email.to_owned(),
                 label: Some(row.label.clone()),
+                named,
+                word,
                 logged_in,
                 login: LoginHere::of_row(
                     half,
@@ -592,16 +656,43 @@ pub fn covered(places: &Places<'_>) -> Vec<Covered> {
         if out.iter().any(|seen| seen.key == key) {
             continue;
         }
+        let named = named_of_login(&key, &login.email, places.lab);
+        let word = word_among(&named, &rows, places.lab);
         out.push(Covered {
             key,
             email: login.email.clone(),
             label: None,
+            named,
+            word,
             logged_in: logged_in(&login.email),
             login: LoginHere::Half(LoginHalf::Ok),
             login_turns: None,
         });
     }
-    out
+    (out, rows)
+}
+
+/// The account `key` keys, named by its key alone: one whose address the resolver cannot key.
+#[must_use]
+pub fn named_by_key(key: &Key) -> Named<'static> {
+    Named {
+        pk: key.as_str().to_owned(),
+        row: None,
+        names: aterm_file::AccountNames::default(),
+    }
+}
+
+/// The Claude Code account of the address `email` (keyed `key` by the lab journal), as the
+/// resolver names it ([`account_names::names_of_login`]), else by `key` alone.
+fn named_of_login(key: &Key, email: &str, lab: Option<&Lab>) -> Named<'static> {
+    account_names::names_of_login(Cli::Claude, None, email, lab).map_or_else(
+        || named_by_key(key),
+        |(pk, names)| Named {
+            pk,
+            row: None,
+            names,
+        },
+    )
 }
 
 /// Each covered account ([`covered`]) and each account this Mac's table keeps a row of, as one
@@ -610,7 +701,7 @@ pub fn covered(places: &Places<'_>) -> Vec<Covered> {
 /// ([`tokens::Table::row_for`]), as the route, the verb and execution admission judge it.
 #[must_use]
 pub fn view(places: &Places<'_>, vault: &dyn TokenVault) -> Vec<AccountToken> {
-    let mut covered = covered(places);
+    let (mut covered, rows) = covered_in(places);
     // A check file that does not read leaves `tokens.json`'s rows, by which a token minted on
     // another Mac is judged as the route judges it ([`tokens::TableRead::for_token`]).
     let table = tokens::read_parts(places.store)
@@ -623,10 +714,14 @@ pub fn view(places: &Places<'_>, vault: &dyn TokenVault) -> Vec<AccountToken> {
         if covered.iter().any(|seen| seen.key == key) {
             continue;
         }
+        let named = named_of_login(&key, &row.email, places.lab);
+        let word = word_among(&named, &rows, places.lab);
         covered.push(Covered {
             key,
             email: row.email.clone(),
             label: row.label.clone(),
+            named,
+            word,
             logged_in: false,
             login: LoginHere::Unread,
             login_turns: None,
@@ -952,7 +1047,8 @@ impl PeersShown {
 pub struct SessionRoute {
     /// The session's sid.
     pub sid: String,
-    /// The roster row it is on, as the survey masks it.
+    /// The label of the roster row it is on, as the survey names it: the local key, which no
+    /// surface prints (the report names the account that row holds, `on_row`).
     pub account: Option<String>,
     /// `stored`, `token` or `outside`.
     pub auth: String,
@@ -1050,24 +1146,16 @@ impl Report {
                 }
                 for account in accounts {
                     text.push_str(&account.text(peers));
-                    let person = account.label.as_ref().map(|label| {
-                        Step::Token {
-                            label: label.clone(),
-                            replace: false,
-                        }
-                        .to_string()
-                    });
+                    let person = Step::Token {
+                        word: account.word(),
+                        replace: false,
+                    }
+                    .to_string();
                     if let Some(step) = steps.stopped.get(&account.key) {
-                        text.push_str(&format!(
-                            "\n    token step: {}",
-                            step.words(person.as_deref())
-                        ));
+                        text.push_str(&format!("\n    token step: {}", step.words(Some(&person))));
                     }
                     if let Some(ran) = steps.tried.get(&account.key) {
-                        text.push_str(&format!(
-                            "\n    token upkeep: {}",
-                            ran.words(person.as_deref())
-                        ));
+                        text.push_str(&format!("\n    token upkeep: {}", ran.words(Some(&person))));
                     }
                     text.push('\n');
                 }
@@ -1075,10 +1163,11 @@ impl Report {
                     let words: Vec<String> = sessions
                         .iter()
                         .map(|session| {
-                            let on = session
-                                .account
-                                .as_deref()
-                                .map_or_else(String::new, |on| format!(" on {on}"));
+                            let on = match (session.account.as_deref(), on_row(session, accounts)) {
+                                (Some(_), Some(account)) => format!(" on {}", account.shown()),
+                                (Some(_), None) => " on a row with no account key".to_owned(),
+                                (None, _) => String::new(),
+                            };
                             let login = match login_of(session, accounts) {
                                 (Some(key), Some(account)) => format!(
                                     " (logged into {} {key}, token: {})",
@@ -1149,7 +1238,21 @@ impl Report {
                                     s.insert("sid".into(), Value::from(session.sid.clone()));
                                     s.insert(
                                         "account".into(),
-                                        Value::from(session.account.clone()),
+                                        on_row(session, accounts).map_or(Value::Null, |account| {
+                                            let mut a = Map::new();
+                                            a.insert(
+                                                "key".into(),
+                                                Value::from(account.key.clone()),
+                                            );
+                                            a.insert(
+                                                "slug".into(),
+                                                Value::from(
+                                                    Some(account.named.names.slug.clone())
+                                                        .filter(|slug| !slug.is_empty()),
+                                                ),
+                                            );
+                                            Value::Object(a)
+                                        }),
                                     );
                                     s.insert("route".into(), Value::from(session.auth.clone()));
                                     s.insert("token".into(), Value::from(session.token.clone()));
@@ -1286,6 +1389,15 @@ pub fn steps_here(
     .stopped
 }
 
+/// The account of the roster row `session` is on, as the survey names that row by its label
+/// (the local key no surface prints): the covered account that row holds.
+fn on_row<'a>(session: &SessionRoute, accounts: &'a [AccountToken]) -> Option<&'a AccountToken> {
+    let label = session.account.as_deref()?;
+    accounts
+        .iter()
+        .find(|account| account.label.as_deref() == Some(label))
+}
+
 /// The account key `session`'s login record names, and that account among `accounts`.
 fn login_of<'a>(
     session: &'a SessionRoute,
@@ -1344,10 +1456,12 @@ pub fn view_here(
     let roster = config.and_then(|config| accounts::roster_beside_for(config, Cli::Claude));
     let vault = tokens::configured_vault(aterm_secrets::client::Paths::for_home(home))?;
     let logins = tokens::session_logins_at(Some(&store), roster.as_deref(), Some(home), now);
+    let lab = super::alab_roster::current();
     let mut accounts = view(
         &Places {
             store: &store,
             roster: roster.as_deref(),
+            lab: lab.as_deref(),
             logins: &logins,
             now,
             offers: OFFERED_HERE,

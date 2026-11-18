@@ -5,14 +5,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use aterm_uds::trace::Since;
+
 /// Local scheduling hints. A selected account still needs current
 /// root authority and local policy before any credential or provider access.
-#[derive(Default)]
+#[derive(Default, Hash)]
 pub struct PreparationQueue {
     seen: BTreeMap<(PathBuf, [u8; 32]), Seen>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Hash)]
 struct Seen {
     revision: [u8; 32],
     at: Instant,
@@ -21,6 +23,14 @@ struct Seen {
 const COOLDOWN: Duration = Duration::from_secs(60);
 
 impl PreparationQueue {
+    /// A queue that has selected nothing, as [`Default`] makes one, for a static.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            seen: BTreeMap::new(),
+        }
+    }
+
     /// Choose the least recently selected mature candidate, with unseen accounts
     /// first and account IDs breaking ties. Retired accounts release this home's
     /// slots after cooling; temporary absence cannot bypass a cooldown. Another
@@ -183,6 +193,12 @@ impl PreparationQueue {
     /// A changed checked revision is eligible without consuming another slot.
     /// Refusal preserves the previous revision and timestamp. Revision identifiers
     /// are scheduling context only; selection grants no authority or credential access.
+    ///
+    /// Every comparison of `now` with a selection's time goes through
+    /// `aterm_uds::trace::Since`: a selection still cooling, or one stamped after `now`, records
+    /// when that answer ends in the trace scope armed on this thread, so the accounts keeper's
+    /// verdict of a pass that found nothing eligible stands no longer than the first cooldown it
+    /// waited on.
     pub fn pick_revisions_if(
         &mut self,
         home: &Path,
@@ -191,23 +207,17 @@ impl PreparationQueue {
         mut admit: impl FnMut([u8; 32], [u8; 32]) -> bool,
     ) -> Option<([u8; 32], [u8; 32])> {
         self.seen.retain(|(path, account), seen| {
-            path != home
-                || candidates.contains_key(account)
-                || now
-                    .checked_duration_since(seen.at)
-                    .is_none_or(|elapsed| elapsed < COOLDOWN)
+            path != home || candidates.contains_key(account) || !cooled(seen, now)
         });
         let eligible: BTreeSet<_> = candidates
             .iter()
             .filter_map(|(account, revision)| {
                 let seen = self.seen.get(&(home.to_owned(), *account));
                 match seen {
-                    Some(seen) if now.checked_duration_since(seen.at).is_none() => None,
-                    Some(seen)
-                        if seen.revision == *revision && now.duration_since(seen.at) < COOLDOWN =>
-                    {
+                    Some(seen) if !Since::new(seen.at).elapsed_at_least(Duration::ZERO, now) => {
                         None
                     }
+                    Some(seen) if seen.revision == *revision && !cooled(seen, now) => None,
                     _ => Some((
                         seen.filter(|seen| seen.revision == *revision)
                             .map(|seen| seen.at),
@@ -225,6 +235,12 @@ impl PreparationQueue {
             .insert((home.to_owned(), account), Seen { revision, at: now });
         Some((account, revision))
     }
+}
+
+/// Whether `seen`'s cooldown has gone by as of `now` ([`COOLDOWN`] since it was selected), judged
+/// through `aterm_uds::trace::Since`; never for a selection stamped after `now`.
+fn cooled(seen: &Seen, now: Instant) -> bool {
+    Since::new(seen.at).elapsed_at_least(COOLDOWN, now)
 }
 
 #[cfg(test)]

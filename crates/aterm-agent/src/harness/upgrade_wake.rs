@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 const ANCESTOR_RECHECK: Duration = Duration::from_millis(250);
 
 /// One host's watch on what a newer build's landing moves: where a Claude Code or Codex build
-/// lands ([`Self::new`]), each agent's own marks (agy's and Muse Code's, [`Self::with_agent`]),
-/// the owner's word ([`Self::with_word`]) and the side marks ([`Self::with_side`]).
+/// lands ([`Self::new`]), each agent's own marks (agy's and Muse Code's, [`Self::with_agent`])
+/// and the owner's word ([`Self::with_word`]).
 pub struct ActivationWake {
     #[cfg(target_os = "macos")]
     marks: Vec<Mark>,
@@ -167,21 +167,6 @@ impl ActivationWake {
         wake
     }
 
-    /// Also watch `path` for a listener of its own.
-    #[must_use]
-    pub fn with_side(self, path: Option<PathBuf>, told: Box<dyn FnMut() + Send>) -> Self {
-        let mut wake = self;
-        #[cfg(target_os = "macos")]
-        if let Some(path) = path {
-            let mut mark = Mark::new(Box::new(move || Some(path.clone())));
-            mark.told = Some(told);
-            wake.marks.push(mark);
-        }
-        #[cfg(not(target_os = "macos"))]
-        wake.polled.sides.push(SidePoll::new(path, told));
-        wake
-    }
-
     #[cfg(target_os = "macos")]
     fn with_marks(marks: Vec<Mark>) -> Self {
         Self {
@@ -320,15 +305,14 @@ fn moved<T: PartialEq>(seen: &mut Option<T>, next: Option<T>) -> bool {
     true
 }
 
-/// What a marker IS to the fallback's poll ([`SidePoll`], [`PolledMark`]): its
-/// file number (the inode on unix, the file index on Windows; `0` elsewhere),
-/// its length and when it was last modified.
+/// What a marker IS to the fallback's poll ([`PolledMark`]): its file number (the inode on
+/// unix, the file index on Windows; `0` elsewhere), its length and when it was last modified.
 #[cfg(any(test, not(target_os = "macos")))]
-type SideStamp = (u64, u64, Option<std::time::SystemTime>);
+type MarkStamp = (u64, u64, Option<std::time::SystemTime>);
 
-/// [`SideStamp`] of the file at `path`; `None` where no file is there.
+/// [`MarkStamp`] of the file at `path`; `None` where no file is there.
 #[cfg(any(test, not(target_os = "macos")))]
-fn side_stamp(path: &Path) -> Option<SideStamp> {
+fn mark_stamp(path: &Path) -> Option<MarkStamp> {
     #[cfg(windows)]
     let (m, ino) = {
         let file = std::fs::File::open(path).ok()?;
@@ -351,36 +335,6 @@ fn side_stamp(path: &Path) -> Option<SideStamp> {
     Some((ino, m.len(), m.modified().ok()))
 }
 
-/// A side mark as the fallback's poll keeps it ([`ActivationWake::with_side`]
-/// off macOS): where the marker lives, its stamp at the last look, and its
-/// listener.
-#[cfg(any(test, not(target_os = "macos")))]
-struct SidePoll {
-    path: Option<PathBuf>,
-    seen: Option<SideStamp>,
-    told: Box<dyn FnMut() + Send>,
-}
-
-#[cfg(any(test, not(target_os = "macos")))]
-impl SidePoll {
-    fn new(path: Option<PathBuf>, told: Box<dyn FnMut() + Send>) -> Self {
-        Self {
-            seen: path.as_deref().and_then(side_stamp),
-            path,
-            told,
-        }
-    }
-
-    fn look(&mut self) -> bool {
-        let next = self.path.as_deref().and_then(side_stamp);
-        let changed = moved(&mut self.seen, next);
-        if changed {
-            (self.told)();
-        }
-        changed
-    }
-}
-
 /// Where a mark lives, asked again at every look: a Settings edit may move the package prefix.
 #[cfg(any(test, not(target_os = "macos")))]
 type Locate = Box<dyn FnMut() -> Option<PathBuf> + Send>;
@@ -397,16 +351,13 @@ fn agent_twin(
 }
 
 /// The wake where no directory watch exists (off macOS): what a newer build moves (the managed
-/// twins, the native link, the owner's word), the agents' own twins and the side marks are looked
-/// at once every fallback, and a wait answers `true` only for a mark that moved, as the watch does
-/// on macOS.
+/// twins, the native link, the owner's word) and the agents' own twins are looked at once every
+/// fallback, and a wait answers `true` only for a mark that moved, as the watch does on macOS.
 #[cfg(any(test, not(target_os = "macos")))]
 struct Polled {
     /// What a [`WakeTrigger`] pulls ([`ring`]).
     pulled: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     marks: Vec<PolledMark>,
-    /// The side marks ([`ActivationWake::with_side`]), told only when changed.
-    sides: Vec<SidePoll>,
 }
 
 #[cfg(any(test, not(target_os = "macos")))]
@@ -418,7 +369,6 @@ impl Polled {
         let mut wake = Self {
             pulled: std::sync::Arc::default(),
             marks: Vec::new(),
-            sides: Vec::new(),
         };
         for twin in twins {
             wake.waking(twin);
@@ -441,7 +391,7 @@ impl Polled {
     }
 
     /// Park for `fallback`, cut short by a pulled trigger (`false`, nothing looked at); then tell
-    /// each side or agent mark that changed, and answer whether a general mark moved.
+    /// each agent mark that changed, and answer whether a general mark moved.
     fn wait(&mut self, fallback: Duration) -> bool {
         let (flag, bell) = &*self.pulled;
         let pulled = flag
@@ -454,9 +404,6 @@ impl Polled {
         drop(pulled);
         if fired {
             return false;
-        }
-        for side in &mut self.sides {
-            side.look();
         }
         self.marks.iter_mut().fold(false, |woke, m| {
             let changed = m.changed();
@@ -484,13 +431,13 @@ fn ring(pulled: &(std::sync::Mutex<bool>, std::sync::Condvar)) {
 }
 
 /// One thing a newer build moves, as [`Polled`] keeps it: where it lives, its stamp at the last
-/// look ([`SideStamp`], through a link to the file it names) and, for an agent's own mark
+/// look ([`MarkStamp`], through a link to the file it names) and, for an agent's own mark
 /// ([`Polled::with_agent`]), the listener `told` of its move, which ends no wait.
 #[cfg(any(test, not(target_os = "macos")))]
 struct PolledMark {
     locate: Locate,
     path: Option<PathBuf>,
-    seen: Option<SideStamp>,
+    seen: Option<MarkStamp>,
     told: Option<Box<dyn FnMut() + Send>>,
 }
 
@@ -499,7 +446,7 @@ impl PolledMark {
     fn new(mut locate: Locate) -> Self {
         let path = locate();
         Self {
-            seen: path.as_deref().and_then(side_stamp),
+            seen: path.as_deref().and_then(mark_stamp),
             path,
             locate,
             told: None,
@@ -511,10 +458,10 @@ impl PolledMark {
         let at = (self.locate)();
         if at != self.path {
             self.path = at;
-            self.seen = self.path.as_deref().and_then(side_stamp);
+            self.seen = self.path.as_deref().and_then(mark_stamp);
             return true;
         }
-        let next = self.path.as_deref().and_then(side_stamp);
+        let next = self.path.as_deref().and_then(mark_stamp);
         moved(&mut self.seen, next)
     }
 }
@@ -717,8 +664,8 @@ struct Mark {
     /// Looked at again every [`ANCESTOR_RECHECK`] while its watch sits on an
     /// ancestor of its own directory.
     recheck: bool,
-    /// A side mark's or an agent's own mark's listener ([`ActivationWake::with_side`],
-    /// [`ActivationWake::with_agent`]), told of a change that ends no wait.
+    /// An agent's own mark's listener ([`ActivationWake::with_agent`]), told of a change that
+    /// ends no wait.
     told: Option<Box<dyn FnMut() + Send>>,
 }
 
@@ -919,8 +866,8 @@ fn watch(kq: &std::os::fd::OwnedFd, dir: &Path) -> std::io::Result<std::fs::File
 #[path = "upgrade_wake_tests.rs"]
 mod tests;
 
-/// The fallback's poll of a side marker ([`SidePoll`]), on every platform: off macOS it is the
-/// only thing that tells a side mark's listener.
+/// The fallback's poll of the marks ([`Polled`]), on every platform: off macOS it is the only
+/// thing that hears a newer build's landing.
 #[cfg(test)]
 #[path = "upgrade_wake_poll_tests.rs"]
 mod poll_tests;

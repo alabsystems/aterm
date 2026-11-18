@@ -153,6 +153,9 @@ fn renewal_identity_case(
     let tmp = tmp_dir("renewal-identity");
     let env = env_at(&tmp);
     let store = env.accounts_store();
+    // A renewal names the row by its account's address, the identity address where the row's
+    // `email` only delivers.
+    let address = MAIL;
     let row = accounts::Row {
         label: "account".into(),
         email: Some(
@@ -227,11 +230,9 @@ fn renewal_identity_case(
     let mut out = Vec::new();
     let mut err = Vec::new();
     let code = if mode == 2 {
-        shared_renewal::run(
-            &env, &host, "account", [1; 16], &Approval, &mut out, &mut err,
-        )
+        shared_renewal::run(&env, &host, address, [1; 16], &Approval, &mut out, &mut err)
     } else {
-        let Cmd::Accounts(command) = parsed("accounts renew account").unwrap() else {
+        let Cmd::Accounts(command) = parsed(&format!("accounts renew {address}")).unwrap() else {
             unreachable!()
         };
         run_accounts(&command, &env, &host, &mut out, &mut err)
@@ -241,9 +242,7 @@ fn renewal_identity_case(
         let retained = store.load_logins(host.now).unwrap().0;
         for request in [[1; 16], [2; 16]] {
             assert_ne!(
-                shared_renewal::run(
-                    &env, &host, "account", request, &Approval, &mut out, &mut err,
-                ),
+                shared_renewal::run(&env, &host, address, request, &Approval, &mut out, &mut err),
                 ExitCode::SUCCESS,
                 "a consumed grant cannot authorize another provider attempt"
             );

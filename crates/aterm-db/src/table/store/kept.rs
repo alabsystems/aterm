@@ -25,10 +25,14 @@
 //! (a writing open refuses them). The records classified at or past the acknowledged witness they
 //! were classified under (a writing open's adopted tail, and every record appended since) are
 //! replayed again as an open replays them, under the claim's acknowledged witness now. The
-//! journal's records after the kept ones are read (a writer's from its log, an observer's from
-//! the journal's process cache, `journals`), their chain continued from the kept witness and
+//! journal's records after the kept ones are read (a writer's from its log; an observer's from
+//! the read of the journal it keeps, where the journal stands as that read's witness showed it,
+//! else from the journal's process cache, `journals`), their chain continued from the kept witness and
 //! judged against the claim as an open judges a whole chain, and replayed as an open replays
-//! them. A writing reopen then finishes as a writing open does ([`Store::finish_open`]), seals
+//! them. A writer's journal is let go between holds by parking it
+//! ([`aterm_journal::Log::park`]), and a writing reopen resumes it ([`aterm_journal::Log::resume`]):
+//! neither of an open's whole-prefix hashes runs again where the journal stands as the store left
+//! it. A writing reopen then finishes as a writing open does ([`Store::finish_open`]), seals
 //! held writes as [`Store::open`] does, and every reopen ends in the store's check.
 //!
 //! So no classification outlives the evidence it was made under: a verdict that changed
@@ -57,6 +61,15 @@ use std::{
 /// The verdict of each class a kept store's records were classified under.
 pub(crate) type Classes = BTreeMap<Class, Verdict>;
 
+/// What an open records of the store it opens to keep ([`Store::open_claimed_classified`]).
+#[derive(Default)]
+pub(crate) struct Recorded {
+    /// Its records' classes and their verdicts.
+    pub(super) classes: Classes,
+    /// An observer's read of its journal, where a witness stands for it.
+    pub(super) journal: Option<journals::Held>,
+}
+
 /// Of each run of reopens of a kept store, the one after this many opens the store afresh, as an
 /// open after any change does: a read of its whole journal stands for every reopen before it.
 const REVALIDATE: u32 = 64;
@@ -68,6 +81,12 @@ pub(crate) struct Kept {
     /// was classified as an unwitnessed tail, or appended since, and is classified again.
     acknowledged: u64,
     classes: Classes,
+    /// An observer's last read of its journal, where a witness stands for it: a reopen that finds
+    /// the journal as that read did reads nothing again ([`journals::read_held`]).
+    journal: Option<journals::Held>,
+    /// A writer's journal, let go between its holds: a writing reopen resumes it, hashing none of
+    /// its prefix where it stands as this store left it ([`aterm_journal::Log::resume`]).
+    parked: Option<aterm_journal::Parked>,
     /// Reopens since the store was opened afresh.
     reopens: u32,
 }
@@ -116,14 +135,14 @@ impl Kept {
             Region::Primary,
         )?;
         let acknowledged = super::Witness::decode(&claimed.claim[WITNESS_AT..])?.count;
-        let mut classes = Classes::new();
+        let mut recorded = Recorded::default();
         let mut store = Store::open_claimed_classified(
             session,
             dir,
             scope,
             false,
             claimed,
-            Some(&mut classes),
+            Some(&mut recorded),
         )?;
         if !read_only {
             store.seal_held(session)?;
@@ -131,7 +150,9 @@ impl Kept {
         Ok(Self {
             store,
             acknowledged,
-            classes,
+            classes: recorded.classes,
+            journal: recorded.journal,
+            parked: None,
             reopens: 0,
         })
     }
@@ -150,7 +171,7 @@ impl Kept {
         {
             return None;
         }
-        self.store.log = None;
+        self.parked = self.store.log.take().and_then(Log::park);
         Some(self)
     }
 
@@ -174,6 +195,8 @@ impl Kept {
             mut store,
             acknowledged: classified,
             mut classes,
+            journal: kept_journal,
+            parked,
             reopens,
         } = self;
         let dir = store.data_dir.clone();
@@ -200,18 +223,24 @@ impl Kept {
             return Ok(None);
         }
         let boundary = group::read(&claim_dir, &claim_name, &claim)?;
-        let (log, tail, permitted) = if read_only {
-            let journal = journals::read(&dir, &claim[..super::ANCHOR_LEN], capacity.journal())?;
+        let (log, tail, permitted, journal) = if read_only {
+            let journal = journals::read_held(
+                &dir,
+                &claim[..super::ANCHOR_LEN],
+                capacity.journal(),
+                kept_journal.as_ref(),
+            )?;
+            let read = journal.held();
             let Some(tail) = journal.witnessed_after(boundary, held)? else {
                 return Ok(None);
             };
-            (None, tail, false)
+            (None, tail, false, read)
         } else {
-            let mut log = Log::open(
+            let (mut log, _reopened) = Log::resume(
+                parked,
                 &dir,
                 "table",
                 &claim[..super::ANCHOR_LEN],
-                true,
                 capacity.journal(),
             )
             .map_err(|error| {
@@ -230,7 +259,7 @@ impl Kept {
                                 && stored.receipt.received_ms == received_ms
                         })
                 })?;
-            (Some(log), tail, boundary.end().is_some())
+            (Some(log), tail, boundary.end().is_some(), None)
         };
         #[cfg(test)]
         super::replay_observed();
@@ -353,6 +382,8 @@ impl Kept {
             store,
             acknowledged: acknowledged.count,
             classes,
+            journal,
+            parked: None,
             reopens: reopens + 1,
         }))
     }

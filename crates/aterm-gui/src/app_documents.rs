@@ -4461,6 +4461,7 @@ impl App {
             }
         } else {
             self.mark_document_save_success(document);
+            self.commit_saved_face(document);
             self.finish_pending_document_closes(document)?;
         }
         if let Some(prepared) = prepared_config {
@@ -5394,6 +5395,29 @@ impl App {
                 let presentation = &mut *route_guard_presentation;
                 presentation.indicators.attention = true;
                 presentation.tooltip = Some(message.to_string());
+            }
+            self.request_native_redraw(window);
+        }
+    }
+
+    /// A document saved durably whose path is a shared file's face: the commit the host
+    /// installed starts (`crate::shared_face`), and each Editor view of it says so.
+    fn commit_saved_face(&mut self, document: DocumentId) {
+        let Some(path) = self
+            .document_store
+            .canonical_uri(document)
+            .and_then(|uri| crate::native_document_host::file_uri_path(uri).ok())
+        else {
+            return;
+        };
+        let Some(name) = crate::shared_face::saved(&path) else {
+            return;
+        };
+        for (window, _, view) in self.document_native_views(document) {
+            if let Some(AppViewState::Editor(state)) =
+                self.native_runtime.view_state_mut(view).as_deref_mut()
+            {
+                state.status = Some(format!("Saved · committing {name}"));
             }
             self.request_native_redraw(window);
         }

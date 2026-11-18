@@ -9,10 +9,13 @@
 //!
 //! Everything is drawn in the design's own units: a box 200 tall laid out for a 26 px mono face
 //! (the words' baseline at 184), so a page draws it at `px / 26` points per unit. The road and
-//! the cat are baked as two images: [`RoadArt`] (the ribbon, its underglow and highlight, the dots
-//! and the star, the done sparkles) and [`CatArt`] (a pose with its contact shadow, at its tilt),
-//! so a pose change never rebakes the road and the cat can be moved without rebaking either.
-//! Each is baked at the exact device size it is drawn at.
+//! the cat are baked as two images, each for its ground at the exact device size it is drawn
+//! at: [`RoadArt`] (the ribbon, its underglow and highlight, the dots and the star, the done
+//! sparkles), keyed by the road's length, the run's progress and whether it is done, and
+//! [`CatArt`] (a pose with its contact shadow), keyed by the pose and its lean in whole degrees.
+//! So a pose change rebakes only the cat, unless it is to or from the loaf, which comes with the
+//! done road; a step of progress rebakes the road, whose ribbon runs to just past the cat, and
+//! the cat only where its lean there rounds to another degree.
 
 mod canvas;
 mod cat;

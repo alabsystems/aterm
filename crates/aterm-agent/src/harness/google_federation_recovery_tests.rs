@@ -61,6 +61,7 @@ impl Fixture {
             cli: Cli::Kimi,
             route,
             row: &self.row,
+            word: None,
             staging: stage,
             store: &self.store,
             hosts: route.hosts.of(Some(Region::Global)).unwrap(),

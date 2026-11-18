@@ -124,7 +124,7 @@ fn one_renew_invocation_commits_its_login_and_captures_its_window_token() {
         let code = journal::with_keyer(keyer, || {
             run_accounts(
                 &AccountsCmd::Renew {
-                    labels: vec!["work".into()],
+                    accounts: vec![EMAIL.into()],
                     due: false,
                     on: None,
                 },
@@ -173,9 +173,11 @@ fn one_renew_invocation_commits_its_login_and_captures_its_window_token() {
                 "test-code#test-state"
             );
         }
-        // Where no sign-in window opens, no token can be made, and no step is said for one.
+        // Where no sign-in window opens, no token can be made, and no step is said for one, by
+        // any word.
         if !window {
-            assert!(!String::from_utf8_lossy(&out).contains("aterm harness accounts token work"));
+            let said = String::from_utf8_lossy(&out);
+            assert!(!said.contains("aterm harness accounts token "), "{said}");
         }
         let value = sentinel();
         for bytes in [

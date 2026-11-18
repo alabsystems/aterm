@@ -14,9 +14,17 @@ serde = { package = "aterm-serde", path = "../../crates/aterm-serde" }
 serde_json = { package = "aterm-json", path = "../../crates/aterm-json" }
 sha2 = { package = "trust-sha2", path = "../trust-sha2", default-features = false }
 
+[target.'cfg(unix)'.dependencies]
+trust-exec-policy = { path = "../trust-exec-policy" }
+
 [dev-dependencies]
 tempfile = { package = "aterm-tempfile", path = "../../crates/aterm-tempfile" }
 aterm-uds = { path = "../../crates/aterm-uds" }
+
+[[test]]
+name = "closed_exec_native"
+path = "tests/closed_exec_native.rs"
+harness = false
 
 [package.metadata.aterm-vendor]
 upstream = "https://github.com/alabsystems/trust"

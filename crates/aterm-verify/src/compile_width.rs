@@ -147,7 +147,24 @@ impl Units {
 thread_local! {
     static JOBS: Cell<Option<u32>> = const { Cell::new(None) };
     static UNITS: RefCell<Option<Units>> = const { RefCell::new(None) };
-    static FLAGS: RefCell<Option<String>> = const { RefCell::new(None) };
+    static POOL: RefCell<Option<std::sync::Arc<PoolAdvertisement>>> = const { RefCell::new(None) };
+}
+
+/// Flags and their exact held FIFO come from one charged Jobserver, never ambient make flags.
+#[derive(Debug)]
+pub(crate) struct PoolAdvertisement {
+    flags: String,
+    fifo: aterm_capacity::HeldJobserverFifo,
+}
+
+impl PoolAdvertisement {
+    pub(crate) fn fifo_path(&self) -> std::io::Result<&Path> {
+        self.fifo.path()
+    }
+}
+
+pub(crate) fn current_pool() -> Option<std::sync::Arc<PoolAdvertisement>> {
+    POOL.with(|slot| slot.borrow().clone())
 }
 
 pub(crate) fn current() -> Option<u32> {
@@ -209,11 +226,11 @@ pub(crate) fn with_jobs<T>(jobs: Option<u32>, run: impl FnOnce() -> T) -> T {
 /// Give every Cargo in this stage the same pool and, when present, the unit admission wrapper.
 /// Resolution queries reach the real compiler directly; only named compiler units claim memory.
 pub(crate) fn configure(command: &mut aterm_uds::spawnfd::Command) {
-    FLAGS.with(|slot| {
-        if let Some(flags) = &*slot.borrow() {
+    POOL.with(|slot| {
+        if let Some(pool) = &*slot.borrow() {
             command
-                .env("MAKEFLAGS", flags)
-                .env("CARGO_MAKEFLAGS", flags);
+                .env("MAKEFLAGS", &pool.flags)
+                .env("CARGO_MAKEFLAGS", &pool.flags);
         }
     });
     UNITS.with(|slot| {
@@ -237,17 +254,17 @@ pub(crate) fn run<T>(
     run: impl FnOnce() -> T,
 ) -> std::io::Result<T> {
     struct Restore {
-        flags: Option<String>,
+        pool: Option<std::sync::Arc<PoolAdvertisement>>,
         units: Option<Units>,
     }
     impl Drop for Restore {
         fn drop(&mut self) {
-            let _ = FLAGS.with(|slot| slot.replace(self.flags.take()));
+            let _ = POOL.with(|slot| slot.replace(self.pool.take()));
             let _ = UNITS.with(|slot| slot.replace(self.units.take()));
         }
     }
     let _restore = Restore {
-        flags: FLAGS.with(|slot| slot.borrow().clone()),
+        pool: current_pool(),
         units: UNITS.with(|slot| slot.replace(units.cloned())),
     };
     // Charge only Cargo's implicit job. Every additional job borrows from this very FIFO,
@@ -256,13 +273,14 @@ pub(crate) fn run<T>(
         (Some(pool), Some(_)) => Some(pool.acquire(stopped)?),
         _ => None,
     };
-    let _ = FLAGS.with(|slot| {
-        slot.replace(
-            token
-                .as_ref()
-                .and_then(|_| pool.map(aterm_capacity::Jobserver::flags)),
-        )
-    });
+    let advertised = match (token.as_ref(), pool) {
+        (Some(_), Some(pool)) => Some(std::sync::Arc::new(PoolAdvertisement {
+            flags: pool.flags(),
+            fifo: pool.held_fifo()?,
+        })),
+        _ => None,
+    };
+    let _ = POOL.with(|slot| slot.replace(advertised));
     Ok(with_jobs(jobs, run))
 }
 

@@ -109,9 +109,8 @@ fn a_running_renewal_blocks_readoption_of_its_removed_label() {
         adoption.cancelled = Some(&stop);
         let (code, out, err) = acc(
             AccountsCmd::AdoptDefault {
-                label: "main".into(),
+                account: None,
                 email: Some(OWNER.into()),
-                identity_email: None,
                 browser: None,
             },
             &changed_env,
@@ -130,7 +129,7 @@ fn a_running_renewal_blocks_readoption_of_its_removed_label() {
         assert!(adoption.logins.borrow().is_empty());
         assert_eq!(std::fs::read_to_string(&changed_path).unwrap(), "");
     }));
-    let (code, _, err) = acc(renew(&["main"], false, None), &env, &host);
+    let (code, _, err) = acc(renew(&[OWNER], false, None), &env, &host);
     assert_eq!(code, exit(1), "{err}");
     assert_eq!(host.flows.borrow().len(), 1);
     assert!(err.contains("changed"), "{err}");
@@ -420,18 +419,62 @@ impl AccountsHost for RenewHost {
 
 fn renew(labels: &[&str], due: bool, on: Option<&[&str]>) -> AccountsCmd {
     AccountsCmd::Renew {
-        labels: labels.iter().map(|l| (*l).to_string()).collect(),
+        accounts: labels.iter().map(|l| (*l).to_string()).collect(),
         due,
         on: on.map(|hosts| hosts.iter().map(|h| (*h).to_string()).collect()),
     }
 }
 
+/// No address and no organization in what was `said`, nor in the records.
 fn no_address(env: &Env, said: &[&str]) {
     for text in said {
         assert!(
-            !text.contains(OWNER) && !text.contains(WORK) && !text.contains("Example Org"),
-            "an address or an organization was printed: {text}"
+            !text.contains(OWNER) && !text.contains(WORK),
+            "an address was printed: {text}"
         );
+    }
+    kept_private(env, said);
+}
+
+/// What a sign-in verb `said` holds no organization the vendor reported, and the records hold no
+/// address and no organization. Its lines name an account by its name, which holds its address
+/// ([`crate::harness::account_names::RowName::shown`]): with every such name taken out (written
+/// here from the fixture's addresses, `claude <address>`, as no lab slugs them), no address is
+/// left, and no step a line types (`aterm harness accounts …`) holds one, since a step reaches
+/// logs and captured stderr. NEGATIVE CONTROL: with the renewed line printing the row's address
+/// after `renewed as`, five renewal tests fail on `an address was printed outside an account's
+/// name: … claude owner@example.com: renewed as owner@example.com; …` (2026-11-16, by hand, then
+/// restored).
+fn kept_private(env: &Env, said: &[&str]) {
+    for text in said {
+        assert!(
+            !text.contains("Example Org"),
+            "an organization was printed: {text}"
+        );
+        let unnamed = [OWNER, WORK]
+            .iter()
+            .fold((*text).to_owned(), |text, address| {
+                text.replace(&format!("claude {address}"), "")
+            });
+        assert!(
+            !unnamed.contains(OWNER) && !unnamed.contains(WORK),
+            "an address was printed outside an account's name: {text}"
+        );
+        // Each step a line types, up to its closing backtick; a verb's own refusal prefix
+        // (`aterm harness accounts renew: …`) is no step.
+        for line in text.lines() {
+            for step in line.split("aterm harness accounts ").skip(1) {
+                if step
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|verb| verb.ends_with(':'))
+                {
+                    continue;
+                }
+                let step = step.split('`').next().unwrap_or(step);
+                assert!(!step.contains('@'), "a step types an address: {line}");
+            }
+        }
     }
     let store = env.accounts_store();
     for path in [store.ledger_path(), store.state_file(), store.logins_file()] {
@@ -524,7 +567,7 @@ fn renewal_opener_failures_refuse_before_provider_or_binding_changes() {
         if kind.is_some() || fault == "unavailable" {
             assert_eq!(error.kind, kind, "{fault}");
         }
-        let (code, out, err) = acc(renew(&["work-2"], false, None), &env, &host);
+        let (code, out, err) = acc(renew(&[WORK], false, None), &env, &host);
         assert_eq!(code, exit(1), "{fault}: {out}{err}");
         assert!(err.contains(&error.to_string()), "{fault}: {err}");
         assert!(!err.contains(source.to_str().unwrap()), "{fault}: {err}");
@@ -563,7 +606,7 @@ fn renewal_ready_opener_runs_the_selected_headless_route() {
     relative.push(target.strip_prefix("/").unwrap());
     assert!(!relative.is_absolute());
     host.exe = Some(relative);
-    let (code, out, err) = acc(renew(&["work-2"], false, None), &env, &host);
+    let (code, out, err) = acc(renew(&[WORK], false, None), &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
     let opener = env
         .accounts_store()
@@ -602,7 +645,7 @@ fn renewal_manual_routes_do_not_require_an_unavailable_opener() {
         let mut host = RenewHost::new();
         host.exe = None;
         host.ssh_session = ssh;
-        let (code, out, err) = acc(renew(&["work-2"], false, None), &env, &host);
+        let (code, out, err) = acc(renew(&[WORK], false, None), &env, &host);
         assert_eq!(code, exit(0), "{out}{err}");
         let calls = host.flows.borrow();
         assert_eq!(calls.len(), 1);
@@ -632,7 +675,7 @@ fn renewal_manual_routes_do_not_require_an_unavailable_opener() {
     }
     let mut host = RenewHost::new();
     host.exe = None;
-    let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
+    let (code, out, err) = acc(renew(&[OWNER], false, None), &env, &host);
     assert_eq!(code, exit(1), "{out}{err}");
     assert!(host.flows.borrow().is_empty());
     assert!(host.checked.borrow().is_empty());
@@ -646,9 +689,12 @@ fn the_new_forms_parse_and_their_flags_belong_to_them() {
         Ok(Cmd::Accounts(renew(&[], true, None)))
     );
     assert_eq!(
-        p("accounts renew main work-2 --on m3,m4:17100").map(|(c, _)| c),
+        p(&format!(
+            "accounts renew claude {OWNER} ac-05b50c6fb48b61cd --on m3,m4:17100"
+        ))
+        .map(|(c, _)| c),
         Ok(Cmd::Accounts(renew(
-            &["main", "work-2"],
+            &[&format!("claude {OWNER}"), "ac-05b50c6fb48b61cd"],
             false,
             Some(&["m3", "m4:17100"])
         )))
@@ -661,24 +707,33 @@ fn the_new_forms_parse_and_their_flags_belong_to_them() {
     assert!(p("accounts renew --here").is_err(), "nothing to renew");
     assert_eq!(
         p(&format!(
-            "accounts adopt-default main --email {OWNER} --browser Claude"
+            "accounts adopt-default --email {OWNER} --browser Claude"
         ))
         .map(|(c, _)| c),
         Ok(Cmd::Accounts(AccountsCmd::AdoptDefault {
-            label: "main".into(),
+            account: None,
             email: Some(OWNER.into()),
-            identity_email: None,
             browser: Some("Claude".into()),
         }))
     );
-    assert!(p("accounts adopt-default main").is_err(), "needs --email");
     assert_eq!(
-        p(&format!("accounts add w2 --email {WORK}")).map(|(c, _)| c),
+        p(&format!("accounts adopt-default claude {OWNER}")).map(|(c, _)| c),
+        Ok(Cmd::Accounts(AccountsCmd::AdoptDefault {
+            account: Some(format!("claude {OWNER}")),
+            email: None,
+            browser: None,
+        }))
+    );
+    assert!(
+        p("accounts adopt-default").is_err(),
+        "no account and no address names none"
+    );
+    assert_eq!(
+        p(&format!("accounts add claude {WORK}")).map(|(c, _)| c),
         Ok(Cmd::Accounts(AccountsCmd::Add {
-            label: "w2".into(),
+            account: format!("claude {WORK}"),
             class: Class::Preferred,
-            email: Some(WORK.into()),
-            identity_email: None,
+            email: None,
             browser: None,
         }))
     );
@@ -746,7 +801,7 @@ fn a_completed_claude_renewal_refuses_changed_policy_or_binding_without_a_checkp
             }
             *keep.borrow_mut() = Some(snapshot(&changed_store));
         }));
-        let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
+        let (code, out, err) = acc(renew(&[OWNER], false, None), &env, &host);
         assert_eq!(code, exit(1), "{change}: {out}{err}");
         assert_eq!(
             host.flows.borrow().len(),
@@ -776,12 +831,16 @@ fn claude_alias_renewal_uses_the_login_address_and_checks_the_provider_identity(
     for reported in ["canonical@example.test", "alias@example.test"] {
         let (_tmp, env) = renew_env("renew-identity-alias");
         let (code, _, err) = run_line(
-            "accounts add alias --email alias@example.test --identity-email canonical@example.test --browser Fixture",
+            "accounts add claude canonical@example.test --email alias@example.test --browser Fixture",
             &env,
         );
         assert_eq!(code, exit(0), "{err}");
+        let alias = crate::harness::account_names::tests::added_label(
+            Cli::Claude,
+            "canonical@example.test",
+        );
         let roster = Roster::load(&env.accounts_roster().unwrap()).unwrap();
-        let row = roster.row("alias").unwrap();
+        let row = roster.row(&alias).unwrap();
         assert_eq!(row.email.as_deref(), Some("alias@example.test"));
         assert_eq!(
             row.expected_identity_email(),
@@ -789,12 +848,13 @@ fn claude_alias_renewal_uses_the_login_address_and_checks_the_provider_identity(
         );
         let mut host = RenewHost::new();
         host.signs_in_as = Some(reported);
-        let (code, out, err) = acc(renew(&["alias"], false, None), &env, &host);
+        // The account is its identity address; the row's `email` only delivers.
+        let (code, out, err) = acc(renew(&["canonical@example.test"], false, None), &env, &host);
         assert_eq!(host.flows.borrow()[0].1, "alias@example.test");
         let logins = logins_of(&env);
         if reported == "canonical@example.test" {
             assert_eq!(code, exit(0), "{out}{err}");
-            let binding = logins.get("alias").unwrap();
+            let binding = logins.get(&alias).unwrap();
             let staging = Path::new(binding.dir.as_deref().unwrap());
             let proof = accounts::read_renewal_checkpoint(
                 staging,
@@ -807,7 +867,7 @@ fn claude_alias_renewal_uses_the_login_address_and_checks_the_provider_identity(
             assert_eq!(code, exit(1), "{out}{err}");
             assert!(
                 logins
-                    .get("alias")
+                    .get(&alias)
                     .is_some_and(|binding| binding.dir.is_none())
             );
             assert!(out.contains("REFUSED: wrong account"), "{out}");
@@ -821,7 +881,7 @@ fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding
     let (_tmp, env) = renew_env("renew-happy");
     let host = RenewHost::new();
     let parent = logins_of(&env);
-    let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
+    let (code, out, err) = acc(renew(&[OWNER], false, None), &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
     let store = env.accounts_store();
     let staging = store.logins_dir().join("main+1");
@@ -889,7 +949,16 @@ fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding
         .collect();
     assert_eq!(kinds, [accounts::Kind::Auth, accounts::Kind::Renewed]);
     assert!(store.wake_path().exists(), "the waiting decide again");
-    assert!(out.contains("main: renewed"), "{out}");
+    // The renewal names the account by its name (no lab slugs it here), never the row's label.
+    assert!(out.contains(&format!("claude {OWNER}: renewed")), "{out}");
+    assert!(
+        !out.lines()
+            .chain(err.lines())
+            .any(|line| line.starts_with("main:")
+                || line.contains("`main`")
+                || line.contains(" main:")),
+        "the label `main` is printed: {out}{err}"
+    );
     let opens = if host.macos {
         "it opens in a window of aterm's own"
     } else if cfg!(unix) {
@@ -898,12 +967,13 @@ fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding
         "it opens in your default browser"
     };
     assert!(out.contains(opens), "{out}");
-    no_address(&env, &[&out, &err]);
+    kept_private(&env, &[&out, &err]);
     let (code, report, _) = acc(AccountsCmd::Report { json: false }, &env, &host);
     assert_eq!(code, exit(0));
+    let main = crate::harness::account_names::tests::row_name_of(Cli::Claude, &env, "main").shown;
     let line = report
         .lines()
-        .find(|l| l.starts_with("main "))
+        .find(|l| l.starts_with(&format!("{main} ")))
         .expect("main's row");
     assert!(line.contains("login: idle, renew by "), "{line}");
     let plain = report
@@ -918,10 +988,11 @@ fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding
     let dir = crate::harness::host_path::json(Path::new(&staging));
     assert!(json.contains(&format!("\"dir\":\"{dir}\"")), "{json}");
     assert!(json.contains("\"renews\":true") && json.contains("\"login\":\"idle\""));
-    no_address(&env, &[&report, &json]);
+    // The report names each account by its name, which holds its address.
+    kept_private(&env, &[&report, &json]);
 
     let host = RenewHost::new();
-    let (code, ..) = acc(renew(&["main"], false, None), &env, &host);
+    let (code, ..) = acc(renew(&[OWNER], false, None), &env, &host);
     assert_eq!(code, exit(0));
     let next = store.logins_dir().join("main+2");
     assert_eq!(host.flows.borrow()[0].0, next.to_str().expect("utf-8"));
@@ -949,11 +1020,14 @@ fn a_renewal_says_what_moves_its_sessions_and_the_line_to_start_one_by_hand() {
         )
         .expect("write");
         let host = RenewHost::new();
-        let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
+        let (code, out, err) = acc(renew(&[OWNER], false, None), &env, &host);
         assert_eq!(code, exit(0), "{out}{err}");
         let staging = env.accounts_store().logins_dir().join("main+1");
-        let moves =
-            "main: renewed; its sessions move onto the new login at their next idle turn end";
+        let main =
+            crate::harness::account_names::tests::row_name_of(Cli::Claude, &env, "main").shown;
+        let moves = &format!(
+            "{main}: renewed; its sessions move onto the new login at their next idle turn end"
+        );
         match off {
             None => assert!(out.contains(moves), "{out}"),
             Some(off) => {
@@ -963,7 +1037,7 @@ fn a_renewal_says_what_moves_its_sessions_and_the_line_to_start_one_by_hand() {
                 );
                 assert!(
                     out.contains(&format!(
-                        "main: renewed; `[harness] {off}` is off, so nothing moves a session \
+                        "{main}: renewed; `[harness] {off}` is off, so nothing moves a session \
                          onto the new login"
                     )),
                     "{out}"
@@ -978,7 +1052,7 @@ fn a_renewal_says_what_moves_its_sessions_and_the_line_to_start_one_by_hand() {
             )),
             "{out}"
         );
-        no_address(&env, &[&out, &err]);
+        kept_private(&env, &[&out, &err]);
     }
 }
 
@@ -987,23 +1061,25 @@ fn a_renewal_says_what_moves_its_sessions_and_the_line_to_start_one_by_hand() {
 fn a_staging_home_is_never_a_rows_login_directory() {
     let (_tmp, env) = renew_env("renew-names");
     let host = RenewHost::new();
-    let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
+    let (code, out, err) = acc(renew(&[OWNER], false, None), &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
     let store = env.accounts_store();
     let live = logins_of(&env)
         .get("main")
         .and_then(|b| b.dir.clone())
         .expect("bound");
-    let add = |label: &str| AccountsCmd::Add {
-        label: label.into(),
+    // A row `accounts add` lists is labelled with its account's reserved slug, which no staging
+    // name (`<label>+<n>`) is, and a word that is one names no account.
+    let add = |word: &str| AccountsCmd::Add {
+        account: word.into(),
         class: Class::Preferred,
         email: None,
-        identity_email: None,
         browser: None,
     };
-    let (code, out, err) = acc(add("main.1"), &env, &host);
+    let added = |email: &str| crate::harness::account_names::tests::added_label(Cli::Claude, email);
+    let (code, out, err) = acc(add("claude w1@example.test"), &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
-    let own = store.logins_dir().join("main.1");
+    let own = store.logins_dir().join(added("w1@example.test"));
     assert_ne!(own.to_str(), Some(live.as_str()));
     assert!(!err.contains("already held files"), "{err}");
     assert_eq!(std::fs::read_dir(&own).expect("made").count(), 0);
@@ -1013,10 +1089,10 @@ fn a_staging_home_is_never_a_rows_login_directory() {
     );
     let (code, _, err) = acc(add("main+1"), &env, &host);
     assert_eq!(code, exit(1), "{err}");
-    let before = store.logins_dir().join("w9");
+    let before = store.logins_dir().join(added("w9@example.test"));
     std::fs::create_dir_all(&before).expect("mkdir");
     std::fs::write(before.join(".claude.json"), "{}").expect("write");
-    let (code, _, err) = acc(add("w9"), &env, &host);
+    let (code, _, err) = acc(add("claude w9@example.test"), &env, &host);
     assert_eq!(code, exit(0));
     assert!(err.contains("already held files"), "{err}");
 }
@@ -1027,9 +1103,15 @@ fn a_renewal_that_answers_another_account_changes_nothing_live() {
     let (_tmp, env) = renew_env("renew-wrong");
     let mut host = RenewHost::new();
     host.signs_in_as = Some("someone-else@example.com");
-    let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
+    let (code, out, err) = acc(renew(&[OWNER], false, None), &env, &host);
     assert_eq!(code, exit(1), "{out}{err}");
-    assert!(out.contains("main: REFUSED: wrong account"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "{}: REFUSED: wrong account",
+            crate::harness::account_names::tests::row_name_of(Cli::Claude, &env, "main").shown
+        )),
+        "{out}"
+    );
     assert!(err.contains("ANOTHER account"), "{err}");
     let store = env.accounts_store();
     assert!(
@@ -1050,7 +1132,7 @@ fn a_renewal_that_answers_another_account_changes_nothing_live() {
         .collect();
     assert_eq!(kinds, [accounts::Kind::WrongAccount]);
     assert!(!err.contains("someone-else"), "{err}");
-    no_address(&env, &[&out, &err]);
+    kept_private(&env, &[&out, &err]);
     let (_, report, _) = acc(AccountsCmd::Report { json: false }, &env, &host);
     assert!(report.contains("last renewal: wrong account"), "{report}");
 }
@@ -1071,7 +1153,7 @@ fn a_cancelled_renewal_runs_no_check_and_records_nothing() {
         let mut host = RenewHost::new();
         host.flow = flow;
         host.flow_after_first = Some(0);
-        let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
+        let (code, out, err) = acc(renew(&[OWNER], false, None), &env, &host);
         assert_eq!(code, exit(1), "{out}{err}");
         if accounts::manual_signin_capability() == accounts::ManualSigninCapability::Unavailable {
             // No manual admission on this platform (ATERM-KI-1105-14): a renewal by hand is
@@ -1137,7 +1219,7 @@ fn a_replacement_login_stops_a_stale_manual_authentication_fallback() {
             .map(|path| std::fs::read(path).ok()),
         );
     }));
-    let (code, _, err) = acc(renew(&["main"], false, None), &env, &host);
+    let (code, _, err) = acc(renew(&[OWNER], false, None), &env, &host);
     assert_eq!(code, exit(1), "{err}");
     assert_eq!(host.flows.borrow().len(), 1, "no stale fallback");
     assert_eq!(
@@ -1162,7 +1244,7 @@ fn a_cached_profile_authentication_failure_falls_back_once_to_the_interactive_br
     host.macos = false;
     host.flow = 1;
     host.flow_after_first = Some(0);
-    let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
+    let (code, out, err) = acc(renew(&[OWNER], false, None), &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
     let flows = host.flows.borrow();
     assert_eq!(flows.len(), 2);
@@ -1198,7 +1280,7 @@ fn a_cached_profile_authentication_failure_falls_back_once_to_the_interactive_br
             .collect::<Vec<_>>(),
         [accounts::Kind::Auth, accounts::Kind::Renewed],
     );
-    no_address(&env, &[&out, &err]);
+    kept_private(&env, &[&out, &err]);
 }
 
 #[cfg(unix)]
@@ -1209,7 +1291,7 @@ fn a_verified_renewal_keeps_staging_and_records_nothing_when_checkpoint_is_obstr
     cached_profile_only(&env);
     let mut host = RenewHost::new();
     host.obstruct_checkpoint = true;
-    let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
+    let (code, out, err) = acc(renew(&[OWNER], false, None), &env, &host);
     assert_eq!(code, exit(1), "{out}{err}");
     assert_eq!(host.flows.borrow().len(), 1);
     assert_eq!(
@@ -1232,7 +1314,7 @@ fn a_verified_renewal_keeps_staging_and_records_nothing_when_checkpoint_is_obstr
     );
     assert!(err.contains("its home is kept"), "{err}");
     assert!(!store.logins_dir().join("main+2").exists());
-    no_address(&env, &[&out, &err]);
+    kept_private(&env, &[&out, &err]);
 }
 
 #[cfg(unix)]
@@ -1248,7 +1330,7 @@ fn a_renewal_does_not_start_when_the_ledger_is_unreadable() {
         .expect("known prior state");
     std::fs::create_dir(store.ledger_path()).expect("block ledger append");
     let host = RenewHost::new();
-    let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
+    let (code, out, err) = acc(renew(&[OWNER], false, None), &env, &host);
     assert_eq!(code, exit(1), "{out}{err}");
     assert!(host.flows.borrow().is_empty());
     assert!(host.checked.borrow().is_empty());
@@ -1261,7 +1343,7 @@ fn a_renewal_does_not_start_when_the_ledger_is_unreadable() {
         store.dir.join("retained-ledger-obstruction"),
     )
     .unwrap();
-    let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
+    let (code, out, err) = acc(renew(&[OWNER], false, None), &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
     assert_eq!(host.flows.borrow().len(), 1);
     assert_eq!(
@@ -1293,7 +1375,7 @@ fn a_renewal_does_not_start_when_the_ledger_is_unreadable() {
             .is_some()
     );
     assert!(!store.logins_dir().join("main+2").exists());
-    no_address(&env, &[&out, &err]);
+    kept_private(&env, &[&out, &err]);
 }
 
 #[cfg(unix)]
@@ -1316,7 +1398,7 @@ fn over_ssh_the_paste_code_flow_runs_and_the_profile_is_named() {
     }
     let mut host = RenewHost::new();
     host.ssh_session = true;
-    let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
+    let (code, out, err) = acc(renew(&[OWNER], false, None), &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
     let opener = env
         .accounts_store()
@@ -1340,7 +1422,7 @@ fn over_ssh_the_paste_code_flow_runs_and_the_profile_is_named() {
     let mut host = RenewHost::new();
     // Off macOS, where a person's sign-in is their own browser's.
     host.macos = false;
-    let (code, ..) = acc(renew(&["work-2"], false, None), &env, &host);
+    let (code, ..) = acc(renew(&[WORK], false, None), &env, &host);
     assert_eq!(code, exit(0));
     assert_eq!(host.flows.borrow()[0].2, RenewBrowser::Default);
     assert!(!env.accounts_store().dir.join("bin").exists());
@@ -1355,10 +1437,9 @@ fn due_leaves_a_row_no_session_needs_to_the_upkeep() {
     let host = RenewHost::new();
     let (code, out, err) = acc(
         AccountsCmd::Add {
-            label: "w3".into(),
+            account: "claude w3@example.test".into(),
             class: Class::Preferred,
-            email: Some("w3@example.test".into()),
-            identity_email: None,
+            email: None,
             browser: None,
         },
         &env,
@@ -1410,21 +1491,32 @@ fn due_renews_only_what_is_due_and_says_when_nothing_is() {
         .map(|(_, e, _)| e.clone())
         .collect();
     assert_eq!(renewed, [WORK]);
-    assert!(out.contains("work-2: renewed"), "{out}");
-    no_address(&env, &[&out, &err]);
+    assert!(
+        out.contains(&format!(
+            "{}: renewed",
+            crate::harness::account_names::tests::row_name_of(Cli::Claude, &env, "work-2").shown
+        )),
+        "{out}"
+    );
+    kept_private(&env, &[&out, &err]);
     let mut quiet = RenewHost::new();
     quiet.tty = false;
-    let (code, out, _) = acc(renew(&["main"], false, None), &env, &quiet);
+    let (code, out, _) = acc(renew(&[OWNER], false, None), &env, &quiet);
     assert_eq!(code, exit(1), "a named row left as it was is no renewal");
-    assert_eq!(out, "due here: main\n");
+    assert_eq!(
+        out,
+        format!(
+            "due here: {}\n",
+            crate::harness::account_names::tests::row_name_of(Cli::Claude, &env, "main").shown
+        )
+    );
     assert!(quiet.flows.borrow().is_empty());
 
     let (code, out, err) = acc(
         AccountsCmd::Add {
-            label: "work-3".into(),
+            account: "claude w3@example.test".into(),
             class: Class::Preferred,
-            email: Some("w3@example.test".into()),
-            identity_email: None,
+            email: None,
             browser: None,
         },
         &env,
@@ -1462,7 +1554,7 @@ fn due_renews_only_what_is_due_and_says_when_nothing_is() {
         "--due signs in no successor nobody here runs on when the enrolled rows are at a wall: {out}"
     );
     assert_eq!(out, "nothing is due on this machine\n");
-    no_address(&env, &[&out, &err]);
+    kept_private(&env, &[&out, &err]);
 }
 
 #[test]
@@ -1490,7 +1582,7 @@ fn due_renewal_refuses_foreign_state_before_local_or_remote_actions() {
         std::fs::read_to_string(store.state_file()).unwrap(),
         foreign
     );
-    no_address(&env, &[&out, &err]);
+    kept_private(&env, &[&out, &err]);
 }
 
 #[test]
@@ -1501,7 +1593,7 @@ fn uncertain_binding_bytes_refuse_renewal_before_local_or_remote_actions() {
     let damaged = "{\"schema\":";
     std::fs::write(store.logins_file(), damaged).expect("torn bindings");
     let host = RenewHost::new();
-    let (code, out, err) = acc(renew(&["main"], false, Some(&["m3"])), &env, &host);
+    let (code, out, err) = acc(renew(&[OWNER], false, Some(&["m3"])), &env, &host);
     assert!(host.flows.borrow().is_empty(), "no local renewal");
     assert!(host.checked.borrow().is_empty(), "no local status check");
     assert!(host.remotes.borrow().is_empty(), "no remote renewal");
@@ -1510,7 +1602,7 @@ fn uncertain_binding_bytes_refuse_renewal_before_local_or_remote_actions() {
         std::fs::read_to_string(store.logins_file()).unwrap(),
         damaged
     );
-    no_address(&env, &[&out, &err]);
+    kept_private(&env, &[&out, &err]);
 }
 
 #[test]
@@ -1582,7 +1674,7 @@ fn other_machines_are_renewed_through_native_fleet_in_one_sitting() {
         "m3:65536",
     ] {
         let host = RenewHost::new();
-        let (code, _, err) = acc(renew(&["main"], false, Some(&[bad])), &env, &host);
+        let (code, _, err) = acc(renew(&[OWNER], false, Some(&[bad])), &env, &host);
         assert_eq!(code, exit(1), "{bad}");
         assert!(err.contains("is not a native fleet host ("), "{err}");
         assert!(host.flows.borrow().is_empty() && host.remotes.borrow().is_empty());
@@ -1603,7 +1695,7 @@ fn local_interactive_rows_do_not_prevent_a_native_remote_pass() {
             Ok(events)
         })
         .expect("make the local interactive account due");
-    for (labels, wanted_code) in [(&[][..], exit(0)), (&["main"][..], exit(1))] {
+    for (labels, wanted_code) in [(&[][..], exit(0)), (&[OWNER][..], exit(1))] {
         let mut host = RenewHost::new();
         host.tty = false;
         let (code, out, err) = acc(renew(labels, true, Some(&["m3"])), &env, &host);
@@ -1620,41 +1712,67 @@ fn local_interactive_rows_do_not_prevent_a_native_remote_pass() {
 fn each_line_that_signs_a_row_in_names_its_own_verb() {
     let (_tmp, env) = renew_env("renew-verbs");
     let host = RenewHost::new();
-    let add = |label: &str, email: Option<&str>| AccountsCmd::Add {
-        label: label.into(),
+    let add = |word: &str| AccountsCmd::Add {
+        account: word.into(),
         class: Class::Preferred,
-        email: email.map(str::to_string),
-        identity_email: None,
+        email: None,
         browser: None,
     };
-    let (code, out, err) = acc(add("w3", Some("w3@example.com")), &env, &host);
+    let (code, out, err) = acc(add("claude w3@example.com"), &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
+    let w3 = crate::harness::account_names::tests::added_label(Cli::Claude, "w3@example.com");
     let (_, report, _) = acc(AccountsCmd::Report { json: false }, &env, &host);
-    for (label, verb) in [("w3", "renew"), ("plain", "login")] {
-        let step = format!("`aterm harness accounts {verb} {label}`");
+    // `use` names `w3`'s account by its address, and its refusal names that sign-in. `plain`
+    // holds no address, so no word names it: its label is refused for that, saying what its row
+    // lacks, not which names would reach it (it has none of them). NEGATIVE CONTROL: with that
+    // refusal left the resolver's, it reads ``no account is named `plain`: name one by its slug,
+    // its key, or its provider word and address`` and this fails (2026-11-16, by hand, then
+    // restored).
+    for (label, verb, account) in [
+        (w3.as_str(), "renew", "w3@example.com"),
+        ("plain", "login", "plain"),
+    ] {
+        // A step types the account's word; `plain` holds no address, so its label is its word.
+        let typed =
+            crate::harness::account_names::tests::row_name_of(Cli::Claude, &env, label).word;
+        let step = format!("`aterm harness accounts {verb} {typed}`");
         assert!(report.contains(&step), "{step}\n{report}");
         let (code, _, err) = acc(
             AccountsCmd::Use {
-                label: label.into(),
+                account: account.into(),
             },
             &env,
             &host,
         );
         assert_eq!(code, exit(1));
-        assert!(
-            err.contains(&format!(
-                "aterm harness accounts {verb} {label}`, in a terminal"
-            )),
-            "{err}"
-        );
-        let (code, _, err) = acc(add(label, None), &env, &host);
+        let why = if account == label {
+            format!(
+                "aterm harness accounts use: {}\n",
+                crate::harness::codex_alab::no_pin_words(label)
+            )
+        } else {
+            format!("aterm harness accounts {verb} {typed}`, in a terminal")
+        };
+        assert!(err.contains(&why), "{err}");
+        // An `add` of the account a row lists names its sign-in; `plain`'s label names no
+        // account, so its `add` is refused as no account's.
+        let word = if account == label {
+            label.to_owned()
+        } else {
+            format!("claude {account}")
+        };
+        let (code, _, err) = acc(add(&word), &env, &host);
         assert_eq!(code, exit(1));
-        assert!(
-            err.contains(&format!(
-                "`aterm harness accounts {verb} {label}` signs it in"
-            )),
-            "{err}"
-        );
+        if account == label {
+            assert!(err.contains(&aterm_file::no_account(label)), "{err}");
+        } else {
+            assert!(
+                err.contains(&format!(
+                    "`aterm harness accounts {verb} {typed}` signs it in"
+                )),
+                "{err}"
+            );
+        }
     }
 }
 
@@ -1668,16 +1786,16 @@ fn a_page_that_stopped_a_sign_in_names_the_persons_renewal() {
     let host = RenewHost::new();
     let (code, out, err) = acc(
         AccountsCmd::Add {
-            label: "w3".into(),
+            account: "claude w3@example.com".into(),
             class: Class::Preferred,
-            email: Some("w3@example.com".into()),
-            identity_email: None,
+            email: None,
             browser: None,
         },
         &env,
         &host,
     );
     assert_eq!(code, exit(0), "{out}{err}");
+    let w3_label = crate::harness::account_names::tests::added_label(Cli::Claude, "w3@example.com");
     let at = host.now() - 60;
     let store = env.accounts_store();
     let record = |outcome| {
@@ -1688,17 +1806,18 @@ fn a_page_that_stopped_a_sign_in_names_the_persons_renewal() {
                 at,
                 &mut None,
                 |_, _, logins| {
-                    accounts::admit_workflow(logins, "w3")?;
+                    accounts::admit_workflow(logins, &w3_label)?;
                     Ok(accounts::note_sign_in_attempt(
-                        logins, "w3", outcome, "mailbox", at,
+                        logins, &w3_label, outcome, "mailbox", at,
                     ))
                 },
             )
             .expect("recorded");
     };
+    let w3 = crate::harness::account_names::tests::row_name_of(Cli::Claude, &env, &w3_label);
     let step = format!(
         "sign-in needed: Run {} in a terminal",
-        Step::Renew(Cli::Claude, "w3".into())
+        Step::renew(Cli::Claude, w3.word.clone())
     );
     record(accounts::AttemptOutcome::Failed);
     let (_, left, _) = acc(AccountsCmd::Report { json: false }, &env, &host);
@@ -1708,17 +1827,25 @@ fn a_page_that_stopped_a_sign_in_names_the_persons_renewal() {
     assert!(report.contains(&step), "{report}");
     assert!(report.contains("sign-in: error blocked since"), "{report}");
     assert!(
-        report.contains(
-            "w3: not-enrolled (no login made yet: a page stopped aterm's sign-in: run `aterm \
-             harness accounts renew w3` in a terminal"
-        ),
+        report.contains(&format!(
+            "{}: not-enrolled (no login made yet: a page stopped aterm's sign-in: run \
+             `{}` in a terminal",
+            w3.shown,
+            Step::renew(Cli::Claude, w3.word.clone())
+        )),
         "{report}"
     );
     assert!(
-        !report.contains("`aterm harness accounts renew w3` runs that now"),
+        !report.contains(&format!(
+            "`{}` runs that now",
+            Step::renew(Cli::Claude, w3.word.clone())
+        )),
         "{report}"
     );
-    assert!(!report.contains("accounts login w3"), "{report}");
+    assert!(
+        !report.contains(&format!("accounts login {w3_label}")),
+        "{report}"
+    );
 }
 
 /// WHO MAY OPEN ATERM'S SIGN-IN WINDOW. On macOS every sign-in this Mac starts for its own row
@@ -2012,7 +2139,7 @@ fn only_a_sign_in_this_mac_started_for_itself_opens_the_sign_in_window() {
         if who.mailbox {
             host.env_mailbox = Some(tmp.path().to_owned());
         }
-        let (_, out, err) = acc(renew(&["main"], false, None), &env, &host);
+        let (_, out, err) = acc(renew(&[OWNER], false, None), &env, &host);
         let flows = host.flows.borrow();
         let first = flows.first().unwrap_or_else(|| panic!("{tag}: {out}{err}"));
         let opened = match first.2 {
@@ -2375,7 +2502,11 @@ fn a_window_renewal_writes_no_login_credential_to_the_vault() {
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = crate::harness::journal::with_keyer(keyer, || {
         run_accounts(
-            &renew(&["work"], false, None),
+            &renew(
+                &[crate::harness::accounts_tokens::tests::EMAIL],
+                false,
+                None,
+            ),
             &scratch.env(),
             &host,
             &mut out,
@@ -2462,7 +2593,7 @@ fn an_agents_terminal_opens_no_browser_for_a_row() {
         let (_tmp, env) = renew_env("renew-agent-no-route");
         let mut host = RenewHost::new();
         host.agent = agent;
-        let (got, out, err) = acc(renew(&["main"], false, None), &env, &host);
+        let (got, out, err) = acc(renew(&[OWNER], false, None), &env, &host);
         assert_eq!(got, exit(code), "{out}{err}");
         assert_eq!(host.flows.borrow().len(), flows, "{out}{err}");
     }
@@ -2476,7 +2607,7 @@ fn an_agents_terminal_opens_no_browser_for_a_row() {
         host.agent = agent;
         host.flow = 1;
         host.flow_after_first = Some(0);
-        let (_, out, err) = acc(renew(&["main"], false, None), &env, &host);
+        let (_, out, err) = acc(renew(&[OWNER], false, None), &env, &host);
         assert_eq!(host.flows.borrow().len(), flows, "{out}{err}");
     }
 }
@@ -2488,21 +2619,21 @@ fn the_report_shows_a_rows_failed_automatic_sign_in_until_a_login_is_made() {
     let host = RenewHost::new();
     let (code, out, err) = acc(
         AccountsCmd::Add {
-            label: "w3".into(),
+            account: "claude w3@example.com".into(),
             class: Class::Preferred,
-            email: Some("w3@example.com".into()),
-            identity_email: None,
+            email: None,
             browser: None,
         },
         &env,
         &host,
     );
     assert_eq!(code, exit(0), "{out}{err}");
+    let w3_label = crate::harness::account_names::tests::added_label(Cli::Claude, "w3@example.com");
     let routes = "profile(none) mailbox(none configured) vault(not a member) \
                   headless-browser(none installed) hosts(none configured)";
     let at = host.now() - 60;
     let store = env.accounts_store();
-    for label in ["w3", "main"] {
+    for label in [w3_label.as_str(), "main"] {
         store
             .transact_pool_logins_within(
                 &accounts::LOCK_LADDER,
@@ -2536,20 +2667,17 @@ fn the_report_shows_a_rows_failed_automatic_sign_in_until_a_login_is_made() {
     let (_, json, _) = acc(AccountsCmd::Report { json: true }, &env, &host);
     let doc: Value = aterm_json::from_str(&json).expect("json");
     let attempt_of = |label: &str| {
-        doc["accounts"]
-            .as_array()
-            .expect("rows")
-            .iter()
-            .find(|row| row["label"] == Value::from(label))
+        crate::harness::account_names::tests::report_row(Cli::Claude, &env, label, &doc)
             .map(|row| row["sign_in_attempt"].clone())
             .expect("the row")
     };
-    let w3 = attempt_of("w3");
+    let w3 = attempt_of(&w3_label);
     assert_eq!(w3["outcome"], Value::from("no-route"), "{json}");
     assert_eq!(w3["routes"], Value::from(routes));
     assert_eq!(w3["since"], Value::from(at));
     assert_eq!(attempt_of("work-2"), Value::Null, "never tried");
-    no_address(&env, &[&report, &json]);
+    // The report names each account by its name, which holds its address.
+    kept_private(&env, &[&report, &json]);
 }
 
 #[test]
@@ -2558,19 +2686,29 @@ fn login_and_renew_each_refuse_the_other_ones_rows() {
     let host = RenewHost::new();
     let (code, _, err) = acc(
         AccountsCmd::Login {
-            label: "work-2".into(),
+            account: WORK.into(),
         },
         &env,
         &host,
     );
     assert_eq!(code, exit(1));
-    assert!(err.contains("aterm harness accounts renew work-2"), "{err}");
+    let work = crate::harness::account_names::tests::row_name_of(Cli::Claude, &env, "work-2");
+    assert!(
+        err.contains(&format!(
+            "{} has an email, so it signs in through `{}`",
+            work.shown,
+            Step::renew(Cli::Claude, work.word.clone())
+        )),
+        "{err}"
+    );
+    // A row with no address is named by its label, the one word a sign-in takes for it.
     let (code, _, err) = acc(renew(&["plain"], false, None), &env, &host);
     assert_eq!(code, exit(1));
-    assert!(err.contains("`plain` has no email"), "{err}");
+    assert!(err.contains("plain (no address) has no email"), "{err}");
+    // A label the roster does not hold names no account.
     let (code, _, err) = acc(renew(&["nobody"], false, None), &env, &host);
     assert_eq!(code, exit(1));
-    assert!(err.contains("`nobody` is not in the roster"), "{err}");
+    assert!(err.contains(&aterm_file::no_account("nobody")), "{err}");
     assert!(host.flows.borrow().is_empty());
     no_address(&env, &[&err]);
 }
@@ -2580,55 +2718,89 @@ fn login_and_renew_each_refuse_the_other_ones_rows() {
 fn adopt_default_lists_this_machines_own_login_once() {
     let tmp = tmp_dir("adopt");
     let env = env_at(&tmp);
-    let adopt = |label: &str, email: &str| AccountsCmd::AdoptDefault {
-        label: label.into(),
-        email: Some(email.into()),
-        identity_email: None,
+    let adopt = |account: Option<&str>, email: Option<&str>| AccountsCmd::AdoptDefault {
+        account: account.map(str::to_owned),
+        email: email.map(str::to_owned),
         browser: Some("Claude m7-a".into()),
     };
-    let (code, out, err) = acc_quiet(adopt("m7-a", OWNER), &env);
+    let (code, out, err) = acc_quiet(adopt(None, Some(OWNER)), &env);
     assert_eq!(code, exit(0), "{err}");
-    assert!(
-        out.contains("renew it with: aterm harness accounts renew m7-a"),
-        "{out}"
-    );
+    let label = crate::harness::account_names::tests::added_label(Cli::Claude, OWNER);
+    // Its renewal names the row by its account's key (no lab slugs it here), which `renew`
+    // resolves back to the row; never by its label, which `renew` refuses for a row with an
+    // address. NEGATIVE CONTROL: with the receipt typing `row.label` again, this fails on
+    // `renew it with: aterm harness accounts renew m7-a` (2026-11-16, by hand, then restored, when
+    // the row was labelled `m7-a`).
+    let pk = aterm_db::typed::keys::account_pk("claude", OWNER).expect("a key");
+    let step = out
+        .lines()
+        .find_map(|line| line.strip_prefix("renew it with: aterm harness accounts renew "))
+        .unwrap_or_else(|| panic!("no renewal step: {out}"));
+    assert_eq!(step, pk, "{out}");
     let roster = Roster::load(&env.accounts_roster().expect("a path")).expect("admits");
+    let candidates = crate::harness::account_names::Candidates {
+        roster: &roster.rows,
+        ..crate::harness::account_names::Candidates::default()
+    };
+    assert_eq!(
+        crate::harness::account_names::row_named(Cli::Claude, step, &candidates, "")
+            .map(|row| row.label.as_str()),
+        Ok(label.as_str())
+    );
+    assert_eq!(
+        crate::harness::account_names::row_named(Cli::Claude, &label, &candidates, ""),
+        Err(aterm_file::no_account(&label)),
+        "the label of a row with an address names nothing"
+    );
     assert_eq!(
         roster.rows,
         vec![accounts::Row {
-            label: "m7-a".into(),
+            label: label.clone(),
             email: Some(OWNER.into()),
             browser: Some("Claude m7-a".into()),
             ..accounts::Row::default()
         }]
     );
-    let (code, _, err) = acc_quiet(adopt("m7-b", WORK), &env);
+    let (code, _, err) = acc_quiet(adopt(None, Some(WORK)), &env);
     assert_eq!(code, exit(1));
-    assert!(err.contains("listed already, as `m7-a`"), "{err}");
-    let (code, _, err) = acc_quiet(adopt("m7-a", WORK), &env);
-    assert_eq!(code, exit(1));
-    assert!(err.contains("already listed"), "{err}");
+    assert!(
+        err.contains(&format!("listed already, as claude {OWNER}")),
+        "{err}"
+    );
+    let owner = format!("claude {OWNER}");
+    for word in [owner.as_str(), OWNER, pk.as_str()] {
+        let (code, _, err) = acc_quiet(adopt(Some(word), None), &env);
+        assert_eq!(code, exit(1));
+        assert!(
+            err.contains(&format!("claude {OWNER} is already listed in"))
+                && err.contains(&format!("`aterm harness accounts renew {pk}` signs it in")),
+            "{word}: {err}"
+        );
+    }
     let fresh = tmp_dir("adopt-bad");
     let env2 = env_at(&fresh);
-    let (code, _, err) = acc_quiet(adopt("m7-a", "not-an-address"), &env2);
+    let (code, _, err) = acc_quiet(adopt(None, Some("not-an-address")), &env2);
     assert_eq!(code, exit(1));
-    assert!(err.contains("its email is not one address"), "{err}");
+    assert!(err.contains("--email takes an address"), "{err}");
     assert!(!err.contains("not-an-address"), "{err}");
     assert!(!env2.accounts_roster().expect("a path").exists());
-    no_address(&env, &[&out, &err]);
+    kept_private(&env, &[&out, &err]);
     let (code, out, _) = acc_quiet(
         AccountsCmd::Add {
-            label: "w2".into(),
+            account: format!("claude {WORK}"),
             class: Class::Preferred,
-            email: Some(WORK.into()),
-            identity_email: None,
+            email: None,
             browser: None,
         },
         &env,
     );
     assert_eq!(code, exit(0));
+    let work = crate::harness::account_names::tests::added_label(Cli::Claude, WORK);
     assert!(
-        out.contains("run: aterm harness accounts renew w2"),
+        out.contains(&format!(
+            "run: aterm harness accounts renew {}",
+            crate::harness::account_names::tests::row_name_of(Cli::Claude, &env, &work).word
+        )),
         "{out}"
     );
 }
@@ -2834,7 +3006,7 @@ fn a_whole_sitting_through_a_stand_in_checks_only_in_staging_homes() {
         program.clone(),
         env.home.clone().expect("a scratch home").into_os_string(),
     );
-    let (code, out, err) = acc(renew(&["main", "work-2"], false, None), &env, &host);
+    let (code, out, err) = acc(renew(&[OWNER, WORK], false, None), &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
     let ran = std::fs::read_to_string(tmp.path().join("bin").join("ran")).expect("it ran");
     let logins = env.accounts_store().logins_dir();
@@ -2860,7 +3032,7 @@ fn a_whole_sitting_through_a_stand_in_checks_only_in_staging_homes() {
         bound.get("work-2").and_then(|b| b.dir.clone()),
         Some(staging[1].clone())
     );
-    no_address(&env, &[&out, &err]);
+    kept_private(&env, &[&out, &err]);
 }
 
 #[test]
@@ -2966,7 +3138,7 @@ fn a_mailbox_directory_runs_accounts_renew_without_a_terminal_through_the_opener
         program,
         env.home.clone().expect("a scratch home").into_os_string(),
     );
-    let (code, out, err) = acc(renew(&["work-2"], false, None), &env, &host);
+    let (code, out, err) = acc(renew(&[WORK], false, None), &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
     let ran = std::fs::read_to_string(tmp.path().join("bin").join("ran")).expect("it ran");
     let lines: Vec<&str> = ran.lines().collect();
@@ -3382,7 +3554,7 @@ fn a_failed_renewal_by_hand_is_the_rows_last_sign_in_and_one_ledger_row() {
     if accounts::manual_signin_capability() == accounts::ManualSigninCapability::Unavailable {
         // No manual admission on this platform (ATERM-KI-1105-14): a renewal by hand is refused
         // before its provider runs, and a refusal is no sign-in of the row's to record.
-        let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
+        let (code, out, err) = acc(renew(&[OWNER], false, None), &env, &host);
         assert_eq!(code, exit(1), "{out}{err}");
         assert!(err.contains("the sign-in lock could not be taken"), "{err}");
         assert!(host.flows.borrow().is_empty());
@@ -3390,7 +3562,7 @@ fn a_failed_renewal_by_hand_is_the_rows_last_sign_in_and_one_ledger_row() {
         return;
     }
     for run in 0..2 {
-        let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
+        let (code, out, err) = acc(renew(&[OWNER], false, None), &env, &host);
         assert_eq!(code, exit(1), "{out}{err}");
         assert!(
             host.checked.borrow().is_empty(),
@@ -3422,7 +3594,7 @@ fn a_failed_renewal_by_hand_is_the_rows_last_sign_in_and_one_ledger_row() {
             accounts::AttemptOutcome::of_sign_in(&ledger[0].why),
             Some(accounts::AttemptOutcome::Failed)
         );
-        no_address(&env, &[&out, &err]);
+        kept_private(&env, &[&out, &err]);
     }
     assert_eq!(host.flows.borrow().len(), 2);
 }
@@ -3464,7 +3636,7 @@ fn a_terminal_opener_failure_releases_the_machine_signin_lock() {
     };
     let (done, result) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        let answer = acc(renew(&["work-2"], false, None), &worker_env, &host);
+        let answer = acc(renew(&[WORK], false, None), &worker_env, &host);
         let _ = done.send(answer);
     });
     let answer = result.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
@@ -3538,7 +3710,7 @@ fn an_unattended_renewal_timeout_releases_the_machine_signin_lock() {
     };
     let (done, result) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        let answer = acc(renew(&["work-2"], false, None), &worker_env, &host);
+        let answer = acc(renew(&[WORK], false, None), &worker_env, &host);
         let _ = done.send(answer);
     });
     // The short interval is the configured behavior under test. This separate
@@ -3704,8 +3876,11 @@ fn an_unattended_browser_challenge_records_a_task_but_cancellation_does_not() {
             // The step is the one a person can run: `accounts login` refuses a row with an email.
             let out = String::from_utf8(out).unwrap();
             assert!(
-                out.contains("aterm harness accounts renew work-2")
-                    && out.contains("in a terminal on this Mac"),
+                out.contains(&format!(
+                    "aterm harness accounts renew {}",
+                    crate::harness::account_names::tests::row_name_of(Cli::Claude, &env, "work-2")
+                        .word
+                )) && out.contains("in a terminal on this Mac"),
                 "{out}"
             );
             assert!(!out.contains("accounts login"), "{out}");
@@ -3819,15 +3994,22 @@ fn renews_choice_of_rows_reads_the_environment_through_its_host() {
     std::fs::create_dir_all(&mailbox).expect("mailbox");
     let mut quiet = RenewHost::new();
     quiet.tty = false;
-    let (code, out, err) = acc(renew(&["work-2"], false, None), &env, &quiet);
+    let (code, out, err) = acc(renew(&[WORK], false, None), &env, &quiet);
     assert_eq!(code, exit(1), "{out}{err}");
-    assert_eq!(out, "due here: work-2\n", "CONTROL");
+    assert_eq!(
+        out,
+        format!(
+            "due here: {}\n",
+            crate::harness::account_names::tests::row_name_of(Cli::Claude, &env, "work-2").shown
+        ),
+        "CONTROL"
+    );
     assert!(quiet.flows.borrow().is_empty());
 
     let mut named = RenewHost::new();
     named.tty = false;
     named.env_mailbox = Some(mailbox);
-    let (code, out, err) = acc(renew(&["work-2"], false, None), &env, &named);
+    let (code, out, err) = acc(renew(&[WORK], false, None), &env, &named);
     assert_eq!(code, exit(0), "{out}{err}");
     let renewed: Vec<_> = named
         .flows
@@ -3854,13 +4036,13 @@ fn renews_profile_route_uses_only_the_browser_its_host_names() {
     let mut quiet = RenewHost::new();
     quiet.tty = false;
     assert!(!quiet.system_browsers());
-    let (code, out, err) = acc(renew(&["work-2"], false, None), &env, &quiet);
+    let (code, out, err) = acc(renew(&[WORK], false, None), &env, &quiet);
     assert_eq!(code, exit(1), "{out}{err}");
     assert!(quiet.flows.borrow().is_empty());
     let mut named = RenewHost::new();
     named.tty = false;
     named.env_browser = Some(browser);
-    let (code, out, err) = acc(renew(&["work-2"], false, None), &env, &named);
+    let (code, out, err) = acc(renew(&[WORK], false, None), &env, &named);
     assert_eq!(code, exit(0), "{out}{err}");
     assert_eq!(named.flows.borrow().len(), 1);
 }
@@ -3923,7 +4105,7 @@ fn a_repaired_browser_reopens_noninteractive_renewal_without_proving_its_identit
                 Some(wrong_at)
             );
         }));
-        let (code, out, err) = acc(renew(&["work-2"], false, None), &env, &host);
+        let (code, out, err) = acc(renew(&[WORK], false, None), &env, &host);
         assert_eq!(
             host.flows.borrow().len(),
             usize::from(repaired),
@@ -3973,7 +4155,7 @@ fn closing_automatic_work_between_provider_and_status_defers_without_adoption() 
         } else {
             host.during_flow = Some(close);
         }
-        let result = acc(renew(&["work-2"], false, None), &env, &host);
+        let result = acc(renew(&[WORK], false, None), &env, &host);
         assert_ne!(result.0, exit(0));
         assert_eq!(host.flows.borrow().len(), 1);
         assert_eq!(host.checked.borrow().len(), usize::from(close_at_status));

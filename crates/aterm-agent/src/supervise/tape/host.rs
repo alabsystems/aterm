@@ -677,6 +677,10 @@ enum RosterWire {
         ready: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         held: Option<String>,
+        /// The word that names the ready row's account ([`Ready::word`]); none where the row
+        /// holds no address, and on a tape an earlier build wrote, which knew no word.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        word: Option<String>,
     },
     /// No other row ready, and what holds the tab at the limit even once one
     /// is ([`held_word`]).
@@ -715,6 +719,7 @@ impl TapeValue for Option<RosterWord> {
                         next,
                         ready: ready.label.clone(),
                         held,
+                        word: ready.word.clone(),
                     },
                     (None, Some(held)) => RosterWire::Held { next, held },
                     (None, None) => RosterWire::Row(next),
@@ -736,9 +741,14 @@ impl TapeValue for Option<RosterWord> {
                         ready: None,
                         held: None,
                     },
-                    RosterWire::Ready { next, ready, held } => RosterWord::Row {
+                    RosterWire::Ready {
+                        next,
+                        ready,
+                        held,
+                        word,
+                    } => RosterWord::Row {
                         next: next_of(next),
-                        ready: Some(Ready { label: ready }),
+                        ready: Some(Ready { label: ready, word }),
                         held: held.as_deref().map(held_of).transpose()?,
                     },
                     RosterWire::Held { next, held } => RosterWord::Row {

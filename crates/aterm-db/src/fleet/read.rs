@@ -16,6 +16,8 @@
 
 use aterm_digest::Sha256;
 use aterm_types::machine_name::Number;
+use aterm_types::needs::NeedWord;
+use aterm_types::update_standing::UpdateFact;
 use std::collections::BTreeMap;
 
 /// The glance and task words a record holds, which [`crate::words`] defines on every platform.
@@ -246,6 +248,14 @@ pub struct AgentSeen {
     /// session's (a new run counts from 0, so a fall between two reads is a new run, not a
     /// count that went back).
     pub tools: Option<u32>,
+    /// The need word its row's `needs=` says: `Some(None)` where it said `-` (none),
+    /// `None` where its row sent no `needs=` (an aterm before it) or a word outside the need
+    /// grammar (a newer aterm's). A fact the class reads (an agent that asked a question or lost
+    /// its login is an error, FP-D5), never a request of a person.
+    pub need: Option<Option<NeedWord>>,
+    /// The comprehension system's activity word for it, its row's `word=` (CX-09), kept as sent
+    /// ([`activity_word`]); `None` where its row sent none. Nothing here decides a word.
+    pub activity: Option<String>,
     /// Its work class, by [`Work::of`] its state and [`Self::turn`].
     pub work: Work,
     /// When the window that listed it answered, Unix ms on its machine's own clock (its reply's
@@ -790,6 +800,10 @@ pub struct Answered {
     /// `access=` (an aterm that does not say) and for this Mac's own machine, whose windows
     /// answer a local read that asks for no grant (it drives its own sessions without one).
     pub drive: Option<bool>,
+    /// Where its updater stands, as its header's `update=` and `update_*=` words say
+    /// ([`UpdateFact::of_fields`], each word outside its grammar unread on its own); `None` for a
+    /// header with no `update=` (an aterm before these words) or whose word is none.
+    pub update: Option<UpdateFact>,
     /// Its live sessions, agents or not, where its answer counted them all: `None` for a
     /// partial answer (a window of it went unread, or its reply left rows out), whose rows are a
     /// lower bound and no count.
@@ -934,6 +948,31 @@ impl MachineSeen {
 /// The canonical `m<N>` a header's `label=` names.
 pub fn label_word(raw: &str) -> Option<String> {
     Number::leading(raw).map(|n| format!("m{}", n.get()))
+}
+
+/// The longest activity word kept.
+pub const ACTIVITY_MAX: usize = 32;
+
+/// `raw` as an activity word (a row's `word=`): 1 to [`ACTIVITY_MAX`] bytes of lowercase
+/// letters, digits, `-` and `:`, with a letter among them (`busy`, `wall:usage-weekly`). Any
+/// other word, `-` included, names none. The vocabulary is the comprehension system's: this
+/// read keeps the word as sent and decides nothing from it.
+pub fn activity_word(raw: &str) -> Option<String> {
+    (raw.len() <= ACTIVITY_MAX
+        && raw.bytes().any(|b| b.is_ascii_lowercase())
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b':'))
+    .then(|| raw.to_owned())
+}
+
+/// The need a row's `needs=` word says: `Some(None)` for `-`, `Some(Some(_))` for a word of
+/// the need grammar, and `None` for no key or any other word.
+pub fn need_of(raw: Option<&str>) -> Option<Option<NeedWord>> {
+    match raw? {
+        "-" => Some(None),
+        word => NeedWord::parse(word).map(Some),
+    }
 }
 
 /// `raw` as a bounded word a row may carry: 1 to `max` bytes of letters, digits, spaces and

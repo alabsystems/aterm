@@ -5,6 +5,21 @@
 
 use super::*;
 
+fn managed_compiler_store() -> crate::trust_lock::ManagedStoreContext {
+    let home = aterm_uds::host::tool_home().unwrap();
+    let prefix = std::env::var_os("ATERM_TEST_PACKAGE_PREFIX")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            aterm_toolchain::atpkg_prefix(
+                &home,
+                std::env::var_os("XDG_CONFIG_HOME")
+                    .as_deref()
+                    .map(Path::new),
+            )
+        });
+    crate::trust_lock::ManagedStoreContext::declared(&home, &prefix).unwrap()
+}
+
 /// A prepared record beside a live supervisor and its exclusively held workspace.
 /// The controller releases both claims only after the child reports entering the wait.
 #[cfg(unix)]
@@ -30,14 +45,16 @@ impl PrefreezeFixture {
             sources: "2".repeat(64),
             seal: "3".repeat(64),
         });
-        let prepared = crate::release_tools::stage_cutter(
+        let mut prepared = crate::release_tools::stage_cutter(
             &cache,
             &fixture.candidate,
             &source,
             &real.step_log(real.step),
+            inputs.as_ref().map(|inputs| inputs.seal.clone()),
             inputs,
         )
         .unwrap();
+        prepared.compiler = real.compiler.as_ref().map(|compiler| compiler.pin.clone());
         crate::release_tools::publish_cutter(&cache, &prepared).unwrap();
         let pid = std::process::id();
         let started = started_of(pid).unwrap();
@@ -61,9 +78,10 @@ impl PrefreezeFixture {
     pub fn real(root: &Path) -> Real {
         let repo = root.join("repo");
         let mut real = Real::new(&repo, Some(&repo), true, false).unwrap();
+        real.compiler_store = managed_compiler_store();
         real.release = root.join("release");
         real.state = root.join("state");
-        real.prefrozen_inputs = |state, _| Some(state.join("kept-seal"));
+        real.prefrozen_inputs = |_, _, state, _| Some(state.join("kept-seal"));
         real.prefrozen_step1 = Some(PrefrozenStep1 {
             commit: crate::ledger::git_ok(&GitCli::new(&repo), &["rev-parse", "--branches"])
                 .unwrap()
@@ -72,15 +90,19 @@ impl PrefreezeFixture {
                 .into(),
             seal: "3".repeat(64),
         });
+        let commit = real.prefrozen_step1.as_ref().unwrap().commit.clone();
+        real.candidate_prover(&commit, None).unwrap();
         real.handed_inputs = || Some(PathBuf::from("/fixture/kept-seal"));
         real.argv = vec!["release".into(), "--dry-run".into()];
         real
     }
 
     pub fn judge(real: &Real, commit: &str) -> Result<(), Refusal> {
+        let compiler = real.compiler.as_ref().unwrap();
         let unused = Prover {
-            bin: PathBuf::from("/no-compiler"),
-            commit: "f".repeat(40),
+            compiler: Some(compiler.pin.clone()),
+            bin: compiler.bin.clone(),
+            commit: compiler.pin.compiler_commit.clone(),
             source: "unused".into(),
         };
         let cutter = real
@@ -145,6 +167,10 @@ impl Fixture {
             "version=4\n[[package]]\nname='aterm-release'\nversion='0.0.0'\n",
         )
         .unwrap();
+        // This source-policy fixture runs the real managed compiler selected by the test
+        // checkout, so its immutable candidate must carry the same declaration too.
+        let lock = aterm_tempfile::manifest_dir().join("../../trust.lock");
+        std::fs::copy(lock, repo.join("trust.lock")).unwrap();
         let git = GitCli::new(&repo);
         let revision = |verdict, label| {
             std::fs::write(repo.join("crates/aterm-release/src/main.rs"), format!(
@@ -173,16 +199,13 @@ impl Fixture {
     /// supplies only the chosen revision; no release credentials or remote writes exist.
     pub fn verdict(&self, commit: &str) -> (i32, String) {
         let mut real = Real::new(&self.repo, Some(&self.repo), true, false).unwrap();
+        real.compiler_store = managed_compiler_store();
         real.release = self.root.path().join("release");
         real.state = self.root.path().join("state");
-        real.build_inputs = || Ok("f".repeat(64));
+        real.build_inputs = |_, _| Ok("f".repeat(64));
         real.arm_inputs = |_, _| {};
         real.argv = vec!["release".into(), "--dry-run".into()];
-        let prover = Prover {
-            bin: crate::gates::trust_stage2_bin().unwrap(),
-            commit: "0".repeat(40),
-            source: "fixture Trust".into(),
-        };
+        let prover = real.candidate_prover(commit, None).unwrap();
         let cutter = real.frozen_cutter(commit, &prover).unwrap();
         let mut command = real.cutter_command(&cutter.tool.path);
         let output =
@@ -335,6 +358,7 @@ impl BumpFixture {
 
     pub fn preview(&mut self, c: &Candidate) -> Result<String, Refusal> {
         let prover = Prover {
+            compiler: None,
             bin: crate::gates::trust_stage2_bin().unwrap(),
             commit: "0".repeat(40),
             source: "fixture Trust".into(),
@@ -359,6 +383,7 @@ fn private_bump_tree_matches_the_real_bump_edits() {
     };
     let preview = fixture.preview(&c).unwrap();
     let prover = Prover {
+        compiler: None,
         bin: crate::gates::trust_stage2_bin().unwrap(),
         commit: "0".repeat(40),
         source: "fixture Trust".into(),
@@ -396,6 +421,7 @@ fn the_open_next_commit_is_the_previewed_bump_alone_on_a_scratch_remotes_tip() {
     let candidate = unwritten_bump(&fixture);
     let preview = fixture.preview(&candidate).unwrap();
     let prover = Prover {
+        compiler: None,
         bin: crate::gates::trust_stage2_bin().unwrap(),
         commit: "0".repeat(40),
         source: "fixture Trust".into(),

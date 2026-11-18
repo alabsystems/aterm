@@ -214,10 +214,10 @@ fn a_record_is_only_of_a_stop_and_of_its_builds() {
             "{word:?}"
         );
         assert_ne!(step.why(), "failed", "{word:?}");
-        let words = step.words(Some("aterm harness accounts token work"));
+        let words = step.words(Some("aterm harness accounts token claude-ada-x"));
         assert!(words.starts_with("stopped 2027-01-15: "), "{words}");
         assert!(
-            words.ends_with(", or by `aterm harness accounts token work`"),
+            words.ends_with(", or by `aterm harness accounts token claude-ada-x`"),
             "{words}"
         );
         assert!(!words.contains(" on claude"), "{words}");

@@ -18,9 +18,11 @@
 //! writer per [`STRIDE`] of its own.
 //!
 //! Each pass then records the table's floor (tracker LT-B10C1): the newest checkpoint this Mac
-//! signed that is final by the rule the vault log shares ([`finality`]): more than half of the
-//! members that signed a record of the table in the 30 days before the cut have signed its body,
-//! the cut's time being its newest frontier tip's. The store counts its quotas above that floor.
+//! signed that is final by the rule the vault log shares ([`finality`]), judged as every read
+//! judges its settled floor ([`checkpoint::finals`], tracker LT-B10D1): more than half of the
+//! members whose own frontier tip in the cut was signed in the 30 days before the cut have signed
+//! its body, the cut's time being its newest frontier tip's. The store counts its quotas above
+//! that floor.
 
 use super::{Handle, Table, View, decode};
 use crate::{
@@ -57,7 +59,8 @@ pub(crate) fn state(
     log: &Log,
     cut: &BTreeSet<Digest>,
 ) -> Result<Digest> {
-    let view = View::read(table, session, &log.as_of_cut(cut))?;
+    // The cut judged as a final checkpoint of it will be: what a read from it holds.
+    let view = View::read(table, session, &log.settled_at(cut).as_of_cut(cut))?;
     let index = log.causal_index();
     let cells = checkpoint::cells_digest(&view.cells, |id| {
         index.get(id).map(|header| (header.actor, header.sequence))
@@ -254,57 +257,26 @@ impl Pass<'_> {
         Ok(Signed::Proposed)
     }
 
-    /// The newest checkpoint of this table this Mac signed that is final ([`finality`]), whose
-    /// cut holds the store's present floor; `None` where there is none.
+    /// The newest checkpoint of this table this Mac signed that is final, whose cut holds the
+    /// store's present floor; `None` where there is none. Final is judged by the function every
+    /// read names its settled floor by ([`checkpoint::finals`]), over the store's checkpoints now,
+    /// this pass's own share included, so the floor this Mac records is the settled floor it
+    /// signed.
     fn final_floor(&self, store: &crate::table::store::Store) -> Option<Body> {
         let me = self.session.actor();
-        // Each body, by its one encoding, with the members that signed it.
-        let mut signers: BTreeMap<Vec<u8>, (&Body, BTreeSet<Actor>)> = BTreeMap::new();
-        for (signer, body) in store.checkpoints() {
-            if body.scope == self.scope.digest() && body.generation == self.scope.generation() {
-                signers
-                    .entry(checkpoint::encode(body))
-                    .or_insert_with(|| (body, BTreeSet::new()))
-                    .1
-                    .insert(signer);
-            }
-        }
         let floor = store.floor();
-        signers
-            .into_values()
-            .filter(|(body, signed)| {
-                signed.contains(&me)
-                    && floor.is_none_or(|floor| contains(body, floor))
-                    && self.cut_ms(body).is_some_and(|cut_ms| {
-                        let seats = finality::recent(self.members, cut_ms, |seat| {
-                            self.last_signed_ms(seat, cut_ms)
-                        });
-                        finality::is_final(&seats, signed)
-                    })
-            })
-            .max_by_key(|(body, _)| body.below)
-            .map(|(body, _)| (*body).clone())
-    }
-
-    /// The cut's time: its newest frontier tip's authored time. `None` where a tip is not here.
-    fn cut_ms(&self, body: &Body) -> Option<u64> {
-        body.frontier
-            .values()
-            .map(|tip| self.log.authored_ms(&tip.digest))
-            .try_fold(0, |newest, at| Some(newest.max(at?)))
-    }
-
-    /// `seat`'s newest record here authored at or before `cut_ms`.
-    fn last_signed_ms(&self, seat: &Actor, cut_ms: u64) -> Option<u64> {
-        let index = self.log.causal_index();
-        self.log
-            .projection()
-            .ordered
-            .iter()
-            .filter(|id| index.get(id).is_some_and(|header| header.actor == *seat))
-            .filter_map(|id| self.log.authored_ms(id))
-            .filter(|at| *at <= cut_ms)
-            .max()
+        checkpoint::finals(
+            store.checkpoints(),
+            self.scope.digest(),
+            self.scope.generation(),
+            &self.session.member_actors(),
+            |actor, tip| self.log.tip_ms(actor, tip),
+        )
+        .into_iter()
+        .rfind(|(body, signed)| {
+            signed.contains(&me) && floor.is_none_or(|floor| contains(body, floor))
+        })
+        .map(|(body, _)| body)
     }
 }
 

@@ -18,6 +18,11 @@
 //! guest's OS, so the host's tests drive the serve loop and the watch connection with a
 //! Fake ([`fake::Fake`]) over unix sockets; on macOS the bin itself serves on unix sockets
 //! ([`seam`]), the test seam only.
+//!
+//! It is Unix's: the agent runs in the Linux guest and its seam on the Mac that hosts the
+//! lane, and its dependents (aterm-vz, the lab's `linux vz-host`) are the macOS lane's. On
+//! Windows the library is empty and the bin says so.
+#![cfg(unix)]
 
 pub mod boot;
 #[cfg(any(test, debug_assertions))]

@@ -233,6 +233,10 @@ pub struct ClaudeAccounts {
     /// when that row has an email, never one its source gives other Macs alone
     /// ([`crate::harness::accounts_sync::rows_of_other_macs_at`]).
     pub next_sign_in: Option<String>,
+    /// The word the sign-in of the row a sign-in renews (`next_sign_in`, else this row) names it
+    /// by ([`crate::harness::account_names::sign_in_word`]); `None` where the roster lists no
+    /// such row, whose sign-in names it by its label ([`Self::sign_in_word_or`]).
+    pub sign_in_word: Option<crate::harness::account_names::Word>,
     /// aterm's own sign-in of the row a sign-in renews (`next_sign_in`, else this row) that
     /// failed and stands on record.
     pub tried: Option<Tried>,
@@ -498,8 +502,8 @@ pub struct CliAccounts {
     /// launch while this row stays refused, which the report says too. Why a launch is refused is
     /// [`Self::launch_end`].
     pub default_moved: Option<(String, crate::harness::accounts_step::Step)>,
-    /// The label the owner's pin (`aterm harness accounts use <label>`) holds every launch to,
-    /// where a pin stands.
+    /// The label of the row the owner's pin (`aterm harness accounts use <account>`) holds every
+    /// launch to, where a pin stands.
     pub pinned: Option<String>,
     /// What a default-home run sets for the serving row (`accounts::login_env_for`), when the
     /// pool selects one.
@@ -536,6 +540,9 @@ pub struct CliAccounts {
     /// aterm's own sign-in of the row a sign-in signs in ([`Self::sign_in_target`]) that failed
     /// and stands on record.
     pub tried: Option<Tried>,
+    /// The word the sign-in of each roster row names it by, by label
+    /// ([`crate::harness::account_names::sign_in_word`], [`Self::word`]).
+    pub words: std::collections::BTreeMap<String, crate::harness::account_names::Word>,
     /// The step a person owes that row, where its last renewal stopped for one and no signed-in
     /// `accounts browser` window answered it since
     /// ([`crate::harness::accounts_sync::unaddressed_sign_in_task_at`]): its browser profile
@@ -551,17 +558,54 @@ pub struct CliAccounts {
     pub off: Option<String>,
 }
 
+impl ClaudeAccounts {
+    /// The word the sign-in of the row a sign-in renews names it by ([`Self::sign_in_word`]),
+    /// `label` (`next_sign_in`, else this row) where the roster lists no such row.
+    #[must_use]
+    pub fn sign_in_word_or(&self, label: &str) -> crate::harness::account_names::Word {
+        self.sign_in_word.clone().unwrap_or_else(|| {
+            crate::harness::account_names::sign_in_word_of(
+                crate::harness::accounts::Cli::Claude,
+                label,
+                &[],
+                None,
+            )
+        })
+    }
+}
+
+/// The row a sign-in of a CLI's pool signs in ([`CliAccounts::sign_in_target`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignInTarget<'a> {
+    /// The row's label, the local key the pool's records hold it under.
+    pub label: &'a str,
+    /// The word its sign-in names it by ([`crate::harness::account_names::sign_in_word`]).
+    pub word: crate::harness::account_names::Word,
+    /// The `aterm harness accounts` verb that signs it in.
+    pub verb: &'static str,
+}
+
 impl CliAccounts {
+    /// The word the sign-in of the row labelled `label` names it by ([`Self::words`]); a label
+    /// the roster does not list by itself.
+    #[must_use]
+    pub fn word(
+        &self,
+        cli: crate::harness::accounts::Cli,
+        label: &str,
+    ) -> crate::harness::account_names::Word {
+        self.words.get(label).cloned().unwrap_or_else(|| {
+            crate::harness::account_names::sign_in_word_of(cli, label, &[], None)
+        })
+    }
+
     /// The row a sign-in of `cli`'s pool signs in and the `aterm harness accounts` verb it takes
     /// ([`crate::harness::accounts::Cli::sign_in_verb`]): [`Self::next`], except where that row
     /// is this machine's own login's on a Codex build that keeps no row's login its own
     /// ([`crate::ai::login::default_home_sign_in`]), whose sign-in is Codex's own in its default
     /// home, a person's and no pool verb. `None` where no such row is.
     #[must_use]
-    pub fn sign_in_target(
-        &self,
-        cli: crate::harness::accounts::Cli,
-    ) -> Option<(&str, &'static str)> {
+    pub fn sign_in_target(&self, cli: crate::harness::accounts::Cli) -> Option<SignInTarget<'_>> {
         if crate::ai::login::default_home_sign_in(self) {
             return None;
         }
@@ -570,7 +614,11 @@ impl CliAccounts {
         }
         self.next
             .as_deref()
-            .map(|label| (label, cli.sign_in_verb(true)))
+            .map(|label| SignInTarget {
+                label,
+                word: self.word(cli, label),
+                verb: cli.sign_in_verb(true),
+            })
             .or_else(|| self.moved_sign_in())
     }
 
@@ -581,14 +629,21 @@ impl CliAccounts {
         matches!(self.launch_end, Some(LaunchEnd::DefaultMoved(_)))
     }
 
-    /// The row and verb of [`Self::default_moved`]'s step where a pool sign-in is that step.
-    fn moved_sign_in(&self) -> Option<(&str, &'static str)> {
+    /// The row, word and verb of [`Self::default_moved`]'s step where a pool sign-in of its row
+    /// is that step.
+    fn moved_sign_in(&self) -> Option<SignInTarget<'_>> {
         use crate::harness::accounts_step::Step;
-        match &self.default_moved {
-            Some((_, Step::Renew(_, row))) => Some((row.as_str(), "renew")),
-            Some((_, Step::Login(_, row))) => Some((row.as_str(), "login")),
-            _ => None,
-        }
+        let (label, step) = self.default_moved.as_ref()?;
+        let (word, verb) = match step {
+            Step::Renew(_, words) => (words.first()?.clone(), "renew"),
+            Step::Login(_, word) => (word.clone(), "login"),
+            _ => return None,
+        };
+        Some(SignInTarget {
+            label: label.as_str(),
+            word,
+            verb,
+        })
     }
 }
 
@@ -762,13 +817,13 @@ fn unnamed_holder<'a>(
 }
 
 /// Why `aterm ai login` signs in no row of `holder`'s: nobody named it, and that command also runs
-/// with nobody here. It names the verb that borrows it.
+/// with nobody here. It names the verb that borrows it, naming the row by `word`.
 fn another_macs_refusal(
     cli: crate::harness::accounts::Cli,
-    label: &str,
+    word: crate::harness::account_names::Word,
     holder: Option<&str>,
 ) -> Option<String> {
-    let sign_in = crate::harness::accounts_step::Step::sign_in(cli, label, true);
+    let sign_in = crate::harness::accounts_step::Step::sign_in(cli, word, true);
     holder.map(|holder| crate::harness::cli::another_macs_words(holder, &sign_in))
 }
 
@@ -816,6 +871,7 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
             renewed_at: None,
             signed_out_at: None,
             next_sign_in: None,
+            sign_in_word: None,
             tried: None,
             unattended: false,
             off: None,
@@ -847,6 +903,7 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
             renewed_at: None,
             signed_out_at: None,
             next_sign_in: None,
+            sign_in_word: None,
             tried: None,
             unattended: false,
             off: m.config.as_deref().and_then(|config| {
@@ -916,11 +973,23 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
     let sign_in_refused = next_sign_in
         .is_none()
         .then(|| {
-            local_sign_in_refusal(&row, &state, &logins)
-                .or_else(|| another_macs_refusal(accounts::Cli::Claude, &row.label, unnamed_holder))
+            local_sign_in_refusal(&row, &state, &logins).or_else(|| {
+                another_macs_refusal(
+                    accounts::Cli::Claude,
+                    crate::harness::account_names::sign_in_word_here(
+                        accounts::Cli::Claude,
+                        &row,
+                        &bound.rows,
+                    ),
+                    unnamed_holder,
+                )
+            })
         })
         .flatten();
     let target = next_sign_in.as_deref().unwrap_or(&row.label);
+    let sign_in_word = bound.row(target).map(|target| {
+        crate::harness::account_names::sign_in_word_here(accounts::Cli::Claude, target, &bound.rows)
+    });
     let target_email = bound.row(target).and_then(|r| r.email.as_deref());
     let renews_target = target_email.is_some() && bound.row(target).is_some_and(local);
     let (login_state, renew_by, on_token_until) = if renews {
@@ -986,6 +1055,7 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
             )
         }),
         next_sign_in,
+        sign_in_word,
         store: Some(store),
         roster: m.roster.clone(),
     })
@@ -1617,7 +1687,7 @@ fn pool_for_with(
         match crate::harness::accounts_pool::default_serving(&bound, &state, &enrolled_here, m.now)
         {
             Ok(row) => match &default_identity_words {
-                None => crate::harness::codex_alab::DefaultRow::Serves(row.label.clone()),
+                None => crate::harness::codex_alab::DefaultRow::serves(row, &bound.rows),
                 Some(why) => crate::harness::codex_alab::DefaultRow::Other {
                     label: row.label.clone(),
                     why: why.clone(),
@@ -1650,12 +1720,12 @@ fn pool_for_with(
     // or where none is listed, that login listed as a row and then pinned (a listing alone leaves
     // the pin where it is).
     let launch_step = match (&launch, &default_serving) {
-        (Err(_), Some(crate::harness::codex_alab::DefaultRow::Serves(label)))
+        (Err(_), Some(crate::harness::codex_alab::DefaultRow::Serves(_, Some(word))))
             if unread && pinned_own =>
         {
             Some(format!(
                 "`{}`",
-                crate::harness::codex_alab::unread_fix(Some(label))
+                crate::harness::codex_alab::unread_fix(Some(word))
             ))
         }
         (Err(_), Some(crate::harness::codex_alab::DefaultRow::Unlisted))
@@ -1664,7 +1734,9 @@ fn pool_for_with(
             Some(format!(
                 "`{}`, then `{}`",
                 crate::harness::codex_alab::unread_fix(None),
-                crate::harness::codex_alab::unread_fix(Some("<label>"))
+                crate::harness::codex_alab::unread_fix(Some(
+                    &crate::harness::account_names::Word::chosen()
+                ))
             ))
         }
         _ => None,
@@ -1729,6 +1801,22 @@ fn pool_for_with(
         launch_end,
         default_moved,
         pinned: state.active.clone().filter(|_| state.pinned),
+        words: {
+            let lab = crate::harness::alab_roster::current();
+            bound
+                .rows
+                .iter()
+                .map(|row| {
+                    let word = crate::harness::account_names::sign_in_word(
+                        cli,
+                        row,
+                        &bound.rows,
+                        lab.as_deref(),
+                    );
+                    (row.label.clone(), word)
+                })
+                .collect()
+        },
         ..CliAccounts::default()
     };
     if let Some(row) = serving {
@@ -1830,7 +1918,7 @@ fn pool_for_with(
             local_sign_in_refusal(row, &state, &logins).or_else(|| {
                 another_macs_refusal(
                     cli,
-                    &row.label,
+                    out.word(cli, &row.label),
                     unnamed_holder(&other_macs, &state, &row.label),
                 )
             })
@@ -1838,8 +1926,8 @@ fn pool_for_with(
     }
     // What stands on record of the row a sign-in signs in, and the switches that keep aterm's
     // own sign-ins off here.
-    if let Some((label, _)) = out.sign_in_target(cli) {
-        let label = label.to_owned();
+    if let Some(target) = out.sign_in_target(cli) {
+        let label = target.label.to_owned();
         out.tried = raw_roster
             .row(&label)
             .and_then(|raw| tried_of(&logins, raw));

@@ -85,7 +85,16 @@ impl Vault {
     fn through_head_in(&self, identity: &Identity, context: [u8; 32]) -> Option<Store> {
         let file = std::fs::File::open(&self.data).unwrap();
         let stamp = fsx::FileStamp::of(&fsx::meta_of(&file).unwrap());
-        open(&self.head, &file, stamp, context, identity, Self::empty()).map(|(store, _)| store)
+        open(
+            &self.head,
+            &file,
+            stamp,
+            context,
+            identity,
+            Self::empty(),
+            Publication::Allowed,
+        )
+        .map(|(store, _)| store)
     }
 
     /// The head written by a full open's resolve under `identity`; whether one was written.

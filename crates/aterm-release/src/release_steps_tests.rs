@@ -1741,6 +1741,7 @@ fn production_build_and_tree_wiring_owns_the_fixture_handoff() {
         line: "1 0.0.0".into(),
     };
     let prover = Prover {
+        compiler: None,
         bin: repo.join("prover/bin"),
         commit: "33".repeat(20),
         source: "fixture".into(),
@@ -2746,14 +2747,14 @@ fn the_next_cut_promotes_the_exact_prefrozen_cutter_and_says_so() {
     real.release = temp.path().join("release");
     real.state = temp.path().join("state");
     real.logs = temp.path().join("logs");
-    real.build_inputs = prepared_identity;
+    real.build_inputs = |_, _| prepared_identity();
     real.arm_prefrozen_inputs = arm_prefrozen_fixture;
     real.handed_inputs = || {
         Some(PathBuf::from(
             "/state/aterm-release/inputs-seal/current.toml",
         ))
     };
-    real.prefrozen_inputs = |state, expected| {
+    real.prefrozen_inputs = |_, _, state, expected| {
         if expected != PREPARED_SEAL {
             return None;
         }
@@ -2785,10 +2786,25 @@ fn the_next_cut_promotes_the_exact_prefrozen_cutter_and_says_so() {
         &commit,
         &source,
         &real.step_log(real.step),
+        Some(inputs.seal.clone()),
         Some(inputs.clone()),
     )
     .unwrap();
     prepared.built_from.clone_from(&built_from);
+    let pin = crate::release::CompilerPin {
+        build: 1,
+        tree_root: "a".repeat(64),
+        compiler_commit: "f".repeat(40),
+        receipt: "SEED-MINT sha256:00".into(),
+        stock_toolchain: "1.99.1".into(),
+    };
+    prepared.compiler = Some(pin.clone());
+    real.compiler = Some(crate::trust_lock::CompilerInputs {
+        bin: temp.path().join("no-prover"),
+        stock: crate::buildplan::Stock::under(temp.path().as_os_str(), &pin.stock_toolchain),
+        pin: pin.clone(),
+    });
+    real.compiler_source = Some(commit.clone());
     crate::release_tools::publish_cutter(&cache, &prepared).unwrap();
     real.seal_inputs().unwrap();
     assert!(
@@ -2802,6 +2818,7 @@ fn the_next_cut_promotes_the_exact_prefrozen_cutter_and_says_so() {
     // This path cannot build anything. Success therefore proves that the real cut promoted
     // the exact cache record instead of entering cutter_workspace_at/frozen_cutter_here.
     let unusable = Prover {
+        compiler: Some(pin.clone()),
         bin: temp.path().join("no-prover"),
         commit: "f".repeat(40),
         source: "negative-control prover".into(),
@@ -2833,8 +2850,78 @@ fn the_next_cut_promotes_the_exact_prefrozen_cutter_and_says_so() {
         "the next cut must state exact preparation adoption: {log}"
     );
 
+    // A successful exact-source freeze retains S0 even when its optional graph
+    // cannot describe a build-script declaration. Neither selecting it nor
+    // promoting its prepared record may compile/exec the same candidate again.
     std::fs::remove_file(crate::release_tools::cutter_record_path(&real.release)).unwrap();
-    real.build_inputs = changed_identity;
+    let mut exact = prepared.clone();
+    exact.built_from.clone_from(&commit);
+    exact.inputs = None;
+    crate::release_tools::publish_cutter(&cache, &exact).unwrap();
+    real.seal_inputs().unwrap();
+    let (selected, handed) = real.frozen_cutter_with_inputs(&commit, &unusable).unwrap();
+    assert_eq!(selected.seal.as_deref(), Some(PREPARED_SEAL));
+    assert!(selected.inputs.is_none());
+    assert!(handed.is_some());
+    assert_eq!(
+        real.frozen_cutter_with_inputs(&commit, &unusable)
+            .unwrap()
+            .0,
+        selected,
+        "the exact-source release-root record also works without adoption evidence"
+    );
+    for recovery in [
+        crate::release_tools::Recovery::Refreeze,
+        crate::release_tools::Recovery::Refuse,
+    ] {
+        assert!(
+            real.select_frozen_cutter(&commit, &unusable, recovery)
+                .is_err(),
+            "a failed-check repair decision cannot fall back to the rejected cached proof"
+        );
+    }
+    for seal in [None, Some(CHANGED_SEAL.into())] {
+        std::fs::remove_file(crate::release_tools::cutter_record_path(&real.release)).unwrap();
+        let mut mutant = exact.clone();
+        mutant.seal = seal;
+        crate::release_tools::publish_cutter(&cache, &mutant).unwrap();
+        real.seal_inputs().unwrap();
+        assert!(
+            real.frozen_cutter_with_inputs(&commit, &unusable).is_err(),
+            "a missing or changed independent seal cannot reuse the exact-source cache"
+        );
+        assert!(!crate::release_tools::cutter_record_path(&real.release).exists());
+        // Restore a valid record so the next mutation has an independently
+        // admitted release-root copy to remove.
+        crate::release_tools::publish_cutter(&cache, &exact).unwrap();
+        real.seal_inputs().unwrap();
+        real.frozen_cutter_with_inputs(&commit, &unusable).unwrap();
+    }
+    std::fs::remove_file(crate::release_tools::cutter_record_path(&real.release)).unwrap();
+    crate::release_tools::publish_cutter(&cache, &prepared).unwrap();
+    real.seal_inputs().unwrap();
+    real.frozen_cutter_with_inputs(&commit, &unusable).unwrap();
+
+    std::fs::remove_file(crate::release_tools::cutter_record_path(&real.release)).unwrap();
+    let mut other = pin.clone();
+    other.tree_root = "b".repeat(64);
+    real.compiler.as_mut().unwrap().pin = other.clone();
+    let other_prover = Prover {
+        compiler: Some(other),
+        ..unusable.clone()
+    };
+    assert!(
+        real.frozen_cutter_with_inputs(&commit, &other_prover)
+            .is_err(),
+        "same commit and bin with another tree must enter a real freeze, not adopt the old cache"
+    );
+    assert!(!crate::release_tools::cutter_record_path(&real.release).exists());
+    assert_eq!(
+        crate::release_tools::recorded_cutter(&cache, &commit).unwrap(),
+        prepared
+    );
+    real.compiler.as_mut().unwrap().pin = pin;
+    real.build_inputs = |_, _| changed_identity();
     real.seal_inputs().unwrap();
     assert!(
         real.frozen_cutter_with_inputs(&commit, &unusable).is_err(),
@@ -3142,6 +3229,7 @@ fn measure_automatic_prefreeze_timeline() {
     let next = commit();
     let bin = crate::gates::trust_stage2_bin().unwrap();
     let prover = Prover {
+        compiler: None,
         bin,
         commit: "0".repeat(40),
         source: "fixture pinned Trust".into(),
@@ -3155,11 +3243,11 @@ fn measure_automatic_prefreeze_timeline() {
         real.state = state.join("state");
         real.logs = state.join("logs");
         std::fs::create_dir_all(&real.logs).unwrap();
-        real.build_inputs = || Ok(MEASURED_SEAL.into());
+        real.build_inputs = |_, _| Ok(MEASURED_SEAL.into());
         real.arm_inputs = |_, _| {};
         real.arm_prefrozen_inputs = |_, _, _| {};
         real.handed_inputs = || Some(PathBuf::from("/measurement/inputs-seal.toml"));
-        real.prefrozen_inputs = |state, expected| {
+        real.prefrozen_inputs = |_, _, state, expected| {
             if expected != MEASURED_SEAL {
                 return None;
             }
@@ -3386,7 +3474,7 @@ fn measure_real_cutter_rebuilds() {
     real.state = state.join("state");
     real.release = state.join("release");
     real.logs = state.join("logs");
-    real.build_inputs = || Ok("f".repeat(64));
+    real.build_inputs = |_, _| Ok("f".repeat(64));
     real.arm_inputs = |_, _| {};
     std::fs::create_dir_all(&real.logs).unwrap();
     let prover = real.prover(None).unwrap();
@@ -3752,6 +3840,8 @@ fn a_warming_verifier_is_bound_to_the_candidate_it_started_from() {
     };
     let expected = "a".repeat(40);
     real.warming = Some(WarmingVerifier {
+        compiler: None,
+        inputs: None,
         commit: expected.clone(),
         child,
         _forwarded: forwarded,
@@ -3764,6 +3854,151 @@ fn a_warming_verifier_is_bound_to_the_candidate_it_started_from() {
     assert!(error.contains(&format!("not {expected}")), "{error}");
     assert!(real.warm_verifier.is_none());
     assert!(real.warming.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_completed_warm_build_cannot_be_relabelled_with_later_inputs() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    crate::ledger::testing::init(&repo, &[]);
+    std::fs::write(repo.join("input"), "source\n").unwrap();
+    let git = GitCli::new(&repo);
+    crate::ledger::git_ok(&git, &["add", "."]).unwrap();
+    crate::ledger::git_ok(
+        &git,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "source",
+        ],
+    )
+    .unwrap();
+    let commit = crate::ledger::git_ok(&git, &["rev-parse", "HEAD"])
+        .unwrap()
+        .stdout_utf8()
+        .trim()
+        .to_owned();
+    let mut real = Real::new(&repo, Some(&repo), true, false).unwrap();
+    real.release = root.path().join("release");
+    real.build_inputs = |_, _| Ok("later inputs".into());
+    let mut command = command(aterm_uds::os_path!("true"));
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let child = command.spawn().unwrap();
+    let forwarded = Forwarded {
+        _running: interrupt::Running::enter(child.id()),
+        meter: None,
+        note: None,
+    };
+    real.warming = Some(WarmingVerifier {
+        commit,
+        compiler: None,
+        inputs: Some("inputs when compile began".into()),
+        child,
+        _forwarded: forwarded,
+        stdout: root.path().join("must-not-read-build-output"),
+        stderr: root.path().join("must-not-read-build-errors"),
+    });
+    let why = real.finish_tools().unwrap_err();
+    assert!(why.contains("inputs changed while warming"), "{why}");
+    assert!(real.warming.is_none());
+    assert!(real.warm_verifier.is_none());
+    assert!(!crate::release_tools::record_path(&real.release).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_finished_warm_verifier_retains_its_inputs_until_tool_selection() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    crate::ledger::testing::init(&repo, &[]);
+    std::fs::write(repo.join("input"), "source\n").unwrap();
+    let git = GitCli::new(&repo);
+    crate::ledger::git_ok(&git, &["add", "."]).unwrap();
+    crate::ledger::git_ok(
+        &git,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "source",
+        ],
+    )
+    .unwrap();
+    let commit = crate::ledger::git_ok(&git, &["rev-parse", "HEAD"])
+        .unwrap()
+        .stdout_utf8()
+        .trim()
+        .to_owned();
+    let mut real = Real::new(&repo, Some(&repo), true, false).unwrap();
+    real.release = root.path().join("release");
+    real.build_inputs = |_, _| Ok("compile inputs".into());
+    let executable = root.path().join("reported-verifier");
+    let stdout = root.path().join("cargo-output");
+    let stderr = root.path().join("cargo-errors");
+    std::fs::write(
+        &stdout,
+        aterm_json::to_vec(&aterm_json::json!({
+            "reason":"compiler-artifact",
+            "target":{"name":"aterm-verify", "kind":["bin"]},
+            "manifest_path":repo.join("crates/aterm-verify/Cargo.toml"),
+            "executable":executable,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(&stderr, b"").unwrap();
+    let mut command = command(aterm_uds::os_path!("true"));
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let child = command.spawn().unwrap();
+    let forwarded = Forwarded {
+        _running: interrupt::Running::enter(child.id()),
+        meter: None,
+        note: None,
+    };
+    real.warming = Some(WarmingVerifier {
+        commit: commit.clone(),
+        compiler: None,
+        inputs: Some("compile inputs".into()),
+        child,
+        _forwarded: forwarded,
+        stdout,
+        stderr,
+    });
+    assert_eq!(real.finish_warming().unwrap(), Some(commit.clone()));
+    let warm = real.warm_verifier.as_ref().unwrap();
+    assert_eq!(
+        warm.path_for(&commit, None, Some("compile inputs"))
+            .unwrap(),
+        executable
+    );
+    // Drift happens only after the positive owning wait and its successful seal check.
+    // The exact same selection used before tool copying/publication must retain S0.
+    real.build_inputs = |_, _| Ok("inputs after completion".into());
+    let later = real.inputs().unwrap();
+    assert!(
+        real.warm_verifier
+            .as_ref()
+            .unwrap()
+            .path_for(&commit, None, Some(&later))
+            .is_err()
+    );
+    assert!(!crate::release_tools::record_path(&real.release).exists());
 }
 
 #[test]
@@ -3820,6 +4055,8 @@ fn an_early_refusal_settles_owned_warmups_and_their_groups() {
         };
         if warming {
             drop(WarmingVerifier {
+                compiler: None,
+                inputs: None,
                 commit: "a".repeat(40),
                 child,
                 _forwarded: forwarded,
@@ -4479,6 +4716,7 @@ fn the_qualify_pool_goes_only_to_the_branch_children_that_adopt_it() {
     let repo = std::env::current_dir().unwrap();
     let mut real = Real::new(&repo, None, true, false).unwrap();
     let prover = Prover {
+        compiler: None,
         bin: PathBuf::from("/fixture/trust/bin"),
         commit: "0".repeat(40),
         source: "fixture".into(),
@@ -4500,6 +4738,15 @@ fn the_qualify_pool_goes_only_to_the_branch_children_that_adopt_it() {
     );
     real.hand_pool(&mut spawn_mirror, true).unwrap();
     real.finalize_spawn_environment(&mut spawn_mirror).unwrap();
+    if let Some((name, captured)) = real.sdk.environment() {
+        assert_eq!(
+            spawn_mirror
+                .get_envs()
+                .find(|(key, _)| *key == name)
+                .and_then(|(_, value)| value),
+            Some(captured),
+        );
+    }
     assert_eq!(
         spawn_mirror
             .get_envs()
@@ -5003,6 +5250,7 @@ fn publication_admission_is_retained_and_a_refusal_never_probes_scanners() {
     real.prerequisite_acquire = |_, _| Err("selected package has a bad signature".into());
     real.scanner_probe = |_| panic!("admission must refuse before scanner execution");
     let prover = Prover {
+        compiler: None,
         bin: dir.path().to_path_buf(),
         commit: "fixture".into(),
         source: "fixture".into(),
@@ -5587,6 +5835,7 @@ fn step_seven_judges_only_the_draft_journaled_for_its_build() {
     );
     // The source signing has no draft of build 191 to attach to: refused, and nothing ran.
     let prover = Prover {
+        compiler: None,
         bin: lab.ctx.repo.join("prover/bin"),
         commit: "33".repeat(20),
         source: "fixture".into(),
@@ -7047,6 +7296,7 @@ fn a_cutter_that_cannot_name_itself_starts_no_step() {
     )
     .expect("a backend");
     let prover = Prover {
+        compiler: None,
         bin: PathBuf::from("/store/trust/9192/bin"),
         commit: "321aaeda7".into(),
         source: "the store".into(),
@@ -7081,6 +7331,7 @@ fn the_engine_the_release_judges_is_the_one_every_child_reads() {
     )
     .expect("a backend");
     let prover = Prover {
+        compiler: None,
         bin: PathBuf::from("/store/trust/9192/bin"),
         commit: "321aaeda7".into(),
         source: "the store".into(),
@@ -7301,6 +7552,7 @@ fn scanner_failures_stop_the_export_and_its_tools_reach_only_the_engine() {
     std::fs::create_dir(&bin).unwrap();
     std::os::unix::fs::symlink("/usr/bin/false", bin.join("targo")).unwrap();
     let prover = Prover {
+        compiler: None,
         bin: bin.clone(),
         commit: "test".into(),
         source: "test".into(),
@@ -7493,6 +7745,7 @@ fn the_fixture_generator_refuses_a_clone_off_the_candidates_tree() {
     std::fs::create_dir(&bin).unwrap();
     std::os::unix::fs::symlink("/usr/bin/false", bin.join("targo")).unwrap();
     let prover = Prover {
+        compiler: None,
         bin,
         commit: "test".into(),
         source: "test".into(),
@@ -7540,6 +7793,7 @@ fn the_stage_step_is_handed_this_cutter_only_as_the_commits_own_build() {
     )
     .expect("a backend");
     let prover = Prover {
+        compiler: None,
         bin: PathBuf::from("/store/trust/9192/bin"),
         commit: "321aaeda7".into(),
         source: "the store".into(),
@@ -8059,7 +8313,7 @@ fn step_one_keeps_the_inputs_seal_and_every_child_is_handed_it() {
                 .push((state.into(), log.map(Path::to_path_buf)));
         });
     };
-    real.build_inputs = || {
+    real.build_inputs = |_, _| {
         TAKEN.with(|n| n.set(n.get() + 1));
         Ok("inputs".into())
     };
@@ -8080,7 +8334,7 @@ fn step_one_keeps_the_inputs_seal_and_every_child_is_handed_it() {
         }
     );
     assert!(real.state.ends_with(RELEASE_STATE));
-    real.build_inputs = || Err("build input changed while it was hashed: /sdk".into());
+    real.build_inputs = |_, _| Err("build input changed while it was hashed: /sdk".into());
     assert_eq!(
         real.seal_inputs().is_err(),
         macos,
@@ -8093,6 +8347,7 @@ fn step_one_keeps_the_inputs_seal_and_every_child_is_handed_it() {
             .and_then(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
     };
     let prover = Prover {
+        compiler: None,
         bin: PathBuf::from("/store/trust/9192/bin"),
         commit: "321aaeda7".into(),
         source: "the store".into(),

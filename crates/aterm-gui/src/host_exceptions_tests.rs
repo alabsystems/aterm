@@ -1473,6 +1473,95 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
     assert_eq!(glass(&app), before);
 }
 
+/// L8 OF THE WINDOW'S ACCOUNT LINES (accounts upkeep on a cause): A LINE OUT OF THE DIGEST ASKS
+/// ITS RE-TELL AT THE INSTANT ITS FILING STOPS KEEPING IT QUIET, and a re-post at that instant is
+/// taken as new. A told line in the digest asks nothing; filed, it asks the instant the message
+/// center names (`quiet_until`), once; told again while quiet it asks nothing more, and a line
+/// told afresh while its filing keeps it quiet (a post the center suppresses, which moves no
+/// digest) asks the same instant. A signed-out line whose first label moved is ended and told
+/// again at once, and asks no re-tell.
+///
+/// NEGATIVE CONTROLS (2026-11-16), each the one mutation of its mutant build that reached this
+/// test, the file touched after its restore:
+/// - `tell_account_line` without its `ask_account_lines_again`: `a line told while its filing
+///   keeps it quiet asks its re-tell` failed, left `[]`;
+/// - the `HostNote::Accounts` signed-out branch without its `forget_account_line` before
+///   `except_end`: `a line ended and told again at once asks no re-tell` failed.
+#[test]
+fn an_account_line_out_of_the_digest_asks_its_retell_when_its_filing_stops_keeping_it_quiet() {
+    use crate::messages_host::wall_stamp_now;
+    let listed = |signed_out: &[&str]| {
+        HostNote::Accounts(AccountsSaid::Listed {
+            signed_out: signed_out.iter().map(|l| l.to_string()).collect(),
+            credits: Vec::new(),
+            window_full: Vec::new(),
+            due: Vec::new(),
+            none_soon: false,
+            wrong: Vec::new(),
+            no_sign_in: Vec::new(),
+            clock: None,
+        })
+    };
+    let mut app = App::headless_for_test();
+    let _ = crate::exceptions_host::take_account_asks();
+    let entry = mr::accounts_signed_out_entry(&["work-2".to_string()]).expect("one");
+    let key = entry.key();
+    let resurface = entry
+        .message()
+        .ok()
+        .and_then(|msg| msg.resurface())
+        .expect("the line resurfaces");
+    app.tell_account_line(&entry);
+    assert!(
+        crate::exceptions_host::take_account_asks().is_empty(),
+        "in the digest, nothing is asked"
+    );
+    assert_eq!(app.dismiss_exceptions(), 1);
+    let until = app
+        .messages
+        .quiet_until(&key, resurface, wall_stamp_now())
+        .expect("the filing keeps a re-post quiet");
+    assert_eq!(
+        crate::exceptions_host::take_account_asks(),
+        [until],
+        "filed: asked at the instant the filing stops keeping it quiet"
+    );
+    app.tell_account_line(&entry);
+    assert!(
+        crate::exceptions_host::take_account_asks().is_empty(),
+        "asked once for that instant"
+    );
+    app.forget_account_line(&key);
+    app.tell_account_line(&entry);
+    assert!(app.messages.digest().is_empty(), "the post was suppressed");
+    assert_eq!(
+        crate::exceptions_host::take_account_asks(),
+        [until],
+        "a line told while its filing keeps it quiet asks its re-tell"
+    );
+    let posted = app.messages.post(
+        entry.message().expect("the line's message"),
+        aterm_messages::WallStamp { unix_ms: until },
+        Instant::now(),
+    );
+    assert_eq!(
+        posted.outcome,
+        aterm_messages::PostOutcome::New,
+        "a re-post at that instant is new"
+    );
+
+    let mut app = App::headless_for_test();
+    app.note_harness_host(listed(&["work-2"]));
+    assert_eq!(app.messages.digest().len(), 1);
+    let _ = crate::exceptions_host::take_account_asks();
+    app.note_harness_host(listed(&["pool-a"]));
+    assert_eq!(app.messages.digest().len(), 1, "the line told again");
+    assert!(
+        crate::exceptions_host::take_account_asks().is_empty(),
+        "a line ended and told again at once asks no re-tell"
+    );
+}
+
 /// One account on the window-full line, with the reset offer it carries.
 fn nearly_full(
     label: &str,

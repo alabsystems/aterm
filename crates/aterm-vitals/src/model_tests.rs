@@ -4339,7 +4339,7 @@ fn the_processes_state_follows_the_jobs_well() {
     s.set_jobs(Some(Arc::new(view(Some(7)))));
     assert_eq!(s.resources[Processes.index()].state, Some(State::Zombies));
     s.set_jobs(Some(Arc::new(view(None))));
-    assert_eq!(s.resources[Processes.index()].state, None);
+    assert_eq!(s.resources[Processes.index()].state, Some(State::Zombies));
     assert!(State::Critical > State::Warn && State::Warn > State::Stuck);
     assert!(State::Stuck > State::Zombies && State::Quiet > State::Waiting);
     assert!(State::Waiting > State::Stopped);

@@ -83,25 +83,70 @@ fn read_with(reader: Option<&Reader>, home: Option<&Path>) -> Option<Result<Cata
     (!absent).then(|| reader(home))?.transpose()
 }
 
-/// What this Mac holds, as a catalog row's `local` reads it: its roster, where one was read, and
-/// the address its default home's login file names now (`own`), which counts as this Mac's own
-/// login where no row lists it (`docs/DESIGN-account-discovery-2026-11-09.md`).
+/// What this Mac holds, as a catalog row's `local` reads it: its roster, where one was read, the
+/// address its default home's login file names now (`own`), which counts as this Mac's own login
+/// where no row lists it (`docs/DESIGN-account-discovery-2026-11-09.md`), and how the report
+/// names the roster's rows (`names`, [`super::account_names::Listing`]), where it names them.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Here<'a> {
     pub roster: Option<&'a Roster>,
     pub own: Option<&'a str>,
+    pub names: Option<&'a super::account_names::Listing>,
+}
+
+/// Where a catalog row's account is on this Mac ([`Catalog::local`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Local<'a> {
+    /// The roster row that holds it ([`Catalog::local_label`]), of this pool.
+    Row(Cli, &'a accounts::Row),
+    /// This Mac's own login, which no row lists.
+    Own,
+}
+
+impl Local<'_> {
+    /// As a person reads it: the row by its account's name and slug as `names` names it, else as
+    /// [`super::account_names::shown_row`] names it with no lab (a row with no address by its
+    /// label, marked so); else `this Mac's own login`.
+    pub(crate) fn words(&self, names: Option<&super::account_names::Listing>) -> String {
+        match (self, names) {
+            (Local::Row(_, row), Some(names)) => names.shown(&row.label).into_owned(),
+            (Local::Row(cli, row), None) => super::account_names::shown_row(*cli, row, None),
+            (Local::Own, _) => "this Mac's own login".to_owned(),
+        }
+    }
+
+    /// As the JSON names it (`local`): the row's account key, else a row with no address by its
+    /// label; `None` for this Mac's own login, which `local_own` says.
+    fn id(&self, names: Option<&super::account_names::Listing>) -> Option<String> {
+        match (self, names) {
+            (Local::Row(_, row), Some(names)) => Some(names.id(&row.label).to_owned()),
+            (Local::Row(cli, row), None) => Some(
+                super::account_names::names_of_row(*cli, row, None)
+                    .map_or_else(|| row.label.clone(), |(pk, _)| pk),
+            ),
+            (Local::Own, _) => None,
+        }
+    }
 }
 
 impl Catalog {
-    /// What `account` is on this Mac, as a person reads it: the roster row it is ([`Self::local_label`]),
-    /// else `this Mac's own login` where the default home's login names it, by the same unique
-    /// identity rule. `None` where this Mac holds it nowhere it can see.
+    /// What `account` is on this Mac, as a person reads it ([`Local::words`]). `None` where this
+    /// Mac holds it nowhere it can see.
     pub(crate) fn local_words(&self, account: &Account, here: Here<'_>) -> Option<String> {
-        if let Some(label) = here
-            .roster
-            .and_then(|roster| self.local_label(account, roster))
+        self.local(account, here)
+            .map(|local| local.words(here.names))
+    }
+
+    /// Where `account` is on this Mac: the roster row it is ([`Self::local_label`]), else this
+    /// Mac's own login where the default home's login names it, by the same unique identity rule.
+    /// `None` where this Mac holds it nowhere it can see.
+    pub(crate) fn local<'a>(&self, account: &Account, here: Here<'a>) -> Option<Local<'a>> {
+        if let Some((cli, roster)) = account.cli().zip(here.roster)
+            && let Some(row) = self
+                .local_label(account, roster)
+                .and_then(|label| roster.row(label))
         {
-            return Some(label.to_owned());
+            return Some(Local::Row(cli, row));
         }
         let own = here.own?;
         let listed = here
@@ -131,7 +176,7 @@ impl Catalog {
                 })
                 .count()
                 == 1;
-        (unique && !listed).then(|| "this Mac's own login".to_owned())
+        (unique && !listed).then_some(Local::Own)
     }
 
     pub(crate) fn local_label<'a>(&self, account: &Account, roster: &'a Roster) -> Option<&'a str> {
@@ -246,7 +291,9 @@ fn report_rows(catalog: &Result<Catalog, String>, cli: Option<Cli>, here: Here<'
                 "provider":row.provider, "method":row.method, "email":row.email,
                 "realm":row.realm, "secret_reference":row.secret_reference,
                 "native_capability":super::native_keys::capability(&row.provider,row.method.as_deref(),row.secret_reference),
-                "state":row.state(), "local_label":catalog.local_words(row, here),
+                "state":row.state(),
+                "local":catalog.local(row, here).and_then(|local| local.id(here.names)),
+                "local_own":(catalog.local(row, here) == Some(Local::Own)),
                 "preparation_reason":(row.state() == "unsupported-preparation").then_some(NAMED_BROWSER_UNSUPPORTED),
                 "login_authority":"none", "auth_details_pending":row.import.is_some(),
                 "origin":if row.import.is_some() { "import-candidate" } else { "proposal" },
@@ -277,8 +324,8 @@ pub(crate) fn text_here(catalog: &Result<Catalog, String>, cli: Cli, here: Here<
         return text_rows(catalog, Some(cli), here);
     };
     let of_cli = rows.rows.iter().filter(|row| row.belongs_to(cli));
-    let (shown, others): (Vec<_>, Vec<_>) = of_cli
-        .partition(|row| row.stopped || row.conflicted || rows.local_words(row, here).is_some());
+    let (shown, others): (Vec<_>, Vec<_>) =
+        of_cli.partition(|row| row.stopped || row.conflicted || rows.local(row, here).is_some());
     let mut out = header(rows);
     if !others.is_empty() {
         out.push_str(&format!(

@@ -10,6 +10,62 @@ const SOURCE: &str = "/Applications/aterm.app";
 const SOURCE_EXE: &str = "/Applications/aterm.app/Contents/MacOS/aterm";
 const PRINT: &str = "/bin/launchctl print system/systems.alab.aterm-lan";
 
+#[cfg(unix)]
+#[test]
+fn reverting_disables_before_cleanup_and_preserves_files_when_disable_fails() {
+    let revert = LanBroker::default()
+        .revert()
+        .unwrap()
+        .replace(super::super::sharing::LAUNCHCTL, "record_launchctl")
+        .replace("/bin/rm", "record_remove");
+    // Execute the journal's shell control flow with inert functions: no launchd operation
+    // or file removal runs, including when the job has already disappeared.
+    let script = format!(
+        r#"
+record_launchctl() {{
+    printf 'launchctl:%s\n' "$1"
+    case "$1" in
+        disable) return "$DISABLE_EXIT" ;;
+        bootout) return "$BOOTOUT_EXIT" ;;
+        *) return 99 ;;
+    esac
+}}
+record_remove() {{ printf 'remove:%s\n' "$1"; }}
+{revert}
+"#
+    );
+    for (disable, bootout, exit, calls) in [
+        (
+            "0",
+            "0",
+            0,
+            "launchctl:disable\nlaunchctl:bootout\nremove:-f\nremove:-rf\n",
+        ),
+        ("7", "0", 7, "launchctl:disable\n"),
+        (
+            "0",
+            "113",
+            0,
+            "launchctl:disable\nlaunchctl:bootout\nremove:-f\nremove:-rf\n",
+        ),
+    ] {
+        let mut command = aterm_uds::spawnfd::command("/bin/sh");
+        command
+            .args(["-c", &script])
+            .env("DISABLE_EXIT", disable)
+            .env("BOOTOUT_EXIT", bootout);
+        let output = aterm_uds::deadline::output_while_process_progressing(
+            &mut command,
+            aterm_uds::deadline::ECHO_HANG,
+            "the LAN broker revert's inert shell fixture",
+        )
+        .unwrap();
+        assert_eq!(output.status.code(), Some(exit), "{output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), calls);
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+}
+
 fn this_build() -> Vec<u8> {
     install::test_image(0x0100_000c, &[b"this build"])
 }

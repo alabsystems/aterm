@@ -13,6 +13,7 @@ use aterm_vitals::jobs::{
     JobTab, JobTick, Jobs, JobsView, LanesSeen, LeaderExit, Machine, NamedWait, ProcState,
     SweepProc, TermWord, ThreadState, TtyMode,
 };
+use aterm_vitals::model::{ProcSample, ProcState as ModelProcState, Sample, Vitals};
 
 /// The world's clock at the start, ms (any value; the engine reads deltas).
 pub const T0: u64 = 5_000_000;
@@ -173,6 +174,11 @@ pub struct World {
     pub machine: Machine,
     pub lanes: LanesSeen,
     pub jobs: Jobs,
+    /// The canonical model is persistent across process observations and jobs passes.
+    vitals: Vitals,
+    source_seq: Option<u64>,
+    /// Whether a scripted process observation stopped at a cap.
+    pub process_truncated: bool,
     pub limit: Option<u64>,
     /// Named pids a scenario keeps.
     pub vars: HashMap<&'static str, u32>,
@@ -216,6 +222,9 @@ impl World {
             machine: Machine::default(),
             lanes: LanesSeen::default(),
             jobs: Jobs::new(),
+            vitals: Vitals::new(),
+            source_seq: None,
+            process_truncated: false,
             read_lag_ms: 0,
             probe_lag_ms: 0,
             unread: BTreeSet::new(),
@@ -523,8 +532,45 @@ impl World {
         }
     }
 
-    /// Runs one sweep-plan-read-absorb tick at the current clock.
-    pub fn observe(&mut self) -> JobsView {
+    /// Records a process observation independently of whether Jobs runs. Advancing
+    /// the scripted clock alone is not a process observation.
+    pub fn observe_processes(&mut self) {
+        let procs = self
+            .procs
+            .values()
+            .map(|p| ProcSample {
+                pid: p.pid,
+                ppid: p.ppid,
+                pgid: p.pgid,
+                uid: Some(p.uid),
+                name: p.name.clone(),
+                state: match p.state {
+                    ProcState::Zombie => ModelProcState::Zombie,
+                    ProcState::Stopped => ModelProcState::Stopped,
+                    ProcState::Uninterruptible => ModelProcState::Uninterruptible,
+                    ProcState::Unknown => ModelProcState::Unknown,
+                    _ => ModelProcState::Run,
+                },
+                start: Some(p.start),
+                ..ProcSample::default()
+            })
+            .collect();
+        let snapshot = self.vitals.absorb(&Sample {
+            at_ns: self.at.saturating_mul(1_000_000),
+            mono_ms: self.at,
+            at_unix_ms: i64::try_from(self.at).expect("scripted clock"),
+            self_pid: 100,
+            self_uid: Some(UID),
+            procs: Some(procs),
+            procs_truncated: self.process_truncated,
+            ..Sample::default()
+        });
+        self.source_seq = Some(snapshot.seq);
+    }
+
+    /// Captures one source-bound sweep-plan-read tick without running Jobs.
+    pub fn capture_tick(&mut self) -> JobTick {
+        self.observe_processes();
         let sweep: Vec<SweepProc> = self.procs.values().map(sweep_of).collect();
         let tabs: Vec<JobTab> = self.tabs.iter().map(|t| t.tab.clone()).collect();
         let wants = self.jobs.plan(&sweep, &tabs);
@@ -540,8 +586,10 @@ impl World {
             };
             read.push(self.facts_of(&p, w.fds));
         }
-        let tick = JobTick {
+        JobTick {
             at_ms: self.at,
+            source_seq: self.source_seq,
+            zombie_facts: self.vitals.current_zombie_facts(),
             read_ms: self.at + self.read_lag_ms,
             probe_ms: self.at + self.probe_lag_ms,
             self_uid: Some(UID),
@@ -556,7 +604,13 @@ impl World {
             program_check_judged: false,
             grant_ms: self.grant_ms,
             exits: std::mem::take(&mut self.exits),
-        };
+        }
+    }
+
+    /// Runs one sweep-plan-read-absorb tick at the current clock. All process-only readings
+    /// recorded since the previous Jobs pass remain in the same canonical model book.
+    pub fn observe(&mut self) -> JobsView {
+        let tick = self.capture_tick();
         let view = self.jobs.absorb(&tick);
         for t in &mut self.tabs {
             t.tab.named.clear();

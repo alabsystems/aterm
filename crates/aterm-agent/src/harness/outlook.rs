@@ -1255,6 +1255,9 @@ pub struct Outlook {
     pub approx: Vec<Approx>,
     /// The enrolled rows no pass uses.
     pub not_needed: Vec<String>,
+    /// How its words and its JSON name each row ([`Outlook::named`]): the report's names, by the
+    /// row's account; empty, each row by its label.
+    pub names: super::account_names::Listing,
 }
 
 /// What [`outlook`] reads: nothing but what aterm already observed.
@@ -1548,14 +1551,17 @@ fn fresh_of(
 }
 
 /// The first sighting of the earliest wall that walls `acct`'s window `w` and stands at `now`,
-/// where one does. A wall walls its own window; a wall that names no window, or another week's (a
-/// model's), walls the week. A 5-hour wall never does: the week keeps its figure.
+/// where one does. A wall walls its own window; a wall that names no window walls the week. A
+/// 5-hour wall never does: the week keeps its figure; nor does a model's own week's
+/// ([`accounts::model_window`]), which walls that model's sessions alone.
 fn walled_from(acct: &accounts::Account, w: Window, now: i64) -> Option<i64> {
     acct.walls
         .iter()
         .filter(|(id, wall)| {
-            let walls_w =
-                *id == w.id() || (w == Window::Week && id.as_str() != accounts::SESSION_LIMIT);
+            let walls_w = *id == w.id()
+                || (w == Window::Week
+                    && id.as_str() != accounts::SESSION_LIMIT
+                    && !accounts::model_window(id));
             walls_w && wall.stands_until().is_some_and(|end| now < end)
         })
         .map(|(_, wall)| wall.at)
@@ -2260,7 +2266,8 @@ impl<'a> Sim<'a> {
         self.at_wall(w)
     }
 
-    /// The end of the carrier's own standing wall: `None` where none stands, and a stop is
+    /// The end of the carrier's own standing wall ([`accounts::Account::limited_until`]: a
+    /// model's own walls only that model's sessions): `None` where none stands, and a stop is
     /// planned to the resume bound. The worst case's invented wall stands past the bound
     /// ([`Self::assume_worst`]), so a stop planned to it is still open there, as one planned to
     /// the bound is.
@@ -2268,11 +2275,7 @@ impl<'a> Sim<'a> {
         self.state
             .accounts
             .get(&self.carrier_label())?
-            .walls
-            .values()
-            .filter_map(accounts::Wall::stands_until)
-            .filter(|end| self.t < *end)
-            .max()
+            .limited_until(self.t)
     }
 
     /// R6's decision at the carrier's standing wall on `w`.
@@ -3134,7 +3137,10 @@ fn build(
                 .and_then(|a| {
                     a.walls
                         .iter()
-                        .filter(|(_, w)| w.stands_until().is_some_and(|end| end > now))
+                        .filter(|(k, w)| {
+                            !accounts::model_window(k)
+                                && w.stands_until().is_some_and(|end| end > now)
+                        })
                         .map(|(k, _)| k.clone())
                         .next()
                 })
@@ -3244,6 +3250,7 @@ fn build(
         verdict: Verdict::Continuous,
         approx,
         not_needed: Vec::new(),
+        names: super::account_names::Listing::default(),
     };
     let Some(carrier_label) = carrier_label else {
         out.verdict = Verdict::Refused(choice.err().unwrap_or(Refusal::NoFigure));
@@ -3975,7 +3982,25 @@ impl Outlook {
             verdict: Verdict::Refused(refusal),
             approx: self.approx.clone(),
             not_needed: Vec::new(),
+            names: self.names.clone(),
         }
+    }
+
+    /// This outlook naming each row as `names` names it in its words and its JSON (the report's
+    /// [`super::account_names::Listing`]), where it named each by its label.
+    #[must_use]
+    pub fn named(self, names: super::account_names::Listing) -> Self {
+        Self { names, ..self }
+    }
+
+    /// The row `label` as the outlook's words name it ([`Outlook::names`]).
+    fn shown<'a>(&'a self, label: &'a str) -> std::borrow::Cow<'a, str> {
+        self.names.shown(label)
+    }
+
+    /// The row `label` as the outlook's JSON names it ([`Outlook::names`]).
+    fn id(&self, label: &str) -> Value {
+        Value::from(self.names.id(label).to_owned())
     }
 
     fn row(&self, label: &str) -> Option<&RowOutlook> {
@@ -4069,9 +4094,10 @@ impl Outlook {
             .which()
         };
         match &self.verdict {
-            Verdict::Walled { to: Some(to), .. } => {
-                format!("Walled now: the rotation moves to {to} at the turn's end.")
-            }
+            Verdict::Walled { to: Some(to), .. } => format!(
+                "Walled now: the rotation moves to {} at the turn's end.",
+                self.shown(to)
+            ),
             Verdict::Walled { to: None, until } => format!(
                 "Walled now: the work waits until {}.",
                 until.map_or_else(|| "its reset".into(), |u| self.spoken_when(u))
@@ -4091,7 +4117,7 @@ impl Outlook {
                     .spoken_end(*end)
                     .map_or_else(|| " with no end in reach".into(), |e| format!(" to {e}"));
                 let tail = match lean {
-                    Some(row) => format!(", whatever {row}, {}, holds", which(row)),
+                    Some(row) => format!(", whatever {}, {}, holds", self.shown(row), which(row)),
                     None => ", when every account is out".into(),
                 };
                 format!(
@@ -4110,13 +4136,15 @@ impl Outlook {
                         .spoken_end(end)
                         .map_or_else(|| " with no end in reach".into(), |e| format!(" to {e}"));
                     format!(
-                        " If {row} has nothing, a stop from {}{end}.",
+                        " If {} has nothing, a stop from {}{end}.",
+                        self.shown(row),
                         self.spoken_about(from),
                     )
                 });
                 format!(
-                    "Continuous until {}. After that the rotation moves to {row}, {}.{worst}",
+                    "Continuous until {}. After that the rotation moves to {}, {}.{worst}",
                     self.spoken_about(*until),
+                    self.shown(row),
                     Why::of_lean(*why).which()
                 )
             }
@@ -4130,7 +4158,13 @@ impl Outlook {
                     .iter()
                     .flat_map(|p| p.chain.windows(2))
                     .filter(|w| w[0].label != w[1].label)
-                    .map(|w| format!("{} around {}", w[1].label, self.spoken_about(w[1].from)))
+                    .map(|w| {
+                        format!(
+                            "{} around {}",
+                            self.shown(&w[1].label),
+                            self.spoken_about(w[1].from)
+                        )
+                    })
                     .map(|s| s.replace("around about", "around"))
                     .collect();
                 if moves.is_empty() {
@@ -4332,7 +4366,7 @@ impl Outlook {
                 if let Some(lean) = self.turns_on(&row.label, w.window) {
                     out.push_str(&format!(
                         " \u{b7} depends on {} after ~{}",
-                        lean.row,
+                        self.shown(&lean.row),
                         self.cli_when(round_down(lean.at, self.as_of, &self.offsets))
                     ));
                 }
@@ -4370,7 +4404,9 @@ impl Outlook {
                     self.carrier_plan()
                         .1
                         .unwrap_or_else(|| "the carrier's plan".into()),
-                    self.carrier.as_deref().unwrap_or("the carrier")
+                    self.carrier
+                        .as_deref()
+                        .map_or_else(|| "the carrier".into(), |carrier| self.shown(carrier))
                 )
             })
         };
@@ -4434,10 +4470,17 @@ impl Outlook {
                     None => "plan not seen".into(),
                 };
                 let like = like.as_deref().unwrap_or("the carrier's");
-                format!("{label}: {seen}, counted as {like} like {carrier}")
+                format!(
+                    "{}: {seen}, counted as {like} like {}",
+                    self.shown(label),
+                    self.shown(carrier)
+                )
             }
             Approx::PlansAlike { carrier } => {
-                format!("{carrier}: plan not seen; every row counted alike")
+                format!(
+                    "{}: plan not seen; every row counted alike",
+                    self.shown(carrier)
+                )
             }
             Approx::MultiplesScaled => {
                 "weeks put on one scale by the plans' 5-hour multiples, which Anthropic states \
@@ -4461,7 +4504,7 @@ impl Outlook {
             Verdict::Continuous => "continuous".to_string(),
             Verdict::Refused(why) => format!("not projected: {}", why.words()),
             Verdict::Walled { to: Some(to), .. } => {
-                format!("the work moves to {to} at the turn's end")
+                format!("the work moves to {} at the turn's end", self.shown(to))
             }
             v => self
                 .verdict_phrase()
@@ -4496,7 +4539,8 @@ impl Outlook {
             (None, Ok(_)) => {}
         }
         if !self.not_needed.is_empty() {
-            out.push_str(&format!("  not needed: {}\n", self.not_needed.join(", ")));
+            let rows: Vec<_> = self.not_needed.iter().map(|row| self.shown(row)).collect();
+            out.push_str(&format!("  not needed: {}\n", rows.join(", ")));
         }
         for a in &self.approx {
             out.push_str(&format!("  \u{2248} {}\n", self.approx_words(a)));
@@ -4513,7 +4557,7 @@ impl Outlook {
         let links: Vec<&Link> = pass.chain.iter().filter(|l| l.to > l.from).collect();
         let width = links
             .iter()
-            .map(|l| super::footer::text_width(&l.label))
+            .map(|l| super::footer::text_width(&self.shown(&l.label)))
             .max()
             .unwrap_or(4)
             .max(4);
@@ -4567,12 +4611,12 @@ impl Outlook {
                     }
                 }
             };
-            let pad = width.saturating_sub(super::footer::text_width(&link.label));
+            let shown = self.shown(&link.label);
+            let pad = width.saturating_sub(super::footer::text_width(&shown));
             lines.push((
                 link.from,
                 format!(
-                    "{indent}{}{}  {from:<17} \u{2192} {to:<17}  {tail}",
-                    link.label,
+                    "{indent}{shown}{}  {from:<17} \u{2192} {to:<17}  {tail}",
                     " ".repeat(pad)
                 ),
             ));
@@ -4609,7 +4653,7 @@ impl Outlook {
                 "{indent}{:<width$}  {} onto {} ({}):\n",
                 "lean",
                 at(lean.at),
-                lean.row,
+                self.shown(&lean.row),
                 lean.why.word()
             ));
             out.push_str(&format!("{indent}  if it has nothing:\n"));
@@ -4682,13 +4726,17 @@ impl Outlook {
     #[must_use]
     pub fn json(&self) -> Value {
         let mut o = Map::new();
-        o.insert("v".into(), Value::from(1u64));
+        // 2: every row is named by its account's key, else its label ([`Outlook::names`]), and
+        // a chain's link and an approximation say `account` where 1 said `label`.
+        o.insert("v".into(), Value::from(2u64));
         o.insert("as_of".into(), Value::from(self.as_of));
         o.insert("mode".into(), Value::from(self.mode.as_str()));
         o.insert("credits".into(), Value::from(self.credits));
         o.insert(
             "carrier".into(),
-            self.carrier.clone().map_or(Value::Null, Value::from),
+            self.carrier
+                .as_deref()
+                .map_or(Value::Null, |carrier| self.id(carrier)),
         );
         let pace = |p: Result<Pace, Refusal>| {
             let mut o = Map::new();
@@ -4729,14 +4777,17 @@ impl Outlook {
                 _ => Value::Null,
             },
         );
-        v.insert("row".into(), row.map_or(Value::Null, Value::from));
+        v.insert(
+            "row".into(),
+            row.as_deref().map_or(Value::Null, |row| self.id(row)),
+        );
         v.insert("why".into(), why.map_or(Value::Null, Value::from));
         o.insert("verdict".into(), Value::Object(v));
         let passes: Vec<Value> = self
             .week
             .iter()
             .chain(self.working.iter())
-            .map(pass_json)
+            .map(|pass| pass_json(pass, &self.names))
             .collect();
         o.insert("passes".into(), Value::Array(passes));
         let approx: Vec<Value> = self
@@ -4752,14 +4803,14 @@ impl Outlook {
                         carrier,
                     } => {
                         o.insert("kind".into(), Value::from("plan-assumed"));
-                        o.insert("label".into(), Value::from(label.clone()));
+                        o.insert("account".into(), self.id(label));
                         o.insert("word".into(), word.clone().map_or(Value::Null, Value::from));
                         o.insert("like".into(), like.clone().map_or(Value::Null, Value::from));
-                        o.insert("carrier".into(), Value::from(carrier.clone()));
+                        o.insert("carrier".into(), self.id(carrier));
                     }
                     Approx::PlansAlike { carrier } => {
                         o.insert("kind".into(), Value::from("plans-alike"));
-                        o.insert("carrier".into(), Value::from(carrier.clone()));
+                        o.insert("carrier".into(), self.id(carrier));
                     }
                     Approx::MultiplesScaled => {
                         o.insert("kind".into(), Value::from("multiples-scaled"));
@@ -4771,7 +4822,7 @@ impl Outlook {
         o.insert("approx".into(), Value::Array(approx));
         o.insert(
             "not_needed".into(),
-            Value::Array(self.not_needed.iter().cloned().map(Value::from).collect()),
+            Value::Array(self.not_needed.iter().map(|row| self.id(row)).collect()),
         );
         // Each row's peer bounds by window id, where it shows one ([`WindowOutlook::lab`]).
         let lab: Map = self
@@ -4783,7 +4834,8 @@ impl Outlook {
                     .iter()
                     .filter_map(|w| Some((w.window.id().to_owned(), lab_json(w.lab.as_ref()?))))
                     .collect();
-                (!windows.is_empty()).then(|| (row.label.clone(), Value::Object(windows)))
+                (!windows.is_empty())
+                    .then(|| (self.names.id(&row.label).to_owned(), Value::Object(windows)))
             })
             .collect();
         o.insert("lab".into(), Value::Object(lab));
@@ -4849,7 +4901,9 @@ fn end_json(end: StopEnd) -> Value {
     Value::Object(o)
 }
 
-fn pass_json(p: &Pass) -> Value {
+/// A pass in `--json`, each row named as `names` names it ([`Outlook::names`]).
+fn pass_json(p: &Pass, names: &super::account_names::Listing) -> Value {
+    let id = |label: &str| Value::from(names.id(label).to_owned());
     let mut o = Map::new();
     o.insert("pass".into(), Value::from(p.kind.word()));
     o.insert("horizon".into(), Value::from(p.horizon));
@@ -4859,7 +4913,7 @@ fn pass_json(p: &Pass) -> Value {
         .iter()
         .map(|l| {
             let mut o = Map::new();
-            o.insert("label".into(), Value::from(l.label.clone()));
+            o.insert("account".into(), id(&l.label));
             o.insert("from".into(), Value::from(l.from));
             o.insert("to".into(), Value::from(l.to));
             o.insert("ends".into(), Value::from(l.ends.word()));
@@ -4884,11 +4938,11 @@ fn pass_json(p: &Pass) -> Value {
         "lean".into(),
         p.lean.as_ref().map_or(Value::Null, |l| {
             let mut o = Map::new();
-            o.insert("row".into(), Value::from(l.row.clone()));
+            o.insert("row".into(), id(&l.row));
             o.insert("at".into(), Value::from(l.at));
             o.insert("why".into(), Value::from(l.why.word()));
-            o.insert("worst".into(), pass_json(&l.worst));
-            o.insert("best".into(), pass_json(&l.best));
+            o.insert("worst".into(), pass_json(&l.worst, names));
+            o.insert("best".into(), pass_json(&l.best, names));
             // What the best case assumed: `read`, `fresh`, or `peer` with the bound it held.
             o.insert("assumed".into(), Value::from(l.assumed.word()));
             if let Assumed::Peer(bound) = &l.assumed {

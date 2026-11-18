@@ -215,7 +215,9 @@ pub(super) fn check_dir_verdict(dir: &Path, verdict: DirIs) -> io::Result<()> {
 
 /// `name` directly in `dir`, under `dir`'s verdict `judged`, opened as `how` says and judged
 /// on its open handle ([`judge_opened`]). A file that is missing from a folder that is not
-/// private reads [`PrivateFileError::Missing`], as on Unix.
+/// private reads [`PrivateFileError::Missing`], as on Unix. Each look at the name and its open
+/// is made with this thread's placeholders exposed ([`exposed`]); where they cannot be, nothing
+/// is looked at and the answer is [`PrivateFileError::Io`].
 pub(super) fn open_in(
     dir: &Path,
     judged: DirIs,
@@ -230,6 +232,8 @@ pub(super) fn open_in(
             return Err(PrivateFileError::Malformed("the directory is no directory"));
         }
         DirIs::Others | DirIs::Open(_) => {
+            // Whether the name is there is looked at as every look here is, placeholders exposed.
+            let _exposed = exposed().map_err(PrivateFileError::Io)?;
             match std::fs::symlink_metadata(dir.join(name)) {
                 Err(e) if e.kind() == io::ErrorKind::NotFound && how != Opening::ReadWrite => {
                     return Err(PrivateFileError::Missing);

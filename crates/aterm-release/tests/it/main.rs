@@ -10,7 +10,8 @@
 //! inline `#[cfg(test)]` tests, so the mounts live here once and the bin target has `test =
 //! false`.
 //! Every mount is `allow(dead_code)`: a test exercises part of a module, and the binary's own
-//! build holds the dead-code line for src/.
+//! build holds the dead-code line for src/. Unix's, as the cutter is (src/main.rs).
+#![cfg(unix)]
 #![allow(
     clippy::disallowed_types,
     reason = "never linked into the shipped binary: the release cutter, run from source"

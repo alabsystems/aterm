@@ -74,6 +74,16 @@ pub const DEFAULT_EDITOR_WORD: &str = "amacs";
 /// Environment variable every aterm tab's session carries (`ATERM_CHILD=1`).
 pub const ENV_ATERM_CHILD: &str = "ATERM_CHILD";
 
+/// The marker aterm's token wrapper sets beside Claude Code's token descriptor: the vault token
+/// entry it served (`aterm_agent::harness::token_route::MARKER_ENV`). It names a token only
+/// beside the descriptor, which Claude Code consumes, so a copy any later process inherits reads
+/// as a route of its own ([`ENV_DENY_VARS`]).
+pub const ENV_CLAUDE_TOKEN: &str = "ATERM_CLAUDE_TOKEN";
+
+/// The `minted_at` aterm's token wrapper sets beside [`ENV_CLAUDE_TOKEN`]: which token of the
+/// entry it served (`aterm_agent::harness::token_route::MINTED_ENV`).
+pub const ENV_CLAUDE_TOKEN_MINTED: &str = "ATERM_CLAUDE_TOKEN_MINTED";
+
 /// Whether an inherited `EDITOR` is the default an outer aterm's tab exported rather than the
 /// person's own: exactly [`DEFAULT_EDITOR_WORD`], in an environment an aterm tab handed down
 /// (`aterm_child`, the inherited [`ENV_ATERM_CHILD`], is non-empty). Each aterm drops such an
@@ -134,6 +144,8 @@ pub const ENV_DENY_VARS: &[&str] = &[
     "ATERM_LINK_CAP_FILE",
     "ATERM_LINK_FLEET",
     "ATERM_FABRIC_COMMAND",
+    ENV_CLAUDE_TOKEN,
+    ENV_CLAUDE_TOKEN_MINTED,
 ];
 
 /// The variables that mean an agent is running this command: its tools carry them.

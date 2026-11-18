@@ -150,17 +150,30 @@ impl Bundle {
     }
 }
 
+/// The parts of a registry mailbox a Google sign-in is handed: its password, and its TOTP seed
+/// where it lists one.
 #[cfg(unix)]
-fn registry_bundle(mailbox: &super::alab_roster::LabMailbox) -> Result<Bundle, Error> {
-    use super::alab_roster::{self, Part};
+fn registry_parts(
+    mailbox: &super::alab_roster::LabMailbox,
+) -> Result<&'static [super::alab_roster::Part], Error> {
+    use super::alab_roster::Part;
     if !mailbox.held.contains(&Part::Password) {
         return Err(Error::MissingEntry);
     }
-    let parts: &[Part] = if mailbox.held.contains(&Part::Totp) {
+    Ok(if mailbox.held.contains(&Part::Totp) {
         &[Part::Password, Part::Totp]
     } else {
         &[Part::Password]
-    };
+    })
+}
+
+/// The registry mailbox's bundle, revealed (and journalled) once: [`Credentials::check_current`]
+/// asks later, with nothing revealed, whether it is still the registry's
+/// ([`super::alab_roster::same_bound`]).
+#[cfg(unix)]
+fn registry_bundle(mailbox: &super::alab_roster::LabMailbox) -> Result<Bundle, Error> {
+    use super::alab_roster::{self, Part};
+    let parts = registry_parts(mailbox)?;
     let values = alab_roster::reveal_bound(mailbox, parts).map_err(|_| Error::Unavailable)?;
     let password = &values[0];
     if password.is_empty() || password.len() > 4096 || password.chars().any(char::is_control) {
@@ -190,6 +203,7 @@ pub struct Credentials {
     paths: aterm_secrets::client::Paths,
     #[cfg(unix)]
     snapshot: Option<aterm_secrets::client::EntrySnapshot>,
+    /// The registry mailbox the bundle was revealed from ([`registry_bundle`]).
     #[cfg(unix)]
     registry: Option<super::alab_roster::LabMailbox>,
 }
@@ -264,7 +278,10 @@ impl Credentials {
 
     /// Recheck the complete credential and its vault authorization before publication.
     /// Advances the observation floor across unrelated updates. This is a fresh local
-    /// observation, not a lease excluding a later credential change.
+    /// observation, not a lease excluding a later credential change. A registry mailbox's
+    /// bundle is rechecked with nothing revealed: under the same binding, its cells must still
+    /// open to the values this bundle holds (`alab_roster::same_bound`), so a drive that
+    /// rechecks at every step journals one reveal, its load's.
     ///
     /// # Errors
     /// The credential, audience, trust context or observed history changed, or cannot be read.
@@ -272,14 +289,15 @@ impl Credentials {
         #[cfg(unix)]
         {
             if let Some(mailbox) = &self.registry {
-                let current = registry_bundle(mailbox).map_err(|_| Error::Changed)?;
-                if current.password.as_slice() != self.bundle.password.as_slice()
-                    || current.authenticator.as_ref().map(|s| s.as_slice())
-                        != self.bundle.authenticator.as_ref().map(|s| s.as_slice())
-                {
-                    return Err(Error::Changed);
-                }
-                return Ok(());
+                let parts = registry_parts(mailbox).map_err(|_| Error::Changed)?;
+                let held: Vec<&[u8]> = std::iter::once(&self.bundle.password)
+                    .chain(&self.bundle.authenticator)
+                    .map(SecretBytes::as_slice)
+                    .collect();
+                return match super::alab_roster::same_bound(mailbox, parts, &held) {
+                    Ok(true) => Ok(()),
+                    Ok(false) | Err(_) => Err(Error::Changed),
+                };
             }
             let entry = self
                 .snapshot

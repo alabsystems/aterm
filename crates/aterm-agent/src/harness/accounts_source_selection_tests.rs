@@ -135,7 +135,6 @@ fn source_selection_conforms_and_rejects_promoted_manual_scope() {
 #[test]
 fn assignment_and_missing_roster_read_the_selected_source_instead_of_its_copy() {
     use super::super::login_tests::{Desk, NOW, upkeep_effects};
-    use std::sync::{Arc, Mutex};
 
     let _registry = TestSourceOverride::new(SourceSnapshot::Absent);
     let desk = Desk::new("m27");
@@ -171,9 +170,9 @@ fn assignment_and_missing_roster_read_the_selected_source_instead_of_its_copy() 
     };
     assert_eq!(fleet.accounts[0].label, "selected");
 
-    let cooldown = Mutex::new(None);
-    let rediscovery = Mutex::new(Rediscovery::default());
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let cooldown = Watched::new("accounts_sync/sync_cooldown", None);
+    let rediscovery = Watched::new("accounts_sync/rediscovery", Rediscovery::default());
+    let guard = AutoRenewGuard::default().shared();
     let fetch = |_: &Env, _: &str| panic!("the selected local input must be captured");
     let spawn = |_: Box<dyn FnOnce() + Send>| panic!("a sync must not start a sign-in");
     let fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);

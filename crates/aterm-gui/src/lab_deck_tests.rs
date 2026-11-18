@@ -9,21 +9,52 @@ use aterm_agent::harness::alab_seen::{LastUse, SignedIn, WindowSeen};
 
 const NOW: i64 = 1_800_000_000;
 
-fn account(pk: &str, label: &str, preferred: &[(&str, Option<u64>)]) -> LabAccount {
+/// The account `pk` the lab slugs `slug`: its roster row is labelled with its reserved slug, a
+/// local key no surface prints, and it signs in as `<slug>@example.test`.
+fn account(pk: &str, slug: &str, preferred: &[(&str, Option<u64>)]) -> LabAccount {
     LabAccount {
         pk: pk.into(),
         cli: Cli::Claude,
         vendor: Vendor::default(),
-        label: label.into(),
+        label: format!("claude-{}", pk.trim_start_matches("ac-")),
         legacy_label: None,
-        email: format!("{label}@example.test"),
-        identity: Some(format!("id-{label}@example.test")),
+        email: format!("{slug}@example.test"),
+        identity: Some(format!("id-{slug}@example.test")),
         browser: None,
         joinable: true,
         preferred: preferred
             .iter()
             .map(|(m, rank)| (test_machine(m), *rank))
             .collect(),
+    }
+}
+
+/// The lab of `accounts` with this Mac bound to `me`, each account named as its fixture says
+/// ([`account`]): its slug is its login address's local part.
+fn lab(me: &str, accounts: Vec<LabAccount>) -> Lab {
+    let names = accounts
+        .iter()
+        .map(|account| {
+            let slug = account
+                .email
+                .strip_suffix("@example.test")
+                .unwrap_or_default();
+            let names = aterm_file::AccountNames {
+                realm: "claude".into(),
+                slug: slug.into(),
+                name: Some(format!("claude {}", account.email)),
+                email: Some(account.email.clone()),
+                login: Some(account.email.clone()),
+                live: account.joinable,
+            };
+            (account.pk.clone(), names)
+        })
+        .collect();
+    Lab {
+        me: Some(test_machine(me)),
+        accounts,
+        names,
+        ..Lab::default()
     }
 }
 
@@ -73,37 +104,51 @@ fn every_word(deck: &LabDeck) -> String {
     out
 }
 
-/// Negative control: `label_of` returning `account.label` as it stands puts the mistyped label's
-/// `@` on the glass and fails the first assertion; reading `email` or `identity` for a row's name
-/// fails it for every row.
+/// A row names its account by its slug, and by its key where the lab has no slug for it or no
+/// names at all; never by its roster label, even one that holds an address, and never by an
+/// address.
+/// Negative control: `label_of` returning `account.label` puts the roster label on the glass and
+/// fails the first assertion; reading `email` or `identity` for a row's name fails it for every
+/// row; indexing the lab's names (`lab.names[&account.pk].slug`) panics the projection on the
+/// account the lab has no names for: `` no entry found for key ``.
 #[test]
-fn rows_name_an_account_by_its_label_never_an_address() {
-    let lab = Lab {
-        me: Some(test_machine("m1")),
-        accounts: vec![
+fn rows_name_an_account_by_its_slug_never_its_roster_label_or_an_address() {
+    let mut lab = lab(
+        "m1",
+        vec![
             account(
                 "ac-0a1b2c3d4e5f60718293a4",
                 "claude-0a1b2c",
                 &[("m1", Some(1))],
             ),
-            account(
-                "ac-9f8e7d6c5b4a39281706f5",
-                "typed@example.test",
-                &[("m1", Some(2))],
-            ),
+            account("ac-9f8e7d6c5b4a39281706f5", "unslugged", &[("m1", Some(2))]),
+            account("ac-8e7d6c5b4a39281706f5e4", "unnamed", &[("m1", Some(3))]),
         ],
-        ..Lab::default()
-    };
+    );
+    lab.accounts[1].label = "typed@example.test".into();
+    if let Some(names) = lab.names.get_mut("ac-9f8e7d6c5b4a39281706f5") {
+        names.slug.clear();
+    }
+    lab.names.remove("ac-8e7d6c5b4a39281706f5e4");
     let deck = project(Some(&lab), None, NOW);
     let words = every_word(&deck);
+    for account in &lab.accounts {
+        assert!(!words.contains(&account.label), "{words}");
+    }
     assert!(!words.contains('@'), "{words}");
     assert_eq!(deck.rows[0].label, "claude-0a1b2c");
     assert_eq!(
-        deck.rows[1].label, "claude-9f8e7d",
-        "§0's default label in its place"
+        deck.rows[1].label, "ac-9f8e7d6c5b4a39281706f5",
+        "its key, with no slug"
     );
-    // The fixture the dev seam shows holds no address either.
-    assert!(!every_word(&fixture(NOW)).contains('@'));
+    assert_eq!(
+        deck.rows[2].label, "ac-8e7d6c5b4a39281706f5e4",
+        "its key, with no names"
+    );
+    // The fixture the dev seam shows holds no address and no roster label either.
+    let fixture = every_word(&fixture(NOW));
+    assert!(!fixture.contains('@'), "{fixture}");
+    assert!(!fixture.contains("claude-0a1b2c3d"), "{fixture}");
 }
 
 /// Negative controls: sorting this Mac's rows by label alone puts `b-first` (rank 2) before
@@ -111,17 +156,16 @@ fn rows_name_an_account_by_its_label_never_an_address() {
 /// journal says nothing of adds `silent`.
 #[test]
 fn this_macs_preferred_accounts_come_first_and_a_preference_limits_nothing() {
-    let lab = Lab {
-        me: Some(test_machine("m1")),
-        accounts: vec![
+    let lab = lab(
+        "m1",
+        vec![
             account("ac-01", "b-first", &[("m1", Some(2))]),
             account("ac-02", "z-first", &[("m1", Some(1))]),
             account("ac-03", "elsewhere", &[("m2", Some(1))]),
             account("ac-04", "older", &[]),
             account("ac-05", "silent", &[("m2", None)]),
         ],
-        ..Lab::default()
-    };
+    );
     let mut seen = Seen {
         at: NOW,
         ..Seen::default()
@@ -142,21 +186,48 @@ fn this_macs_preferred_accounts_come_first_and_a_preference_limits_nothing() {
     assert!(project(None, Some(&seen), NOW).is_empty());
 }
 
+/// Rows that tie (this Mac prefers two at one rank, or two others were last used at one time)
+/// are ordered by the word each prints, its slug, never by the roster label beneath it (the
+/// reserved slug, which orders them by key).
+/// NEGATIVE CONTROL: with the ties broken on `LabAccount.label` (the code before this test), each
+/// pair comes in key order: `` left: ["zed-a", "amy-b", "yew-c", "bob-d"] right: ["amy-b",
+/// "zed-a", "bob-d", "yew-c"] ``.
+#[test]
+fn tied_rows_are_ordered_by_the_word_they_print() {
+    let lab = lab(
+        "m1",
+        vec![
+            account("ac-00", "zed-a", &[("m1", Some(1))]),
+            account("ac-ff", "amy-b", &[("m1", Some(1))]),
+            account("ac-01", "yew-c", &[("m2", Some(1))]),
+            account("ac-fe", "bob-d", &[("m2", Some(1))]),
+        ],
+    );
+    let mut seen = Seen {
+        at: NOW,
+        ..Seen::default()
+    };
+    seen.accounts.insert("ac-01".into(), used_by("m2", 60));
+    seen.accounts.insert("ac-fe".into(), used_by("m3", 60));
+    let deck = project(Some(&lab), Some(&seen), NOW);
+    let labels: Vec<_> = deck.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["amy-b", "zed-a", "bob-d", "yew-c"]);
+}
+
 /// Negative controls: taking the first window rather than the most used reads 5h's 62% left;
 /// skipping the wall leaves the cell a heat; letting a workspace's window bind makes it 1% left.
 /// Reusing the sign-in words or projection clock leaves their ages unchanged or labels the
 /// future record as one made in the past.
 #[test]
 fn quota_left_is_the_binding_windows_with_its_readings_age() {
-    let lab = Lab {
-        me: Some(test_machine("m1")),
-        accounts: vec![
+    let lab = lab(
+        "m1",
+        vec![
             account("ac-01", "two-windows", &[("m1", Some(1))]),
             account("ac-02", "walled", &[("m1", Some(2))]),
             account("ac-03", "unread", &[("m1", Some(3))]),
         ],
-        ..Lab::default()
-    };
+    );
     let mut seen = Seen {
         at: NOW,
         ..Seen::default()
@@ -425,11 +496,7 @@ fn the_lens_steps_from_secrets_onto_the_accounts_and_shows_their_rows() {
 /// `overview` says the journal was read.
 #[test]
 fn an_unread_journal_is_not_read_as_an_empty_one() {
-    let lab = Lab {
-        me: Some(test_machine("m1")),
-        accounts: vec![account("ac-01", "mine", &[("m1", Some(1))])],
-        ..Lab::default()
-    };
+    let lab = lab("m1", vec![account("ac-01", "mine", &[("m1", Some(1))])]);
     let unread = project(Some(&lab), None, NOW);
     let row = &unread.rows[0];
     assert_eq!(fact(row, "Last used by"), "The lab journal is not read yet");
@@ -472,16 +539,15 @@ fn an_account_held_from_use_has_no_cell_and_is_counted() {
     paused.joinable = false;
     let mut unseen = account("ac-03", "quiet", &[]);
     unseen.joinable = false;
-    let lab = Lab {
-        me: Some(test_machine("m1")),
-        accounts: vec![
+    let lab = lab(
+        "m1",
+        vec![
             retired,
             paused,
             unseen,
             account("ac-04", "live", &[("m1", Some(2))]),
         ],
-        ..Lab::default()
-    };
+    );
     let mut seen = Seen {
         at: NOW,
         ..Seen::default()
@@ -502,15 +568,14 @@ fn an_account_held_from_use_has_no_cell_and_is_counted() {
 /// limit until` a time already gone; one that keeps a figure past its reset draws `Used(900)`.
 #[test]
 fn a_reading_older_than_its_wall_or_reset_draws_neither() {
-    let lab = Lab {
-        me: Some(test_machine("m1")),
-        accounts: vec![
+    let lab = lab(
+        "m1",
+        vec![
             account("ac-01", "lifted", &[("m1", Some(1))]),
             account("ac-02", "reset", &[("m1", Some(2))]),
             account("ac-03", "standing", &[("m1", Some(3))]),
         ],
-        ..Lab::default()
-    };
+    );
     let mut seen = Seen {
         at: NOW - 180,
         ..Seen::default()

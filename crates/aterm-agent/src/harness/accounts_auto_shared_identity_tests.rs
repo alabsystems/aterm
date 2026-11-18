@@ -6,7 +6,7 @@ use crate::harness::cli::{Renewal, RenewalExit, RenewalObservation};
 
 fn read_activity(
     bed: &Bed,
-    guard: &Arc<Mutex<AutoRenewGuard>>,
+    guard: &Arc<Watched<AutoRenewGuard>>,
     clock: Instant,
 ) -> Vec<LoginActivity> {
     login_activity_of(
@@ -23,7 +23,7 @@ fn read_activity(
 fn a_running_shared_login_keeps_its_captured_row_after_roster_replacement() {
     for change_email in [false, true] {
         let bed = Bed::new(None);
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         let records = bed
             .store
             .read_account_records(Some(&bed.roster), NOW)
@@ -144,7 +144,7 @@ fn activity_retry_and_active_owners_merge_only_for_the_same_captured_row() {
     let mut active_row = original.clone();
     active_row.dir = Some("synthetic-active-home".into());
     let clock = Instant::now();
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let diagnostic = LoginDiagnostic::from_exit_for_test(&original, NOW, 1, None);
     {
         let mut state = guard.lock().unwrap();
@@ -231,7 +231,7 @@ fn an_active_replacement_cannot_clear_or_complete_another_rows_owner() {
     let original = records.roster.row("shared").unwrap();
     let mut replacement = original.clone();
     replacement.email = Some("replacement@example.test".into());
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let clock = Instant::now();
     let permit = AutoRenewPermit::claim(&guard, &original.label, clock, true).unwrap();
     permit.attribute_row(

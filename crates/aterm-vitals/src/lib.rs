@@ -29,6 +29,7 @@ pub mod scheduling;
 pub mod self_cpu;
 pub mod services;
 pub mod situation;
+pub mod spotlight;
 pub mod starts;
 pub mod strain;
 pub mod sys;

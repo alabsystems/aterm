@@ -19,6 +19,7 @@ use crate::release::{
 use crate::release_steps::Real;
 
 mod allowance;
+mod compiler_pin;
 mod distribution;
 mod host_fit;
 mod open_next;
@@ -101,6 +102,8 @@ type ExecJudge = Box<dyn FnMut(&str) -> Result<(), Refusal> + Send>;
 type BumpPreview = Box<dyn FnMut(&Candidate) -> Result<String, Refusal> + Send>;
 
 struct World {
+    compiler_pins: BTreeMap<String, crate::release::CompilerPin>,
+    exec_prover: Option<Prover>,
     preview_bump_judge: Option<BumpPreview>,
     private_bump: Option<(String, String)>,
     preview_own: bool,
@@ -458,6 +461,8 @@ impl World {
         let mut origin_tags = BTreeMap::new();
         origin_tags.insert("v0.5.0".into(), OLD.into());
         Self {
+            compiler_pins: BTreeMap::new(),
+            exec_prover: None,
             preview_bump_judge: None,
             private_bump: None,
             preview_own: false,
@@ -791,6 +796,7 @@ fn bump() -> ReleaseOptions {
 
 fn prover() -> Prover {
     Prover {
+        compiler: None,
         bin: PathBuf::from("/store/trust/9192/bin"),
         commit: "321aaeda7000000000000000000000000000000".into(),
         source: "the store".into(),
@@ -1766,6 +1772,24 @@ impl Backend for World {
             .clone()
             .map_or_else(|| Ok(self.prover.clone()), Err)
     }
+    fn candidate_prover(
+        &mut self,
+        commit: &str,
+        journal: Option<&Journal>,
+    ) -> Result<Prover, String> {
+        let mut prover = self.prover(journal.map(|journal| journal.prover.as_str()))?;
+        if let Some(pin) = self.compiler_pins.get(commit) {
+            prover.compiler = Some(pin.clone());
+            prover.commit = pin.compiler_commit.clone();
+        }
+        Ok(prover)
+    }
+    fn compiler_pin(
+        &mut self,
+        commit: &str,
+    ) -> Result<Option<crate::release::CompilerPin>, String> {
+        Ok(self.compiler_pins.get(commit).cloned())
+    }
     fn lease(&mut self, _prover: &Prover) -> Result<(), String> {
         self.calls.push("lease".into());
         self.lease_error.clone().map_or(Ok(()), Err)
@@ -2103,7 +2127,8 @@ impl Backend for World {
     fn cutter_recovery(&mut self, _commit: &str) -> crate::release_tools::Recovery {
         self.cutter_recovery
     }
-    fn exec_cutter(&mut self, commit: &str, _prover: &Prover) -> Result<(), Refusal> {
+    fn exec_cutter(&mut self, commit: &str, prover: &Prover) -> Result<(), Refusal> {
+        self.exec_prover = Some(prover.clone());
         self.calls.push("exec-cutter".into());
         self.exec_commit = Some(commit.to_owned());
         if let Some(judge) = &mut self.exec_judge {
@@ -11770,6 +11795,7 @@ fn a_prepare_stops_before_the_publish_and_the_bare_run_reasks_then_releases() {
             "another prover",
             |w| {
                 w.prover = Prover {
+                    compiler: None,
                     bin: PathBuf::from("/store/trust/9300/bin"),
                     commit: "fd87ed4a0060000000000000000000000000000".into(),
                     source: "TRUST_STAGE2_BIN".into(),
@@ -12534,7 +12560,7 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
         carry: Vec::new(),
     };
     let mut real = Real::new(&repo, None, true, false).expect("a backend");
-    real.build_inputs = || Ok("fixture inputs".into());
+    real.build_inputs = |_, _| Ok("fixture inputs".into());
     let judge = |r: &str| {
         crate::check_record::checks(&git, r, Some(&"ab".repeat(32)), || {
             Ok("fixture inputs".into())
@@ -12623,7 +12649,7 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .to_string())
     }
-    real.build_inputs = changing_inputs;
+    real.build_inputs = |_, _| changing_inputs();
     let refused = verify(&mut real, Step::Bundle, &measure).expect_err("inputs changed");
     assert!(
         refused.why.contains("compiler or SDK bytes changed"),
@@ -12641,7 +12667,7 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
         "the run's began record is withdrawn: {}",
         began.line()
     );
-    real.build_inputs = || Ok("fixture inputs".into());
+    real.build_inputs = |_, _| Ok("fixture inputs".into());
 
     // A resume names exactly its missing checks and the lint packages that passed.
     let resume = VerifyRun {
@@ -12747,13 +12773,13 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
         }
     }
     let interrupted = INTERRUPTED.get_or_init(|| dir.path().join("interrupted"));
-    real.build_inputs = interrupted_inputs;
+    real.build_inputs = |_, _| interrupted_inputs();
     let interrupted_events = format!(
         "{}{}",
         binary("-p a --lib", "ok"),
         binary("-p c --lib", "ok")
     );
-    real.inputs_held = |_| false;
+    real.inputs_held = |_, _, _| false;
     set("143", "interrupt", &interrupted_events);
     let refused = verify(&mut real, Step::Qualify, &resume).expect_err("the held seal moved");
     assert!(refused.could_not_run, "{refused:?}");
@@ -12763,7 +12789,7 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
         "a seal that does not stand keeps nothing of the interrupted run"
     );
     std::fs::remove_file(interrupted).unwrap();
-    real.inputs_held = |seal| seal == "fixture inputs";
+    real.inputs_held = |_, _, seal| seal == "fixture inputs";
     set("143", "interrupt", &interrupted_events);
     let ran = verify(&mut real, Step::Qualify, &resume).expect("the interrupted run is kept");
     assert_eq!(ran.code, 143);
@@ -12776,7 +12802,7 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
         "the interrupted run's rows are recorded"
     );
     std::fs::remove_file(interrupted).unwrap();
-    real.build_inputs = || Ok("fixture inputs".into());
+    real.build_inputs = |_, _| Ok("fixture inputs".into());
 
     set("0", "", &finished(&all_ok));
     let ran = verify(&mut real, Step::Qualify, &every(Half::Tree)).expect("it ran");

@@ -76,6 +76,9 @@ mod managed_taskless_loop;
 #[path = "restart_claim_loop_tests.rs"]
 mod restart_claim_loop;
 
+#[path = "move_left_limit_loop_tests.rs"]
+mod move_left_limit_loop;
+
 fn hosted(max_s: u64) -> SuperviseOpts {
     SuperviseOpts {
         policy: SupervisorConfig {
@@ -10936,6 +10939,9 @@ fn a_clock_stepped_forward_is_no_sleep_where_the_machine_counts() {
         let mut m = Mock::new(vec![busy_screen()]);
         let mut s = session(&mut m, Some("@s-1".to_string()));
         s.set_clock(TEST_NOW, PDT);
+        // A sleep is the wall's lead on the monotonic clock: standing, a loaded Mac's
+        // millisecond between two reads is not taken off the four hours.
+        s.set_mono_standing();
         if counts {
             s.count_sleeps(Duration::from_secs(600));
         }
@@ -15726,6 +15732,12 @@ struct AccountHost {
     late_agent: std::sync::Mutex<Option<(u32, i64, Option<&'static str>)>>,
     /// What the loop told of the session's own login ([`IdleHost::login_seen`]), in order.
     login_facts: std::sync::Mutex<Vec<crate::supervise::policy::turn_end::LoginSeen>>,
+    /// Each limit episode the loop opened (`true`) or closed (`false`) ([`IdleHost::limited`]),
+    /// in order.
+    limits: std::sync::Mutex<Vec<bool>>,
+    /// When the process the next restart starts began (unix seconds), named from that restart
+    /// on ([`IdleHost::agent_started`]); none: the start stands as it was.
+    started_on_restart: std::sync::Mutex<Option<i64>>,
     /// A sibling session of the same account whose served turn its own host files while this
     /// one's loop waits ([`Sibling`]); `None`: no sibling.
     sibling: std::sync::Mutex<Option<Sibling>>,
@@ -15970,6 +15982,9 @@ impl IdleHost for AccountHost {
         if moved.is_some() {
             *self.pid.lock().unwrap() = moved;
         }
+        if let Some(started) = self.started_on_restart.lock().unwrap().take() {
+            *self.started.lock().unwrap() = Some(started);
+        }
         let mut lefts = self.left_on_restart.lock().unwrap();
         *self.left.lock().unwrap() = if lefts.len() > 1 {
             lefts.pop_front()
@@ -16114,6 +16129,9 @@ impl IdleHost for AccountHost {
     }
     fn login_seen(&self, seen: crate::supervise::policy::turn_end::LoginSeen) {
         self.login_facts.lock().unwrap().push(seen);
+    }
+    fn limited(&self, open: bool) {
+        self.limits.lock().unwrap().push(open);
     }
     fn account_answered(&self, bad: AccountBad) {
         self.said.lock().unwrap().push(
@@ -19314,6 +19332,7 @@ fn a_relaunch_the_host_switched_off_is_named_at_a_weekly_limit() {
         next: None,
         ready: Some(Ready {
             label: "m8-3".to_string(),
+            word: None,
         }),
         held: Some(HeldBy::Earlier),
     };
@@ -19362,6 +19381,7 @@ fn a_relaunch_switched_on_reaches_a_tab_waiting_at_its_weekly_limit() {
             next: None,
             ready: Some(Ready {
                 label: "m8-3".to_string(),
+                word: None,
             }),
             held: None,
         });
@@ -19527,6 +19547,7 @@ fn an_account_added_at_a_login_left_at_a_weekly_limit_reaches_the_tab() {
             next: None,
             ready: Some(Ready {
                 label: "work".to_string(),
+                word: None,
             }),
             held: None,
         });
@@ -19652,6 +19673,7 @@ fn a_draft_cleared_at_a_weekly_limit_lets_the_move_be_asked() {
             next: None,
             ready: Some(Ready {
                 label: "m8-3".to_string(),
+                word: None,
             }),
             held: None,
         });
@@ -20951,7 +20973,7 @@ fn a_move_made_at_a_wall_is_carried_on_past_the_limit_it_left() {
         (stepped, action, host.all())
     };
     let resume = TurnEndAction::Type {
-        text: CLEARED.to_string(),
+        text: crate::supervise::policy::turn_end::MOVED_TEXT.to_string(),
         rule_id: crate::supervise::policy::turn_end::RULE_LIMIT_RESUME,
     };
     let (stepped, action, said) = moved(true);
@@ -25089,7 +25111,8 @@ fn a_loop_that_takes_up_a_move_made_at_a_wall_carries_it_on_past_the_notice() {
         let (lines, m, journal) =
             account_run(&format!("te-{tag}"), vec![limited_screen()], &host, &ledger);
         let _ = std::fs::remove_dir_all(&dir);
-        let typed = m.requests.iter().filter(|r| r.contains(CLEARED));
+        let moved = crate::supervise::policy::turn_end::MOVED_TEXT.to_string();
+        let typed = m.requests.iter().filter(|r| r.contains(&moved));
         (
             host.all(),
             typed.count(),

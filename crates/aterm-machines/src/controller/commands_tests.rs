@@ -2492,7 +2492,7 @@ fn here_apply_plain_says_nothing_and_exits_with_why_it_did_not_finish() {
         let sys = Fake::root();
         sys.on(
             "/usr/bin/mdutil -s /System/Volumes/Data",
-            Ran::ok("Indexing disabled."),
+            Ran::ok("/System/Volumes/Data:\n\tIndexing disabled.\n"),
         );
         sys.born(std::process::id(), 123).running(&[]);
         sys.stat_of(
@@ -2733,7 +2733,7 @@ fn here_apply_plain_says_nothing_and_exits_with_why_it_did_not_finish() {
                 .count();
             permission.on(
                 "/usr/bin/mdutil -s /System/Volumes/Data",
-                Ran::ok("Indexing disabled."),
+                Ran::ok("/System/Volumes/Data:\n\tIndexing disabled.\n"),
             );
             assert!(matches!(
                 here_report(
@@ -3316,7 +3316,7 @@ fn here_apply_plain_names_the_mac_and_exits_on_the_tools_alone() {
         let sys = Fake::root();
         sys.on(
             "/usr/bin/mdutil -s /System/Volumes/Data",
-            Ran::ok("Indexing disabled."),
+            Ran::ok("/System/Volumes/Data:\n\tIndexing disabled.\n"),
         );
         sys.stat_of("/dev/console", console);
         for executable in [

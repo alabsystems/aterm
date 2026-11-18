@@ -18,7 +18,14 @@ fn shared_command_requires_explicit_nonzero_identifiers_without_duplicate_option
         "33".repeat(16).into(),
     ];
     let parsed = parse(&args).unwrap();
-    assert_eq!(parsed.label, "m3.2");
+    assert_eq!(parsed.account_word, "m3.2");
+    // The provider word and address name one account, in either form.
+    let mut spaced = args.clone();
+    spaced.splice(0..1, ["claude".into(), "ada@x.example".into()]);
+    assert_eq!(parse(&spaced).unwrap().account_word, "claude ada@x.example");
+    let mut two = args.clone();
+    two.insert(1, "m3.3".into());
+    assert!(parse(&two).is_err());
     assert_eq!(parsed.account, [0x11; 32]);
     assert_eq!(parsed.decision, [0x22; 32]);
     assert_eq!(parsed.request, [0x33; 16]);
@@ -65,6 +72,8 @@ fn environment(home: &std::path::Path) -> cli::Env {
     }
 }
 
+/// The roster of `row` alone. A shared renewal names the row by its account's address, the one
+/// it is expected to sign in as (`Row::expected_identity_email`), never its label.
 fn write_roster(env: &cli::Env, row: &accounts::Row) {
     let roster = env.accounts_roster().unwrap();
     std::fs::create_dir_all(roster.parent().unwrap()).unwrap();
@@ -522,7 +531,7 @@ fn referenced_identity_requirements_are_not_silently_accepted() {
             cli::shared_renewal::run(
                 &env,
                 &host,
-                &row.label,
+                row.expected_identity_email().unwrap(),
                 [1; 16],
                 &approved,
                 &mut Vec::new(),
@@ -667,7 +676,7 @@ fn a_required_browser_profile_cannot_fall_back_to_the_default_browser() {
         cli::shared_renewal::run(
             &env,
             &host,
-            &row.label,
+            row.expected_identity_email().unwrap(),
             [1; 16],
             &approved,
             &mut Vec::new(),
@@ -799,7 +808,7 @@ fn offline_sync_policy_preserves_one_shot_authority_and_observed_stops() {
                 cli::shared_renewal::run(
                     &env,
                     &host,
-                    &row.label,
+                    row.expected_identity_email().unwrap(),
                     [1; 16],
                     &authority,
                     &mut output,
@@ -860,7 +869,7 @@ fn offline_sync_policy_preserves_one_shot_authority_and_observed_stops() {
                 cli::shared_renewal::run(
                     &env,
                     &host,
-                    &row.label,
+                    row.expected_identity_email().unwrap(),
                     [2; 16],
                     &authority,
                     &mut output,

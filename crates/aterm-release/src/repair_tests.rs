@@ -360,6 +360,10 @@ fn multibyte_excerpts_leave_the_inputs_and_what_to_do_whole() {
 
 /// A worker that started is said even when the record cannot keep it: the next failing cut on
 /// these inputs then asks again.
+///
+/// Unix's: the save fails in a directory its mode bits leave read-only, which Windows has no
+/// counterpart of (a directory's read-only attribute does not refuse a new file in it).
+#[cfg(unix)]
 #[test]
 fn a_started_worker_the_record_cannot_keep_is_said_unrecorded() {
     use std::os::unix::fs::PermissionsExt as _;

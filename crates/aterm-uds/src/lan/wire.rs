@@ -986,6 +986,11 @@ impl Reader {
         self.frame_cancelled(stream, deadline, None)
     }
 
+    /// [`Self::frame`], whose wait a readable `cancel` ends with `Interrupted` (the only
+    /// `Interrupted` it returns), with or without a deadline. A whole frame already read off the
+    /// connection is returned before `cancel` is looked at; with none here, a readable `cancel`
+    /// wins over whatever the connection holds, which stays there for the next call, as does any
+    /// part of a frame read so far. `cancel` itself is never read.
     pub(crate) fn frame_cancelled(
         &mut self,
         stream: &CtlStream,
@@ -996,8 +1001,8 @@ impl Reader {
             if let Some(frame) = self.complete()? {
                 return Ok(Some(frame));
             }
-            match deadline {
-                Some(deadline) => {
+            match (deadline, cancel) {
+                (Some(deadline), cancel) => {
                     crate::ready::until_cancelled(
                         stream.as_fd(),
                         crate::ready::Interest::Read,
@@ -1005,7 +1010,8 @@ impl Reader {
                         cancel,
                     )?;
                 }
-                None => crate::ready::one(stream.as_fd())?,
+                (None, Some(cancel)) => crate::ready::readable_cancelled(stream.as_fd(), cancel)?,
+                (None, None) => crate::ready::one(stream.as_fd())?,
             }
             let mut chunk = [0u8; 16 * 1024];
             let max = self.max_fds;

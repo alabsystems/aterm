@@ -22,7 +22,7 @@ fn checker_sharing_requires_an_actual_checker_enabled_test() {
                 .with_checks(&selected)
                 .with_release(release)
                 .with_checkers_in_tests(enabled);
-                let planned = plan::plan(&ctx);
+                let planned = plan::plan(&ctx).expect("complete graph and plan");
                 let shared = enabled && selected.contains(&Check::Test);
                 assert_eq!(
                     planned.iter().any(|s| s.id == StageId::SpecCheckers),
@@ -177,7 +177,7 @@ fn compile_only_keeps_its_shared_compile_separate_from_runtime_evidence() {
     .with_checkers_in_tests(true);
     let runtime_key = checks::part(Check::Checkers, &ctx, "base", "changed");
     ctx.compile_only = true;
-    let planned = plan::plan(&ctx);
+    let planned = plan::plan(&ctx).expect("complete graph and plan");
     assert_eq!(planned.len(), 1);
     assert_eq!(planned[0].id, StageId::TestCompile);
     assert_eq!(

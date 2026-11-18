@@ -119,6 +119,8 @@ fn a_sync_from_the_lab_adds_preferred_accounts_and_drops_no_row() {
             lab_account("cy", "claude-cccccc", &[("m20", Some(1))]),
             lab_account("gil", "claude-gggggg", &[("m22", Some(2))]),
         ],
+        names: Default::default(),
+        barred: Default::default(),
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
         #[cfg(unix)]
@@ -265,6 +267,8 @@ fn a_cli_sync_from_the_lab_keeps_a_legacy_labelled_row_and_its_state() {
             legacy_label: Some("kimi-m16".into()),
             ..lab_account("eve", "kimi-eeeeee", &[("m16", Some(1))])
         }],
+        names: Default::default(),
+        barred: Default::default(),
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
         #[cfg(unix)]
@@ -366,6 +370,8 @@ fn a_cli_sync_from_a_lab_that_prefers_nothing_here_keeps_every_row_and_clears_ho
             vendor: region,
             ..lab_account("eve", "kimi-eeeeee", &[("m20", Some(1))])
         }],
+        names: Default::default(),
+        barred: Default::default(),
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
         #[cfg(unix)]
@@ -521,6 +527,8 @@ fn lab_of(accounts: Vec<LabAccount>) -> Lab {
         me: Some(test_machine("m22")),
         bound: Default::default(),
         accounts,
+        names: Default::default(),
+        barred: Default::default(),
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
         #[cfg(unix)]
@@ -852,16 +860,14 @@ fn the_first_adds_main_is_the_default_login_under_the_lab() {
     );
 }
 
-/// Where the lab names this Mac the upkeep reads no sheet: an edit to `ai-accounts.csv` moves
-/// neither Claude Code's sync inputs nor a CLI's, the sheet counts as no fleet source and names
-/// nothing, and the init trigger asks the lab, which is satisfied by a roster that holds what it
-/// prefers. With no lab held, the same edit moves both digests, as it always did; while the lab
-/// is pending (held, not read yet) the sheet is no fleet source either, and an edit to it moves
-/// no CLI's inputs.
+/// Where the lab names this Mac the upkeep reads no sheet: an edit to `ai-accounts.csv` moves no
+/// input of Claude Code's sync, the sheet counts as no fleet source and names nothing, and the
+/// init trigger asks the lab, which is satisfied by a roster that holds what it prefers. With no
+/// lab held, the same edit moves the inputs, as it always did; while the lab is pending (held,
+/// not read yet) the sheet is no fleet source either.
 /// NEGATIVE CONTROL: with `sync_inputs`' `lab_chosen` arm removed, the sheet edit moves Claude
 /// Code's inputs under the lab (`reads no sheet`); with `has_fleet_source`'s `sheet_read_here`
-/// gate removed, the sheet is a source (`no fleet source`); with `cli_sync_inputs` reading the
-/// sheet ungated, the pending digest moves (`while the lab is not read yet`).
+/// gate removed, the sheet is a source (`no fleet source`).
 #[test]
 #[cfg(unix)]
 fn a_mac_the_lab_names_reads_no_sheet_in_its_upkeep() {
@@ -892,18 +898,13 @@ fn a_mac_the_lab_names_reads_no_sheet_in_its_upkeep() {
         "claude-aaaaaa",
         &[("m22", Some(1))],
     )]);
-    let digests = || {
-        (
-            sync_inputs(&home, &state_dir, &roster_path, NOW),
-            cli_sync_inputs(Cli::Kimi, &home, &state_dir, &toml),
-        )
-    };
+    let digests = || sync_inputs(&home, &state_dir, &roster_path, NOW);
     edit("email,computer,claude,kimi\none@example.com,m22,1,global\n");
     let store = accounts::Store::at(&state_dir);
     let held = store.acquire().unwrap();
     store.retire_source_held(&held, NOW).unwrap();
     drop(held);
-    let (claude, kimi) = alab_roster::with_lab(lab.clone(), || {
+    let claude = alab_roster::with_lab(lab.clone(), || {
         assert!(!has_fleet_source(&home, &store), "no fleet source");
         assert!(!sheet_names_this_machine(
             Some(&toml),
@@ -915,30 +916,19 @@ fn a_mac_the_lab_names_reads_no_sheet_in_its_upkeep() {
         );
         digests()
     });
-    let (bare_claude, bare_kimi) = digests();
+    let bare_claude = digests();
     edit("email,computer,claude,kimi\ntwo@example.com,m22,1,global\n");
     alab_roster::with_lab(lab, || {
-        assert_eq!(digests().0, claude, "reads no sheet");
-        assert_eq!(digests().1, kimi, "a CLI's upkeep reads no sheet");
+        assert_eq!(digests(), claude, "reads no sheet");
     });
-    let (moved_claude, moved_kimi) = digests();
-    assert_ne!(moved_claude, bare_claude, "with no lab the sheet is read");
-    assert_ne!(moved_kimi, bare_kimi);
+    assert_ne!(digests(), bare_claude, "with no lab the sheet is read");
     assert!(has_fleet_source(&home, &store));
-    let pending_kimi = alab_roster::while_pending(|| {
+    alab_roster::while_pending(|| {
         assert!(
             !has_fleet_source(&home, &store),
             "a lab not read yet reads no sheet"
         );
-        digests().1
     });
-    edit("email,computer,claude,kimi\nthree@example.test,m22,1,global\n");
-    assert_ne!(digests().1, moved_kimi, "with no lab the edit moves it");
-    assert_eq!(
-        alab_roster::while_pending(|| digests().1),
-        pending_kimi,
-        "a CLI's upkeep reads no sheet while the lab is not read yet"
-    );
 }
 
 /// What a sync says of the rows it added to a pool no upkeep tries names `renew` alone: an
@@ -1072,6 +1062,8 @@ fn a_first_lab_sync_lists_the_default_login_under_its_lab_label() {
                 codex("bea", "codex-bbbbbb", &[("m16", Some(2))]),
                 codex("cid", "codex-cccccc", &[("m3", Some(1))]),
             ],
+            names: Default::default(),
+            barred: Default::default(),
             aliases: BTreeMap::new(),
             mailboxes: BTreeMap::new(),
             #[cfg(unix)]
@@ -1153,16 +1145,22 @@ fn a_first_lab_sync_lists_the_default_login_under_its_lab_label() {
         "{said}"
     );
     assert_eq!(rows[0].email.as_deref(), Some(email("ann").as_str()));
+    // The receipt names each row by its account (the lab names none here, so by its provider
+    // word and address), never by its label.
     assert!(
-        said.contains("on this machine's own login: codex-aaaaaa"),
+        said.contains("on this machine's own login: oai ann@example.com"),
         "{said}"
     );
     let unsigned = said
         .lines()
         .find(|line| line.starts_with("not signed in yet: "))
         .expect("the row with no login yet");
-    assert!(unsigned.contains("codex-bbbbbb"), "{said}");
-    assert!(!unsigned.contains("codex-aaaaaa"), "{said}");
+    assert!(unsigned.contains("oai bea@example.com"), "{said}");
+    assert!(!unsigned.contains("oai ann@example.com"), "{said}");
+    assert!(
+        !said.contains("codex-aaaaaa") && !said.contains("codex-bbbbbb"),
+        "{said}"
+    );
     assert!(said.contains("the lab prefers here"), "{said}");
     assert!(!said.contains("across the fleet"), "{said}");
 

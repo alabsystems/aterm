@@ -63,6 +63,122 @@ fn never(_: &Path, _: &TrustLock) -> Result<(), String> {
     panic!("no install was due")
 }
 
+#[cfg(unix)]
+#[test]
+fn an_explicit_store_holds_its_source_compiler_independently_of_home_policy() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().canonicalize().unwrap();
+    let prefix = home.join("pkg");
+    let root = store_build(&prefix, 16387, COMMIT);
+    let bin = bin_of(&prefix, 16387);
+    let lock = lock_of(16387, &root, COMMIT);
+    let store = ManagedStoreContext::declared(&home, &prefix).unwrap();
+    let mut hold = None;
+    let selected = super::locked_prover(
+        store.prefix(),
+        &lock,
+        None,
+        Run::Cut,
+        &mut never,
+        &mut |bin| {
+            hold = Some(store.offer(bin, lock.build)?);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(selected.bin, bin);
+    assert!(hold.is_some());
+    assert!(store.offer(&bin, lock.build + 1).is_err());
+    let atpkg::lease::Holders::Held(holders) = atpkg::lease::holders(
+        &prefix,
+        &atpkg::lease::Subject::build("trust", lock.build).unwrap(),
+    ) else {
+        panic!("the source compiler is protected by a real holder");
+    };
+    assert_eq!(holders.len(), 1);
+}
+
+/// These disposable stores have no managed lease registry. Production supplies the hold
+/// before any compiler probe; the ordering control below exercises that boundary directly.
+fn locked_prover(
+    prefix: &Path,
+    lock: &TrustLock,
+    explicit: Option<&Path>,
+    run: Run,
+    install: &mut dyn FnMut(&Path, &TrustLock) -> Result<(), String>,
+) -> Result<LockedProver, String> {
+    super::locked_prover(prefix, lock, explicit, run, install, &mut |_| Ok(()))
+}
+
+#[test]
+fn a_compiler_probe_requires_its_lease_first() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let prefix = scratch.path().canonicalize().unwrap().join("pkg");
+    store_build(&prefix, 16387, COMMIT);
+    let bin = bin_of(&prefix, 16387);
+    let invoked = scratch.path().join("compiler-ran");
+    let leased = scratch.path().join("lease-held");
+    let quoted = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+    std::fs::write(
+        bin.join("trustc"),
+        format!(
+            "#!/bin/sh\nprintf invoked > {}\ntest -f {} || exit 73\nprintf 'commit-hash: {COMMIT}\\n'\n",
+            quoted(&invoked),
+            quoted(&leased),
+        ),
+    )
+    .unwrap();
+    let root = atpkg::tree::tree_root(bin.parent().unwrap()).unwrap();
+    let lock = lock_of(16387, &root, COMMIT);
+    let why = super::locked_prover(&prefix, &lock, None, Run::Cut, &mut never, &mut |_| {
+        Err("lease refused".into())
+    })
+    .unwrap_err();
+    assert_eq!(why, "lease refused");
+    assert!(
+        !invoked.exists(),
+        "a refused lease must execute no compiler"
+    );
+
+    let selected = super::locked_prover(&prefix, &lock, None, Run::Cut, &mut never, &mut |asked| {
+        assert_eq!(asked, bin);
+        std::fs::write(&leased, b"held").map_err(|error| error.to_string())
+    })
+    .unwrap();
+    assert_eq!(selected.bin, bin);
+    assert!(invoked.exists());
+}
+
+#[test]
+fn a_held_replacement_with_the_same_compiler_commit_is_not_the_selected_tree() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let prefix = scratch.path().canonicalize().unwrap().join("pkg");
+    let root = store_build(&prefix, 16387, COMMIT);
+    let bin = bin_of(&prefix, 16387);
+    let lock = lock_of(16387, &root, COMMIT);
+    // Populate the old identity's standing record as a prior release would have done.
+    assert!(matches!(
+        atpkg::trust_lock::standing(&prefix, &lock),
+        LockedBuild::Present { .. }
+    ));
+    let invoked = scratch.path().join("replacement-ran");
+    let why = super::locked_prover(&prefix, &lock, None, Run::Cut, &mut never, &mut |_| {
+        // Change bytes in place too: a directory-identity record alone cannot authorize
+        // the compiler that will execute after acquisition.
+        std::fs::write(
+            bin.join("trustc"),
+            format!(
+                "#!/bin/sh\nprintf invoked > '{}'\nprintf 'commit-hash: {COMMIT}\\n'\n",
+                invoked.to_string_lossy().replace('\'', "'\\''"),
+            ),
+        )
+        .map_err(|error| error.to_string())
+    })
+    .unwrap_err();
+    assert!(why.contains("held compiler tree changed"), "{why}");
+    assert!(!invoked.exists(), "replacement must not execute");
+}
+
 /// FLIPPING `current` BETWEEN STEPS LEAVES THE PROVER UNCHANGED: each step's resolution of the
 /// candidate's lock is its build, whichever build `current` names. NEGATIVE CONTROL: the
 /// unlocked resolution a cut used before (discovery with no lock) follows the flip.
@@ -233,7 +349,8 @@ fn an_override_of_another_tree_is_refused_in_a_cut_and_taken_otherwise() {
 /// The lock a commit carries: none, a lock, and a lock that does not parse (refused, not none).
 #[test]
 fn lock_at_reads_the_lock_a_commit_carries() {
-    use crate::ledger::testing::{Git, git, init};
+    use crate::ledger::GitCli;
+    use crate::ledger::testing::{git, init};
     let scratch = aterm_tempfile::tempdir().unwrap();
     let repo = scratch.path().canonicalize().unwrap();
     init(
@@ -258,7 +375,7 @@ fn lock_at_reads_the_lock_a_commit_carries() {
         ok(&["add", "-A"]);
         ok(&["commit", "-q", "--allow-empty", "-m", message]);
     };
-    let runner = Git::new(&repo);
+    let runner = GitCli::new(&repo);
     commit("no lock");
     assert_eq!(lock_at(&runner, "HEAD").unwrap(), None);
 
@@ -270,11 +387,199 @@ fn lock_at_reads_the_lock_a_commit_carries() {
     .unwrap();
     commit("lock");
     assert_eq!(lock_at(&runner, "HEAD").unwrap(), Some(lock.clone()));
+    let selected = crate::ledger::git_ok(&runner, &["rev-parse", "HEAD"])
+        .unwrap()
+        .stdout_utf8()
+        .trim()
+        .to_owned();
     assert_eq!(lock_at(&runner, "HEAD~1").unwrap(), None);
-    assert_eq!(stock_toolchain(Some(&lock)), "1.91.1");
-    assert_eq!(stock_toolchain(None), "stable");
+    assert_eq!(stock_toolchain_at(&runner, "HEAD").as_deref(), Ok("1.91.1"));
 
     std::fs::write(repo.join(LOCK_FILE), "version = 2\n").unwrap();
     commit("broken");
     assert!(lock_at(&runner, "HEAD").is_err());
+    assert_eq!(
+        CompilerPin::at(&runner, &selected).unwrap(),
+        CompilerPin::of(&lock)
+    );
+    assert!(CompilerPin::at(&runner, "HEAD").is_err());
+    let tree = crate::ledger::git_ok(&runner, &["rev-parse", &format!("{selected}^{{tree}}")])
+        .unwrap()
+        .stdout_utf8()
+        .trim()
+        .to_owned();
+    assert!(
+        CompilerPin::at(&runner, &tree).is_err(),
+        "a lock-bearing tree is not a selected commit"
+    );
+
+    // A local replacement makes an ordinary exact-commit read name the broken checkout's
+    // lock. The release must still read the original selected source, not that rewritten view.
+    assert!(
+        git()
+            .arg("-C")
+            .arg(&repo)
+            .args(["replace", &selected, "HEAD"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let replaced = git()
+        .arg("-C")
+        .arg(&repo)
+        .args(["show", &format!("{selected}:{LOCK_FILE}")])
+        .output()
+        .unwrap();
+    assert!(replaced.status.success());
+    assert_eq!(replaced.stdout, b"version = 2\n");
+    assert_eq!(
+        CompilerPin::at(&runner, &selected).unwrap(),
+        CompilerPin::of(&lock)
+    );
+}
+
+#[test]
+fn unavailable_original_lock_evidence_never_becomes_an_unlocked_candidate() {
+    struct Unread;
+    impl GitRunner for Unread {
+        fn git(&self, _: &[&str]) -> crate::ledger::Result<crate::ledger::RunOut> {
+            panic!("candidate compiler authority may not use ordinary Git reads")
+        }
+        fn git_original(&self, _: &[&str]) -> crate::ledger::Result<crate::ledger::RunOut> {
+            Err(crate::ledger::Error::new("original objects unavailable"))
+        }
+    }
+    let why = CompilerPin::at(&Unread, &"1".repeat(40)).unwrap_err();
+    assert!(why.contains("original objects unavailable"));
+}
+
+#[test]
+fn original_candidate_b_selects_its_build_while_checkout_and_current_hold_a() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let prefix = scratch.path().canonicalize().unwrap().join("pkg");
+    let a = lock_of(16387, &store_build(&prefix, 16387, COMMIT), COMMIT);
+    let b = lock_of(16500, &store_build(&prefix, 16500, COMMIT), COMMIT);
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let git = crate::ledger::GitCli::new(&repo);
+    crate::ledger::git_ok(&git, &["init", "-q"]).unwrap();
+    let save = |lock: &TrustLock, name: &str| {
+        std::fs::write(repo.join(LOCK_FILE), atpkg::trust_lock::render_body(lock)).unwrap();
+        crate::ledger::git_ok(&git, &["add", LOCK_FILE]).unwrap();
+        crate::ledger::git_ok(
+            &git,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                name,
+            ],
+        )
+        .unwrap();
+        crate::ledger::git_ok(&git, &["rev-parse", "HEAD"])
+            .unwrap()
+            .stdout_utf8()
+            .trim()
+            .to_owned()
+    };
+    let source_a = save(&a, "compiler A");
+    let source_b = save(&b, "compiler B");
+    crate::ledger::git_ok(&git, &["checkout", "-q", "--detach", &source_a]).unwrap();
+    point_current(&prefix, a.build);
+    let selected = CompilerPin::at(&git, &source_b).unwrap();
+    assert_eq!(selected, CompilerPin::of(&b));
+    assert_eq!(lock_at(&git, "HEAD").unwrap(), Some(a.clone()));
+    let prover = locked_prover(&prefix, &selected.lock(), None, Run::Cut, &mut never).unwrap();
+    assert_eq!(prover.bin, bin_of(&prefix, b.build));
+    assert_ne!(prover.bin, bin_of(&prefix, a.build));
+    // The binaries report the same compiler revision. Neither that revision nor a physical
+    // path from the other checkout can replace the exact build and tree declaration.
+    assert!(
+        locked_prover(
+            &prefix,
+            &selected.lock(),
+            Some(&bin_of(&prefix, a.build)),
+            Run::Cut,
+            &mut never
+        )
+        .is_err()
+    );
+}
+
+/// THE STOCK SLICES' RELEASE IS THE LOCK'S, AND NOTHING STANDS IN FOR A MISSING ONE: a commit or
+/// checkout whose lock names `[stock] toolchain` drives that release; one that carries no lock,
+/// or a lock with no `[stock]` table, is refused with what is missing named. NEGATIVE CONTROL: a
+/// resolver that falls back to rustup's `stable` for the lockless commit answers `Ok("stable")`
+/// and the first refusal assertion fails.
+#[test]
+fn the_stock_release_is_the_locks_and_a_lockless_tree_is_refused() {
+    use crate::ledger::GitCli;
+    use crate::ledger::testing::{git, init};
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let repo = scratch.path().canonicalize().unwrap();
+    init(
+        &repo,
+        &[
+            ("user.name", "Andrew Yates"),
+            ("user.email", "a@example.invalid"),
+        ],
+    );
+    let commit = |message: &str| {
+        for args in [
+            &["add", "-A"][..],
+            &["commit", "-q", "--allow-empty", "-m", message],
+        ] {
+            assert!(
+                git()
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    };
+    let runner = GitCli::new(&repo);
+    commit("no lock");
+    let refused = stock_toolchain_at(&runner, "HEAD").unwrap_err();
+    assert!(
+        refused.contains("commit HEAD carries no trust.lock")
+            && refused.contains("[stock] toolchain")
+            && refused.contains("never falls back"),
+        "{refused}"
+    );
+    let refused = stock_toolchain_in(&repo).unwrap_err();
+    assert!(refused.contains("carries no trust.lock"), "{refused}");
+
+    let lock = lock_of(16387, &"4".repeat(64), COMMIT);
+    let body = atpkg::trust_lock::render_body(&lock);
+    std::fs::write(repo.join(LOCK_FILE), &body).unwrap();
+    commit("lock");
+    assert_eq!(stock_toolchain_at(&runner, "HEAD").as_deref(), Ok("1.91.1"));
+    let below = repo.join("crates/some-crate");
+    std::fs::create_dir_all(&below).unwrap();
+    assert_eq!(
+        stock_toolchain_in(&below).as_deref(),
+        Ok("1.91.1"),
+        "a checkout's lock is found on the way up, as Trust's own is"
+    );
+
+    let without_stock = body
+        .split("\n[stock]")
+        .next()
+        .expect("a rendered lock carries [stock]")
+        .to_string();
+    assert_ne!(without_stock, body);
+    std::fs::write(repo.join(LOCK_FILE), format!("{without_stock}\n")).unwrap();
+    commit("lock without [stock]");
+    for refused in [
+        stock_toolchain_at(&runner, "HEAD").unwrap_err(),
+        stock_toolchain_in(&repo).unwrap_err(),
+    ] {
+        assert!(refused.contains("no `stock.toolchain`"), "{refused}");
+    }
 }

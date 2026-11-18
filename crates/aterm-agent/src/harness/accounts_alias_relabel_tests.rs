@@ -92,7 +92,7 @@ fn default_unlisted(built: &Roster, observed: Option<&str>) -> bool {
     if let Some(email) = observed {
         desk.default_login(email);
     }
-    let rediscovery = std::sync::Mutex::new(Rediscovery::default());
+    let rediscovery = Watched::new("accounts_sync/rediscovery", Rediscovery::default());
     let due = default_login_unlisted(
         &desk.home,
         &desk.state,

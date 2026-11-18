@@ -117,12 +117,21 @@ pub struct HeldProgram {
 
 mod system_command;
 pub use system_command::HeldSystemCommand;
+mod command_search;
+pub use command_search::HeldCommandSearchInputs;
+mod closed_exec;
+pub use closed_exec::{HeldExecImage, HeldExecImageSet, PreparedExecTransfer, RefusedExecImageSet};
 mod target_sysroot;
 pub use target_sysroot::{HeldRustTargetSysroot, RustTargetSysrootPlan};
 mod package_source;
 pub use package_source::{HeldPackageSource, PackageEntry, PackageSourcePlan};
 mod current_code;
 pub use current_code::{CURRENT_CODE_POLICY, HeldExecutingProgram};
+mod selected_source;
+pub use selected_source::{
+    HeldSourceFileOffer, HeldSourceReadSet, RefusedSourceFileOffer, SourceDirectoryEntry,
+    SourceEntryKind, SourceRead,
+};
 mod directory_input;
 pub use directory_input::HeldDirectoryInput;
 
@@ -741,6 +750,31 @@ impl HeldProgram {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "native Bootstrap archive declarations require macOS arm64",
+        ));
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        self.validate(deadline)
+    }
+
+    /// Require only the distinct offline preparation declaration from this
+    /// SAME held image. General Bootstrap graph support is insufficient.
+    /// Marker presence supplies no native owner, availability, Seed or SDK.
+    pub fn require_bootstrap_preparation_protocol_marker(
+        &self,
+        _expected: &[u8; 64],
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.validate(deadline)?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        protocol_marker::require(
+            &self.executable.file,
+            protocol_marker::Profile::BootstrapPreparation,
+            _expected,
+            deadline,
+        )?;
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native Bootstrap preparation declarations require macOS arm64",
         ));
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         self.validate(deadline)

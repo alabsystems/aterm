@@ -310,8 +310,11 @@ pub(crate) fn repo_list(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
 /// The most `--depth` takes.
 const DEPTH_MAX: u32 = 1_000_000;
 
-/// `agh repo clone REPO [DIR] [--depth N]`: a clone through the isolated git runner. `DIR`
-/// defaults to the repository's name in the current directory, and must be absent or empty.
+/// `agh repo clone REPO [DIR] [--depth N | --mirror] [--source-object-cache CACHE]`: a clone
+/// through the isolated git runner. `DIR` defaults to the repository's name in the current
+/// directory, and must be absent or empty. `CACHE`, a local repository with complete history,
+/// lends the clone its objects, so only what it lacks is downloaded; the clone keeps a copy of
+/// what it borrowed, and every object it holds is hashed before it is published.
 /// It prints nothing; the receipt (`--meta`) notes `as={profile}`, or `as=anonymous`: the
 /// identity the git run spoke as, its one `as=` key. The run routes as agh.toml says (the read
 /// chain, or the writer for a release-tier owner), so `--anonymous` and `--as` are Usage
@@ -319,13 +322,21 @@ const DEPTH_MAX: u32 = 1_000_000;
 ///
 /// # Errors
 ///
-/// Usage for `--anonymous` or `--as`, the repository, a `DIR` that is not empty, or a
-/// `--depth` outside 1 to 1,000,000 or combined with `--mirror`;
-/// the runner's refusals and git's failure.
+/// Usage for `--anonymous` or `--as`, the repository, a `DIR` that is not empty, a
+/// `--depth` outside 1 to 1,000,000, or `--depth` or `--source-object-cache` combined with
+/// `--mirror`; a source cache that is shallow or reaches objects elsewhere (alternates,
+/// grafts, replace refs) or whose borrowed objects fail their check is refused; the runner's
+/// other refusals and git's failure.
 pub(crate) fn repo_clone(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let mirror = inv.has("--mirror");
     if mirror && inv.flag("--depth").is_some() {
         return Err(inv.usage("--mirror needs complete history: drop --depth"));
+    }
+    let cache = inv.flag("--source-object-cache").map(PathBuf::from);
+    if mirror && cache.is_some() {
+        return Err(
+            inv.usage("--source-object-cache lends objects to an ordinary clone: drop --mirror")
+        );
     }
     if inv.global.anonymous || inv.global.as_profile.is_some() {
         return Err(inv.usage(
@@ -372,6 +383,9 @@ pub(crate) fn repo_clone(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     .with_named(named);
     if let Some(depth) = depth {
         run = run.with_depth(depth);
+    }
+    if let Some(cache) = &cache {
+        run = run.with_source_object_cache(cache);
     }
     let out = gh.run_git(&run)?;
     let mut receipt = Receipt::for_repo(inv, &gh, &slug);

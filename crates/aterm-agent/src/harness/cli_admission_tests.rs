@@ -133,6 +133,12 @@ impl AccountsHost for NoSignIn {
     }
 }
 
+/// An explicit sign-in and a window refuse account records they cannot read before anything is
+/// written, each naming the refused file: `renew`, `browser` (its row named by its address, which
+/// it resolves first) and, for a Claude row with no address, `login`.
+/// NEGATIVE CONTROL: with the window naming the row by its label (`main`), which names nothing
+/// for a row with an address, it is refused before the records and this fails on its diagnostic
+/// (2026-11-16, by hand, then restored).
 #[test]
 fn explicit_signins_and_windows_refuse_unknown_records_before_side_effects() {
     for cli in [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi] {
@@ -177,9 +183,25 @@ fn explicit_signins_and_windows_refuse_unknown_records_before_side_effects() {
             };
             assert!(diagnostic.contains(&refused_path.display().to_string()));
             assert_eq!(every_file(tmp.path()), before);
+            // The row's account, by its address: the window resolves it before the records,
+            // and is refused for those records, not for the word.
+            err.clear();
             assert_eq!(
-                run_accounts_browser(cli, &env, &NoSignIn, "main", &mut out, &mut err),
+                run_accounts_browser(
+                    cli,
+                    &env,
+                    &NoSignIn,
+                    "owner@example.test",
+                    &mut out,
+                    &mut err
+                ),
                 ExitCode::from(1)
+            );
+            let diagnostic = String::from_utf8(err.clone()).unwrap();
+            assert!(
+                diagnostic.contains("account records cannot be read")
+                    && diagnostic.contains(&refused_path.display().to_string()),
+                "{cli:?}/{state_bad}/{bindings_bad}: {diagnostic}"
             );
             assert_eq!(every_file(tmp.path()), before);
             if cli == Cli::Claude {

@@ -102,6 +102,8 @@ pub(in crate::harness_host) fn host_for(
         switches,
         activations: Arc::default(),
         wake: std::sync::OnceLock::new(),
+        keeper: std::sync::OnceLock::new(),
+        keeper_owed: AtomicBool::new(false),
         host_done: AtomicBool::new(false),
         net: NetProbe::new(),
         login_latches: Arc::default(),

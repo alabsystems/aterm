@@ -1017,14 +1017,7 @@ pub(crate) struct Named {
 pub(crate) type Targets = BTreeMap<&'static str, Named>;
 
 /// The shortest ending of `pk`, four characters at least, that none of `others` ends with.
-#[cfg_attr(
-    not(unix),
-    expect(
-        dead_code,
-        reason = "only the registry read of macOS and Linux lists the rows"
-    )
-)]
-fn ending<'a>(pk: &'a str, others: &[&str]) -> &'a str {
+pub(crate) fn ending<'a>(pk: &'a str, others: &[&str]) -> &'a str {
     let chars: Vec<(usize, char)> = pk.char_indices().collect();
     for n in 4..chars.len() {
         let end = &pk[chars[chars.len() - n].0..];

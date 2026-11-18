@@ -673,7 +673,7 @@ fn family(
             // the last one left it.
             let mut read: Option<(Log, View)> = None;
             for at in 0..works.len() {
-                let Some((_, bound)) = works[at].file.table() else {
+                let Some((_, bound)) = works[at].file.edited() else {
                     continue;
                 };
                 let collection = compiled.collection(bound.name)?;
@@ -888,16 +888,21 @@ fn publish_intents(paths: &Paths, config: &Path, only: Option<&Name>, pass: &Pas
         }
     };
     if let Some(policy) = policy {
-        // A file of the journal ring or a view has no catalog table an intent could be signed
-        // into: each Mac's rows go out with its journal flush, and nobody writes a view. What
-        // waits in such a file's outbox stays there, said why, and is never signed.
+        // A log, a file of the journal ring and a view take no intent: each Mac's program
+        // appends its own log entries, its rows go out with its journal flush, and nobody
+        // writes a view. What waits in such a file's outbox stays there, said why, and is
+        // never signed.
         for work in &mut works {
-            if work.file.table().is_none() && work.held.outbox().waiting().next().is_some() {
-                work.queue("this file is written by each Mac's journal flush, not by its outbox");
+            if work.file.edited().is_none() && work.held.outbox().waiting().next().is_some() {
+                work.queue(if work.file.table().is_some() {
+                    "this file is a log each machine's program appends to, not its outbox"
+                } else {
+                    "this file is written by each Mac's journal flush, not by its outbox"
+                });
             }
         }
         let mut families: Vec<&'static Compiled> = Vec::new();
-        for (family, _) in works.iter().filter_map(|work| work.file.table()) {
+        for (family, _) in works.iter().filter_map(|work| work.file.edited()) {
             if !families
                 .iter()
                 .any(|known| known.table.role == family.table.role)
@@ -910,7 +915,7 @@ fn publish_intents(paths: &Paths, config: &Path, only: Option<&Name>, pass: &Pas
                 .iter_mut()
                 .filter(|work| {
                     work.file
-                        .table()
+                        .edited()
                         .is_some_and(|(family, _)| family.table.role == first.table.role)
                         && work.held.outbox().waiting().next().is_some()
                 })
@@ -1202,7 +1207,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "HereOldWeek",
-        reason = "A Mac's reading of a limit window is the environment: the harness reads it, and states it in its ai/usage row (SF-08b). shared_file_conforms states each reading as that row says it and folds them."
+        reason = "A Mac's reading of a limit window is the environment: the harness reads it, and the journal flusher states it in the Mac's ai/usage row (alab::journal::book::Facts::usage_row). shared_file_conforms states each reading as that row says it and folds them."
     )
 )]
 #[cfg_attr(
@@ -1210,7 +1215,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "HereNewWeek",
-        reason = "A Mac's reading of a limit window is the environment: the harness reads it, and states it in its ai/usage row (SF-08b). shared_file_conforms states each reading as that row says it and folds them."
+        reason = "A Mac's reading of a limit window is the environment: the harness reads it, and the journal flusher states it in the Mac's ai/usage row (alab::journal::book::Facts::usage_row). shared_file_conforms states each reading as that row says it and folds them."
     )
 )]
 #[cfg_attr(
@@ -1218,7 +1223,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "PeerOldWeek",
-        reason = "A Mac's reading of a limit window is the environment: the harness reads it, and states it in its ai/usage row (SF-08b). shared_file_conforms states each reading as that row says it and folds them."
+        reason = "A Mac's reading of a limit window is the environment: the harness reads it, and the journal flusher states it in the Mac's ai/usage row (alab::journal::book::Facts::usage_row). shared_file_conforms states each reading as that row says it and folds them."
     )
 )]
 #[cfg_attr(
@@ -1226,7 +1231,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "PeerNewWeek",
-        reason = "A Mac's reading of a limit window is the environment: the harness reads it, and states it in its ai/usage row (SF-08b). shared_file_conforms states each reading as that row says it and folds them."
+        reason = "A Mac's reading of a limit window is the environment: the harness reads it, and the journal flusher states it in the Mac's ai/usage row (alab::journal::book::Facts::usage_row). shared_file_conforms states each reading as that row says it and folds them."
     )
 )]
 #[doc(hidden)]

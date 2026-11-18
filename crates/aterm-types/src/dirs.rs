@@ -194,6 +194,13 @@ impl std::error::Error for AtermConfigReadError {
 /// [`aterm_config_refusal`] using the opened handle's metadata. No Windows ownership policy
 /// is inferred from Unix modes. On Unix the open does not block on a FIFO.
 ///
+/// With a trace scope armed on the calling thread ([`aterm_uds::trace`]), the read records
+/// `path`'s stamp, or that nothing is there, before its open
+/// ([`aterm_uds::atomic_file::read_regular`]): an edit, a link swapped or retargeted, a mode
+/// change and a file made where none was each move it. That stamp also decides the look that
+/// tells no entry from a dangling link, since it was taken first: any change between the two
+/// moves it.
+///
 /// # Errors
 /// Returns [`AtermConfigReadError::Refused`] for a failed ownership policy, or
 /// [`AtermConfigReadError::Unavailable`] for I/O, invalid file type or oversized contents.

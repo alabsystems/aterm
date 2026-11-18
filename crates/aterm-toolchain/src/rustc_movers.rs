@@ -169,16 +169,13 @@ pub fn lock_refusal(
 ) -> Option<String> {
     let winner = movers.first()?;
     let resolved = winner.resolve(path_env);
-    let reported = resolved
-        .as_deref()
-        .and_then(crate::trust_lock::compiler_commit_of);
-    if reported.as_deref() == Some(lock.compiler_commit.as_str()) {
-        return None;
-    }
-    let answers = match (&resolved, &reported) {
-        (None, _) => "names no executable".to_string(),
-        (Some(path), None) => format!("({}) answers no commit-hash", path.display()),
-        (Some(path), Some(commit)) => format!("({}) answers commit {commit}", path.display()),
+    let answers = match resolved {
+        None => "names no executable".to_string(),
+        Some(path) => match crate::trust_lock::compiler_commit_of(&path) {
+            Ok(commit) if commit == lock.compiler_commit => return None,
+            Ok(commit) => format!("({}) answers commit {commit}", path.display()),
+            Err(error) => format!("({}): {error}", path.display()),
+        },
     };
     Some(format!(
         "{} = {} {answers}, and {} names compiler commit {}: every compile child would build \

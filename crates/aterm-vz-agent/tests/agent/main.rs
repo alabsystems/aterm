@@ -4,7 +4,8 @@
 //! The agent's inert tests (the design's §13): the serve loop and the watch connection
 //! over unix sockets with the Fake `System`, and the seam bin end to end. Every command
 //! they run is the agent's own debug executable in a stand-in mode; every wait for what
-//! must happen is a one-minute hang detector.
+//! must happen is a one-minute hang detector. Unix's, as the agent is.
+#![cfg(unix)]
 
 #[cfg(not(target_os = "linux"))]
 mod seam;

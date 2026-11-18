@@ -3,6 +3,30 @@
 
 //! Admitted file reads (`O_NOFOLLOW | O_NONBLOCK`) and atomic 0600 writes; on Windows the same
 //! reads and writes under an access list in place of a mode (`fsx_win.rs`).
+//!
+//! With a trace scope armed on the calling thread (`aterm_uds::trace`), every look here records
+//! what its answer is taken from, so a replay of the trace sees each file a run decided by. A
+//! read records the file's stamp before its open, or that nothing is there ([`read_private`] and
+//! every reader through `open_admitted`); an `lstat` whose answer holds a file's times records
+//! its stamp ([`stamp`], [`seen_if_present`], [`JournalSeen::of`], a [`Glance`]'s, given or
+//! kept); an `lstat` that answers less records a standing of what it answers ([`kind`],
+//! [`kind_and_id`], [`file_id`], [`private_dir_settled`], and [`folder_in`] for a folder judged
+//! by its identity, owner and mode, whose times every file written in it moves); a listing
+//! records the names it lists and the kind each names ([`tree_paths`]). A look or read
+//! that fails for a reason nothing recorded decides records a retry, and a write here that does
+//! not go through `aterm_uds::atomic_file` records a write. With no scope armed, each adds one
+//! thread-local look. The Windows arm records the same. A look of its own ([`Meta`], the name
+//! opened as itself) where Unix records a stamp (a read through `open_admitted`, [`stamp`],
+//! [`seen_if_present`], [`JournalSeen::of`], a [`Glance`]'s, [`has_private_nonempty`]'s) is made
+//! after the trace's own look at the path recorded its stamp; one that answers less records a
+//! standing of what it answers, as on Unix ([`kind`], [`kind_and_id`], [`file_id`],
+//! [`private_dir_settled`], [`folder_in`], each of which takes its look with nothing recorded of
+//! it). A folder's standing holds its attributes and its owner and access list in place of an
+//! owner, group and mode, and the writers that make, rename or remove a name itself record a
+//! write. A stamp there holds the file's volume and id, its change time, its names and a digest
+//! of its owner and access list (`aterm_uds::trace::Meta` on Windows), so a change of who may
+//! use a file read, or of its names, moves the stamp a replay looks at, as a `chmod`, `chown` or
+//! `link` moves a Unix one.
 
 use crate::{Error, SecretBytes};
 use std::fs::File;
@@ -24,12 +48,12 @@ use win::MetaLen as _;
 pub(crate) use win::{
     access_digest, create_private_dir_new, create_private_file_new, dir_owned_unshared, id_of,
     lock_metadata, lock_wide, meta_of, narrow_lock, open_lock, open_lock_existing,
-    owned_unshared_dir_id, owner_only, private_dir_settled, private_file_settled,
+    owned_unshared_dir_id, owner_only, private_file_settled,
 };
 #[cfg(windows)]
 pub use win::{ensure_private_dir, has_private_nonempty};
 #[cfg(windows)]
-use win::{gone, kind_of, open_admitted, seen_of, write_all_at};
+use win::{gone, kind_of, open_admitted, private_dir_settled_now, seen_of, write_all_at};
 
 /// What one look at a path, or at the file a read opened, shows: Unix's `lstat` or `fstat`
 /// (`std::fs::Metadata`); on Windows the handle's own facts ([`aterm_dirfd::Stat`]), the name
@@ -81,6 +105,39 @@ fn look_at(path: &Path) -> io::Result<Meta> {
     win::lstat(path)
 }
 
+/// [`look_at`], recorded: with a trace scope armed, the stamp of what it shows
+/// (`aterm_uds::trace::fs::symlink_metadata`, which on Unix is this very `lstat`).
+///
+/// # Errors
+/// As [`look_at`].
+#[cfg(unix)]
+fn look_traced(path: &Path) -> io::Result<Meta> {
+    aterm_uds::trace::fs::symlink_metadata(path)
+}
+
+/// [`look_at`], recorded: with a trace scope armed, the stamp the trace's own look at `path` shows
+/// ([`record_look`]), taken just before the name is opened as itself, so a change after it moves
+/// the stamp a replay looks at.
+///
+/// # Errors
+/// As [`look_at`].
+#[cfg(windows)]
+fn look_traced(path: &Path) -> io::Result<Meta> {
+    record_look(path);
+    win::lstat(path)
+}
+
+/// Record, with a trace scope armed on this thread, the stamp the trace's own look at `path` shows
+/// (`aterm_uds::trace::fs::symlink_metadata`), for a look the Windows arm then makes its own way
+/// (the name opened as itself, its handle read), as `aterm_uds::trace::fs::opening` does for a
+/// read. With none armed it looks at nothing.
+#[cfg(windows)]
+fn record_look(path: &Path) {
+    if aterm_uds::trace::armed() {
+        let _stamped = aterm_uds::trace::fs::symlink_metadata(path);
+    }
+}
+
 #[cfg(unix)]
 fn check_and_narrow_dir_fd(dir: &Path, dir_fd: &File) -> crate::Result<()> {
     check_access_list(dir_fd, true).map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
@@ -88,6 +145,7 @@ fn check_and_narrow_dir_fd(dir: &Path, dir_fd: &File) -> crate::Result<()> {
         .metadata()
         .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
     if !owned_dir(dir, &meta)? {
+        wrote();
         dir_fd
             .set_permissions(std::fs::Permissions::from_mode(0o700))
             .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
@@ -113,13 +171,29 @@ fn owned_dir(dir: &Path, meta: &std::fs::Metadata) -> crate::Result<bool> {
 }
 
 /// Whether [`ensure_private_dir`] would leave the existing `dir` as it is: a folder, no link,
-/// this user's, of mode exactly `0700` (its `lstat`).
+/// this user's, of mode exactly `0700` (its `lstat`); on Windows the user's folder under a
+/// protected list of the user and SYSTEM alone (`fsx_win.rs`). With a trace scope armed, the
+/// verdict is recorded as a standing of `dir` ([`dir_settled_standing`]), never its times.
 ///
 /// # Errors
 /// `dir` is missing, a link or no folder, another user's, or of another mode, which
-/// [`ensure_private_dir`] would make `0700`.
-#[cfg(unix)]
+/// [`ensure_private_dir`] would make `0700` (on Windows a reparse point, or a list that is not
+/// private).
 pub(crate) fn private_dir_settled(dir: &Path) -> crate::Result<()> {
+    let verdict = private_dir_settled_now(dir);
+    if aterm_uds::trace::armed() {
+        aterm_uds::trace::standing(
+            dir,
+            Some(dir_settled_digest(&verdict)),
+            dir_settled_standing,
+        );
+    }
+    verdict
+}
+
+/// [`private_dir_settled`]'s verdict, with nothing recorded; on Windows the arm's own.
+#[cfg(unix)]
+fn private_dir_settled_now(dir: &Path) -> crate::Result<()> {
     aterm_uds::private_file::check_private_dir(dir)
         .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
     let meta = std::fs::symlink_metadata(dir)
@@ -140,19 +214,54 @@ pub(crate) fn private_dir_settled(dir: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+/// A trace's standing of the folder `dir` that [`private_dir_settled`] judges: the digest of its
+/// verdict now ([`dir_settled_digest`]), so a folder made another's, opened up, narrowed, swapped
+/// for a link or removed moves it, and a file written in it does not.
+fn dir_settled_standing(dir: &Path) -> Option<[u8; 32]> {
+    Some(dir_settled_digest(&private_dir_settled_now(dir)))
+}
+
+/// The digest of a [`private_dir_settled`] verdict: one value for a settled folder, and the
+/// refusal's words for each other.
+fn dir_settled_digest(verdict: &crate::Result<()>) -> [u8; 32] {
+    let mut digest = aterm_digest::Sha256::new();
+    match verdict {
+        Ok(()) => digest.update([0]),
+        Err(why) => {
+            digest.update([1]);
+            digest.update(why.to_string().as_bytes());
+        }
+    }
+    digest.finalize()
+}
+
+/// Record, in a trace scope armed on this thread, that a run wrote: a file, a link, a folder or
+/// a mode, by a writer here that does not go through `aterm_uds::atomic_file` (whose temporary
+/// files record theirs).
+fn wrote() {
+    aterm_uds::trace::effect(aterm_uds::trace::Effect::Write);
+}
+
 /// Makes `dir`, a new `0700` directory (`mkdir`): a taken name is `AlreadyExists`. On Windows a new
 /// folder of the user's under a protected list of the user and SYSTEM alone from its creation.
+/// With a trace scope armed, it records a write.
 ///
 /// # Errors
 /// The creation's.
 #[cfg(unix)]
 pub(crate) fn create_private_dir_new(dir: &Path) -> io::Result<()> {
+    wrote();
     std::fs::DirBuilder::new().mode(0o700).create(dir)
 }
 
-/// Ensures `dir` exists as a 0700 directory owned by this user, refusing symlinks.
+/// Ensures `dir` exists as a 0700 directory owned by this user, refusing symlinks. With a trace
+/// scope armed, what it decides by is recorded as [`private_dir_settled`] records it, and each
+/// step that makes a folder or sets a mode as a write.
 #[cfg(unix)]
 pub fn ensure_private_dir(dir: &Path) -> crate::Result<()> {
+    if aterm_uds::trace::armed() {
+        let _settled_or_why = private_dir_settled(dir);
+    }
     let open_dir = || {
         OpenOptions::new()
             .read(true)
@@ -165,6 +274,7 @@ pub fn ensure_private_dir(dir: &Path) -> crate::Result<()> {
     match kind(dir)? {
         Kind::Dir => {}
         Kind::Missing => {
+            wrote();
             if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| Error::new(format!("{}: {e}", parent.display())))?;
@@ -200,6 +310,7 @@ pub fn ensure_private_dir(dir: &Path) -> crate::Result<()> {
             meta.uid()
         )));
     }
+    wrote();
     aterm_uds::private_file::ensure_private_dir(dir)
         .map(|_| ())
         .map_err(|e| Error::new(format!("{}: {e}", dir.display())))
@@ -339,7 +450,10 @@ fn read_bounded(
     path: &Path,
 ) -> Result<Vec<u8>, Unread> {
     let refused = |why: String| Unread::Refused(Error::new(format!("{}: {why}", path.display())));
-    let failed = |e: io::Error| Unread::Failed(Error::new(format!("{}: {e}", path.display())));
+    let failed = |e: io::Error| {
+        aterm_uds::trace::fs::failed(path, &e);
+        Unread::Failed(Error::new(format!("{}: {e}", path.display())))
+    };
     let limit = u64::try_from(max).unwrap_or(u64::MAX);
     if past == Past::Refuse && len > limit {
         return Err(refused(format!("larger than {max} bytes")));
@@ -359,6 +473,16 @@ fn read_bounded(
     Ok(bytes)
 }
 
+/// Open the file at `path` for a read and admit it under `admit`, doing `links` with a symlink
+/// there: the one opening every read here goes through (on Windows the arm's own, which records
+/// the same). With a trace scope armed, the file's stamp (a link's target's too), or that nothing
+/// is there, is recorded before the open, so a change after it moves the stamp a replay looks at,
+/// and an open or `fstat` that failed records a retry ([`aterm_uds::trace::fs::failed`]). A
+/// refusal records nothing more: what it is refused by is what the stamp shows, a link, a file of
+/// another kind, owner or mode, or an access list (whose change moves the inode's change time);
+/// on Windows a reparse point, a file of another kind, or its owner, access list or second name
+/// (the stamp's digest of the owner and list, its change time and its names,
+/// `aterm_uds::trace::Meta`).
 #[cfg(unix)]
 fn open_admitted(
     path: &Path,
@@ -371,7 +495,11 @@ fn open_admitted(
         0
     };
     let refused = |why: String| Unread::Refused(Error::new(format!("{}: {why}", path.display())));
-    let failed = |e: io::Error| Unread::Failed(Error::new(format!("{}: {e}", path.display())));
+    let failed = |e: io::Error| {
+        aterm_uds::trace::fs::failed(path, &e);
+        Unread::Failed(Error::new(format!("{}: {e}", path.display())))
+    };
+    aterm_uds::trace::fs::opening(path);
     look_afresh();
     #[cfg(test)]
     count_read(path);
@@ -554,7 +682,7 @@ pub(crate) fn read_buffer(len: u64, max: usize) -> Vec<u8> {
 #[must_use]
 pub fn has_private_nonempty(path: &Path, max: usize) -> bool {
     let limit = u64::try_from(max).unwrap_or(u64::MAX);
-    std::fs::symlink_metadata(path).is_ok_and(|meta| {
+    aterm_uds::trace::fs::symlink_metadata(path).is_ok_and(|meta| {
         meta.file_type().is_file()
             && meta.uid() == euid()
             && meta.mode() & 0o6077 == 0
@@ -647,6 +775,9 @@ pub fn write_atomic_with(
 /// # Errors
 /// As [`write_atomic`], where it writes.
 pub fn write_atomic_if_changed(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<bool> {
+    // What the file holds decides whether it is written: with a trace scope armed, a run that
+    // leaves it as it is records its stamp, so a change to it moves what a replay looks at.
+    aterm_uds::trace::fs::opening(path);
     if holds_exactly(path, bytes, mode) {
         return Ok(false);
     }
@@ -710,9 +841,14 @@ fn opened_as(path: &Path, bytes: &[u8], mode: u32) -> Option<File> {
 
 /// Opens or creates a `0600` regular lock file at `path` (`O_NOFOLLOW | O_NONBLOCK`), verifying
 /// ownership and a single hard link, narrowing its permissions to `0600`, and keeping its
-/// descriptor out of child processes.
+/// descriptor out of child processes. With a trace scope armed, a lock file it makes, and a mode
+/// it narrows, record a write; a lock taken in one that was there records nothing, since taking
+/// it changes no file. The Windows arm's records the same.
 #[cfg(unix)]
 pub(crate) fn open_lock(path: &Path) -> crate::Result<File> {
+    if aterm_uds::trace::armed() && aterm_uds::trace::unrecorded(|| file_id(path)).is_none() {
+        wrote();
+    }
     let file = aterm_uds::kept_out(|| {
         OpenOptions::new()
             .read(true)
@@ -786,6 +922,7 @@ pub(crate) fn judge_lock(
 /// The `fchmod` fails (a read-only filesystem, say).
 #[cfg(unix)]
 pub(crate) fn narrow_lock(file: &File, path: &Path) -> crate::Result<()> {
+    wrote();
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
         .map_err(|e| Error::new(format!("{}: {e}", path.display())))
 }
@@ -1073,7 +1210,10 @@ pub fn seen_set(paths: &[(std::path::PathBuf, Look)]) -> Option<SeenSet> {
 /// an entry cannot be examined or a directory cannot be listed. Each listing, and the `lstat` of
 /// `root`, is a fresh look
 /// ([`fresh_looks`]); a directory gone between its listing and its own (`NotFound`) is in the
-/// list as an entry of its parent and lists nothing.
+/// list as an entry of its parent and lists nothing. With a trace scope armed, the `lstat` of
+/// `root` records its stamp, and each directory's listing the names it holds and the kind each
+/// names, or that nothing is there (`aterm_uds::trace::fs::read_dir`), so an entry made, removed
+/// or renamed anywhere the walk listed moves the trace.
 #[must_use]
 pub fn tree_paths(root: &Path, stop: &[std::path::PathBuf]) -> Option<Vec<std::path::PathBuf>> {
     let mut paths = vec![root.to_path_buf()];
@@ -1089,13 +1229,12 @@ pub fn tree_paths(root: &Path, stop: &[std::path::PathBuf]) -> Option<Vec<std::p
     let mut folders = vec![root.to_path_buf()];
     while let Some(folder) = folders.pop() {
         look_afresh();
-        let entries = match std::fs::read_dir(&folder) {
+        let entries = match aterm_uds::trace::fs::read_dir(&folder) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(_) => return None,
         };
         for entry in entries {
-            let entry = entry.ok()?;
             let path = entry.path();
             if stop.contains(&path) {
                 continue;
@@ -1127,14 +1266,16 @@ pub(crate) fn lstat_in(glance: Option<&Glance>, path: &Path) -> io::Result<Optio
 }
 
 /// The `lstat` of `path` taken now, `None` where nothing is there: [`lstat_in`]'s own, or a
-/// glance's first ([`Glance::symlink_metadata`]).
+/// glance's first ([`Glance::symlink_metadata`]). With a trace scope armed, the stamp this very
+/// `lstat` shows is recorded ([`look_traced`]; on Windows the stamp of the trace's own look, taken
+/// just before).
 ///
 /// # Errors
 /// The `lstat`'s, other than a missing path.
 fn lstat_now(path: &Path) -> io::Result<Option<Meta>> {
     #[cfg(test)]
     count_look(path);
-    match look_at(path) {
+    match look_traced(path) {
         Ok(meta) => Ok(Some(meta)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
@@ -1224,17 +1365,46 @@ impl Glance {
     }
 
     /// The `lstat` of `path` this look took first, `None` where nothing was there; taken now
-    /// where it took none. An error is not kept: the next ask looks again.
+    /// where it took none. An error is not kept: the next ask looks again. With a trace scope
+    /// armed, the first is recorded as it is taken ([`lstat_now`]), and one given again is
+    /// recorded again ([`retrace`]), since the scope that heard the first may not be the one armed
+    /// now.
     ///
     /// # Errors
     /// The `lstat`'s, other than a missing path.
     pub(crate) fn symlink_metadata(&self, path: &Path) -> io::Result<Option<Meta>> {
         if let Some(meta) = self.first(path) {
+            if aterm_uds::trace::armed() {
+                retrace(path, meta.as_ref());
+            }
             return Ok(meta);
         }
+        self.take_first(path, lstat_now)
+    }
+
+    /// The `lstat` of the folder `dir` this look took first, for a caller that judges a folder by
+    /// its identity, owner and mode alone ([`folder_in`], which records what it judges): taken now
+    /// where it took none, with nothing recorded of it, whose times every file written in the
+    /// folder moves. A later [`Self::symlink_metadata`] of `dir` records its stamp then.
+    ///
+    /// # Errors
+    /// The `lstat`'s, other than a missing path.
+    fn folder(&self, dir: &Path) -> io::Result<Option<Meta>> {
+        if let Some(meta) = self.first(dir) {
+            return Ok(meta);
+        }
+        self.take_first(dir, |dir| aterm_uds::trace::unrecorded(|| lstat_now(dir)))
+    }
+
+    /// Take this look's first `lstat` of `path` by `lstat`, and keep it.
+    fn take_first(
+        &self,
+        path: &Path,
+        lstat: impl FnOnce(&Path) -> io::Result<Option<Meta>>,
+    ) -> io::Result<Option<Meta>> {
         // The one look at the disk that is no fresh look ([`fresh_looks`]): what it finds is
         // this glance's for the rest of its life. One that fails is not kept, and is.
-        let meta = lstat_now(path).inspect_err(|_| look_afresh())?;
+        let meta = lstat(path).inspect_err(|_| look_afresh())?;
         #[cfg_attr(
             windows,
             expect(
@@ -1268,7 +1438,7 @@ impl Glance {
     /// What this look's first `lstat` of `path` showed, where it showed a regular file that had
     /// settled ([`settled`]) when the look began; `None` where it took none of `path`, or its
     /// first showed nothing, something other than a regular file, or a file that changed within
-    /// [`SETTLED_NS`] of when the look began. It looks at nothing.
+    /// [`SETTLED`] of when the look began. It looks at nothing.
     fn first_seen_settled(&self, path: &Path) -> Option<Seen> {
         self.first(path)
             .flatten()
@@ -1302,6 +1472,152 @@ impl Glance {
         look_afresh();
         matches!(lstat_now(path), Ok(Some(now)) if seen_of(&now) == first)
     }
+}
+
+/// Record, in the trace scope armed on this thread, what a glance gives again of `path`, which it
+/// took first as `first` (`None` for nothing there): the stamp one `lstat` taken now shows, which
+/// the glance does not keep, recorded as any read's is, and a retry where that shows other than
+/// `first` did ([`Seen`]: its kind, stamp, owner, mode and link count; on Windows its kind,
+/// stamp, link count and attributes), since the run then took an answer from before a change no
+/// record shows. This `lstat` is the trace's, not the reader's, so it moves no count of fresh
+/// looks ([`fresh_looks`]).
+fn retrace(path: &Path, first: Option<&Meta>) {
+    let now = look_traced(path);
+    let same = match (&now, first) {
+        (Ok(now), Some(first)) => seen_of(now) == seen_of(first),
+        (Err(error), None) => error.kind() == io::ErrorKind::NotFound,
+        _ => false,
+    };
+    if !same {
+        aterm_uds::trace::retry(format!(
+            "{}: changed after a look's first lstat of it",
+            path.display()
+        ));
+    }
+}
+
+/// The `lstat` of the folder `dir`, `None` where nothing is there, for a caller that judges the
+/// folder by its kind, device, inode, owner, group and mode alone (on Windows its kind, volume,
+/// file id and attributes, and its owner and access list, [`access_digest`]), never its times,
+/// which every file written in it moves (a vault folder whose `state.toml` the vault's subscriber
+/// rewrites about once a minute): `glance`'s where the caller looks through one
+/// ([`Glance::folder`]), a fresh one where it does not. With a trace scope armed, what the caller
+/// judges is recorded as a standing of `dir` ([`folder_standing`]) and no stamp of it, and an
+/// `lstat` that failed for any reason but a missing path, or an access list that could not be
+/// read, records a retry.
+///
+/// # Errors
+/// The `lstat`'s, other than a missing path.
+pub(crate) fn folder_in(glance: Option<&Glance>, dir: &Path) -> io::Result<Option<Meta>> {
+    if !aterm_uds::trace::armed() {
+        return lstat_in(glance, dir);
+    }
+    let looked = match glance {
+        Some(glance) => glance.folder(dir),
+        None => {
+            look_afresh();
+            aterm_uds::trace::unrecorded(|| lstat_now(dir))
+        }
+    };
+    match &looked {
+        Ok(meta) => match folder_digest(dir, meta.as_ref()) {
+            Some(digest) => aterm_uds::trace::standing(dir, Some(digest), folder_standing),
+            None => aterm_uds::trace::retry(format!(
+                "{}: its access list could not be read",
+                dir.display()
+            )),
+        },
+        Err(error) => aterm_uds::trace::retry(format!("{}: {error}", dir.display())),
+    }
+    looked
+}
+
+/// A trace's standing of a folder [`folder_in`] judged: the digest of what one `lstat` of `dir`
+/// shows now ([`folder_digest`]); `None` where it fails for any reason but a missing path.
+fn folder_standing(dir: &Path) -> Option<[u8; 32]> {
+    match look_at(dir) {
+        Ok(meta) => folder_digest(dir, Some(&meta)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => folder_digest(dir, None),
+        Err(_) => None,
+    }
+}
+
+/// The digest of what [`folder_in`]'s callers judge of the `lstat` `meta` of the folder `dir`: its
+/// kind, device, inode, owner, group and mode, or that nothing is there. Always `Some` here: the
+/// Windows arm's is `None` where it cannot read the folder's access list.
+#[cfg(unix)]
+fn folder_digest(_dir: &Path, meta: Option<&Meta>) -> Option<[u8; 32]> {
+    let fields = meta.map_or([0; 6], |meta| {
+        [
+            u128::from(kind_tag(kind_of(meta))),
+            u128::from(meta.dev()),
+            wide(meta.ino()),
+            u128::from(meta.uid()),
+            u128::from(meta.gid()),
+            u128::from(meta.mode()),
+        ]
+    });
+    Some(answer_digest(b'f', &fields))
+}
+
+/// The digest of what [`folder_in`]'s callers judge of the look `meta` of the folder `dir` on
+/// Windows: its kind, volume, file id and attributes, and its owner and access list
+/// ([`access_digest`], read now), or that nothing is there; `None` where the access list cannot be
+/// read.
+#[cfg(windows)]
+fn folder_digest(dir: &Path, meta: Option<&Meta>) -> Option<[u8; 32]> {
+    let Some(meta) = meta else {
+        return Some(answer_digest(b'f', &[0; 4]));
+    };
+    let (dev, ino) = id_of(meta);
+    let fields = answer_digest(
+        b'f',
+        &[
+            u128::from(kind_tag(kind_of(meta))),
+            u128::from(dev),
+            wide(ino),
+            u128::from(meta.attributes),
+        ],
+    );
+    let access = aterm_uds::trace::unrecorded(|| access_digest(dir)).ok()?;
+    let mut digest = aterm_digest::Sha256::new();
+    digest.update(fields);
+    digest.update(access);
+    Some(digest.finalize())
+}
+
+/// A [`Kind`] as a number a standing's digest holds.
+const fn kind_tag(kind: Kind) -> u64 {
+    match kind {
+        Kind::Missing => 0,
+        Kind::File => 1,
+        Kind::Symlink => 2,
+        Kind::Dir => 3,
+        Kind::Other => 4,
+    }
+}
+
+/// The digest of an answer of one of this module's looks that a trace's standing holds: `tag`
+/// names the look, `fields` the answer, each wide enough for a Windows file id ([`Ino`]).
+fn answer_digest(tag: u8, fields: &[u128]) -> [u8; 32] {
+    let mut digest = aterm_digest::Sha256::new();
+    digest.update([tag]);
+    for field in fields {
+        digest.update(field.to_le_bytes());
+    }
+    digest.finalize()
+}
+
+/// `ino` as a field of [`answer_digest`].
+#[cfg(unix)]
+fn wide(ino: Ino) -> u128 {
+    u128::from(ino)
+}
+
+/// `ino` as a field of [`answer_digest`]: already a 128-bit file id.
+#[cfg(windows)]
+const fn wide(ino: Ino) -> u128 {
+    ino
 }
 
 /// The SHA-256 of the file at `path` as [`read_private`] reads it, `None` where there is none,
@@ -1369,7 +1685,7 @@ impl Reader {
 
 /// The digest `reader` gives of the file at `path`, kept for that reader while one `lstat` of
 /// `path` ([`Seen`]) shows what it showed before the read that gave it, when the file the read
-/// opened was the one that `lstat` saw and had stood [`SETTLED_NS`] unchanged when that `lstat`
+/// opened was the one that `lstat` saw and had stood [`SETTLED`] unchanged when that `lstat`
 /// was taken: at the ask, or, where the caller's check looks through a glance, when the glance
 /// began, before it took any `lstat` ([`Glance`]), which may be well before the ask.
 ///
@@ -1435,7 +1751,7 @@ std::thread_local! {
 
 /// Run `f` with each digest this thread asks ([`digest_while_seen`]), and each glance it begins
 /// ([`Glance::new`]), asked `by` later than the clock: a test's files have stood settled
-/// ([`SETTLED_NS`]) without its waiting. Where `by` is not zero, the digests kept within it are
+/// ([`SETTLED`]) without its waiting. Where `by` is not zero, the digests kept within it are
 /// this thread's own ([`THREAD_DIGESTS`]), which no other thread's asks let go of. Another
 /// crate's tests ask it as `client::test_as_if_later`.
 #[cfg(any(test, debug_assertions))]
@@ -1452,21 +1768,16 @@ type KeptDigests =
     std::sync::Mutex<std::collections::VecDeque<(std::path::PathBuf, Reader, Seen, [u8; 32])>>;
 
 /// How long before a digest's witness was taken (its ask's `lstat`, or the start of the glance
-/// that took it) its file must have last changed for the digest to be kept. A change made after
-/// the witness then takes a later time on a clock that ticks this coarsely or finer
-/// (FAT's two seconds), so the file's [`Seen`] shows it, as git's index treats a file it stamped
-/// within its own tick as racily clean. Without it, a rewrite in place at the same length, or a
-/// new file given a freed inode, in one tick of a coarse clock would keep the stamp of the file
-/// it replaced.
-const SETTLED_NS: i128 = SETTLED.as_nanos() as i128;
+/// that took it) its file must have last changed for the digest to be kept: the settle window of
+/// `aterm_uds::trace`, whose rule ([`settled`]) this crate's kept digests and a trace's reads
+/// share. A measurement of quiet rounds waits it out, and a tenth of a second past it, after its
+/// fixture's last write (`client::test_settled_after`).
+pub(crate) const SETTLED: std::time::Duration = aterm_uds::trace::SETTLED;
 
-/// `SETTLED_NS` as a time to wait: a measurement of quiet rounds waits it out, and a tenth of a
-/// second past it, after its fixture's last write (`client::test_settled_after`).
-pub(crate) const SETTLED: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Whether what `seen` shows last changed [`SETTLED_NS`] or more before `now`, so that a change
-/// made after `now` moves a stamp a later `lstat` shows, on a clock that ticks this coarsely or
-/// finer. Only then may a reader keep what it read while the path's [`Seen`] stands.
+/// Whether what `seen` shows last changed [`SETTLED`] or more before `now` (`aterm_uds::trace`'s
+/// rule, `trace::settled`, over the later of its modification and inode-change times), so that a
+/// change made after `now` moves a stamp a later `lstat` shows, on a clock that ticks this
+/// coarsely or finer. Only then may a reader keep what it read while the path's [`Seen`] stands.
 pub(crate) fn settled(seen: &Seen, now: std::time::SystemTime) -> bool {
     stamp_settled(&seen.stamp, now)
 }
@@ -1477,16 +1788,13 @@ pub(crate) fn read_began() -> std::time::SystemTime {
     asked_now()
 }
 
-/// Whether the file whose stamp is `stamp` had stood [`SETTLED_NS`] unchanged at `began`, a time
-/// taken before its bytes were read: a write after that takes a later time on a clock that ticks
-/// this coarsely or finer, so no other bytes ever show this stamp. One taken within its file's
-/// own tick may later show other bytes, written in place at the same length.
+/// Whether the file whose stamp is `stamp` had stood [`SETTLED`] unchanged at `began`
+/// (`aterm_uds::trace::settled`), a time taken before its bytes were read: a write after that
+/// takes a later time on a clock that ticks this coarsely or finer, so no other bytes ever show
+/// this stamp. One taken within its file's own tick may later show other bytes, written in place
+/// at the same length.
 pub(crate) fn stamp_settled(stamp: &FileStamp, began: std::time::SystemTime) -> bool {
-    began
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|since| i128::try_from(since.as_nanos()).ok())
-        .is_some_and(|now| stamp.mtime_ns.max(stamp.ctime_ns) <= now - SETTLED_NS)
+    aterm_uds::trace::settled(stamp.mtime_ns.max(stamp.ctime_ns), began)
 }
 
 /// What one `lstat` each showed of a journal's folder and of the files a read of it reads
@@ -1598,7 +1906,7 @@ fn digest_while_seen_in(
 /// As [`stamp_if_present`].
 pub(crate) fn kind_and_stamp_if_present(path: &Path) -> crate::Result<Option<(Kind, FileStamp)>> {
     look_afresh();
-    match look_at(path) {
+    match look_traced(path) {
         Ok(meta) => Ok(Some((kind_of(&meta), FileStamp::of(&meta)))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(Error::new(format!("{}: {error}", path.display()))),
@@ -1648,6 +1956,7 @@ pub fn append_at_with(
         )));
     }
     let appended = open_append(path, expected).and_then(|mut file| {
+        wrote();
         {
             let mut exact = ExactWriter {
                 writer: &mut file,
@@ -1947,19 +2256,79 @@ pub enum Kind {
     Other,
 }
 
-/// What is at `path` (`lstat`).
+/// What is at `path` (`lstat`). With a trace scope armed, the kind is recorded as a standing of
+/// `path` ([`kind_standing`]), so a file written, or one renamed over it, moves nothing a replay
+/// looks at, and a failed `lstat` records a retry.
 pub fn kind(path: &Path) -> crate::Result<Kind> {
-    kind_and_id(path).map(|(kind, _)| kind)
+    let found = kind_and_id_now(path).map(|(kind, _)| kind);
+    if aterm_uds::trace::armed() {
+        match &found {
+            Ok(kind) => aterm_uds::trace::standing(path, Some(kind_digest(*kind)), kind_standing),
+            Err(error) => aterm_uds::trace::retry(error.to_string()),
+        }
+    }
+    found
 }
 
-/// What is at `path` (`lstat`), together with its `(device, inode)` when present.
+/// What is at `path` (`lstat`), together with its `(device, inode)` when present (on Windows its
+/// volume and 128-bit file id). With a trace scope armed, both are recorded as a standing of
+/// `path` ([`kind_and_id_standing`]), and a failed `lstat` records a retry.
 pub fn kind_and_id(path: &Path) -> crate::Result<(Kind, Option<(u64, Ino)>)> {
+    let found = kind_and_id_now(path);
+    record_kind_and_id(path, &found);
+    found
+}
+
+/// [`kind_and_id`]'s answer, with nothing recorded.
+fn kind_and_id_now(path: &Path) -> crate::Result<(Kind, Option<(u64, Ino)>)> {
     look_afresh();
     match look_at(path) {
         Ok(meta) => Ok((kind_of(&meta), Some(id_of(&meta)))),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((Kind::Missing, None)),
         Err(e) => Err(Error::new(format!("{}: {e}", path.display()))),
     }
+}
+
+/// Record, in a trace scope armed on this thread, that a run took `found`, [`kind_and_id`]'s
+/// answer for `path`: a standing of it, or a retry for a failed `lstat`.
+fn record_kind_and_id(path: &Path, found: &crate::Result<(Kind, Option<(u64, Ino)>)>) {
+    if aterm_uds::trace::armed() {
+        match found {
+            Ok(found) => aterm_uds::trace::standing(
+                path,
+                Some(kind_and_id_digest(*found)),
+                kind_and_id_standing,
+            ),
+            Err(error) => aterm_uds::trace::retry(error.to_string()),
+        }
+    }
+}
+
+/// A trace's standing of `path` as [`kind`] answers it now; `None` where its `lstat` fails.
+fn kind_standing(path: &Path) -> Option<[u8; 32]> {
+    kind_and_id_now(path)
+        .ok()
+        .map(|(kind, _)| kind_digest(kind))
+}
+
+/// A trace's standing of `path` as [`kind_and_id`] answers it now; `None` where its `lstat`
+/// fails.
+fn kind_and_id_standing(path: &Path) -> Option<[u8; 32]> {
+    kind_and_id_now(path).ok().map(kind_and_id_digest)
+}
+
+/// The digest of a [`kind`] answer.
+fn kind_digest(kind: Kind) -> [u8; 32] {
+    answer_digest(b'k', &[u128::from(kind_tag(kind))])
+}
+
+/// The digest of a [`kind_and_id`] answer.
+fn kind_and_id_digest((kind, id): (Kind, Option<(u64, Ino)>)) -> [u8; 32] {
+    let (dev, ino) = id.unwrap_or_default();
+    answer_digest(
+        b'i',
+        &[u128::from(kind_tag(kind)), u128::from(dev), wide(ino)],
+    )
 }
 
 #[cfg(unix)]
@@ -1976,10 +2345,13 @@ fn kind_of(meta: &std::fs::Metadata) -> Kind {
     }
 }
 
-/// Returns `(device, inode)` of `path` via `lstat`, or `None` if missing.
+/// Returns `(device, inode)` of `path` via `lstat` (on Windows its volume and 128-bit file id),
+/// or `None` if missing or it cannot be examined. With a trace scope armed, it records what
+/// [`kind_and_id`] records.
 pub fn file_id(path: &Path) -> Option<(u64, Ino)> {
-    look_afresh();
-    look_at(path).ok().map(|meta| id_of(&meta))
+    let found = kind_and_id_now(path);
+    record_kind_and_id(path, &found);
+    found.ok().and_then(|(_, id)| id)
 }
 
 /// Renames `from` to `to` without replacing an existing `to`.
@@ -2010,6 +2382,7 @@ enum Moved {
 #[cfg(unix)]
 fn link_then_unlink(from: &Path, to: &Path) -> Result<(), Moved> {
     std::fs::hard_link(from, to).map_err(Moved::NotLinked)?;
+    wrote();
     let Err(e) = std::fs::remove_file(from) else {
         return Ok(());
     };
@@ -2024,9 +2397,10 @@ fn link_then_unlink(from: &Path, to: &Path) -> Result<(), Moved> {
 
 /// [`rename_noreplace`] on Windows: one rename that refuses a taken name in the same step
 /// ([`win::rename_noreplace`]), so nothing is ever linked twice and no removal can fail apart.
+/// With a trace scope armed, a rename that moved the file records a write.
 #[cfg(windows)]
 fn link_then_unlink(from: &Path, to: &Path) -> Result<(), Moved> {
-    win::rename_noreplace(from, to)
+    win::rename_noreplace(from, to).inspect(|()| wrote())
 }
 
 /// Zeroes and removes a regular file at `path` (one this user cannot read stays), or unlinks a
@@ -2040,7 +2414,10 @@ pub fn wipe_and_remove(path: &Path) -> crate::Result<()> {
     #[cfg(windows)]
     let removed = win::remove_link(path);
     match removed {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            wrote();
+            Ok(())
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(Error::new(format!("{}: {e}", path.display()))),
     }
@@ -2063,11 +2440,14 @@ pub fn wipe_if(path: &Path, max: usize, ours: impl FnOnce(&[u8]) -> bool) -> cra
     })
 }
 
-/// [`wipe_if`]'s steps, with `judge` reading the file it opened.
+/// [`wipe_if`]'s steps, with `judge` reading the file it opened. With a trace scope armed, the
+/// file's stamp is recorded before its open, since `judge` decides by what it holds, and its
+/// removal as a write.
 fn wipe(
     path: &Path,
     judge: impl FnOnce(&mut File, &Meta) -> io::Result<bool>,
 ) -> crate::Result<bool> {
+    aterm_uds::trace::fs::opening(path);
     let at = |e: io::Error| Error::new(format!("{}: {e}", path.display()));
     #[cfg(unix)]
     let open = |write: bool| {
@@ -2102,6 +2482,7 @@ fn wipe(
     {
         return Ok(false);
     }
+    wrote();
     match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -2330,3 +2711,9 @@ pub(crate) fn as_another_user<T>(f: impl FnOnce() -> T) -> T {
 #[cfg(test)]
 #[path = "fsx_tests.rs"]
 mod tests;
+
+/// The trace's laws of this module, on both arms: what a read, a look, a walk and a write record,
+/// where a Unix mode and a Windows access list each stand for who may use a file.
+#[cfg(test)]
+#[path = "fsx_trace_tests.rs"]
+mod trace_tests;

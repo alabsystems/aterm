@@ -4,18 +4,22 @@
 //! SHARED FILES, aterm-db's side (docs/DESIGN-shared-files-2026-11-11.md): which files this
 //! build compiles and the collections they project ([`types`]), the materializer that writes
 //! their snapshots and faces from this Mac's replica ([`materialize`]): the registry's owner
-//! files, the journal ring's Mac files, and the views folded from them ([`limits`]); the
+//! files, `lab/tracker`'s logs, the journal ring's Mac files, and the views folded from them
+//! ([`limits`]); the
 //! publisher that
 //! signs the writes this Mac queued ([`publish`]), the write verbs that queue them (`write`,
 //! private to this module, and clippy.toml lets only [`command::main_entry`] and
 //! [`rename`], a rename of this Mac asked for by name, run them, so an owner act is made
-//! only by a verb a person or a program ran by name), and `aterm file` ([`command`]).
+//! only by a verb a person or a program ran by name), the commit that reads a face back as
+//! writes (`face`, which only the `commit` and `edit` verbs run), and `aterm file`
+//! ([`command`]).
 //!
 //! Reading a shared file is `aterm_file::File::read`, in a crate that cannot reach this one: it
 //! answers from the snapshot whatever this Mac's custody is doing. Only the materializer here
 //! opens custody, and it turns every refusal into a state word rather than an error.
 
 pub mod command;
+mod face;
 pub(crate) mod growth;
 pub mod limits;
 pub mod materialize;
@@ -24,8 +28,8 @@ pub mod types;
 mod write;
 
 pub use types::{
-    ACCOUNTS, Class, Computed, EVENTS, FILES, Fold, LIMITS, LINKS, LOGINS, MACHINES, Store, Type,
-    USAGE, find,
+    ACCOUNTS, Class, Computed, EVENTS, FILES, Fold, LIMITS, LINKS, LOGINS, MACHINES, MEASURES,
+    NOTES, Store, Type, USAGE, find,
 };
 
 use crate::typed::keys;
@@ -407,8 +411,9 @@ pub fn root(paths: &Paths) -> aterm_file::Root {
     aterm_file::Root::for_home(&paths.home)
 }
 
-/// Seams another crate's tests take a stand-in lab's home through: a writer succession its
-/// strict readers refuse while a shared file still answers. Absent from release builds.
+/// Seams another crate's tests take a stand-in lab's home through: a table family declared with
+/// no row written, and a writer succession its strict readers refuse while a shared file still
+/// answers. Absent from release builds.
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub mod fixture {
@@ -420,6 +425,22 @@ pub mod fixture {
     /// records `held` (`succession`).
     pub fn fence_pending(paths: &Paths, bootstrap: &Bootstrap) {
         crate::generation::file_seams::fence_pending(paths, bootstrap);
+    }
+
+    /// Declare `compiled` in the catalog of the Mac whose home is `paths` and enroll it, writing
+    /// no row of it: what a lab whose Macs have not written `lab/tracker` yet still needs for
+    /// every file to read `live`.
+    ///
+    /// # Panics
+    /// The table could not be declared.
+    pub fn declare(paths: &Paths, compiled: &'static crate::att::Compiled) {
+        crate::documents::application::with_store(
+            paths,
+            true,
+            |bootstrap| compiled.descriptor(bootstrap.trust()),
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
     }
 }
 
@@ -438,4 +459,4 @@ mod model_read_tests;
 #[cfg(test)]
 pub(crate) mod model_tests;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -11,15 +11,19 @@
 //! over the words under it for the road's glow; the chevron and the words are drawn as lines and
 //! text in the brand face ([`TextFace::Brand`]: SF Mono as the design sets it, `aterm` bold, the
 //! separator and `ALab` medium and quieter, as heavy as the approved render reads, each
-//! character 0.3 units apart as the design spaces them), the road and the cat as two baked images, so a pose change never rebakes the road. Serious Mode
-//! and High Contrast draw the words alone in the terminal's mono face, a caret after them and a
-//! plain capsule the one progress. One paint-only node; VoiceOver hears it as the page's
-//! progress indicator.
+//! character 0.3 units apart as the design spaces them), the road and the cat as two baked
+//! images. Each step of the run rebakes the road, whose ribbon runs to just past the cat, and the
+//! cat only where its pose or its lean in whole degrees changes; a pose change between steps
+//! rebakes only the cat, unless it is to or from the loaf, which comes with the done road.
+//! Serious Mode and High Contrast draw the words alone in the terminal's mono face, a caret
+//! after them and a plain capsule the one progress. One paint-only node; VoiceOver hears it as
+//! the page's progress indicator.
 //!
 //! The images are never baked where they are drawn: the view asks [`super::prebake`] for the
 //! moment it wants, and until that moment's images are kept it paints the road and the cat it
-//! last painted, as they were baked (their width and scale), clipped to the node; with none, the
-//! words alone ([`LockupSpec::paint`]).
+//! last painted, as they were baked (their width and scale), clipped to the node, where they
+//! were laid out after the same words at the same size on the same ground (so the road starts
+//! where these words end); else the words alone ([`LockupSpec::paint`]).
 
 use aterm_effects::rainbow_road::{self as design, CatArt, CatPose, RoadArt};
 
@@ -46,8 +50,9 @@ const LETTER_SPACING: f32 = 0.3;
 /// What a lockup node draws, from its value.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct LockupSpec {
-    /// The road and the cat show (not Serious Mode, not High Contrast).
-    pub(crate) kitty: bool,
+    /// The road and the cat show after the words (not in Serious Mode, under High Contrast or in
+    /// a pane too narrow for the road).
+    pub(crate) road: bool,
     /// The words' size.
     pub(crate) px: f32,
     /// The display's device pixels per point.
@@ -164,7 +169,7 @@ impl LockupPaint {
         };
         format!(
             "paint-lockup key={key:?} road={} drawn={drawn} pending={}",
-            paint.spec.kitty, paint.pending
+            paint.spec.road, paint.pending
         )
     }
 }
@@ -178,7 +183,7 @@ impl LockupSpec {
             .unwrap_or(0);
         format!(
             "{},{},{},{},{},{},{},{}",
-            if self.kitty { "kitty" } else { "text" },
+            if self.road { "road" } else { "text" },
             self.px,
             self.scale,
             u8::from(self.alab),
@@ -191,7 +196,7 @@ impl LockupSpec {
 
     fn parse(value: Option<&str>) -> Self {
         let mut parts = value.unwrap_or_default().split(',');
-        let kitty = parts.next() == Some("kitty");
+        let road = parts.next() == Some("road");
         let number = |part: Option<&str>, fallback: f32| {
             part.and_then(|part| part.parse::<f32>().ok())
                 .filter(|value| value.is_finite() && *value > 0.0)
@@ -210,7 +215,7 @@ impl LockupSpec {
             .and_then(|at| CatPose::ALL.get(at).copied())
             .unwrap_or(CatPose::ALL[0]);
         Self {
-            kitty,
+            road,
             px,
             scale,
             alab,
@@ -264,7 +269,7 @@ impl LockupSpec {
     /// The height a lockup needs: the design's whole box under its headroom with the road, else
     /// the words.
     pub(crate) fn needed_height(self) -> f32 {
-        if self.kitty {
+        if self.road {
             (design::DESIGN_H + design::HEADROOM) * self.unit()
         } else {
             self.px * 1.3
@@ -312,7 +317,7 @@ impl LockupSpec {
     /// Where the words end, from the node's left edge: with the road, after the chevron's
     /// room, each run in its own weight.
     fn words_end(self) -> f32 {
-        if !self.kitty {
+        if !self.road {
             let words =
                 crate::tray_raster::measure_text(self.words(), self.px, TextWeight::Regular);
             return self.advance() * 2.0 + words;
@@ -333,7 +338,7 @@ impl LockupSpec {
     /// The least width that draws it whole: the words and the least road (or the caret and
     /// the capsule's least length).
     pub(crate) fn least_width(self) -> f32 {
-        if self.kitty {
+        if self.road {
             (self.road_x() + design::LEAST_LENGTH * self.unit()).ceil()
         } else {
             let advance = self.advance();
@@ -398,17 +403,27 @@ impl LockupSpec {
     }
 
     /// What a view paints for this moment in a lockup `width` wide, having last painted `last`'s
-    /// images: this moment's own once both are kept, else `last`'s while they are (on the same
-    /// ground; their width and scale as baked), else none, the words alone until a bake lands.
-    /// It never bakes: the view asks [`super::prebake::prewarm`] for this moment's
+    /// images: this moment's own once both are kept, else `last`'s while they are and were laid
+    /// out after these words at this size on this ground (their width and scale as baked), else
+    /// none, the words alone until a bake lands. Laid out after other words (`aterm` became
+    /// `aterm · ALab` mid-run) or at another size (a resize past a size step), the last road
+    /// starts where those words ended and would lie over these or stand apart from them. It
+    /// never bakes: the view asks [`super::prebake::Requester::want`] for this moment's
     /// ([`Self::wanted`]) and is woken when they land.
     pub(crate) fn paint(self, width: f32, last: Option<Baked>) -> LockupPaint {
         let wanted = self.wanted(width);
-        let images = if self.kitty {
+        let images = if self.road {
             if wanted.ready() {
                 Some(wanted)
             } else {
-                last.filter(|last| last.spec.kitty && last.spec.dark == self.dark && last.ready())
+                last.filter(|last| {
+                    let laid = last.spec;
+                    laid.road
+                        && laid.dark == self.dark
+                        && laid.alab == self.alab
+                        && laid.px == self.px
+                        && last.ready()
+                })
             }
         } else {
             None
@@ -416,7 +431,7 @@ impl LockupSpec {
         LockupPaint {
             spec: self,
             images,
-            pending: self.kitty && images != Some(wanted),
+            pending: self.road && images != Some(wanted),
         }
     }
 
@@ -446,7 +461,7 @@ pub(crate) fn paint_lockup(
         if dark { TEAL_DARK } else { TEAL_LIGHT },
         page,
     );
-    if paint.spec.kitty {
+    if paint.spec.road {
         paint_road(prims, rect, paint, dark, teal, roles);
     } else {
         paint_words_alone(prims, rect, paint.spec, teal, roles);

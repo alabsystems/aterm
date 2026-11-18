@@ -1203,13 +1203,17 @@ fn the_left_door_reads_only_a_fresh_view() {
         ..LeftView::default()
     };
     let held = || {
+        let observed_at =
+            crate::vitals_host::memory::ObservedAt::capture(std::time::Instant::now, || Some(0));
         Some(crate::sys_host::Held {
+            processes: None,
             snap: Arc::new(aterm_vitals::model::Snapshot {
                 left: Some(Arc::new(empty.clone())),
                 ..aterm_vitals::model::Snapshot::default()
             }),
             unix_ms: 0,
-            at: std::time::Instant::now(),
+            at: observed_at.instant,
+            observed_at,
             jobs_at: None,
             left_at: None,
         })

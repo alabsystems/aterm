@@ -130,6 +130,7 @@ fn world(family: &'static str, tabs: u64) -> World {
         },
         tabs: (1..=tabs)
             .map(|k| TabFact {
+                sampled_nonce: None,
                 key: k,
                 sid: format!("s-{k}"),
                 window: Some(1),
@@ -462,6 +463,84 @@ fn a_scoped_caller_sees_its_own_tabs_coalition() {
         lines(&hidden, "who").is_empty(),
         "an unswept member has no proved tab: {hidden}"
     );
+}
+
+#[test]
+fn sys_names_memory_holders_show_the_idle_heavy_child_and_keep_scoped_privacy() {
+    let mut scene = calm_1510();
+    let shell_birth = USERSPACE_MS + 210_000;
+    let child_birth = shell_birth + 1000;
+    scene.coalitions.push(Coal {
+        started: 2,
+        footprint: Some((8 << 30) + 4096),
+        ..Coal::new(7000, 0)
+    });
+    scene.procs.extend([
+        Proc::new(7001, 1200, 501, 7000, shell_birth, "sh", 0).holding(0),
+        Proc::new(7002, 7001, 501, 7000, child_birth, "memory-worker", 0).holding(8 << 30),
+    ]);
+    scene.leads.push(LeadIdentity {
+        pid: 7001,
+        birth_ms: shell_birth,
+        exe: "sh".into(),
+        ..LeadIdentity::default()
+    });
+    let snapshot = read(&scene, 3);
+    let w = mac();
+    for owner in [true, false] {
+        let context = ctx(&w, &snapshot, owner);
+        let text = why("why mem top=64", &context);
+        let row = lines(&text, "who")
+            .into_iter()
+            .find(|line| line.starts_with("who coalition=7000 "))
+            .expect("tab's complete current coalition");
+        assert_eq!(field(row, "pid"), 7001, "the label remains the lead");
+        assert_eq!(field(row, "fp_bytes"), (8 << 30) + 4096);
+        assert!(row.contains(" fp_bytes_scope=coalition "), "{row}");
+        assert!(
+            row.contains(" members=7002:memory-worker:8589934592,7001:sh:0 "),
+            "the CPU-idle child, not the old shell, holds the memory: {row}"
+        );
+        assert!(row.contains(" members_coverage=complete "), "{row}");
+
+        let json = render_json(&q("why mem top=64 --json"), &context);
+        assert!(contract_violations(&json).is_empty(), "{}", json.to_text());
+        let Some(Jv::Arr(rows)) = json.get("who") else {
+            panic!("no who rows: {}", json.to_text());
+        };
+        let row = rows
+            .iter()
+            .find(|row| row.get("coalition") == Some(&Jv::u(7000)))
+            .unwrap();
+        assert_eq!(row.get("fp_bytes_scope"), Some(&Jv::s("coalition")));
+        let members = row.get("members").unwrap();
+        assert_eq!(members.get("basis"), Some(&Jv::s("observed_readable")));
+        assert_eq!(members.get("coverage"), Some(&Jv::s("complete")));
+        let Some(Jv::Arr(top)) = members.get("top") else {
+            panic!("no observed members: {}", members.to_text());
+        };
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].get("pid"), Some(&Jv::u(7002)));
+        assert_eq!(top[0].get("exe"), Some(&Jv::s("memory-worker")));
+        assert_eq!(top[0].get("fp_bytes"), Some(&Jv::u(8 << 30)));
+        assert_eq!(top[0].get("start"), Some(&Jv::Int(child_birth)));
+        assert_eq!(top[0].get("birth_ms"), Some(&Jv::Int(child_birth)));
+        assert_eq!(top[0].get("version"), Some(&Jv::why("not_sampled")));
+        assert_eq!(top[0].get("at_ns"), Some(&Jv::why("not_sampled")));
+    }
+
+    let mut other = world("macOS", 2);
+    other.target.key = 2;
+    other.target.tab = Some(2);
+    other.target.panes = vec![2];
+    let context = ctx(&other, &snapshot, false);
+    for rendered in [
+        why("why mem top=64", &context),
+        render_json(&q("why mem top=64 --json"), &context).to_text(),
+    ] {
+        assert!(!rendered.contains("memory-worker"), "{rendered}");
+        assert!(!rendered.contains("7002"), "{rendered}");
+    }
 }
 
 #[test]
@@ -949,7 +1028,7 @@ fn a_memory_role_that_turns_on_an_unread_part_keeps_the_tabs_footprint() {
         let t = why("why mem", &c);
         assert_eq!(
             lines(&t, "you"),
-            ["you tab=1 role=unavailable(lane_off:coalitions) fp_bytes=4311744512"],
+            ["you tab=1 sid=s-1 role=unavailable(lane_off:coalitions) fp_bytes=4311744512"],
             "{t}"
         );
         assert!(
@@ -976,7 +1055,7 @@ fn a_memory_role_that_turns_on_an_unread_part_keeps_the_tabs_footprint() {
     let t = why("why mem", &ctx(&mac(), &s, true));
     assert_eq!(
         lines(&t, "you"),
-        ["you tab=1 role=main fp_bytes=4311744512"],
+        ["you tab=1 sid=s-1 role=main fp_bytes=4311744512"],
         "CONTROL: every part read: {t}"
     );
     assert!(

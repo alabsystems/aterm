@@ -251,8 +251,8 @@ pub(crate) enum Mutant {
     /// The bridge pipelines a sender's posts on the `Hello`'s offer of the fence alone and
     /// never asks for it (`Bridge::ask_gap_fences`), so the broker does not fence its link.
     NeverAskForTheFence,
-    /// A post goes out though an answer read since its drain reached it held its sender
-    /// (`Bridge::unsendable`).
+    /// A post goes out, or is journaled, though an answer read since its drain reached it, or
+    /// a group append the disk refused since, held its sender (`Bridge::held_behind`).
     SendPastAHeldSender,
     /// A post the broker's rate limit refused is retired at the door, as one refused for good
     /// (`Bridge::post_refused`, critic item E06): it is lost.
@@ -312,10 +312,10 @@ pub(crate) enum Mutant {
     DropTheLinkAtAHeldOwnRecord,
     /// The inbox commit passes a held own record (`Bridge::inbox_commit_floor`).
     CommitPastAHeldOwnRecord,
-    /// A held own record a session's refill read ahead of the inbox group's live tail is
-    /// accounted against the inbox commit once delivered, as every build before
-    /// ATERM-KI-1116-4504 accounted it (`Bridge::deliver_held`): the commit passes the node's
-    /// other mail the tail has yet to take.
+    /// A held own record a session's refill read ahead of the inbox group's live tail is marked
+    /// as the tail's (`Bridge::hold_record`) and so accounted against the inbox commit once
+    /// delivered, as every build before ATERM-KI-1116-4504 accounted it: the commit passes the
+    /// node's other mail the tail has yet to take.
     HeldRefillAccounted,
     /// The mirror's floor is trusted as it reads.
     TrustTheFloorThatReads,
@@ -358,6 +358,51 @@ pub(crate) enum Mutant {
     /// asking, asking-with-write-errors, asking-with-fetches or keyed lossy worlds reaches it on
     /// this build.
     RetryPastAnUnhandedLanding,
+    /// A retry at a pin takes no copy of its standing entry's landing that the inbox's reader
+    /// has yet to read (`Bridge::unhanded_landing` answers no `Unhanded::Unread`): a record
+    /// astream streamed to that reader before a cut, not yet pushed into the mailbox, is in
+    /// neither place the retry looks, so it reads back, finds none past the cut and publishes
+    /// again, and the reader is handed both, as every build before ATERM-KI-1115-1149 did. Its
+    /// witness is a real broker's, a frame held between it and the reader
+    /// (`bridge::tests::a_retry_waits_for_the_inbox_reader_to_pass_its_landing`): a world's
+    /// tails send no mark, so its inbox reader is unmarked (`Fx::tail_marks`) and no world's
+    /// retry waits.
+    RetryPastAnUnreadInboxRecord,
+    /// The waits for the inbox's reader take it as marked only once a mark came to it
+    /// (`Mailbox::inbox_marked`, read by `Bridge::unhanded_landing` and `Bridge::answer_queued`),
+    /// not from what its subscription negotiated (`Bridge::tail_marks`), as the first cut of
+    /// ATERM-KI-1115-1149's sweep did: every attach resets the face, and a resubscribed group
+    /// delivers its backlog before its catch-up mark, so a retry or the sweep in that backlog
+    /// publishes past a record still on its way in. Its witnesses are a real broker's, a frame
+    /// held between it and the reader
+    /// (`bridge::tests::a_retry_waits_for_the_inbox_reader_to_pass_its_landing`), and the
+    /// reader played at the mailbox's own doors
+    /// (`bridge::tests::the_sweep_waits_for_the_inbox_reader_to_pass_what_a_cut_gave_up`'s
+    /// backlog arm); no world's reader is marked.
+    UnreadOnlyOnceMarked,
+    /// The inbox's reader is taken as marked whatever its broker answered idle marks
+    /// (`Bridge::tail_marks`), as the first cut of ATERM-KI-1115-1149's retry took every reader:
+    /// on a broker that declines them, a retry waits for a reader that, its node quiet, never
+    /// passes the offset, and the sender is held for good. Its witness is a real broker's
+    /// behind one that refuses `IdleMarks`
+    /// (`bridge::tests::a_retry_waits_for_the_inbox_reader_to_pass_its_landing`'s unmarked arm).
+    UnmarkedTailTakenAsMarked,
+    /// A gap notice reads the inbox face to the end of its range (`Mailbox::push_gap`,
+    /// `Mailbox::gaps_pass_their_range`), as the first cut of ATERM-KI-1115-1149 did: astream
+    /// delivers a record retention still holds inside the range after the notice, so a retry
+    /// waiting for it takes the notice for its passing, publishes again, and the reader is
+    /// handed both. Its witness is a real broker's, a frame held between it and the reader
+    /// (`bridge::tests::a_retry_waits_for_the_inbox_reader_to_pass_its_landing`'s gap arms);
+    /// no world's reader is marked.
+    GapPassesItsRange,
+    /// A keyed re-post's own attempt's unread copy (`PinLanding::Unread`) answers before its
+    /// key's winner is read (`Bridge::keyed_repost_landed`), as the first cut of
+    /// ATERM-KI-1115-1149 did: a winner the attach's replay landed at the entry's offset, which
+    /// the inbox's reader has not read past, holds the re-post in a wait where the winner's
+    /// read settles it at once. Its witness is the reader played at the mailbox's own doors
+    /// (`bridge::tests::a_keyed_reposts_unread_landing_settles_at_a_winner_read_there`);
+    /// no world's reader is marked.
+    KeyedUnreadCutsOffItsWinner,
     /// A read back before a republish goes on at the floor (`transport::fetch_kept`), never
     /// told: a record retention still holds below its subject's oldest is missed.
     ReadBackWithoutTheHeld,
@@ -429,11 +474,202 @@ pub(crate) enum Mutant {
     /// The deadline sweep publishes `expired` for every ask whose deadline passed, reading
     /// nothing of the asker's lane (`Bridge::settled_on_bus`): an answered ask expires.
     SweepIgnoresAnswers,
+    /// The deadline sweep trusts the read of the asker's lane it made before it published
+    /// `expired` (`Bridge::answered_below` reads nothing below it), as every build before
+    /// ATERM-KI-1115-7889: an answer another node's bridge landed between the read and the
+    /// `expired`, below it, leaves the `expired` the ask's verdict, said `expired re=<ask>` on
+    /// the asker's `ev` and journaled `expired=<e>`. Delivery in lane order still makes it moot
+    /// behind the answer (`Bridge::late_answer`); with `LateByTheExpiryAlone` too, as every
+    /// build before, the answer is handed `late=1`, then the `expired`. Its witness is a real
+    /// broker's, the answer landed by a test's seam between the two
+    /// (`bridge::tests::an_answer_landing_between_the_sweeps_read_and_its_expired_is_the_verdict`):
+    /// the simulator runs one node, and a bridge step is atomic there.
+    SweepTrustsItsPreRead,
+    /// The fence takes an answer this bridge alone holds below an `expired`, queued in the
+    /// mailbox or held in hand, for one the bus holds (`Bridge::answered_below`), as the first
+    /// cut of ATERM-KI-1115-7889 took it: the `expired` is journaled moot and its deadline
+    /// dropped, and once a reconnect's reset of the mailbox loses that answer (a cut gave it up
+    /// on the bus), the asker is handed neither it nor the `expired`. Its witness is a real
+    /// broker's
+    /// (`bridge::tests::an_expired_behind_an_answer_only_in_hand_is_handed_once_that_answer_is_lost`).
+    FenceSettlesOnAnAnswerInHand,
+    /// The fence behind this node's `expired` reads no answer held in hand behind an own record
+    /// of the asker's lane (`Bridge::answered_below` reads no `Bridge::held_own`): an `expired`
+    /// the attach's replay lands above an answer held across the link drop, a cut having taken
+    /// it off the bus, is said `expired re=<ask>` and journaled `expired=<e>`, the ask's
+    /// verdict, before that answer is delivered (whose delivery then makes it moot). At the
+    /// sweep the read finds nothing the sweep's own did not (`SweepPastAHeldAnswer`'s). Its
+    /// witness is a real broker's
+    /// (`bridge::tests::an_expired_the_replay_lands_above_an_answer_held_in_hand_is_left_unjudged`).
+    FenceBlindToAHeldAnswer,
+    /// This node's `expired` that no bridge remembers judged is handed unread
+    /// (`Bridge::expiry_stands`), as every build before ATERM-KI-1115-7889 handed it: a bridge
+    /// after the one that published it (killed before its asks journal named the verdict, or
+    /// whose fence read failed) hands an `expired` its ask's answer lies below. Its witness is
+    /// a real broker's
+    /// (`bridge::tests::a_successor_hands_no_moot_expired_with_or_without_the_journals_verdict`).
+    DeliverAnUnjudgedExpiry,
+    /// A later copy of an `expired` whose ask's kept verdict is moot is judged by its own fence
+    /// alone (`Bridge::remember_verdict` keeps no earlier copy's moot verdict for it), as the
+    /// first cut of ATERM-KI-1115-7889 judged it: past a cut that gave the answer and the first
+    /// copy up, a copy the attach's replay lands again from an entry that names no head (an
+    /// older build's, published at its pin unread) finds no answer below it, is said and kept
+    /// the ask's verdict, and is handed, and fetched, after the answer the asker holds. Its
+    /// witness is a real broker's
+    /// (`bridge::tests::a_copy_of_an_expired_behind_a_kept_moot_verdict_is_never_handed`'s
+    /// headless arm).
+    CopyJudgedPastAKeptMoot,
+    /// A copy of an `expired` above its ask's kept moot verdict reads its fence at each delivery
+    /// and fetch (`Bridge::expiry_stands` passes `Bridge::kept_moot_below` by), the kept verdict
+    /// then turning it moot (`Bridge::remember_verdict`): past the cut that gave the answer up
+    /// the read is a told one, so while the told reader is refused at the broker's connection
+    /// cap the copy is held unjudged, its session's later mail behind it, and fetched
+    /// `err=unsettled`, and each read that goes says `expired-moot` again. Its witness is a real
+    /// broker's
+    /// (`bridge::tests::a_copy_of_an_expired_behind_a_kept_moot_verdict_is_never_handed`'s
+    /// headless-read arm).
+    CopyReadPastAKeptMoot,
+    /// The attach's replay reads no kept moot verdict of the ask before it publishes again an
+    /// `expired` it read back nowhere (`Bridge::expiry_moot`): past a cut that gave the answer
+    /// and the first copy up, nothing on the lane says the ask settled, so the copy is published
+    /// again, a record on the bus that raw readers of the lane see. The kept verdict still keeps
+    /// it from being handed (`Bridge::remember_verdict`), and with `CopyJudgedPastAKeptMoot` too
+    /// it is handed. Its witness is a real broker's
+    /// (`bridge::tests::a_copy_of_an_expired_behind_a_kept_moot_verdict_is_never_handed`'s
+    /// headed arm).
+    ReplayBlindToAKeptMoot,
+    /// The attach's replay lands an `expired` again unfenced (`Bridge::replay_in_flight`): no
+    /// read of the lane below where it lands judges it, so nothing says it moot on the asker's
+    /// `ev` or in the asks journal, and the ask's deadline stands, until its delivery judges it
+    /// (`Bridge::expiry_stands`). Its witness is a real broker's, the answer landed by a test's
+    /// seam between the replay's read and its publish
+    /// (`bridge::tests::an_expired_the_replay_lands_again_is_fenced_as_the_sweeps_is`).
+    ReplayLandsUnfenced,
+    /// A delivery whose read of the asker's lane, judging an answer or this node's `expired`,
+    /// fails with the link standing (the told reader's dial, refused at the broker's connection
+    /// cap) drops the link (`Bridge::deliver_record`), as the first cut of ATERM-KI-1115-7889
+    /// did: the attach offers the record again to the same failure, and every session's mail on
+    /// the node waits while it lasts. Its witness is a real broker's
+    /// (`bridge::tests::a_fence_whose_told_read_cannot_be_dialled_holds_its_record_for_its_session_alone`).
+    DropTheLinkAtAnUnreadFence,
+    /// A record held unjudged (`Bridge::judge_waits`) is tried again at every delivery of held
+    /// records (`Bridge::deliver_held`), not at the held back-off's next try alone, and the pass
+    /// stops at it (with no wait to pass it by, it would be picked again): while the told reader
+    /// is refused at the broker's connection cap, every pass of the loop dials it again. Its
+    /// witness is a real broker's, the dials counted
+    /// (`bridge::tests::a_fence_whose_told_read_cannot_be_dialled_holds_its_record_for_its_session_alone`).
+    JudgeAtEveryPass,
+    /// A delivery of held records (`Bridge::deliver_held`) stops at a release held again
+    /// unjudged, as at any record held again: another session's record the same try freed (its
+    /// entry ended at that try's drain) waits for a later pass, the next mailbox record or the
+    /// roster's refresh, and every try repeats it while the judging read fails. Its witness is a
+    /// real broker's
+    /// (`bridge::tests::a_release_held_unjudged_again_lets_another_sessions_held_mail_go`).
+    StopAtAnUnjudgedRelease,
+    /// A record held unjudged keeps its wait once what it waited on is decided
+    /// (`Bridge::lift_judge_waits_on` lifts nothing): an `expired` that waited behind an answer
+    /// in hand, made moot by that answer's delivery, stays held until the held back-off's next
+    /// try, its session's later mail behind it; one that waited behind an answer's pipelined
+    /// line aterm refused stays held the same. Its witnesses are a real broker's
+    /// (`bridge::tests::an_expired_behind_an_answer_in_hand_waits_and_is_moot_once_the_answer_is_taken`,
+    /// `bridge::tests::an_expired_in_its_answers_run_waits_for_aterm_to_take_the_answer`'s
+    /// refused arm).
+    KeepTheWaitPastItsVerdict,
+    /// This node's `expired` whose fence finds only an answer this bridge holds in hand below it
+    /// (`Fenced::InHand`) is handed, and fetched, at once (`Bridge::expiry_stands`), ahead of
+    /// that answer, which then makes moot an `expired` the asker holds. Its witness is a real
+    /// broker's
+    /// (`bridge::tests::an_expired_behind_an_answer_in_hand_waits_and_is_moot_once_the_answer_is_taken`).
+    HandPastAnAnswerInHand,
+    /// An answer's delivery makes the `expired` above it moot at once, remembered, said and
+    /// journaled before aterm has taken the answer (`Bridge::late_answer`), as the first cut of
+    /// the ATERM-KI-1115-7889 review made it: where a cut took the answer off the bus and its
+    /// hand-off then fails (a refused write of the records told aterm, which drops the link; a
+    /// lost lane under which aterm took nothing, the next bridge restoring the moot from the
+    /// journal), the answer is gone, the
+    /// `expired` is moot, and the asker is handed neither. Its witness is a real broker's
+    /// (`bridge::tests::an_answer_aterm_does_not_take_leaves_its_expired_to_be_handed`).
+    MootBeforeTheAnswerIsTaken,
+    /// This node's `expired` is judged by its fence while an answer below it waits on aterm's
+    /// reply to its pipelined line (`Bridge::moots_in_flight`, `Bridge::expiry_stands`): the run
+    /// took the answer out of the mailbox and a cut off the bus, so the fence finds nothing,
+    /// the `expired` is judged the ask's verdict and handed after the answer aterm then takes.
+    /// Its witness is a real broker's
+    /// (`bridge::tests::an_expired_in_its_answers_run_waits_for_aterm_to_take_the_answer`).
+    JudgePastAMootInFlight,
+    /// A pipelined row aterm did not take keeps the moot its answer made of the `expired` above
+    /// it (`Bridge::send_rows` ends no hand-off it did not see taken): where the disk refused
+    /// the records told aterm (the batch never goes, the link drops) or aterm refused the
+    /// answer's line, the moot stays in flight (`Bridge::moots_in_flight`, which no reconnect
+    /// clears), so the `expired` waits in hand at every judgment and is never handed, its
+    /// session's later mail behind it. Its witness is a real broker's
+    /// (`bridge::tests::an_expired_in_its_answers_run_waits_for_aterm_to_take_the_answer`'s told
+    /// and refused arms).
+    KeepTheMootOfAnUntakenRow,
+    /// An answer is delivered `late=1` wherever an `expired` of its ask stands remembered, below
+    /// it on the lane or above it, and makes no `expired` above it moot (`Bridge::late_answer`),
+    /// as every build before ATERM-KI-1115-7889 read it: an answer the inbox's reader brings in
+    /// below an `expired` the fence could not see it under (retention gave it up on the bus,
+    /// unread) is handed late, and the `expired` after it. Its witnesses are a real broker's
+    /// (`bridge::tests::an_answer_queued_below_the_expired_and_cut_off_the_bus_is_the_verdict`,
+    /// `bridge::tests::the_sweep_leaves_an_answer_held_behind_an_own_record_to_its_delivery`).
+    LateByTheExpiryAlone,
     /// The deadline sweep reads the asker's lane on the bus alone, not the inbox records the
     /// mailbox holds read and not yet handled (`Bridge::answer_queued`), as every build before
-    /// ATERM-KI-1114-2241: an answer pumped before a cut gave it up expires its ask, and is then
-    /// handed to the asker after the `expired`.
+    /// ATERM-KI-1114-2241: for an answer pumped before a cut gave it up on the bus, the sweep
+    /// publishes an `expired` above it and drops the deadline, which breaks the sim's deadline
+    /// law (seed 2241). The fence behind the `expired` then finds the answer in hand and leaves
+    /// it unjudged (`Bridge::answered_below`), and the answer's delivery makes it moot; before
+    /// ATERM-KI-1115-7889 the asker was handed the `expired`, then the answer `late=1`.
     SweepIgnoresQueuedAnswers,
+    /// The deadline sweep takes no answer the inbox's reader may still bring in
+    /// (`Bridge::answer_queued` with the range its read was told retention gave up): an answer
+    /// astream streamed to that reader before a cut, not yet pushed, is neither queued nor on
+    /// the bus, so the sweep publishes `expired` and the asker is handed the answer after it,
+    /// as every build before ATERM-KI-1115-1149. Its witness plays the inbox's reader at the
+    /// mailbox's own doors, on a real broker's lane, no frame held
+    /// (`bridge::tests::the_sweep_waits_for_the_inbox_reader_to_pass_what_a_cut_gave_up`:
+    /// `Mailbox::reader_starts`, `push_mark` and `push` called as the reader calls them): the
+    /// simulator's tails send no mark, so its inbox reader is unmarked (`Fx::tail_marks`) and
+    /// no world's sweep waits.
+    SweepPastAnUnreadAnswer,
+    /// The deadline sweep's wait for the inbox's reader takes no range its read of the lane was
+    /// told only that retention may have given up (`Bridge::settled_on_bus`, an uncounted gap
+    /// notice: astream's ledger does not name every record of it, as after a rules change, a
+    /// compaction no rules planned, or for a class kept by last value), as the first cut of
+    /// ATERM-KI-1115-1149 did: an answer retention gave up there, streamed to the reader and
+    /// not yet pushed, is expired over. Its witness plays the reader at the mailbox's own doors
+    /// on a real broker whose rules keep the lane's answers by last value
+    /// (`bridge::tests::the_sweep_waits_for_the_inbox_reader_to_pass_what_a_cut_gave_up`'s
+    /// uncounted arm); no world's reader is marked.
+    SweepPastAnUncountedGap,
+    /// The deadline sweep reads the asker's lane again at every sweep while it waits for the
+    /// inbox's reader (`Bridge::sweep_waits`, `Bridge::expire_deadlines`), as the first cut of
+    /// ATERM-KI-1115-1149 did: a read, a told reader's dial and a retention line every
+    /// `DEADLINE_RETRY` until the reader passes the range. Its witness is a real broker's, an
+    /// answer landed on the lane while the sweep waits, which a read settles the deadline at
+    /// (`bridge::tests::the_sweep_waits_for_the_inbox_reader_to_pass_what_a_cut_gave_up`'s
+    /// record arm); no world's reader is marked.
+    SweepRereadsWhileItWaits,
+    /// The deadline sweep takes no answer held in hand behind an own record of the asker's
+    /// lane (`Bridge::answer_queued` reads no `Bridge::held_own`), as every build before the
+    /// ATERM-KI-1115-1149 review: past a cut that gave the answer up on the bus, the sweep
+    /// publishes `expired` while the bridge holds the answer and drops the deadline. The fence
+    /// behind the `expired` finds the answer in hand and leaves it unjudged, and the answer's
+    /// delivery in lane order makes it moot (`Bridge::late_answer`); with
+    /// `FenceBlindToAHeldAnswer` too the `expired` is said and journaled the ask's verdict at the
+    /// sweep, and with `LateByTheExpiryAlone` as well the asker is handed the answer `late=1`,
+    /// then the `expired`. Its witness is a real broker's
+    /// (`bridge::tests::the_sweep_leaves_an_answer_held_behind_an_own_record_to_its_delivery`).
+    SweepPastAHeldAnswer,
+    /// No subscription's read deadline is armed before its first mark
+    /// (`Bridge::start_reader`), as astream's `recv_live` rule alone arms it: a marked inbox
+    /// tail that stalls before its catch-up mark holds every wait for the inbox's reader, the
+    /// retries waiting on their own lanes and their senders, and the sweep's deadlines, without
+    /// bound. Its witness is a stand-in broker that takes the opt-ins and sends nothing
+    /// (`bridge::tests::a_marked_tail_that_sends_nothing_ends_its_reader_at_the_live_deadline`);
+    /// no world's reader is marked or reads on a live socket.
+    ReaderUnboundUntilItsFirstMark,
     /// A refused post's later entries leave the in-flight journal lowest sequence first
     /// (`Bridge::drop_behind_a_failed_post`), as every build before ATERM-KI-1114-56: a stop
     /// after the first drop leaves later entries the replay publishes ahead of the dropped
@@ -457,6 +693,20 @@ pub(crate) enum Mutant {
     /// none, with that one's answer unread (`Bridge::settle_unjournaled_ahead`): a kill leaves
     /// the entry, the attach's replay lands it, and that post's retry lands behind it.
     EntryAheadOfAPostWithNone,
+    /// The told samples a lineage move took to a later generation forget the log they were read
+    /// on (`ToldSamples::moved_from`, none recorded at the move and none read by the proof): a
+    /// remint met under the witness an attach refused after the move left on that log proves
+    /// nothing from them, and aterm forgets what it holds; the same move met again drops them.
+    MovedSamplesUnpinned,
+    /// A record held in hand keeps the mark of the inbox group's tail that took it across a new
+    /// subscription of the group (`Bridge::subscribe_inbox`): released after the attach, it is
+    /// accounted against the inbox commit, which passes a record that tail took and did not
+    /// hand before the new tail offers it again.
+    HeldTailKeptAcrossAResubscribe,
+    /// A held record released unmarked (`Bridge::deliver_held`) and not taken by aterm (owed, or
+    /// its control lost) does not floor the inbox commit, which a commit the earlier tail owed
+    /// past it then passes.
+    UnmarkedReleaseUnfloored,
     /// A drain pass's group of fresh own-lane posts is sent ahead of the one append that
     /// reserves them and journals their entries (ATERM-KI-1111-5, `Bridge::flush_post_group`):
     /// a kill between leaves a publish on the bus that no reservation names, and the next drain
@@ -748,6 +998,127 @@ pub(crate) enum Mutant {
     /// the media too, so [`Mutant::DroppedPinUnderTheFence`] is pinned in a lossy-log world with
     /// this on (the sim's `lossy_logs_light_rebase`).
     RebaseWitnessUnflushed,
+    /// A log astream gave another id keeping its records is never proved to continue the one
+    /// before (`Bridge::prove_remint`), as every build before ATERM-KI-1116-7314: the attach
+    /// forgets every offset, aterm is told a bare `link log`, and the mail it was shown below
+    /// the head is offered again as new.
+    RemintUnproved,
+    /// The told samples are written once aterm answered the line that offers them, not before it
+    /// goes (`Bridge::flush_told`): a bridge killed between aterm's answer and the write leaves
+    /// samples below a record aterm was shown, a later proof's fork falls below it, and it is
+    /// shown again.
+    ToldAfterTheHand,
+    /// The proof takes a record of a sample's subject at its offset without comparing its bytes
+    /// (`Bridge::prove_remint`): a log set aside whose new records reach a sample's offset proves
+    /// a fork, and aterm answers new mail below it from what it held of the old log.
+    ProofByOffset,
+    /// The proof takes a sample whose read the broker could not answer (`ReadAt::Unasked`) as no
+    /// evidence, not a refusal of the attach (`Bridge::prove_remint`): the newest record told
+    /// goes unread, a lower sample proves a fork below it, and what aterm was shown between is
+    /// shown again.
+    UndecidedSampleSkipped,
+    /// A proved step is not read where astream's lineage would be (`Bridge::read_back_from`,
+    /// `StateDir::forget_log_offsets_proved`): a reply in flight kept on the log before is
+    /// dropped as decided there, and a head kept there reads back from anywhere.
+    ProvedStepUnread,
+    /// The proof runs for an endpoint below `LINK_PROVED_LANE` (`Bridge::prove_remint`): it is
+    /// told `proved=1`, answers usage, and every attach is refused.
+    ProvedToAnOldEndpoint,
+    /// A head above a proved fork comes down to it, as on a move astream's lineage names
+    /// (`Bridge::read_back_from`, `StateDir::forget_log_offsets_proved`): a remint kept the
+    /// records past the fork, so a read from there by words alone takes a sender's earlier post
+    /// of the same words for this one's attempt, and the post is never published.
+    ProvedHeadToTheFork,
+    /// A keyed re-post's head above a proved fork goes where a head on a log that continues none
+    /// goes, as every build before ATERM-KI-1114-1414's own head took it, not to its own head
+    /// (`state::Head::OwnFrom`): an entry's reads from the head the node met the log at
+    /// (`Bridge::read_back_from`'s `keyed_floor`), a pin's from the head the attach read
+    /// (`StateDir::publication_offset_resets`), a keyed reply's in flight from anywhere. Its own
+    /// attempt, which a carried cut kept below that head, its dedup key dropped, goes unread:
+    /// the re-post is retired `dup=1` at its key's winner, or published again, the key's second
+    /// record.
+    ProvedKeyedHeadAtTheMeeting,
+    /// A keyed re-post on a proved log whose own head is known (`state::Head::OwnFrom`) tells its
+    /// own attempt from its key's earlier records by order, as where no own head is known
+    /// (`Bridge::keyed_winner_on_a_proved_log`), not by where each stands
+    /// (`Bridge::keyed_records_split_at`): in its winner's own words, a newer record of them
+    /// than the winner's, an earlier re-post's below its own head while its own attempt never
+    /// landed, is taken for its own attempt, and an ask's deadline is armed on it.
+    KeyedRecordsSplitByOrder,
+    /// The drain makes a keyed re-post's pin, and journals its entry, at a plain `From` head, as
+    /// a build before the own head's mark wrote it (`Bridge::drain_post`,
+    /// `Bridge::publish_journaled_entry`), not at its own head (`state::Head::OwnFrom`): on a
+    /// proved log its key's records are told by order (`Bridge::keyed_winner_on_a_proved_log`),
+    /// so a re-post pinned on the proved log since the step, its first drain cut short, takes an
+    /// earlier re-post's record of its winner's words below its head for its own attempt, and an
+    /// ask's deadline is armed on it.
+    KeyedPinHeadUnmarked,
+    /// A keyed re-post's plain `From` head reads as its own (`state::Head::own`), as the own
+    /// head's second cut read every keyed `From` (`StateDir::publication_offset_resets`,
+    /// `Bridge::read_back_from`, `Bridge::keyed_winner_on_a_proved_log`): a head an older build
+    /// wrote at the head an attach read, where the log continued none, becomes
+    /// `state::Head::OwnFrom` across a later proved step whose fork lies below it, though it
+    /// bounds none of the post's attempts, and the split there takes its own attempt below it, a
+    /// carried cut's, for its key's winner's side: the post is retired `dup=1`.
+    PlainFromHeadReadAsOwn,
+    /// A keyed re-post's own head across a proved step is not brought down to where astream's
+    /// lineage moved the step's log since (`Bridge::read_back_from`): past that fork the
+    /// offsets name records published since the move, and an attempt the replay published there,
+    /// below the head, its answer lost and its dedup key cut, goes unread: the entry is
+    /// published again, the key's second record.
+    OwnHeadPastALineageFork,
+    /// A keyed re-post's own head (`state::Head::OwnFrom`) is read from anywhere on a broker
+    /// that does not tell fetches (`Bridge::found_since`), as `state::Head::Anywhere` is: a read
+    /// below a face's oldest that retention cut is refused there whatever it still holds, so the
+    /// read answers case 6 of `Bridge::unverified_publication` before the key's winner is read,
+    /// which skips such a broker, and the keyed sender is held for good.
+    OwnHeadReadAnywhereUntold,
+    /// A keyed re-post's own head (`state::Head::OwnFrom`) is read from anywhere on a broker
+    /// that tells fetches but takes no ask for origins (`Bridge::found_since`,
+    /// `Bridge::read_anywhere`'s `AnywhereRead::NoOrigins`), as `state::Head::Anywhere` is: no
+    /// row of its words names an origin there, so the read answers case 6 of
+    /// `Bridge::unverified_publication` at every retry, and the keyed sender is held for good.
+    OwnHeadReadAnywhereUnstamped,
+    /// A keyed re-post's own head (`state::Head::OwnFrom`) across a proved step is not brought
+    /// down to the head the step was proved at (`state::Proved::head`;
+    /// `StateDir::publication_offset_resets`, `Bridge::read_back_from`): on a log a power loss
+    /// cut short before astream reminted it, that head lies below the one the node knew on the
+    /// log before, and records published since stand between, the re-post's own attempt among
+    /// them, which its read from the own head misses: it is retired `dup=1` at its key's winner,
+    /// or published again.
+    OwnHeadAboveAShorterLog,
+    /// A key's winner whose offset a proved step took out of the key pin is not read on the log
+    /// the step reaches (`Bridge::keyed_winner_on_a_proved_log`): a cut that carried it dropped
+    /// its dedup key, so astream's dedup does not answer the re-post with it, and the re-post
+    /// lands the key's second record.
+    KeyedWinnerUnreadOnAProvedLog,
+    /// A key's winner on a proved log is read from anywhere on a broker that does not tell
+    /// fetches (`Bridge::keyed_winner_on_a_proved_log`), where a read from 0 of a face retention
+    /// cut never decides and the re-post's sender is held for good.
+    KeyedWinnerReadUntold,
+    /// The read of a key's records on a proved log answers the first record of the winner's
+    /// words (`Bridge::keyed_winner_on_a_proved_log`), though the re-post's own later attempt
+    /// is the newest record astream's dedup answers.
+    KeyedWinnerFirstRecordAnswered,
+    /// A key's winner read with no offset of it lands with none (`Bridge::drain_post`): an ask
+    /// or task in its winner's words is left queued, its sender held at every retry.
+    WinnerLandedWithoutItsOffset,
+    /// The attach's replay gives the attach up where no read decides which record a keyed
+    /// entry's key's dedup answers (`Bridge::replay_in_flight`), at every try while it stays so.
+    ReplayRefusedAtAnUndecidedWinner,
+    /// The attach's replay publishes a keyed entry at its pin though the read of its key's
+    /// records on a proved log found its own attempt there (`Bridge::replay_in_flight`): past a
+    /// cut that dropped that attempt's dedup key, the key's next record lands beside it.
+    ReplayPublishesPastItsReadAttempt,
+    /// A keyed re-post in its winner's own words that attempted is answered the winner at the
+    /// newest record of those words on a proved log (`Bridge::keyed_winner_on_a_proved_log`),
+    /// though the oldest is the winner's and the newer its own attempt: an ask is retired
+    /// `dup=1` there, its recipient and deadline never noted.
+    SameWordsAttemptTakenForTheWinner,
+    /// A stored step is not taken for the step (`Bridge::prove_remint`): an attach killed after
+    /// its tell, its witness still on the log before, proves again from samples that lag what
+    /// the first read and tells a fork below the one aterm keeps.
+    ProvedStepRecomputed,
 }
 
 /// What one run is.
@@ -893,6 +1264,11 @@ pub(crate) struct Opts {
     /// broker is stopped and opened again by its supervisor, as `aterm link broker` exits 75 on
     /// a poison ([`crate::broker_health`]) and is started again.
     pub(crate) poisons: bool,
+    /// THE LOG REMINTED KEEPING ITS RECORDS (ATERM-KI-1116-7314, a stream of its own): one open
+    /// of the broker in four that sets no log aside reads its identity sidecar as unreadable
+    /// ([`bus::Broker::lose_identity`]), so astream mints another id, generation 0 with no
+    /// lineage, that keeps every record at its offset (`logid::settle`'s `Prior::Unreadable`).
+    pub(crate) remints: bool,
 }
 
 /// The session the other writer under the node's producer id posts from ([`Opts::strays`]).
@@ -1035,6 +1411,7 @@ impl Opts {
             strays: false,
             retire_logs: false,
             poisons: false,
+            remints: false,
         }
     }
 
@@ -1047,6 +1424,16 @@ impl Opts {
             retire_logs: true,
             poisons: true,
             ..Self::seed(seed)
+        }
+    }
+
+    /// THE REMINTED SWEEP's configuration for `seed` (ATERM-KI-1116-7314): the lossy-log
+    /// world's, with logs astream reminted keeping their records among its faults
+    /// ([`Opts::remints`]), drawn from a stream of their own.
+    pub(crate) fn lossy_remints(seed: u64) -> Self {
+        Self {
+            remints: true,
+            ..Self::lossy_logs(seed)
         }
     }
 
@@ -1315,6 +1702,12 @@ pub(crate) struct Stats {
     /// poisoned, and the restarts its supervisor made of a poisoned broker.
     pub(crate) another_logs: u64,
     pub(crate) retired_logs: u64,
+    /// The opens that reminted the log keeping its records ([`Opts::remints`]).
+    pub(crate) remints: u64,
+    /// The steps to another id the endpoint was told a bridge proved (`link log … proved=1`).
+    pub(crate) remints_proved: u64,
+    /// The remints the endpoint forgot across, unproved ([`super::conform::View::forgot_remints`]).
+    pub(crate) remints_forgotten: u64,
     pub(crate) poisoned: u64,
     pub(crate) poisoned_refusals: u64,
     pub(crate) poison_restarts: u64,
@@ -1549,6 +1942,10 @@ struct World {
     /// Logs set aside and poisoned brokers ([`Opts::retire_logs`], [`Opts::poisons`]), a
     /// stream of their own, drawn from only in a world of either.
     log_rng: Rng,
+    /// The draws of [`Opts::remints`].
+    remint_rng: Rng,
+    /// The ids the remints minted, as `link log` spells them before the `.`.
+    reminted_ids: BTreeSet<String>,
 }
 
 /// The posts of one idempotency key ([`Opts::keys`]).
@@ -1809,6 +2206,8 @@ impl World {
             key_rng: Rng::new(seed ^ 0x0ce7_5eed_4e75_0f23),
             keyed: BTreeMap::new(),
             log_rng: Rng::new(seed ^ 0x0109_c0de_1111_0004),
+            remint_rng: Rng::new(seed ^ 0x0109_c0de_1116_7314),
+            reminted_ids: BTreeSet::new(),
         };
         // The first open's tick, asked for at once when its rules are set.
         w.tick_now();
@@ -3191,13 +3590,32 @@ impl World {
     /// four sets changed rules ([`changed_rules`], as `asb serve --retain-file` would, and the
     /// open after it aterm's again); one that sets them ticks at once, as astream's first tick
     /// is asked for when its rules are set.
+    /// The remints the endpoint forgot across, unproved: the ids they minted that a session
+    /// forgot what it held across ([`super::endpoint::EpState::forgot_across`]).
+    fn remints_forgotten(&self) -> u64 {
+        let ep = lock(&self.ep.state);
+        self.reminted_ids.intersection(&ep.forgot_across).count() as u64
+    }
+
     fn broker_start(&mut self) {
         // THE LOG SET ASIDE while the broker is down ([`Opts::retire_logs`]): every record it
         // held is gone, so every offset at or above 0 may name another record now.
+        let mut retired = false;
         if self.opts.retire_logs && self.log_rng.chance(1, 6) {
             if let Some(r) = self.core.broker.retire_log() {
+                retired = true;
                 self.stats.retired_logs += 1;
                 self.note("broker log retired (--retire-log)");
+                self.book_restart(&r);
+            }
+        }
+        // THE LOG REMINTED KEEPING ITS RECORDS ([`Opts::remints`]): another id, every record kept.
+        let mut reminted = false;
+        if !retired && self.opts.remints && self.remint_rng.chance(1, 4) {
+            if let Some(r) = self.core.broker.lose_identity() {
+                reminted = true;
+                self.stats.remints += 1;
+                self.note("broker identity unreadable: another log, every record kept");
                 self.book_restart(&r);
             }
         }
@@ -3213,6 +3631,15 @@ impl World {
             self.core.broker.start_with(changed_rules(self.opts.scaled));
         } else {
             self.core.broker.start();
+        }
+        if reminted {
+            let id = lock(&self.core.broker.state).id;
+            self.reminted_ids.insert(
+                astream_broker::LogIdentity { id, generation: 0 }
+                    .to_string()
+                    .split_once('.')
+                    .map_or_else(String::new, |(id, _)| id.to_string()),
+            );
         }
         self.tick_now();
     }
@@ -3718,6 +4145,7 @@ impl World {
             // a reader can continue from (`FabricExactlyOnce`'s `g`).
             generation: self.stats.moves + self.stats.another_logs,
             retired_logs: self.stats.retired_logs,
+            forgot_remints: self.remints_forgotten(),
             group_start: self.core.broker.group_start(&group),
             alive: self.live.is_some(),
             owed: self
@@ -4728,6 +5156,8 @@ impl World {
                 .sum()
         };
         self.stats.deliveries_pipelined = lock(&self.ep.state).deliveries_pipelined;
+        self.stats.remints_proved = lock(&self.ep.state).proved_logs;
+        self.stats.remints_forgotten = self.remints_forgotten();
         self.stats.retires_pipelined = lock(&self.ep.state).retires_pipelined;
         for b in bad {
             if !self.violations.contains(&b) {

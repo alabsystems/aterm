@@ -170,6 +170,114 @@ impl Budget {
             std::thread::sleep(POLL_GAP.min(deadline - now));
         }
     }
+
+    /// Poll `probe` every `gap` until it answers `Some`, for as long as process `pid` and its
+    /// descendants work: a wait for what the subject must do, held to the subject's progress and
+    /// not to the wall clock, which a loaded Mac stretches without bound
+    /// ([`aterm_uds::deadline::ProcessProgressProbe`]: a starved process still advances its CPU
+    /// time within any window it is scheduled in, a hung one does not). It ends after a
+    /// [`MUST_HAPPEN`] in which the tree used no CPU and did no I/O, once the process is gone and
+    /// one more probe had no answer, or once this budget is spent. A tree that does not read, or
+    /// whose members changed since the last reading, is no evidence of a stall: the minute opens
+    /// again at that reading.
+    /// # Errors
+    /// [`CouldNotRun::Refused`] naming `what` and which of the three ended the wait.
+    pub fn await_while_working<T>(
+        &self,
+        pid: u32,
+        what: &str,
+        gap: Duration,
+        probe: impl FnMut() -> Option<T>,
+    ) -> Result<T, CouldNotRun> {
+        use aterm_uds::process::{ProcessPresence, process_presence};
+        let id = i32::try_from(pid).unwrap_or(0);
+        let mut tree = aterm_uds::deadline::ProcessProgressProbe::default();
+        self.working(
+            what,
+            gap,
+            Progress {
+                now: &mut Instant::now,
+                runs: &mut || {
+                    !matches!(
+                        process_presence(id),
+                        ProcessPresence::Absent | ProcessPresence::Exited
+                    )
+                },
+                read: &mut || tree.read(pid),
+                pause: &mut std::thread::sleep,
+            },
+            probe,
+        )
+    }
+
+    /// [`Self::await_while_working`] over its seams ([`Progress`]).
+    fn working<T>(
+        &self,
+        what: &str,
+        gap: Duration,
+        seams: Progress<'_>,
+        mut probe: impl FnMut() -> Option<T>,
+    ) -> Result<T, CouldNotRun> {
+        let Progress {
+            now,
+            runs,
+            read,
+            pause,
+        } = seams;
+        // The minute's start: the last reading at which the tree had advanced or did not compare.
+        let mut worked_at = now();
+        let mut seen = None;
+        let mut read_at: Option<Instant> = None;
+        loop {
+            if let Some(value) = probe() {
+                return Ok(value);
+            }
+            let at = now();
+            if at >= self.ends {
+                return Err(self.spent(&format!("the wait for {what}")));
+            }
+            if read_at.is_none_or(|last| at.saturating_duration_since(last) >= WORK_TICK) {
+                read_at = Some(at);
+                if !runs() {
+                    // What it did as it ended may be the answer.
+                    return probe().ok_or_else(|| {
+                        CouldNotRun::Refused(format!("the subject ended before {what}"))
+                    });
+                }
+                match read() {
+                    Some(generation) if seen == Some(generation) => {}
+                    reading => {
+                        seen = reading;
+                        worked_at = at;
+                    }
+                }
+                if at.saturating_duration_since(worked_at) >= MUST_HAPPEN {
+                    return Err(CouldNotRun::Refused(format!(
+                        "{what} did not happen, and the subject and its descendants made no CPU \
+                         or I/O progress for {MUST_HAPPEN:?}"
+                    )));
+                }
+            }
+            pause(
+                gap.min(self.ends.saturating_duration_since(at))
+                    .max(Duration::from_millis(1)),
+            );
+        }
+    }
+}
+
+/// How often [`Budget::await_while_working`] reads the subject's process tree: a sweep of the
+/// process table, so not once a poll.
+const WORK_TICK: Duration = Duration::from_millis(500);
+
+/// The seams of [`Budget::await_while_working`]: the clock, whether the subject still runs, one
+/// reading of its tree's progress generation (`None` where the tree did not read or compare),
+/// and the pause between polls.
+struct Progress<'a> {
+    now: &'a mut dyn FnMut() -> Instant,
+    runs: &'a mut dyn FnMut() -> bool,
+    read: &'a mut dyn FnMut() -> Option<u64>,
+    pause: &'a mut dyn FnMut(Duration),
 }
 
 /// Run `program --version` outside the measured timeline, bounded by the hang detector.

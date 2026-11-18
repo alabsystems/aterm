@@ -23,7 +23,9 @@ fn checked(result: i32) -> io::Result<()> {
     if result == 0 {
         Ok(())
     } else {
-        Err(io::Error::other(format!("native registered-port revocation refused ({result})")))
+        Err(io::Error::other(format!(
+            "native registered-port revocation refused ({result})"
+        )))
     }
 }
 
@@ -53,7 +55,9 @@ fn lookup(task: u32) -> io::Result<[u32; SLOTS]> {
         })?;
     }
     if !valid {
-        return Err(invalid("native registered-port census unavailable or exceeds SDK bound"));
+        return Err(invalid(
+            "native registered-port census unavailable or exceeds SDK bound",
+        ));
     }
     Ok(ports)
 }
@@ -61,6 +65,15 @@ fn lookup(task: u32) -> io::Result<[u32; SLOTS]> {
 /// Sole trusted entry, with async signals blocked and no concurrent Mach port
 /// mutator/owner. Every error is terminal, including partial irreversible work.
 pub(super) fn revoke() -> io::Result<()> {
+    revoke_with_bootstrap(None)
+}
+
+/// A bootstrap overlap is preserved only by a genuine private own-task capture,
+/// never by a caller-supplied name. That same entry must revoke it immediately
+/// afterward, including ALL refs this lookup added; every error is terminal.
+pub(super) fn revoke_with_bootstrap(
+    bootstrap: Option<&super::bootstrap_port::Captured>,
+) -> io::Result<()> {
     // SAFETY: borrowed own-task runtime name, no new right or foreign task.
     let task = unsafe { mach_task_self_ };
     let ports = lookup(task)?;
@@ -69,13 +82,18 @@ pub(super) fn revoke() -> io::Result<()> {
         .iter()
         .any(|name| *name == u32::MAX || (*name != 0 && (*name == task || *name == thread)))
     {
-        return Err(invalid("native registered port aliases a required self handle or dead name"));
+        return Err(invalid(
+            "native registered port aliases a required self handle or dead name",
+        ));
     }
     // SAFETY: remove only this task's registered inheritance stash. A saved
     // name may still carry existing local user refs, which must be revoked too.
     checked(unsafe { mach_ports_register(task, std::ptr::null(), 0) })?;
     for (index, name) in ports.iter().copied().enumerate() {
-        if name == 0 || ports.iter().take(index).any(|previous| *previous == name) {
+        if name == 0
+            || bootstrap.is_some_and(|original| original.local_name() == name)
+            || ports.iter().take(index).any(|previous| *previous == name)
+        {
             continue;
         }
         let mut references = 0;
@@ -94,7 +112,9 @@ pub(super) fn revoke() -> io::Result<()> {
         // Require complete disappearance of this local name. Remote death or a
         // remaining receive/dead/other role is uncertain, terminal refusal.
         if unsafe { mach_port_type(task, name, &mut kind) } != INVALID_NAME {
-            return Err(invalid("native registered-port name remains or cannot be observed"));
+            return Err(invalid(
+                "native registered-port name remains or cannot be observed",
+            ));
         }
     }
     if lookup(task)?.iter().any(|name| *name != 0) {

@@ -238,6 +238,7 @@ fn accounts(state: Option<&'static str>) -> ClaudeAccounts {
         store: None,
         roster: None,
         label: "main".into(),
+        sign_in_word: None,
         listed: false,
         refused: None,
         unread: None,
@@ -562,18 +563,31 @@ fn the_health_line_names_aterms_fixes_and_only_a_persons_sign_in_needs_you() {
 /// GIVES (the m2 state of 2026-10-27: a signed-out Claude row with an email, no mailbox and no
 /// browser profile of its own, its ladder's record `no-route`): the row is not among aterm's
 /// fixes, and the `NEEDS YOU:` line names the row's own browser profile signed in once (`aterm
-/// harness accounts browser m2-2`), after which its renewals run headless, never `aterm ai login
-/// claude`. A switch that keeps aterm's sign-ins off (`[harness] logins = "off"`) makes a
-/// person's own `aterm ai login` the step, and a pool row whose last renewal stopped for a
-/// person names the step that stop named. CONTROL: with a route and no switch the row is aterm's.
+/// harness accounts browser <account>`, by the word the facts carry for its account: its key,
+/// no lab slugging it here, never the row's label, which `accounts browser` refuses for a row
+/// with an address), after which its renewals run headless, never `aterm ai login claude`. A
+/// switch that keeps aterm's sign-ins off (`[harness] logins = "off"`) makes a person's own
+/// `aterm ai login` the step, and a pool row whose last renewal stopped for a person names the
+/// step that stop named, by its pool's word for the row. CONTROL: with a route and no switch the
+/// row is aterm's.
+/// NEGATIVE CONTROL: with `bar` naming the Claude row by its label
+/// (`sign_in_word_of(Cli::Claude, label, &[], None)`), the step reads `aterm harness accounts
+/// browser m2-2` and this fails (2026-11-16, by hand, then restored).
 #[test]
 fn a_row_aterm_cannot_sign_in_unattended_is_a_persons_with_the_step_only_a_person_gives() {
     use crate::ai::connector::KIMI;
-    use crate::harness::accounts::SignInAction;
+    use crate::harness::account_names::word_of_login;
+    use crate::harness::accounts::{Cli, SignInAction};
+    let word = |cli: Cli, email: &str| word_of_login(cli, email, None).expect("an address");
+    let key =
+        |realm: &str, email: &str| aterm_db::typed::keys::account_pk(realm, email).expect("a key");
+    let m2 = key("claude", "m2-2@x.example");
+    let kimi_one = key("kimi:global", "kimi-one@x.example");
     let mut claude = facts(&CLAUDE);
     claude.accounts = Some(ClaudeAccounts {
         pool_picks: false,
         label: "m2-2".into(),
+        sign_in_word: Some(word(Cli::Claude, "m2-2@x.example")),
         unattended: false,
         tried: Some(crate::ai::facts::Tried {
             outcome: "no-route",
@@ -585,13 +599,11 @@ fn a_row_aterm_cannot_sign_in_unattended_is_a_persons_with_the_step_only_a_perso
     });
     let row = assess(&claude, true, NOW);
     assert_eq!(row.actor, Some(Actor::Person), "{}", row.fact);
-    assert_eq!(
-        row.fix.as_deref(),
-        Some("aterm harness accounts browser m2-2")
-    );
+    let step = format!("aterm harness accounts browser {m2}");
+    assert_eq!(row.fix.as_deref(), Some(step.as_str()));
     let h = health(std::slice::from_ref(&row));
     assert!(h.by_aterm.is_empty(), "{h:?}");
-    assert_eq!(h.person_steps, ["aterm harness accounts browser m2-2"]);
+    assert_eq!(h.person_steps, [step.clone()]);
     assert!(
         h.needs_you()
             .is_some_and(|l| !l.contains("aterm ai login claude")),
@@ -616,13 +628,16 @@ fn a_row_aterm_cannot_sign_in_unattended_is_a_persons_with_the_step_only_a_perso
         next: Some("kimi-one".to_string()),
         state: Some("expired"),
         person_task: Some(SignInAction::Browser),
+        words: [("kimi-one".to_owned(), word(Cli::Kimi, "kimi-one@x.example"))].into(),
         ..crate::ai::facts::CliAccounts::default()
     });
     let row = assess(&kimi, true, NOW);
     assert_eq!(row.actor, Some(Actor::Person));
     assert_eq!(
-        row.fix.as_deref(),
-        Some("aterm harness accounts browser kimi-one --cli kimi")
+        row.fix,
+        Some(format!(
+            "aterm harness accounts browser {kimi_one} --cli kimi"
+        ))
     );
 
     let mut control = claude.clone();

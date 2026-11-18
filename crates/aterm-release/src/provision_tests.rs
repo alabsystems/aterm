@@ -5,6 +5,59 @@ use super::*;
 
 #[cfg(unix)]
 #[test]
+fn a_candidate_audit_uses_its_original_source_and_captured_stock_namespace() {
+    use crate::snapshot_take as fx;
+    use crate::trust_lock::{CompilerInputs, CompilerPin};
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let (repo, _) = fx::fixture(scratch.path());
+    let mut lock =
+        atpkg::trust_lock::read(&aterm_tempfile::manifest_dir().join("../../trust.lock")).unwrap();
+    let mut write_lock = |stock: &str| {
+        lock.stock_toolchain = stock.into();
+        std::fs::write(
+            repo.join("trust.lock"),
+            atpkg::trust_lock::render_body(&lock),
+        )
+        .unwrap();
+        fx::git(&repo, &["add", "trust.lock"]);
+        fx::git(&repo, &["commit", "-qm", stock]);
+        (fx::git(&repo, &["rev-parse", "HEAD"]), lock.clone())
+    };
+    let (selected, selected_lock) = write_lock("1.99.1");
+    let (checkout, _) = write_lock("1.90.7");
+    assert_ne!(selected, checkout);
+    // No compiler is executed here: this is the production audit's original-source/context
+    // boundary, before target probing, signing and roster checks.
+    let mut compiler = CompilerInputs {
+        bin: scratch.path().to_path_buf(),
+        pin: CompilerPin::of(&selected_lock),
+        stock: Ok(crate::buildplan::Stock::unavailable_for_test(
+            scratch.path(),
+            &selected_lock.stock_toolchain,
+        )),
+    };
+    let captured = compiler.stock().unwrap();
+    assert!(std::ptr::eq(
+        candidate_stock(&repo, &selected, Ok(&compiler)).unwrap(),
+        captured,
+    ));
+    assert!(candidate_stock(&repo, &checkout, Ok(&compiler)).is_err());
+    compiler.stock = Ok(crate::buildplan::Stock::unavailable_for_test(
+        scratch.path(),
+        "1.90.7",
+    ));
+    assert!(candidate_stock(&repo, &selected, Ok(&compiler)).is_err());
+    let unavailable = "the original stock namespace is unavailable".to_owned();
+    compiler.stock = Err(unavailable.clone());
+    assert_eq!(
+        candidate_stock(&repo, &selected, Ok(&compiler)).unwrap_err(),
+        unavailable,
+    );
+    assert!(candidate_stock(&repo, &selected, Err("no captured compiler".into())).is_err());
+}
+
+#[cfg(unix)]
+#[test]
 fn roster_only_requires_existing_authority_and_preserves_newer_state() {
     use ring::signature::KeyPair as _;
     let scratch = aterm_tempfile::tempdir().unwrap();

@@ -2,6 +2,60 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+
+#[cfg(unix)]
+#[test]
+fn a_charged_pool_advertisement_restores_flags_and_fifo_together_after_nested_panic() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let outer = aterm_capacity::Jobserver::new(&dir.path().join("outer"), 2).unwrap();
+    let inner = aterm_capacity::Jobserver::new(&dir.path().join("inner"), 2).unwrap();
+    assert!(current_pool().is_none());
+    run(Some(&outer), Some(2), None, &|| false, || {
+        let original = current_pool().unwrap();
+        assert_eq!(
+            original.fifo_path().unwrap(),
+            outer.path().canonicalize().unwrap()
+        );
+        let mut command = aterm_uds::spawnfd::command("unused");
+        configure(&mut command);
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == "CARGO_MAKEFLAGS"
+                    && value == Some(std::ffi::OsStr::new(&outer.flags())))
+        );
+        run(None, None, None, &|| false, || {
+            assert!(current_pool().is_none())
+        })
+        .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&original, &current_pool().unwrap()));
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run(Some(&inner), Some(2), None, &|| false, || {
+                assert_eq!(
+                    current_pool().unwrap().fifo_path().unwrap(),
+                    inner.path().canonicalize().unwrap()
+                );
+                panic!("nested scope control");
+            })
+            .unwrap();
+        }));
+        assert!(failed.is_err());
+        assert!(std::sync::Arc::ptr_eq(&original, &current_pool().unwrap()));
+        let available: Vec<_> = std::iter::from_fn(|| outer.try_acquire().unwrap()).collect();
+        assert_eq!(available.len(), 1, "the outer implicit job stays charged");
+        drop(available);
+        let available: Vec<_> = std::iter::from_fn(|| inner.try_acquire().unwrap()).collect();
+        assert_eq!(
+            available.len(),
+            2,
+            "the unwound inner job returns its token"
+        );
+    })
+    .unwrap();
+    assert!(current_pool().is_none());
+    let available: Vec<_> = std::iter::from_fn(|| outer.try_acquire().unwrap()).collect();
+    assert_eq!(available.len(), 2);
+}
 #[cfg(unix)]
 use crate::memory::StageKey;
 
@@ -52,6 +106,7 @@ fn the_real_lint_stage_installs_pool_flags_without_an_outer_wrapper() {
     ));
     ctx.unit_reader = |_| crate::memory::Named::Nothing;
     let mut spec = crate::plan::plan(&ctx)
+        .expect("complete graph and plan")
         .into_iter()
         .find(|s| s.id == crate::plan::StageId::Tippy)
         .unwrap();
@@ -892,6 +947,24 @@ fn only_a_recorded_test_unit_enables_driver_only_admission_and_the_wrapper() {
         kind: "aterm_gui test".into(),
     };
 
+    // A meter-only shaping observation has the same unit key shape but lacks the successful
+    // wrapper intersection. Its new independent file must not enable driver-only admission.
+    ctx.memory
+        .as_ref()
+        .unwrap()
+        .keep_units(
+            "/fixture",
+            &std::collections::BTreeMap::from([(unit.clone(), 9 << 30)]),
+        )
+        .unwrap();
+    let weak = ctx.memory.as_ref().unwrap().shaping_records();
+    assert!(
+        crate::memory::ShapingSource::learned(&weak, &crate::shape::unit_key("/fixture", &unit),)
+            .is_some()
+    );
+    let test_book = unit_book(&path, crate::plan::StageId::TestCompile);
+    assert!(!test_book.exists());
+
     for jobs in ["1", "3", "14"] {
         ctx.env.cargo_build_jobs = Some(jobs.into());
         let cold_test = claim(&ctx, &test_compile, admit).unwrap().unwrap();
@@ -900,9 +973,9 @@ fn only_a_recorded_test_unit_enables_driver_only_admission_and_the_wrapper() {
             50 << 30,
             "NEGATIVE CONTROL: compiler width {jobs} cannot lower a cold full-stage claim"
         );
+        assert_eq!(cold_test.units.as_ref().unwrap().mode, UnitMode::Record);
         drop(cold_test);
     }
-    let test_book = unit_book(&path, crate::plan::StageId::TestCompile);
     let mut valid = crate::memory::Records::default();
     valid.push(
         crate::shape::compiler_unit_key(crate::shape::UNIT_STAGE, "/fixture", &unit),
@@ -971,6 +1044,7 @@ fn an_obsolete_tippy_unit_book_cannot_replace_the_whole_stage_claim() {
         Some(76 << 30),
     ));
     let spec = crate::plan::plan(&ctx)
+        .expect("complete graph and plan")
         .into_iter()
         .find(|spec| spec.id == crate::plan::StageId::Tippy)
         .unwrap();

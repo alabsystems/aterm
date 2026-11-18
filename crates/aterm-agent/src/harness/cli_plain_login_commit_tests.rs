@@ -104,7 +104,8 @@ impl AccountsHost for Host {
 fn case(custody: i64, seen: i64, kind: i64, prior: bool, legacy: bool) -> [(&'static str, i64); 7] {
     let tmp = tmp_dir("plain-login-commit");
     let env = env_at(&tmp);
-    assert_eq!(acc_quiet(add("work", Class::Preferred), &env).0, exit(0));
+    // A row with no address, as `login` signs in only such a row; `add` lists none.
+    listed_by_hand(&env, Cli::Claude, by_hand("work", None));
     let store = env.accounts_store();
     let old = tmp.path().join("previous");
     let previous = if prior {
@@ -171,7 +172,7 @@ fn case(custody: i64, seen: i64, kind: i64, prior: bool, legacy: bool) -> [(&'st
     };
     let (code, _, err) = acc(
         AccountsCmd::Login {
-            label: "work".into(),
+            account: "work".into(),
         },
         &env,
         &host,

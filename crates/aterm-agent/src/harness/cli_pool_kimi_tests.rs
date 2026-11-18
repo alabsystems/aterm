@@ -893,7 +893,8 @@ fn a_kimi_native_refresh_is_not_held_at_the_renew_door_by_a_bot_check() {
             &crate::harness::cli::AccountsOf {
                 cli: Cli::Kimi,
                 form: crate::harness::cli::AccountsCmd::Renew {
-                    labels: vec!["one".to_owned()],
+                    // The account is its identity address; the row's `email` only delivers.
+                    accounts: vec![EMAIL.to_owned()],
                     due: false,
                     on: None,
                 },
@@ -923,7 +924,10 @@ fn a_kimi_native_refresh_is_not_held_at_the_renew_door_by_a_bot_check() {
             );
         } else {
             assert!(
-                said.contains(&crate::harness::cli::left_words(Cli::Kimi, "one")),
+                said.contains(&crate::harness::cli::left_words(
+                    Cli::Kimi,
+                    &crate::harness::account_names::tests::row_name_of(Cli::Kimi, &env, "one")
+                )),
                 "CONTROL: held at the door, naming the person's step: {said}"
             );
         }

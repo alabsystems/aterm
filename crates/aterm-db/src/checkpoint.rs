@@ -27,6 +27,7 @@
 
 use crate::{Error, Result, database::Cell, documents::Cells};
 use astream_wire::sync::{Actor, Digest, FloorRecord, Index, Projection};
+use aterm_secrets::commons::finality;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The payload's tag: no application payload (JSON commands, catalog descriptors, `ATCUT1`
@@ -315,6 +316,62 @@ pub(crate) fn verify(history: &History<'_>, body: &Body) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The bodies among `shares` (each held checkpoint record's signer and body) of the table
+/// `scope` at `generation` that are final, each with the seats that signed it, in the order
+/// `(below, encoding)`: the last is the table's settled floor (design §5, "Every replica names
+/// the same floor", tracker LT-B10D1).
+///
+/// A body is final by the rule the vault log shares ([`finality`]): `seats` are the current
+/// members; the cut's time is its newest frontier tip's authored time; and a seat's last signed
+/// time is its own frontier tip's authored time, its newest record in the cut, so a seat absent
+/// from the frontier wrote nothing at or below the cut and is not recent at it. `tip_ms` answers
+/// a tip's authored time where this replica holds the record the tip names, with that writer and
+/// sequence. Every input is one every replica holding the cut's tips holds alike, observers
+/// included: the checkpoint records, the membership and the tips. A tip's authored time is in
+/// its record's signed envelope, which a replica authenticates without the payload's key, but
+/// not in its [`astream_wire::sync::Header`]; a replica that does not hold a tip's record (a
+/// fresh one handed only the boundary's headers) finds that body final nowhere: it names an older
+/// floor or none, and judges more records as hot, never fewer.
+pub(crate) fn finals<'a>(
+    shares: impl IntoIterator<Item = (Actor, &'a Body)>,
+    scope: Digest,
+    generation: u64,
+    seats: &BTreeSet<Actor>,
+    tip_ms: impl Fn(&Actor, &Tip) -> Option<u64>,
+) -> Vec<(Body, BTreeSet<Actor>)> {
+    // Each body, by its one encoding, with the members that signed it.
+    let mut signers: BTreeMap<Vec<u8>, (&Body, BTreeSet<Actor>)> = BTreeMap::new();
+    for (signer, body) in shares {
+        if body.scope == scope && body.generation == generation {
+            signers
+                .entry(encode(body))
+                .or_insert_with(|| (body, BTreeSet::new()))
+                .1
+                .insert(signer);
+        }
+    }
+    let mut finals: Vec<(u64, Vec<u8>, Body, BTreeSet<Actor>)> = signers
+        .into_iter()
+        .filter_map(|(encoding, (body, signed))| {
+            let cut_ms = body
+                .frontier
+                .iter()
+                .map(|(actor, tip)| tip_ms(actor, tip))
+                .try_fold(0, |newest, at| Some(newest.max(at?)))?;
+            let recent = finality::recent(seats, cut_ms, |seat| {
+                body.frontier.get(seat).and_then(|tip| tip_ms(seat, tip))
+            });
+            finality::is_final(&recent, &signed)
+                .then(|| (body.below, encoding, body.clone(), signed))
+        })
+        .collect();
+    finals.sort_unstable_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    finals
+        .into_iter()
+        .map(|(_, _, body, signed)| (body, signed))
+        .collect()
 }
 
 /// Each actor's highest sequence in `id`'s past, `id` included.

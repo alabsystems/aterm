@@ -41,26 +41,55 @@
 //! sign-in ladder asks the same reading before it ranks a row ([`retain_not_live`]) and again
 //! under the sign-in lock before it starts one, each from the one set of witnesses its pass
 //! read ([`Pass`]).
+//!
+//! The witnesses are read past the window's accounts keeper's trace (`aterm_uds::trace`): a tap
+//! file moves at every refresh of every live tab, and whether one is still being written
+//! ([`being_written`]) and a baseline stands turn with the clock, compared as numbers. So every
+//! ask of a pass's witnesses poisons the scope armed on its thread ([`Pass::witnesses`]), and an
+//! asker takes the pass's reading raw only once a row is signed out on record: a run that asked
+//! about such a row is never kept, and the keeper makes it again at its rerun
+//! (`trace::RERUN_CAP`, a minute), as the window's minute pass did. A run with no row signed out
+//! on record reads no witness and compares no clock here.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-#[cfg(unix)]
-use aterm_json::Map;
-use aterm_json::Value;
+use aterm_json::{Map, Value};
 
 use super::accounts::{self, Auth, LoginEvidence, Roster, Row, State};
 use super::tap;
 
+/// Why a run that asked the witnesses ([`Pass::witnesses`]) is not kept.
+pub(super) const PAST_THE_TRACE: &str = "the login adoption's witnesses are read past the trace";
+
 /// The file in Claude Code's accounts store that keeps [`Baselines`].
-#[cfg(unix)]
 const BASELINES_FILE: &str = "tap-baselines.json";
 
 /// The most of [`BASELINES_FILE`] that is read.
-#[cfg(unix)]
 const MAX_BASELINES: usize = 256 * 1024;
+
+/// On Windows, the folder of the accounts store that holds [`BASELINES_FILE`] ([`baselines_dir`]).
+#[cfg(windows)]
+const BASELINES_DIR: &str = "adoption";
+
+/// The folder of the accounts store `dir` that holds [`BASELINES_FILE`]. On Unix it is the store's
+/// own, which is private (mode 0700, [`accounts::Store::ensure`]). On Windows the store keeps the
+/// access list its folder inherits, as its login folders do (`accounts_sync_commit`'s
+/// `ensure_login_dir`), so the baselines keep a private folder of their own in it, made private
+/// at its birth: narrowing the store itself would rewrite the list of everything already in it
+/// (`SetSecurityInfo` passes a folder's inheritable entries on to what it holds), each login's
+/// folder and transcripts included, and move each one's change time.
+#[cfg(not(windows))]
+fn baselines_dir(dir: &Path) -> PathBuf {
+    dir.to_path_buf()
+}
+
+#[cfg(windows)]
+fn baselines_dir(dir: &Path) -> PathBuf {
+    dir.join(BASELINES_DIR)
+}
 
 /// The most usage-tap files one reading takes ([`tap::readings_in`]).
 const MOST_READINGS: usize = 512;
@@ -132,7 +161,6 @@ impl Baseline {
 pub(super) struct Baselines(pub(super) BTreeMap<String, Baseline>);
 
 impl Baselines {
-    #[cfg(unix)]
     fn to_json(&self) -> String {
         let mut files = Map::new();
         for (stem, base) in &self.0 {
@@ -148,7 +176,6 @@ impl Baselines {
         Value::Object(o).to_string()
     }
 
-    #[cfg(unix)]
     fn from_json(bytes: &[u8]) -> Option<Self> {
         let value: Value = aterm_json::from_slice(bytes).ok()?;
         if value.get("schema")?.as_u64()? != 1 {
@@ -177,37 +204,35 @@ impl Baselines {
         Some(Self(files))
     }
 
-    /// The baselines kept in the store directory `dir`; none where the file is missing or does
-    /// not read as one, which only delays evidence: every baseline is then taken again.
-    #[cfg(unix)]
+    /// The baselines kept in the store directory `dir` ([`baselines_dir`]); none where the file is
+    /// missing, is no strict private file or does not read as one (on Windows, also before
+    /// [`Self::keep`] made their folder), which only delays evidence: every baseline is then taken
+    /// again.
     pub(super) fn kept(dir: &Path) -> Self {
-        aterm_uds::private_file::read_private(dir, BASELINES_FILE, MAX_BASELINES)
+        aterm_uds::private_file::read_private(&baselines_dir(dir), BASELINES_FILE, MAX_BASELINES)
             .ok()
             .and_then(|bytes| Self::from_json(&bytes))
             .unwrap_or_default()
     }
 
-    /// Off Unix no strict private file is kept, so no baseline is and no reading counts as
-    /// evidence.
-    #[cfg(not(unix))]
-    pub(super) fn kept(_dir: &Path) -> Self {
-        Self::default()
-    }
-
-    /// Keeps these in `dir`, or removes the file where there are none. The caller holds the
-    /// accounts lock.
-    #[cfg(unix)]
+    /// Keeps these in the store directory `dir` ([`baselines_dir`]) as a strict private file
+    /// ([`aterm_uds::private_file`]), or removes the file where there are none. The caller holds
+    /// the accounts lock.
+    ///
+    /// On Unix the store's directory is already private ([`accounts::Store::ensure`] makes it
+    /// mode 0700). On Windows a write first makes the baselines' own folder, private at its
+    /// birth, as that mode does: a protected list of the user and SYSTEM alone
+    /// ([`aterm_uds::private_file::ensure_private_dir`], which an elevated process may not
+    /// make). Where that fails nothing is kept, and the step says so once.
     fn keep(&self, dir: &Path) -> std::io::Result<()> {
+        let dir = baselines_dir(dir);
         if self.0.is_empty() {
-            aterm_uds::private_file::remove_private(dir, BASELINES_FILE).map(|_| ())
+            aterm_uds::private_file::remove_private(&dir, BASELINES_FILE).map(|_| ())
         } else {
-            aterm_uds::private_file::write_private(dir, BASELINES_FILE, self.to_json().as_bytes())
+            #[cfg(windows)]
+            aterm_uds::private_file::ensure_private_dir(&dir)?;
+            aterm_uds::private_file::write_private(&dir, BASELINES_FILE, self.to_json().as_bytes())
         }
-    }
-
-    #[cfg(not(unix))]
-    fn keep(&self, _dir: &Path) -> std::io::Result<()> {
-        Ok(())
     }
 
     /// These after a look at `readings` at `now`, where the newest sign-out on record is
@@ -881,8 +906,13 @@ impl Pass {
         }
     }
 
-    /// The pass's witnesses, read by `read` where this is the first ask.
+    /// The pass's witnesses, read by `read` where this is the first ask. Every ask, the first
+    /// or a later one, poisons the trace scope armed on this thread for [`PAST_THE_TRACE`]
+    /// (`aterm_uds::trace::poison`) before its asker takes the reading raw: the witnesses are
+    /// read past the trace, so no run that decided by them is kept, and that is the first reason
+    /// such a run gives.
     fn witnesses(&self, read: impl FnOnce() -> Witnesses) -> &Witnesses {
+        aterm_uds::trace::poison(PAST_THE_TRACE);
         self.witnesses.get_or_init(read)
     }
 
@@ -904,19 +934,29 @@ impl Pass {
 
     /// THE READING FOR ONE ROW OF THE RECORDS A CALLER HOLDS: the evidence that `label`'s
     /// login is live after its recorded sign-out ([`Witnesses::newer_than_sign_out`]), from
-    /// this pass's witnesses.
+    /// this pass's witnesses. A row not signed out on record asks none and compares no clock;
+    /// one that is takes the reading `now` raw.
     pub(super) fn live(
         &self,
         (home, state_dir): (&Path, &Path),
         store: &accounts::Store,
         (roster, state): (&Roster, &State),
         label: &str,
-        now: i64,
+        now: impl Into<aterm_uds::trace::Now>,
     ) -> Option<LoginEvidence> {
         let row = roster.row(label)?;
         struck_at(row, state)?;
-        self.witnesses(|| Witnesses::read(home, state_dir, store, &struck_rows(roster, state), now))
-            .newer_than_sign_out(row, state, now)
+        let now: aterm_uds::trace::Now = now.into();
+        let witnesses = self.witnesses(|| {
+            Witnesses::read(
+                home,
+                state_dir,
+                store,
+                &struck_rows(roster, state),
+                now.raw(),
+            )
+        });
+        witnesses.newer_than_sign_out(row, state, now.raw())
     }
 }
 
@@ -932,9 +972,10 @@ pub(super) fn retain_not_live(
     paths: (&Path, &Path),
     store: &accounts::Store,
     (roster, state): (&Roster, &State),
-    now: i64,
+    now: impl Into<aterm_uds::trace::Now>,
     pass: &Pass,
 ) {
+    let now: aterm_uds::trace::Now = now.into();
     tiered.retain(|(_, row)| {
         pass.refused(&row.label)
             || pass
@@ -1061,10 +1102,11 @@ pub(super) fn adopt_live_logins(
     home: &Path,
     state_dir: &Path,
     roster_path: &Path,
-    now: i64,
+    now: impl Into<aterm_uds::trace::Now>,
     pass: &Pass,
     log: &dyn Fn(&str),
 ) -> Step {
+    let now: aterm_uds::trace::Now = now.into();
     let mut step = Step::default();
     let store = accounts::Store::at_for(state_dir, accounts::Cli::Claude, home);
     let Ok(records) = store.read_account_records(Some(roster_path), now) else {
@@ -1081,7 +1123,9 @@ pub(super) fn adopt_live_logins(
         }
         return step;
     };
-    let witnesses = pass.witnesses(|| Witnesses::read(home, state_dir, &store, &struck, now));
+    // A sign-out stands: the witnesses are asked, and judged on the reading as a number.
+    let witnesses = pass.witnesses(|| Witnesses::read(home, state_dir, &store, &struck, now.raw()));
+    let now = now.raw();
     let found: Vec<(Row, LoginEvidence)> = struck
         .iter()
         .filter_map(|(row, at)| Some((row.clone(), witnesses.live_login_here(row, *at, now)?)))

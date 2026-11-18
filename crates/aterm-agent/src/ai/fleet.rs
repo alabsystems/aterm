@@ -179,9 +179,15 @@ pub fn held_state(ai_dir: &Path) -> Option<Held> {
 }
 
 /// Reads up to [`SIG_MAX`] bytes from a regular signature file without blocking on a FIFO;
-/// when `refuse_symlink` is set, a symbolic link at `path` is refused too.
+/// when `refuse_symlink` is set, a symbolic link at `path` is refused too. With a trace scope
+/// armed on this thread, the file's stamp is recorded before it is looked at, and a system call
+/// that fails for a reason no stamp decides records a retry (`aterm_uds::trace::fs::opening`,
+/// `failed`); a refusal the stamp decides (a link, not a regular file, too long) records nothing
+/// more.
 pub(crate) fn read_sig_file(path: &Path, refuse_symlink: bool) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
+    let failed = |e: &std::io::Error| aterm_uds::trace::fs::failed(path, e);
+    aterm_uds::trace::fs::opening(path);
     #[cfg(not(unix))]
     if refuse_symlink && std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(std::io::Error::new(
@@ -200,8 +206,8 @@ pub(crate) fn read_sig_file(path: &Path, refuse_symlink: bool) -> std::io::Resul
         }
         open.custom_flags(flags);
     }
-    let file = open.open(path)?;
-    let meta = file.metadata()?;
+    let file = open.open(path).inspect_err(failed)?;
+    let meta = file.metadata().inspect_err(failed)?;
     if !meta.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -216,7 +222,9 @@ pub(crate) fn read_sig_file(path: &Path, refuse_symlink: bool) -> std::io::Resul
     }
     let cap = usize::try_from(meta.len().min(SIG_MAX).saturating_add(1)).unwrap_or(0);
     let mut raw = Vec::with_capacity(cap);
-    file.take(SIG_MAX + 1).read_to_end(&mut raw)?;
+    file.take(SIG_MAX + 1)
+        .read_to_end(&mut raw)
+        .inspect_err(failed)?;
     if raw.len() as u64 > SIG_MAX {
         return Err(std::io::Error::new(
             std::io::ErrorKind::FileTooLarge,
@@ -226,10 +234,17 @@ pub(crate) fn read_sig_file(path: &Path, refuse_symlink: bool) -> std::io::Resul
     Ok(raw)
 }
 
-/// The held document of `url` under `key`, verified again and within its `valid_until`.
+/// The held document of `url` under `key`, verified again and within its `valid_until` as of
+/// `now`, compared through it ([`aterm_uds::trace::Now`]).
 /// # Errors
 /// Why there is none to use: not fetched yet, tampered with, or expired.
-pub fn held(ai_dir: &Path, url: &str, key: &str, now: i64) -> Result<String, String> {
+pub fn held(
+    ai_dir: &Path,
+    url: &str,
+    key: &str,
+    now: impl Into<aterm_uds::trace::Now>,
+) -> Result<String, String> {
+    let now: aterm_uds::trace::Now = now.into();
     let state = held_state(ai_dir)
         .filter(|h| h.of(url, key) && h.fetched_at.is_some())
         .ok_or("not fetched yet")?;
@@ -242,7 +257,8 @@ pub fn held(ai_dir: &Path, url: &str, key: &str, now: i64) -> Result<String, Str
     verify(doc.as_bytes(), &sig, key).map_err(|why| format!("its held copy: {why}"))?;
     let (_, valid_until) = meta(&doc).map_err(|why| format!("its held copy: {why}"))?;
     let _ = state;
-    if let Some(until) = valid_until.filter(|t| *t < now) {
+    // Expired once `now` is past `until`: `now - until >= 1`.
+    if let Some(until) = valid_until.filter(|until| now.aged(*until, 1)) {
         return Err(format!(
             "its held copy expired at {}",
             super::state::when(until)

@@ -121,6 +121,7 @@ fn seed(case: i64, store: &accounts::Store, label: &str, now: i64) {
                     account: label.into(),
                     at: now,
                     held: None,
+                    owner: None,
                 },
             );
         }
@@ -310,7 +311,7 @@ fn creation_case(case: i64, cli: Cli) -> (i64, i64, i64) {
         );
     }
     if case == 25 {
-        assert!(String::from_utf8_lossy(&err).contains("adopt-default <unused-label>"));
+        assert!(String::from_utf8_lossy(&err).contains("adopt-default <account>"));
     }
     (
         i64::from(success),
@@ -421,9 +422,11 @@ fn adopting_a_label_with_a_retained_binding_refuses_instead_of_redirecting() {
     let tmp = tmp_dir("adopt-retained-binding");
     let env = env_at(&tmp);
     let store = env.accounts_store();
+    // A binding retained under the label the adopted row takes: its account's reserved slug.
+    let work = crate::harness::account_names::tests::added_label(Cli::Claude, "new@example.test");
     let mut logins = accounts::Logins::default();
     logins.labels.insert(
-        "work".into(),
+        work.clone(),
         accounts::Binding {
             dir: Some(
                 tmp.path()
@@ -437,9 +440,8 @@ fn adopting_a_label_with_a_retained_binding_refuses_instead_of_redirecting() {
     store.save_logins(&logins).unwrap();
     let (code, out, err) = acc_quiet(
         AccountsCmd::AdoptDefault {
-            label: "work".into(),
+            account: None,
             email: Some("new@example.test".into()),
-            identity_email: None,
             browser: None,
         },
         &env,
@@ -447,7 +449,7 @@ fn adopting_a_label_with_a_retained_binding_refuses_instead_of_redirecting() {
     let resolved = Roster::load(&env.accounts_roster().unwrap())
         .ok()
         .and_then(|raw| store.bound(&raw, env.now).ok())
-        .and_then(|rows| rows.row("work").and_then(|row| row.dir.clone()));
+        .and_then(|rows| rows.row(&work).and_then(|row| row.dir.clone()));
     assert_eq!(
         code,
         exit(1),
@@ -455,4 +457,98 @@ fn adopting_a_label_with_a_retained_binding_refuses_instead_of_redirecting() {
     );
     assert!(!env.accounts_roster().unwrap().exists());
     assert_eq!(store.load_logins(env.now).unwrap().0, logins);
+}
+
+/// A row labelled with its account's reserved slug takes the records that account left under the
+/// label here: an account listed again after its row was removed by hand, whose usage record
+/// (naming its key, or no key) and login binding to the row's own directory are kept, is listed
+/// and keeps them. A binding that would redirect the row to another directory, a record of
+/// another account and work in flight under the label (a session) are refused, naming the
+/// account and never the label, and nothing is written.
+/// NEGATIVE CONTROL: with `accounts_add_admitted` admitting the label as `check_new_labels` does
+/// (no `OwnRecords`), `own` is refused (exit 1, not 0) (2026-11-16, by hand on SF-07H S6's review settle, then restored).
+#[cfg(unix)]
+#[test]
+fn a_reserved_slug_takes_its_own_accounts_retained_records() {
+    let email = "ada@x.example";
+    let label = crate::harness::account_names::tests::added_label(Cli::Claude, email);
+    let pk = aterm_db::typed::keys::account_pk("claude", email).unwrap();
+    let other = aterm_db::typed::keys::account_pk("claude", "bea@x.example").unwrap();
+    for case in ["own", "no-key", "redirect", "another", "session"] {
+        let tmp = tmp_dir("reserved-retained");
+        let env = env_at(&tmp);
+        let store = env.accounts_store();
+        let dir = store.login_dir(&label).unwrap();
+        let bound = if case == "redirect" {
+            tmp.path().join("previous-login")
+        } else {
+            dir.clone()
+        };
+        let mut logins = accounts::Logins::default();
+        logins.labels.insert(
+            label.clone(),
+            accounts::Binding {
+                dir: Some(bound.to_string_lossy().into_owned()),
+                ..accounts::Binding::default()
+            },
+        );
+        store.save_logins(&logins).unwrap();
+        let mut state = accounts::State::default();
+        state.accounts.insert(
+            label.clone(),
+            accounts::Account {
+                pk: match case {
+                    "no-key" => None,
+                    "another" => Some(other.clone()),
+                    _ => Some(pk.clone()),
+                },
+                ..accounts::Account::default()
+            },
+        );
+        if case == "session" {
+            state.sessions.insert(
+                "old-session".into(),
+                accounts::SessionRow {
+                    account: label.clone(),
+                    at: env.now,
+                    held: None,
+                    owner: None,
+                },
+            );
+        }
+        store.save(&state).unwrap();
+        let before = data_files(tmp.path());
+        let (code, out, err) = acc_quiet(
+            AccountsCmd::Add {
+                account: format!("claude {email}"),
+                class: Class::Preferred,
+                email: None,
+                browser: None,
+            },
+            &env,
+        );
+        if matches!(case, "own" | "no-key") {
+            assert_eq!(code, exit(0), "{case}: {out}{err}");
+            let roster = Roster::load(&env.accounts_roster().unwrap()).unwrap();
+            let row = store
+                .bound(&roster, env.now)
+                .unwrap()
+                .row(&label)
+                .cloned()
+                .expect("the account's row, under its reserved slug");
+            assert_eq!(row.dir.as_deref(), dir.to_str(), "{case}: its own login");
+            assert!(
+                store.load(env.now).unwrap().0.accounts.contains_key(&label),
+                "{case}: its usage record is kept"
+            );
+        } else {
+            assert_eq!(code, exit(1), "{case}: {out}{err}");
+            assert!(
+                err.contains("claude ada@x.example") && err.contains("nothing was written"),
+                "{case}: {err}"
+            );
+            assert!(!err.contains(&label), "{case}: the label is printed: {err}");
+            assert_eq!(data_files(tmp.path()), before, "{case}");
+        }
+    }
 }

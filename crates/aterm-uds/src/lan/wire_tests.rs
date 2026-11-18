@@ -392,3 +392,33 @@ fn a_reader_that_takes_no_descriptor_refuses_one() {
         io::ErrorKind::InvalidData
     );
 }
+
+/// A frame wait with no deadline beside a cancel ends once another thread makes the cancel
+/// readable, with `Interrupted` and nothing read from either; the reader then takes the next
+/// frame as before. NEGATIVE CONTROL: a wait with no deadline that polls the connection alone
+/// (`(None, Some(_))` as `ready::one`) never returns, and the hang detector fails it.
+#[test]
+fn a_frame_wait_with_no_deadline_ends_when_cancelled() {
+    let hang = std::time::Duration::from_secs(60);
+    let (ours, mut theirs) = CtlStream::pair().unwrap();
+    let (cancel, ring) = crate::pipe().unwrap();
+    let (said, heard) = std::sync::mpsc::channel();
+    let waiting = std::thread::spawn(move || {
+        let mut reader = Reader::new(0);
+        let waited = reader.frame_cancelled(&ours, None, Some(cancel.as_fd()));
+        said.send(waited.map_err(|error| error.kind())).unwrap();
+        (reader, ours)
+    });
+    (&ring).write_all(&[1]).unwrap();
+    assert_eq!(
+        heard.recv_timeout(hang).expect("the cancel ends the wait"),
+        Err(io::ErrorKind::Interrupted)
+    );
+    let (mut reader, ours) = waiting.join().unwrap();
+    let frame = Frame::Socket { reached: None };
+    theirs.write_all(&encode(&frame).unwrap()).unwrap();
+    assert_eq!(
+        reader.frame(&ours, Some(Instant::now() + hang)).unwrap(),
+        Some(frame)
+    );
+}

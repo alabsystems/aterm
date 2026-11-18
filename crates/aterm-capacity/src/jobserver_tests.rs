@@ -14,6 +14,126 @@ fn every_free_token(pool: &Jobserver) -> Vec<Token<'_>> {
     std::iter::from_fn(|| pool.try_acquire().unwrap()).collect()
 }
 
+#[cfg(unix)]
+#[test]
+fn a_held_fifo_permission_refuses_replacement_and_symlink_names_without_spending_tokens() {
+    for replacement in ["file", "fifo", "link"] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobs");
+        let pool = Jobserver::new(&path, 2).unwrap();
+        let held = pool.held_fifo().unwrap();
+        assert_eq!(held.path().unwrap(), pool.path().canonicalize().unwrap());
+        let free = every_free_token(&pool);
+        assert_eq!(free.len(), 2, "retaining metadata cannot spend a token");
+        drop(free);
+        let original = dir.path().join("original");
+        std::fs::rename(&path, &original).unwrap();
+        let _replacement = match replacement {
+            "file" => {
+                std::fs::write(&path, b"protected").unwrap();
+                None
+            }
+            "fifo" => Some(Jobserver::new(&path, 2).unwrap()),
+            "link" => {
+                std::os::unix::fs::symlink(&original, &path).unwrap();
+                None
+            }
+            _ => unreachable!(),
+        };
+        assert!(
+            held.path().is_err(),
+            "{replacement} cannot inherit a FIFO permission"
+        );
+        assert!(pool.held_fifo().is_err());
+        assert_eq!(every_free_token(&pool).len(), 2);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_held_fifo_permission_resolves_parent_aliases_but_refuses_their_retargeting() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let physical = dir.path().join("physical");
+    let other = dir.path().join("other");
+    let alias = dir.path().join("alias");
+    std::fs::create_dir(&physical).unwrap();
+    std::fs::create_dir(&other).unwrap();
+    std::os::unix::fs::symlink(&physical, &alias).unwrap();
+    let pool = Jobserver::new(&alias.join("jobs"), 2).unwrap();
+    let held = pool.held_fifo().unwrap();
+    assert_eq!(
+        held.path().unwrap(),
+        physical.join("jobs").canonicalize().unwrap()
+    );
+    assert_ne!(held.path().unwrap(), pool.path());
+    let _other_pool = Jobserver::new(&other.join("jobs"), 2).unwrap();
+    std::fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(&other, &alias).unwrap();
+    assert!(
+        held.path().is_err(),
+        "the captured physical name still exists, but the advertised name changed"
+    );
+    assert!(pool.held_fifo().is_err());
+    assert_eq!(every_free_token(&pool).len(), 2);
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[test]
+fn a_retained_fifo_obeys_the_original_fork_mark_and_does_not_keep_a_writer_in_the_child() {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let pool = Jobserver::new(&dir.path().join("jobs"), 1).unwrap();
+    let retained = pool.held_fifo().unwrap();
+    let flags = |file: &File| {
+        // SAFETY: F_GETFD only observes the live descriptor's flags.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0);
+        flags
+    };
+    let original = flags(&pool.file);
+    let duplicate = flags(&retained.file);
+    assert_ne!(duplicate & libc::FD_CLOEXEC, 0);
+    // Darwin's close-on-fork bit. Other kernels retain the FIFO through the deliberate raw
+    // fork below; the exec still closes it. Where the kernel supports the original mark,
+    // duplicating without kept_out loses it and this exact check fails.
+    let fork_bit = if cfg!(target_os = "macos") { 2 } else { 0 };
+    assert_eq!(duplicate & fork_bit, original & fork_bit);
+    let mut reader = aterm_uds::kept_out(|| {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(pool.path())
+    })
+    .unwrap();
+    let child = aterm_uds::fork_window::Parked::park();
+    drop(retained);
+    drop(pool);
+    let mut token = [0];
+    assert_eq!(
+        reader.read(&mut token).unwrap(),
+        1,
+        "the one original token"
+    );
+    let after = reader.read(&mut token);
+    if fork_bit != 0 && original & fork_bit != 0 {
+        assert_eq!(
+            after.unwrap(),
+            0,
+            "the parked child inherited no FIFO writer"
+        );
+    } else {
+        assert_eq!(
+            after.unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "negative control: a kernel without the fork mark retains its writers until exec"
+        );
+    }
+    assert!(child.release().success());
+    assert_eq!(reader.read(&mut token).unwrap(), 0);
+}
+
 #[test]
 fn an_interrupted_read_does_not_report_an_empty_fifo() {
     struct InterruptedOnce<R>(R, bool);
@@ -66,7 +186,16 @@ fn branches_and_their_workers_share_exactly_the_grant() {
                 Some(std::ffi::OsStr::new(&pool.flags()))
             );
         }
-        assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["-j", "3"]);
+        assert_eq!(
+            cmd.get_envs()
+                .find(|(name, _)| *name == "CARGO_BUILD_JOBS")
+                .and_then(|(_, value)| value),
+            Some(OsStr::new("3")),
+        );
+        assert_eq!(
+            cmd.get_args().collect::<Vec<_>>(),
+            ["--config", "build.jobs=3"]
+        );
     }
     // A second FIFO opener represents another process, not a private pool per branch.
     let worker = OpenOptions::new()
@@ -103,6 +232,122 @@ fn branches_and_their_workers_share_exactly_the_grant() {
     drop(all);
     drop(pool);
     assert!(!path.exists());
+}
+
+#[test]
+fn attached_cargo_keeps_config_scope_and_forwarded_arguments() {
+    for (before, after) in [
+        (
+            vec![
+                "--config",
+                "one.toml",
+                "--config=two.toml",
+                "build",
+                "--locked",
+            ],
+            vec![
+                "--config",
+                "one.toml",
+                "--config=two.toml",
+                "--config",
+                "build.jobs=3",
+                "build",
+                "--locked",
+            ],
+        ),
+        (
+            vec!["--config", "prefix.toml", "build", "--config", "post.toml"],
+            vec![
+                "--config",
+                "prefix.toml",
+                "build",
+                "--config",
+                "post.toml",
+                "--config",
+                "build.jobs=3",
+            ],
+        ),
+        (
+            vec!["test", "--", "-j99", "--config", "child.toml"],
+            vec![
+                "test",
+                "--config",
+                "build.jobs=3",
+                "--",
+                "-j99",
+                "--config",
+                "child.toml",
+            ],
+        ),
+        (
+            vec!["build", "--config"],
+            vec!["build", "--config", "build.jobs=3", "--config"],
+        ),
+    ] {
+        let before = before.into_iter().map(OsString::from).collect();
+        let after: Vec<_> = after.into_iter().map(OsString::from).collect();
+        assert_eq!(cargo_args_with_grant(before, 3), after);
+    }
+}
+
+#[test]
+fn attached_cargo_bounds_cli_jobs_before_the_forwarded_tail() {
+    for jobs in [
+        vec!["--jobs", "99"],
+        vec!["--jobs=99"],
+        vec!["-j", "99"],
+        vec!["-j99"],
+        vec!["-j=99"],
+        vec!["-vj99"],
+        vec!["-vvj=99"],
+        vec!["-qj99"],
+    ] {
+        let mut before = vec![OsString::from("test")];
+        before.extend(jobs.iter().copied().map(OsString::from));
+        before.extend(["--", "--jobs=7"].map(OsString::from));
+        let mut after = vec![OsString::from("test")];
+        after.extend(jobs.iter().copied().map(OsString::from));
+        after.extend(["--config", "build.jobs=3", "-j", "3", "--", "--jobs=7"].map(OsString::from));
+        assert_eq!(cargo_args_with_grant(before, 3), after, "{jobs:?}");
+    }
+}
+
+#[test]
+fn a_cancelled_cargo_attachment_changes_no_command_setting_or_token() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let pool = Jobserver::new(&dir.path().join("jobs"), 1).unwrap();
+    let held = pool.acquire(&|| false).unwrap();
+    let mut command = aterm_uds::spawnfd::command("targo");
+    command
+        .args(["build", "--jobs=99"])
+        .current_dir(dir.path())
+        .env("MAKEFLAGS", "caller")
+        .env("CARGO_BUILD_JOBS", "99");
+    let args: Vec<_> = command.get_args().map(OsStr::to_owned).collect();
+    let env: Vec<_> = command
+        .get_envs()
+        .map(|(key, value)| (key.to_owned(), value.map(OsStr::to_owned)))
+        .collect();
+    assert!(
+        matches!(pool.attach_cargo(&mut command, &|| true), Err(error)
+        if error.kind() == io::ErrorKind::Interrupted)
+    );
+    assert_eq!(command.get_program(), OsStr::new("targo"));
+    assert_eq!(command.get_current_dir(), Some(dir.path()));
+    assert_eq!(
+        command.get_args().map(OsStr::to_owned).collect::<Vec<_>>(),
+        args
+    );
+    assert_eq!(
+        command
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(OsStr::to_owned)))
+            .collect::<Vec<_>>(),
+        env,
+    );
+    assert!(pool.try_acquire().unwrap().is_none());
+    drop(held);
+    assert!(pool.try_acquire().unwrap().is_some());
 }
 
 #[test]

@@ -1,21 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm harness accounts token-run (<label> | <email> | --auto) -- <program> <args…>`: aterm's
-//! token wrapper (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.3, slice S8).
+//! `aterm harness accounts token-run (<account> | --auto) -- <program> <args…>`: aterm's token
+//! wrapper (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.3, slice S8).
 //!
-//! A relaunch line for a token decision types it with the row's label (or a row-less account's
-//! email) before the store build; the managed twin's token block types it with `--auto` before a
-//! `claude` a person typed in a tab (`atpkg::launch_tap::with_token_block`). It asks the one judgment
-//! ([`token_route::judge`]) again, and:
+//! A relaunch line for a token decision types it with the account's key (`ac-…`) before the store
+//! build; the managed twin's token block types it with `--auto` before a `claude` a person typed in
+//! a tab (`atpkg::launch_tap::with_token_block`). It asks the one judgment ([`token_route::judge`])
+//! again. A line that names its account names it as every accounts verb does ([`account_key_of`]:
+//! its slug, its key, its provider word and address, or its address; never a roster label), and
+//! the judgment holds the account the launch's own login names to it: a word that names another
+//! account, or none (a roster label an older aterm typed), is `outside`, so nothing is served, and
+//! the launch starts nothing where its row's stored login is one this Mac must not run (below).
+//! Only a slug needs the lab's names, so the lab is read only for a word the roster and the
+//! launch's login do not name, and never for `--auto`. Then it:
 //!
 //! - **falls back** wherever the judgment does not say [`Decision::Token`]: it execs the program
 //!   exactly as typed, with no descriptor, and journals `token-fallback` with the reason word
 //!   where the account has a token entry (a launch on an account with none says nothing);
 //! - **starts nothing** where that fallback would start a session on a stored login this Mac must
-//!   not run ([`Decided::unstored`]): the row's login was never made here, so the session would
-//!   come up signed out on an empty directory and its sign-in wall would ask this Mac to sign in
-//!   another Mac's account (FL-135), or another Mac's warm set holds the row
+//!   not run ([`Decided::unstored`]), a line whose word does not name the launch's account
+//!   included: the row's login was never made here, so the session would come up signed out on
+//!   an empty directory and its sign-in wall would ask this Mac to sign in another Mac's account
+//!   (FL-135), or another Mac's warm set holds the row
 //!   ([`accounts::Row::held_by`], which refuses every route here). It says why on stderr and
 //!   exits [`NOT_STARTED`];
 //! - **serves** otherwise: it unsets every [`accounts::CREDENTIAL_KEYS`] variable (today's
@@ -34,18 +41,22 @@
 //! table's own `tokens.lock`, which no line's relaunch holds and each writer holds only for one
 //! table write; a row it could not make is made by the next judgment.
 
-use super::accounts::{self, ProcessLogin, Roster, Store, TokenEntry};
-use super::token_route::{self, Account, Ask, Decision, Facts, Fallback, Named, TokenFact};
+use super::account_names::{self, Candidates, Login, OtherPool};
+use super::accounts::{self, Cli, ProcessLogin, Roster, Store, TokenEntry};
+use super::alab_roster::Lab;
+use super::token_route::{self, Account, Ask, Decision, Facts, Fallback, TokenFact};
 use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// What the verb was typed with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Run {
-    /// The label or email, or `None` for `--auto`.
+    /// The account word (a provider word and address typed as two words joined into one,
+    /// [`account_names::words`]), or `None` for `--auto`.
     pub named: Option<String>,
     /// The program to run.
     pub program: OsString,
@@ -53,39 +64,114 @@ pub struct Run {
     pub args: Vec<OsString>,
 }
 
-impl Run {
-    /// How the judgment names the account.
-    #[must_use]
-    pub fn named(&self) -> Named<'_> {
-        self.named.as_deref().map_or(Named::Auto, Named::Label)
-    }
-}
-
-/// The verb's words after `accounts token-run`: `(<label> | <email> | --auto) -- <program>
-/// <args…>`.
+/// The verb's words after `accounts token-run`: `(<account> | --auto) -- <program> <args…>`,
+/// the account's words ending at the first `--`.
 ///
 /// # Errors
-/// Any other shape.
+/// Any other shape: no `--`, no program, or anything but one account word or `--auto` before
+/// the `--`.
 pub fn parse(args: &[OsString]) -> Result<Run, String> {
     const USAGE: &str =
-        "usage: aterm harness accounts token-run (<label> | <email> | --auto) -- <program> <args…>";
-    let [named, dash, program, rest @ ..] = args else {
+        "usage: aterm harness accounts token-run (<account> | --auto) -- <program> <args…>";
+    let dash = args.iter().position(|arg| arg == "--").ok_or(USAGE)?;
+    let [program, rest @ ..] = &args[dash + 1..] else {
         return Err(USAGE.to_owned());
     };
-    if dash != "--" {
-        return Err(USAGE.to_owned());
-    }
-    let named = named.to_str().ok_or(USAGE)?;
-    let named = match named {
-        token_route::AUTO => None,
-        "" => return Err(USAGE.to_owned()),
-        name if name.starts_with('-') => return Err(USAGE.to_owned()),
-        name => Some(name.to_owned()),
+    let operands: Vec<&str> = args[..dash]
+        .iter()
+        .map(|word| word.to_str())
+        .collect::<Option<_>>()
+        .ok_or(USAGE)?;
+    let named = match operands.as_slice() {
+        [token_route::AUTO] => None,
+        _ => match account_names::words(&operands).as_slice() {
+            [word] if !word.is_empty() && !word.starts_with('-') => Some(word.clone()),
+            _ => return Err(USAGE.to_owned()),
+        },
     };
     Ok(Run {
         named,
         program: program.clone(),
         args: rest.to_vec(),
+    })
+}
+
+/// What a word that names an account of another pool only is answered with: the wrapper serves
+/// Claude Code's accounts alone, so no `--cli` takes it.
+pub const CLAUDE_ONLY: &str = "the token wrapper serves only a Claude Code account";
+
+/// The account a line's word names, as the wrapper holds a launch to it ([`account_key_of`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Keyed {
+    /// Its token entry's key, as the lab journal keys it ([`TokenEntry::key`]).
+    pub key: String,
+    /// How a refusal names it: its key, with its slug beside it where the lab names it
+    /// ([`account_names::Named::logged`]), never its address.
+    pub logged: String,
+}
+
+/// The Claude Code account `word` names ([`account_names::resolve_in`]) among the `roster`'s
+/// rows, the login the launch is on (its record's address, `login_email`) and the lab's accounts,
+/// keyed as the lab journal keys its token entry: its row's ([`TokenEntry::of_row`]), else its
+/// claims address's, the address its account key is hashed from, else its login address's
+/// ([`TokenEntry::of_email`]). What the judgment holds the launch's own account to. A key or an
+/// address names its account from the roster and the login alone, so `lab` is read only where
+/// they name none (a slug, or a word another pool's account answers).
+///
+/// # Errors
+/// `word` names no account of Claude Code's pool, or several, in the resolver's words (a word
+/// that names an account of another pool says the wrapper serves Claude Code's alone,
+/// [`CLAUDE_ONLY`]); or this aterm cannot key the account it names (no lab journal is
+/// installed).
+pub fn account_key_of(
+    word: &str,
+    roster: Option<&Roster>,
+    lab: &dyn Fn() -> Option<Arc<Lab>>,
+    login_email: Option<&str>,
+) -> Result<Keyed, String> {
+    let logins: Vec<Login<'_>> = login_email
+        .into_iter()
+        .map(|email| Login {
+            region: None,
+            email,
+        })
+        .collect();
+    let rows = roster.map_or(&[][..], |roster| roster.rows.as_slice());
+    let keyed = |lab: Option<&Lab>| {
+        let candidates = Candidates {
+            roster: rows,
+            logins: &logins,
+            lab,
+            held: &[],
+        };
+        let named = account_names::resolve_in(
+            Cli::Claude,
+            word,
+            &candidates,
+            OtherPool::Alone(CLAUDE_ONLY),
+        )?;
+        let entry = match named.row {
+            Some(row) => TokenEntry::of_row(row),
+            None => [named.names.email.as_deref(), named.names.login.as_deref()]
+                .into_iter()
+                .flatten()
+                .find_map(TokenEntry::of_email),
+        };
+        entry
+            .map(|entry| Keyed {
+                key: entry.key().as_str().to_owned(),
+                logged: named.logged(),
+            })
+            .ok_or_else(|| {
+                format!(
+                    "this aterm cannot key {} (no lab journal is installed)",
+                    named.logged()
+                )
+            })
+    };
+    keyed(None).or_else(|why| match lab() {
+        Some(lab) => keyed(Some(&lab)),
+        None => Err(why),
     })
 }
 
@@ -187,15 +273,33 @@ impl Ask for Asked<'_> {
         let who = ProcessLogin::of_env(self.env.iter().copied())
             .with_settings(&settings)
             .with_profile_store(profile);
-        let found = token_route::account_of(
-            &who,
-            self.ctx.roster.as_ref(),
-            self.run.named(),
-            &|login| super::profile::login_record(home, login).map(|record| record.email),
-            &|| token_route::outside_why(self.env, &settings, profile),
-        )?;
+        let login_email =
+            |login: Option<&str>| super::profile::login_record(home, login).map(|r| r.email);
+        let found = token_route::account_of(&who, self.ctx.roster.as_ref(), &login_email, &|| {
+            token_route::outside_why(self.env, &settings, profile)
+        })?;
+        // The launch's own account first, so a line whose word does not name it still starts
+        // nothing on a row whose stored login this Mac must not run ([`Decided::unstored`]).
         self.entry.set(found.1);
         self.label.borrow_mut().clone_from(&found.0.label);
+        if let Some(word) = self.run.named.as_deref() {
+            let named = account_key_of(
+                word,
+                self.ctx.roster.as_ref(),
+                &super::alab_roster::current,
+                login_email(who.login.as_deref()).as_deref(),
+            )?;
+            if !found
+                .1
+                .is_some_and(|entry| entry.key().as_str() == named.key)
+            {
+                return Err(format!(
+                    "`{}` names the login of another account than {}",
+                    accounts::LOGIN_ENV,
+                    named.logged
+                ));
+            }
+        }
         Ok(found)
     }
 
@@ -299,11 +403,16 @@ struct Decided {
     noted: Option<(TokenEntry, &'static str)>,
     /// Why the run must not start on its row's stored login here (`Asked::unstored`), where the
     /// judgment put it there ([`Decision::Stored`]: today's judgment had it on that login, and the
-    /// token does not serve it) or where a token decision found nothing to serve: then the
-    /// wrapper starts nothing ([`NOT_STARTED`]). A run the judgment leaves as typed
+    /// token does not serve it), where a token decision found nothing to serve, or where a line's
+    /// word does not name the account the launch is on (another account's, or none's: a roster
+    /// label an older aterm typed), which runs as typed on that account's stored login: then the
+    /// wrapper starts nothing ([`NOT_STARTED`]). Any other run the judgment leaves as typed
     /// ([`Decision::AsTyped`]) is none: it is off the row's stored login, or no session-starting
     /// shape.
     unstored: Option<String>,
+    /// The token entry today's judgment resolved the launch's account to.
+    #[cfg(test)]
+    entry: Option<TokenEntry>,
 }
 
 /// [`decide`]'s judgment, and the fallback it would journal.
@@ -359,6 +468,11 @@ fn decide_with(run: &Run, ctx: &Ctx) -> Decided {
                 .map(|unstored| format!("{unstored} ({})", why.why()))
         }
         Decision::Token { .. } => asked.unstored(),
+        // A line whose word does not name the launch's account: today's judgment put the launch
+        // on its own account's stored login (`Asked::label`) before it compared the word.
+        Decision::AsTyped(why @ Fallback::Outside(_)) if run.named.is_some() => asked
+            .unstored()
+            .map(|unstored| format!("{unstored} ({})", why.why())),
         Decision::AsTyped(_) => None,
     };
     let noted = match &decision {
@@ -374,10 +488,36 @@ fn decide_with(run: &Run, ctx: &Ctx) -> Decided {
     };
     Decided {
         decision,
+        #[cfg(test)]
+        entry: asked.entry.get(),
         read: asked.read.into_inner(),
         build,
         noted,
         unstored,
+    }
+}
+
+/// The wrapper's judgment of `run` in `ctx` as a test reads it ([`judged`]).
+#[cfg(test)]
+pub(in crate::harness) struct Judged {
+    /// The one judgment.
+    pub decision: Decision,
+    /// The token entry today's judgment resolved the launch's account to.
+    pub entry: Option<TokenEntry>,
+    /// Why the wrapper starts nothing where its token is not served ([`refusal`]).
+    pub refusal: Option<String>,
+}
+
+/// [`decide_with`] of `run` in `ctx`, journaling nothing, with why it starts nothing where the
+/// token is not served: the wrapper as another module's test reads it (the relaunch's round trip,
+/// SF-07H's exit test).
+#[cfg(test)]
+pub(in crate::harness) fn judged(run: &Run, ctx: &Ctx) -> Judged {
+    let decided = decide_with(run, ctx);
+    Judged {
+        refusal: refusal(&decided, false),
+        entry: decided.entry,
+        decision: decided.decision,
     }
 }
 
@@ -464,10 +604,32 @@ fn refusal(decided: &Decided, served: bool) -> Option<String> {
     })
 }
 
-/// Exec `program` exactly as typed: this process's environment, descriptors and stdio.
+/// Exec `program` exactly as typed: this process's environment, descriptors and stdio, less the
+/// wrapper's own marker and minted time ([`as_typed_command`]).
 #[cfg(unix)]
 fn as_typed(program: &std::ffi::OsStr, args: &[OsString]) -> std::io::Error {
-    aterm_uds::spawnfd::transparent(program).args(args).exec()
+    as_typed_command(program, args).exec()
+}
+
+/// `program` with `args` as typed, on this process's environment without the wrapper's own
+/// [`token_route::MARKER_ENV`] and [`token_route::MINTED_ENV`]: the wrapper sets them only beside
+/// a descriptor it serves, so an inherited copy is a token session's, handed on to a tool child
+/// after Claude Code consumed the descriptor. The judgment set that copy aside ([`decide_with`]),
+/// so the program runs on the route judged, its stored login or one of the person's own, and
+/// never reads as a route of its own (`AuthRoute::Outside`). Off Unix no wrapper serves a token,
+/// so none sets them.
+#[cfg(unix)]
+fn as_typed_command(
+    program: &std::ffi::OsStr,
+    args: &[OsString],
+) -> aterm_uds::spawnfd::TransparentCommand {
+    let mut command = aterm_uds::spawnfd::transparent(program);
+    command
+        .args(args)
+        .env_exactly(std::env::vars_os().filter(|(name, _)| {
+            name != token_route::MARKER_ENV && name != token_route::MINTED_ENV
+        }));
+    command
 }
 
 /// Exec `program` on `token` (§5.3, serving): the credential variables and any inherited marker

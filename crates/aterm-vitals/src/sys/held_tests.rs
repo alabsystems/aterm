@@ -48,12 +48,14 @@ fn world(rows: Vec<Holding>, used: u64) -> World {
         },
         tabs: vec![
             TabFact {
+                sampled_nonce: None,
                 key: 7,
                 sid: "s-ab12".into(),
                 window: Some(1),
                 tab: Some(1),
             },
             TabFact {
+                sampled_nonce: None,
                 key: 8,
                 sid: "s-cd34".into(),
                 window: Some(1),
@@ -619,7 +621,7 @@ fn sys_disk_held_says_what_the_passes_removed_and_the_outside_cache_step() {
     );
     assert_eq!(
         line_of(&r, "removed 2"),
-        "removed n=2 age_s=3600 rows=2 bytes=unavailable(not_read) by=tab:2 what=build%20caches"
+        "removed n=2 age_s=3600 rows=2 bytes=unavailable(not_read) by=tab:2 sid=unavailable(not_sampled) what=build%20caches"
     );
     assert!(
         !r.lines.iter().any(|l| l.key == "removed 3"),

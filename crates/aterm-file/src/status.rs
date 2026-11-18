@@ -139,10 +139,16 @@ pub struct State {
     /// How many passes have recorded: each that changed the file, and each that changed
     /// nothing while another pass's look was outstanding (`Recorded::Fenced`); a pass that
     /// changed nothing with no look outstanding leaves it. A pass that looked at one count
-    /// records nothing once the count has moved (section 4, Materializer).
+    /// records nothing once the count has moved (section 4, Materializer). A pass that fenced a
+    /// look and changed nothing moves it and nothing else, so a traced read of the status leaves
+    /// it out of the standing it records ([`crate::File::state`]); a reader that decides by it
+    /// records it as well ([`crate::File::look`]).
     pub seq: u64,
     /// When the last pass that changed the file or fenced a look recorded, Unix milliseconds:
-    /// this Mac's clock, for display only.
+    /// this Mac's clock, for display only. A pass that fenced a look and changed nothing moves
+    /// it and the count alone, so a traced read of the status leaves it out of the standing it
+    /// records ([`crate::File::state`]), and [`Status::json`], which answers with it, poisons
+    /// the scope.
     pub pass_ms: u64,
     /// The snapshot's revision; 0 with none.
     pub rev: u64,
@@ -366,12 +372,20 @@ impl Status {
 
     /// The status as JSON, for `--json`: `passes` and `pass_ms` are the count of passes that
     /// changed the file or fenced a look ([`State::seq`]) and the time of the last of them.
+    ///
+    /// Where a pass recorded, a trace scope armed on this thread is poisoned
+    /// (`aterm_uds::trace::poison`): the JSON then holds that pass's count and time
+    /// ([`State::seq`], [`State::pass_ms`]), which a traced read of the status leaves out of
+    /// what it records ([`crate::File::state`]).
     #[must_use]
     pub fn json(&self) -> Value {
         let mut object = Map::new();
         object.insert("state".to_owned(), Value::from(self.word.as_str()));
         object.insert("why".to_owned(), Value::from(self.why.map(Why::as_str)));
         if let Some(state) = &self.state {
+            aterm_uds::trace::poison(
+                "a shared file's status as JSON: the last pass's count and time",
+            );
             for (name, value) in [
                 ("rev", state.rev),
                 ("rows", state.rows),

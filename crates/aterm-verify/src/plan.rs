@@ -326,20 +326,20 @@ fn folds(ctx: &Ctx, wanted: &[StageId]) -> bool {
 /// last, the lint, runs beside a test compile outside a release), so their errors show before
 /// later stages start.
 const PREFLIGHT: [StageId; 5] = [
+    StageId::Census,
     StageId::ReleasedShim,
     StageId::Formatting,
-    StageId::Census,
     StageId::ExportScan,
     StageId::Tippy,
 ];
 
 /// The preflight stages `id` waits for in a run that is a release or not (`release`,
-/// [`PREFLIGHT`]). The released shim waits for none and every other stage waits for it. The
-/// three source guards and the lint wait for it alone and for none of each other: each reads
-/// the tree and writes none of it (`--fix` is taken only with `fmt` or `census` alone), the lint
-/// builds in its own lane, and a red in any of them ends every run but a release's tree sweep
-/// where it is ([`crate::sched::Halt`]), so running them together loses no red and a run no
-/// longer waits for the three guards one after another.
+/// [`PREFLIGHT`]). Census reads the current tree without running a child, so its red can stop
+/// the released shim's disposable build before it starts. The shim waits for census; formatting,
+/// the export scan and the lint wait for the shim alone and for none of each other. The source
+/// guards write nothing (`--fix` is taken only with `fmt` or `census` alone), the lint builds in
+/// its own lane, and a red in any of them ends every run but a release's tree sweep where it is
+/// ([`crate::sched::Halt`]).
 ///
 /// Outside a release the test compile, each call of a shaped one, and the test run behind it
 /// wait for the shim and the three guards and not for the lint
@@ -354,7 +354,8 @@ const PREFLIGHT: [StageId; 5] = [
 fn preflight_of(id: StageId, release: bool) -> &'static [StageId] {
     match PREFLIGHT.iter().position(|stage| *stage == id) {
         Some(0) => &[],
-        Some(_) => &PREFLIGHT[..1],
+        Some(1) => &PREFLIGHT[..1],
+        Some(_) => &PREFLIGHT[1..2],
         None if !release && matches!(id, StageId::TestCompile | StageId::Test) => &PREFLIGHT[..4],
         None => &PREFLIGHT,
     }
@@ -365,8 +366,10 @@ fn preflight_of(id: StageId, release: bool) -> &'static [StageId] {
 /// it claims
 /// by the run's book ([`StageSpec::mem`]): none for a named skip ([`named_skip`]), which starts
 /// nothing.
-#[must_use]
-pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
+/// # Errors
+/// A required workspace graph could not be read or contains no members. No
+/// compiler work is authorized from missing graph evidence.
+pub fn plan(ctx: &Ctx) -> Result<Vec<StageSpec>, String> {
     let wanted = wanted(ctx);
     // Pooling bounds resource use but does not replace early-error ordering.
     let pooled = ctx.pool.is_some();
@@ -379,7 +382,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     let records = ctx
         .memory
         .as_ref()
-        .map(|b| (b.records(), b.plain_records()));
+        .map(|b| (b.shaping_records(), b.plain_records()));
     let mut planned = Vec::with_capacity(v.len());
     for mut s in v {
         for prerequisite in preflight_of(s.id, ctx.release) {
@@ -407,7 +410,13 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
             if s.id == StageId::TestCompile {
                 let workspace;
                 let selection = if ctx.scope.is_workspace() {
-                    workspace = (ctx.workspace_members)(ctx).specs();
+                    workspace = (ctx.workspace_members)(ctx)?.specs();
+                    if workspace.is_empty() {
+                        return Err(
+                            "workspace graph contains no members; no compiler stage was planned"
+                                .to_owned(),
+                        );
+                    }
                     workspace.as_slice()
                 } else {
                     ctx.scope.crates()
@@ -443,7 +452,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
             s.exclusive = true;
         }
     }
-    planned
+    Ok(planned)
 }
 
 /// The unshaped test compile `s` claims at least its estimate `e` ([`crate::shape::Shaped::Whole`])
@@ -517,6 +526,11 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
     let label = scope.label();
     vec![
         spec(
+            StageId::Census,
+            "source guards and L0 censuses (aterm-census)",
+            Lane::Pure,
+        ),
+        spec(
             StageId::ReleasedShim,
             "released-shim (installed release builds aterm-time offline)",
             Lane::Pure,
@@ -524,11 +538,6 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
         spec(
             StageId::Formatting,
             "formatting (trustfmt over every tracked or cargo-built .rs, at its crate's edition)",
-            Lane::Pure,
-        ),
-        spec(
-            StageId::Census,
-            "source guards and L0 censuses (aterm-census)",
             Lane::Pure,
         ),
         spec(

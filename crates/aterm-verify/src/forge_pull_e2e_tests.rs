@@ -152,7 +152,7 @@ fn forge_report(root: &Path) -> Report {
     )
     .with_checks(&wanted)
     .with_no_windows(true);
-    let plan = plan::plan(&ctx);
+    let plan = plan::plan(&ctx).expect("complete graph and plan");
     let forge = plan
         .iter()
         .find(|stage| stage.id == plan::StageId::Forge)

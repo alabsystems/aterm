@@ -397,7 +397,9 @@ fn combined_reports_age_cached_journal_quota_at_the_command_clock() {
                 assert!(report.local.is_some(), "{}", String::from_utf8_lossy(&err));
                 let lines = if json {
                     let doc: Value = aterm_json::from_slice(&out).unwrap();
-                    let windows = &doc["journal"]["main"]["windows"];
+                    // The section names the row by its account's key, as every reference does.
+                    assert!(doc["journal"].get("main").is_none(), "{doc}");
+                    let windows = &doc["journal"][KEY]["windows"];
                     let five = &windows[0];
                     assert_eq!(five["read"]["t"].as_i64(), Some(original.at));
                     assert_eq!(five["read"]["age_s"].as_i64(), Some(now - original.at));
@@ -422,16 +424,22 @@ fn combined_reports_age_cached_journal_quota_at_the_command_clock() {
                 } else {
                     let text = String::from_utf8(out).unwrap();
                     let journal = text.split_once("\nlab journal").unwrap().1;
-                    ["main: 5h", "main: 7d", "main: credits"]
-                        .into_iter()
-                        .map(|name| {
-                            journal
-                                .lines()
-                                .find(|line| line.contains(name))
-                                .unwrap()
-                                .to_owned()
-                        })
-                        .collect()
+                    // The row by its account's name (its identity address), never its label.
+                    assert!(!journal.contains("main"), "{journal}");
+                    [
+                        "claude owner@example.test: 5h",
+                        "claude owner@example.test: 7d",
+                        "claude owner@example.test: credits",
+                    ]
+                    .into_iter()
+                    .map(|name| {
+                        journal
+                            .lines()
+                            .find(|line| line.contains(name))
+                            .unwrap()
+                            .to_owned()
+                    })
+                    .collect()
                 };
                 if now < end {
                     assert!(lines[0].contains("0% left") && lines[0].contains("at its limit"));

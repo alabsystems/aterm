@@ -7,6 +7,10 @@
 
 use super::*;
 
+/// aterm.log's line for a look of the host's at the roster that found its bytes changed, which
+/// [`log_times`] reads apart from [`MARKER_LOOK`].
+const ROSTER_LOOK: &str = "harness: the accounts' roster changed: news of the accounts";
+
 /// Tab A's journal (S1), its records' `t` and `line`.
 const JOURNAL_A: &str = r#"{"t":1792980405997,"line":"EVENT idle seq=345 ▝▝   ▝▝   /private/tmp/at.v1Xx/proj"}
 {"t":1792980407334,"line":"EVENT idle seq=389 ⏺ Login expired · Please run /login"}
@@ -32,7 +36,7 @@ fn journal_b(cleared: &str) -> Vec<Said> {
         line: format!("CLEARED seq=889 exception=login after=21s {cleared}"),
     });
     j.extend(journal_of(
-        r#"{"t":1792980430908,"line":"WAITING seq=889 until=2026-10-26T02:17:11Z the login is gone: aterm signs lab-b in again by itself"}
+        r#"{"t":1792980430908,"line":"WAITING seq=889 until=2026-10-26T02:17:11Z the login is gone: aterm signs claude-15e8a439470c1cf1 in again by itself"}
 {"t":1792980432511,"line":"ESCALATED seq=1064 attention=OK"}
 "#,
     ));
@@ -60,9 +64,9 @@ const ACTS_B: &str = r"1792980408361 send if-human=0 if-gen=1.378 if=^❯\s*$ --
 const LEDGER: &str = r#"{"account":"lab-a","kind":"auth","sid":"s-a69491f86bf448af665f","t":1792980407,"to":null,"why":"signed-out"}
 {"account":"lab-a","kind":"login-ended","sid":"s-a69491f86bf448af665f","t":1792980407,"to":null,"why":""}
 {"account":"lab-a","kind":"sign-in","sid":null,"t":1792980407,"to":null,"why":"auto no-route: profile(none) mailbox(none configured) vault(not a member) headless-browser(none installed) hosts(none configured)"}
-{"account":"lab-b","kind":"auth","sid":"s-8787e36871885b946278","t":1792980430,"to":null,"why":"signed-out"}
-{"account":"lab-b","kind":"login-ended","sid":"s-8787e36871885b946278","t":1792980430,"to":null,"why":""}
-{"account":"lab-b","kind":"sign-in","sid":null,"t":1792980430,"to":null,"why":"auto no-route: profile(none) mailbox(none configured) vault(not a member) headless-browser(none installed) hosts(none configured)"}
+{"account":"claude-15e8a439470c1cf1","kind":"auth","sid":"s-8787e36871885b946278","t":1792980430,"to":null,"why":"signed-out"}
+{"account":"claude-15e8a439470c1cf1","kind":"login-ended","sid":"s-8787e36871885b946278","t":1792980430,"to":null,"why":""}
+{"account":"claude-15e8a439470c1cf1","kind":"sign-in","sid":null,"t":1792980430,"to":null,"why":"auto no-route: profile(none) mailbox(none configured) vault(not a member) headless-browser(none installed) hosts(none configured)"}
 "#;
 
 /// The window's `messages.log`: tab B's notice posted, then withdrawn at the back-out.
@@ -75,12 +79,13 @@ fn messages() -> Vec<Message> {
     ))
 }
 
-/// The instance's aterm.log, its lines of the host's looks at the roster: the activation wake
-/// armed (its first look), and the first look after the lab laid its roster and added `lab-b`'s
-/// row, which the back-out (1792980430248) came before.
+/// The instance's aterm.log, its lines of the host's news of the accounts: the keeper's look
+/// after the add of [`LABEL_B`]'s row (1792980410000), which found the roster changed and the
+/// store's wake marker replaced, and which the back-out (1792980430248) came after.
 const ATERM_LOG: &str = "1792980402.744 15271 INFO aterm_gui::harness_host: harness: the activation wake is armed; every session supervised before it looks at its next idle point
 1792980404.894 15271 INFO aterm_gui::messages_host: message 5 harness: Autopilot set to cruise
-1792980462.748 15271 INFO aterm_gui::harness_host: harness: the accounts' roster changed: news of the accounts
+1792980410.312 15271 INFO aterm_gui::harness_host: harness: the accounts' roster changed: news of the accounts
+1792980410.313 15271 INFO aterm_gui::harness_host: harness: the accounts store's wake marker moved: news of the accounts
 ";
 
 /// S3's marks: the add at 1792980410000, and S3b's Enter.
@@ -269,47 +274,23 @@ fn s2_holds_on_one_fenced_login_and_enter_and_fails_on_a_key_in_the_picker() {
     }
 }
 
+/// The host's news of the add's wake marker is read off aterm.log by its line ([`MARKER_LOOK`]),
+/// the roster's own line ([`ROSTER_LOOK`]) apart; a line whose time does not read is skipped.
 #[test]
-fn the_hosts_looks_at_the_roster_are_read_off_its_log_and_place_the_add() {
-    assert_eq!(looks_of(ATERM_LOG), [1_792_980_462_748]);
-    assert_eq!(log_times(ATERM_LOG, WAKE_ARMED), [1_792_980_402_744]);
+fn the_hosts_news_of_the_wake_marker_is_read_off_its_log() {
+    assert_eq!(wakes_of(ATERM_LOG), [1_792_980_410_313]);
+    assert_eq!(log_times(ATERM_LOG, ROSTER_LOOK), [1_792_980_410_312]);
     assert_eq!(
-        log_times(
-            "no time here harness: the activation wake is armed\n",
-            WAKE_ARMED
-        ),
+        wakes_of(&format!("no time here {MARKER_LOOK}\n")),
         Vec::<i64>::new(),
         "a line whose time does not read is skipped"
     );
-    let armed = 1_792_980_402_744;
-    let only_armed = ATERM_LOG.lines().next().unwrap();
-    assert_eq!(
-        add_wait(only_armed, armed + 7_000),
-        None,
-        "7 s after the arming, the first look: at once"
-    );
-    assert_eq!(
-        add_wait(only_armed, armed + 30_000),
-        Some(Duration::from_secs(30) + LOOK_SETTLE),
-        "30 s after it: just past the next look"
-    );
-    assert_eq!(
-        add_wait(only_armed, armed + 125_000),
-        None,
-        "5 s past the third look"
-    );
-    assert_eq!(
-        add_wait(ATERM_LOG, 1_792_980_462_748 + 10_000),
-        None,
-        "the latest look logged counts"
-    );
-    assert_eq!(add_wait("", armed), None, "no look logged: at once");
 }
 
 #[test]
-fn s3_holds_on_the_back_out_before_the_hosts_look_and_fails_without_it() {
+fn s3_holds_on_the_back_out_after_the_news_of_the_adds_wake_and_fails_without_it() {
     let decisions = decisions_of(DECISIONS_B);
-    let looks = looks_of(ATERM_LOG);
+    let looks = wakes_of(ATERM_LOG);
     let judge = |journal: &[Said], acts: &[Act], decisions: &[Decided], looks: &[i64], marks| {
         judge_s3(
             (journal, decisions, acts),
@@ -349,7 +330,8 @@ fn s3_holds_on_the_back_out_before_the_hosts_look_and_fails_without_it() {
         rule: RULE_LOGIN_BACK_OUT.into(),
         decision: "approved".into(),
     });
-    let look_first = [1_792_980_420_000];
+    let wake_late = [1_792_980_440_000];
+    let wake_before_the_add = [1_792_980_400_000];
     let late_s3b = (S3.0, 1_792_980_480_000);
     for (case, journal, acts, decisions, looks, marks) in [
         (
@@ -401,19 +383,27 @@ fn s3_holds_on_the_back_out_before_the_hosts_look_and_fails_without_it() {
             S3,
         ),
         (
-            "the Esc after the host's own look at the roster (no wake)",
+            "the Esc before the host's news of the add's wake marker",
             journal.clone(),
             acts_b(),
             decisions.clone(),
-            look_first.to_vec(),
+            wake_late.to_vec(),
             S3,
         ),
         (
-            "no look of the host's logged after the add",
+            "no news of a wake marker logged (a row written by hand)",
             journal.clone(),
             acts_b(),
             decisions.clone(),
             Vec::new(),
+            S3,
+        ),
+        (
+            "news of a wake marker only before the add",
+            journal.clone(),
+            acts_b(),
+            decisions.clone(),
+            wake_before_the_add.to_vec(),
             S3,
         ),
         (
@@ -669,5 +659,22 @@ fn the_watcher_suspects_auth_login_and_opens_and_nothing_else() {
         None,
         "a word naming the shim is no launch of it"
     );
-    assert_eq!(suspect("/x/aterm harness accounts add lab-b"), None);
+    assert_eq!(
+        suspect("/x/aterm harness accounts add claude nobody-b@example.test"),
+        None
+    );
+}
+
+/// S3's `accounts add claude <EMAIL_B>` labels its row with the account's reserved slug, so
+/// [`LABEL_B`], whose login directory S2's tab signs in to, is that slug.
+#[test]
+fn label_b_is_the_reserved_slug_add_gives_its_account() {
+    use aterm_db::typed::keys;
+    assert_eq!(
+        LABEL_B,
+        keys::reserved_slug(
+            "claude",
+            &keys::account_pk("claude", EMAIL_B).expect("a key")
+        )
+    );
 }

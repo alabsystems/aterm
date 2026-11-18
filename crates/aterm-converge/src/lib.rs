@@ -68,6 +68,18 @@ pub trait Item: Send + Sync {
     /// Read the host and decide.
     fn probe(&self) -> Probe;
 
+    /// Complete a pending observation before a proposed change is journaled. This may read
+    /// external state, but must not perform the change. `Some(Ok(()))` asks the engine to
+    /// probe again; `None` leaves the original proposal in place. Only an admitted applying
+    /// item whose probe proposes a change is observed. The hook runs at most once per row;
+    /// transparent item wrappers forward it.
+    ///
+    /// # Errors
+    /// The observation could not complete; the engine fails the row without applying it.
+    fn observe(&self) -> Option<Result<(), String>> {
+        None
+    }
+
     /// Make the change the last [`Item::probe`] planned.
     /// # Errors
     /// One line saying what did not work.
@@ -126,7 +138,7 @@ pub trait Item: Send + Sync {
         None
     }
 
-    /// Why an `Unusable` probe stood aside because the run lacks what the read needs.
+    /// Why an `Unusable` or `Deferred` probe stood aside because the run lacks what it needs.
     fn read_aside(&self) -> Option<StoodAside> {
         None
     }

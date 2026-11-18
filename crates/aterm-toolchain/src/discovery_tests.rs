@@ -88,7 +88,7 @@ fn the_reported_location_when_nothing_resolves_is_the_store() {
     );
 }
 
-/// Pending `atpkg` stubs on `PATH` are skipped in favor of real toolchains.
+/// Pending `atpkg` stubs on `PATH` are skipped even after a long absolute interpreter line.
 #[cfg(unix)]
 #[test]
 fn a_pending_stub_on_path_is_passed_over() {
@@ -96,11 +96,12 @@ fn a_pending_stub_on_path_is_passed_over() {
     let prefix = default_atpkg_prefix(&home);
     let stubs = home.join("pkg-bin");
     fs::create_dir_all(&stubs).expect("mkdir");
+    let pending = format!(
+        "#!/{}/sh\n# atpkg pending-program stub v1\nexit 127\n",
+        "interpreter/".repeat(25)
+    );
     for name in ["targo", "trustc"] {
-        crate::test_script::script(
-            &stubs.join(name),
-            "#!/bin/sh\n# atpkg pending-program stub v1\nexit 127\n",
-        );
+        crate::test_script::script(&stubs.join(name), &pending);
     }
     let real = pinned_bin(&home.join("real/bin"));
     let path = std::env::join_paths([&stubs, &real]).expect("join");
@@ -1384,7 +1385,7 @@ fn the_path_fallback_adopts_only_the_pinned_toolchain() {
     };
 
     let t = discover(OsStr::new(&path));
-    assert!(t.have_targo());
+    assert!(t.have_targo(), "the pinned PATH fixture: {t:?}");
     assert_eq!(t.stage2_dir, fs::canonicalize(&real).expect("canonicalize"));
 
     let t = discover(OsStr::new(impostor.to_string_lossy().as_ref()));
@@ -1446,7 +1447,7 @@ fn bounded_stdout_drains_large_output_without_pipe_deadlock_and_rejects_oversize
         ],
         aterm_spec::wait::MUST_HAPPEN,
     );
-    assert_eq!(noisy.as_deref(), Some("identity"));
+    assert_eq!(noisy.as_deref(), Ok("identity"));
     let exact = bounded_stdout(
         sh,
         &[
@@ -1455,7 +1456,7 @@ fn bounded_stdout_drains_large_output_without_pipe_deadlock_and_rejects_oversize
         ],
         aterm_spec::wait::MUST_HAPPEN,
     );
-    assert_eq!(exact.as_ref().map(String::len), Some(64 << 10));
+    assert_eq!(exact.as_ref().map(String::len), Ok(64 << 10));
     let over = bounded_stdout(
         sh,
         &[
@@ -1464,5 +1465,8 @@ fn bounded_stdout_drains_large_output_without_pipe_deadlock_and_rejects_oversize
         ],
         aterm_spec::wait::MUST_HAPPEN,
     );
-    assert_eq!(over, None);
+    assert!(
+        over.is_err(),
+        "an oversized reply cannot supply a complete identity"
+    );
 }

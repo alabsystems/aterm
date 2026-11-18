@@ -147,3 +147,85 @@ fn the_name_table_judges_only_the_words_a_row_leads() {
         assert!(refusal.contains("`orca`"), "{refusal}");
     }
 }
+
+/// A ready, complete build `store/<id>/<build>/bin/<id>` in `layout`, with the version record a
+/// stage writes where `version` names one; its executable.
+fn staged(
+    layout: &crate::store::Layout,
+    id: &str,
+    build: u64,
+    version: Option<&str>,
+) -> std::path::PathBuf {
+    let dir = layout.build_dir(id, build);
+    std::fs::create_dir_all(dir.join("bin")).expect("build dir");
+    let exe = dir.join("bin").join(id);
+    std::fs::write(&exe, b"#!/bin/sh\n").expect("exe");
+    crate::store::mark_build_ready(&dir).expect("ready");
+    if let Some(version) = version {
+        crate::store::write_version(&dir, version).expect("version record");
+    }
+    exe
+}
+
+/// AN IMAGE PROOF SAYS WHICH BUILD IT ADMITTED AND THAT BUILD'S RECORDED VERSION, on the two
+/// arms no verified record stands behind: contract 3's rule for a seed id
+/// ([`admits_seed_image`]) and a seed row's `AnyBuild` for a build that carries no record
+/// ([`admits_image`]). The version is the one recorded beside that very build when it was
+/// staged; a build beside it that records none is admitted with none.
+/// NEGATIVE HALF: an id that is no seed id, and a file outside the store, admit nothing.
+#[test]
+fn a_seed_build_with_no_record_is_admitted_under_its_recorded_version() {
+    let dir = aterm_tempfile::TempDir::new().expect("dir");
+    let root = std::fs::canonicalize(dir.path()).expect("canonical");
+    let layout = crate::store::Layout {
+        prefix: root.join("pkg"),
+    };
+    let versioned = staged(&layout, "grok-alab", 412, Some("0.4.0+g1a2b3c"));
+    let bare = staged(&layout, "grok-alab", 413, None);
+    let build = |build: u64, version: Option<&str>| {
+        Some(Admitted::Build {
+            build,
+            version: version.map(str::to_string),
+        })
+    };
+
+    assert_eq!(
+        admits_seed_image(&layout, "grok-alab", &versioned),
+        build(412, Some("0.4.0+g1a2b3c")),
+        "contract 3: the build's own recorded version"
+    );
+    assert_eq!(
+        admits_seed_image(&layout, "grok-alab", &bare),
+        build(413, None),
+        "contract 3: a build that records none, not its neighbour's"
+    );
+
+    let trust = Trust::of_layout(&layout);
+    let composed = compose(&layout, &crate::config::HarnessConfig::default(), &trust);
+    let row = composed
+        .rows
+        .iter()
+        .find(|row| row.declaration.id == "grok-alab")
+        .expect("the seed row");
+    assert_eq!(row.origin, Origin::Seed);
+    assert!(row.images.contains(&Image::AnyBuild), "{:?}", row.images);
+    assert_eq!(
+        admits_image(&layout, row, &versioned, &trust),
+        build(412, Some("0.4.0+g1a2b3c")),
+        "a seed row's build with no record: its recorded version"
+    );
+    assert_eq!(
+        admits_image(&layout, row, &bare, &trust),
+        build(413, None),
+        "a seed row's build that records no version"
+    );
+
+    // NEGATIVE HALF.
+    let other = staged(&layout, "other-alab", 5, Some("9.9.0"));
+    assert_eq!(admits_seed_image(&layout, "other-alab", &other), None);
+    assert_eq!(admits_image(&layout, row, &other, &trust), None);
+    let stray = root.join("grok-alab");
+    std::fs::write(&stray, b"x").expect("stray");
+    assert_eq!(admits_seed_image(&layout, "grok-alab", &stray), None);
+    assert_eq!(admits_image(&layout, row, &stray, &trust), None);
+}

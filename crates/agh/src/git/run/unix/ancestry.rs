@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use super::{
-    ANONYMOUS_READ_PROGRESS_WINDOW, ChildOut, Children, Error, GitRun, Kind, Result, os, screened,
+    ChildOut, Children, Error, GitRun, Kind, NETWORK_READ_PROGRESS_WINDOW, Result, os, screened,
 };
 use crate::git::{AncestryQuery, CommitRead};
 use crate::github::How;
@@ -505,7 +505,7 @@ pub(super) fn read(
     // operation. Its source may be filtered, so cover setup as well as Reader.
     let mut children = local_children(children);
     if anonymous && children.progress_window.is_none() {
-        children.progress_window = Some(ANONYMOUS_READ_PROGRESS_WINDOW);
+        children.progress_window = Some(NETWORK_READ_PROGRESS_WINDOW);
     }
     let children = &children;
     // Only this immutable commit reader admits the exact filtered-clone metadata.

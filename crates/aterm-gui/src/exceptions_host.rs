@@ -10,7 +10,7 @@ use aterm_agent::supervise::policy::exception::Urgency;
 use aterm_agent::supervise::{StallSeen, StuckSurvey};
 use aterm_core::terminal::repaint_nudge::GiveUp;
 use aterm_messages::exceptions::{Entry, Family, Mode};
-use aterm_messages::need::Horizon;
+use aterm_messages::need::{Horizon, Resurface};
 use aterm_messages::{Message, PostOutcome};
 
 use crate::App;
@@ -27,6 +27,15 @@ thread_local! {
     /// How often the digest announced a change (the menu-bar item and Settings follow): a test
     /// seam, since a headless App has neither.
     pub(crate) static DIGEST_MOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Each re-tell of an account line asked for, in Unix ms ([`App::ask_account_lines_again`]):
+    /// a test seam, since a headless App has no harness to ask.
+    static ACCOUNT_ASKS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The re-tells of account lines asked for on this thread since the last take, in order.
+#[cfg(test)]
+pub(crate) fn take_account_asks() -> Vec<u64> {
+    ACCOUNT_ASKS.with(|asks| std::mem::take(&mut *asks.borrow_mut()))
 }
 
 /// Deferred exception entry waiting until its ripening horizon (`due`) to be raised.
@@ -59,6 +68,18 @@ const USAGE_TAP_DAY: &str = "usage-tap-day:";
 /// First exception-sweep timestamp and whether adopted supervisor lines have been swept ([`App::sweep_adopted_supervisor_lines`]).
 static LOOKING_SINCE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 static ADOPTED_SWEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// An account line the harness's look told and that stands ([`App::tell_account_line`]): how a
+/// person's filing of it keeps a re-post quiet, and the re-tell asked for it while it is out of
+/// the digest. The look tells a standing line again only when asked (at each tell and each move
+/// of the digest, [`App::digest_moved`]): at the instant a filing stops keeping its re-post
+/// quiet, or at once where nothing does.
+#[derive(Debug)]
+pub(crate) struct AccountLine {
+    resurface: Option<Resurface>,
+    /// The re-tell asked for while the line is out of the digest, in Unix ms (`0`: at once).
+    asked: Option<u64>,
+}
 
 /// Per-tab supervisor failure state after exceeding its restart budget ([`HostNote::SupervisorFailing`]).
 #[derive(Debug)]
@@ -984,21 +1005,27 @@ impl App {
                 ];
                 for (key, entry) in lines {
                     match entry {
-                        Some(entry) => self.except(&entry),
+                        Some(entry) => self.tell_account_line(&entry),
                         None if unread => {
+                            self.forget_account_line(key);
                             self.except_end(key);
                         }
-                        None => self.except_clear(key),
+                        None => {
+                            self.forget_account_line(key);
+                            self.except_clear(key);
+                        }
                     }
                 }
                 if refused {
-                    self.except(&message_reporters::accounts_refused_entry());
+                    self.tell_account_line(&message_reporters::accounts_refused_entry());
                 } else {
+                    self.forget_account_line(message_reporters::ACCOUNTS_REFUSED_KEY);
                     self.except_clear(message_reporters::ACCOUNTS_REFUSED_KEY);
                 }
                 if logins_unread {
-                    self.except(&message_reporters::accounts_logins_unread_entry());
+                    self.tell_account_line(&message_reporters::accounts_logins_unread_entry());
                 } else {
+                    self.forget_account_line(message_reporters::ACCOUNTS_LOGINS_UNREAD_KEY);
                     self.except_clear(message_reporters::ACCOUNTS_LOGINS_UNREAD_KEY);
                 }
                 let key = message_reporters::ACCOUNTS_SIGNED_OUT_KEY;
@@ -1012,14 +1039,20 @@ impl App {
                                     != first
                         });
                         if other {
+                            // The line is told again at once: its end asks no re-tell of it.
+                            self.forget_account_line(key);
                             self.except_end(key);
                         }
-                        self.except(&entry);
+                        self.tell_account_line(&entry);
                     }
                     None if unread => {
+                        self.forget_account_line(key);
                         self.except_end(key);
                     }
-                    None => self.except_clear(key),
+                    None => {
+                        self.forget_account_line(key);
+                        self.except_clear(key);
+                    }
                 }
             }
             HostNote::Pools(said) => {
@@ -1028,8 +1061,12 @@ impl App {
             }
             HostNote::SheetConflicts(conflicts) => {
                 match message_reporters::accounts_sheet_conflict_entry(&conflicts) {
-                    Some(entry) => self.except(&entry),
-                    None => self.except_clear(message_reporters::ACCOUNTS_SHEET_CONFLICT_KEY),
+                    Some(entry) => self.tell_account_line(&entry),
+                    None => {
+                        let key = message_reporters::ACCOUNTS_SHEET_CONFLICT_KEY;
+                        self.forget_account_line(key);
+                        self.except_clear(key);
+                    }
                 }
             }
             HostNote::Inform { sid, text } => {
@@ -1696,13 +1733,78 @@ impl App {
         }
     }
 
-    /// Notifies Settings ▸ Messages and the menu-bar item after the digest changes.
+    /// Notifies Settings ▸ Messages and the menu-bar item after the digest changes, and asks the
+    /// harness to tell again each standing account line the digest no longer holds
+    /// ([`Self::ask_account_lines_again`]).
     pub(crate) fn digest_moved(&mut self) {
         #[cfg(test)]
         DIGEST_MOVES.with(|c| c.set(c.get() + 1));
         self.publish_native_messages_state_if_due(Instant::now());
         self.mark_status_dirty();
         self.note_message_rule();
+        self.ask_account_lines_again();
+    }
+
+    /// Post the account line `entry` the harness's look told, and hold it while it stands; where
+    /// the post leaves it out of the digest (a person's filing keeps it quiet, and the digest did
+    /// not move), its re-tell is asked for all the same ([`Self::ask_account_lines_again`]).
+    pub(crate) fn tell_account_line(&mut self, entry: &Entry) {
+        let resurface = entry.message().ok().and_then(|msg| msg.resurface());
+        self.account_lines
+            .entry(entry.key())
+            .or_insert(AccountLine {
+                resurface,
+                asked: None,
+            })
+            .resurface = resurface;
+        self.except(entry);
+        self.ask_account_lines_again();
+    }
+
+    /// The account line `key` no longer stands: no re-tell is asked for it.
+    pub(crate) fn forget_account_line(&mut self, key: &str) {
+        self.account_lines.remove(key);
+    }
+
+    /// For each standing account line out of the digest (a person filed it, or it aged out),
+    /// ask the harness's look to tell it again ([`crate::harness_host::HostHandle::look_again_at`])
+    /// at the instant the message center would take its re-post as new
+    /// ([`aterm_messages::MessageCenter::quiet_until`]), or at once where nothing keeps it quiet;
+    /// once per such instant, until the line is back in the digest.
+    fn ask_account_lines_again(&mut self) {
+        if self.account_lines.is_empty() {
+            return;
+        }
+        let open: std::collections::BTreeSet<String> = self
+            .messages
+            .digest()
+            .entries
+            .iter()
+            .map(|open| open.key.clone())
+            .collect();
+        let stamp = wall_stamp_now();
+        let mut asks = Vec::new();
+        for (key, line) in &mut self.account_lines {
+            if open.contains(key) {
+                line.asked = None;
+                continue;
+            }
+            let at = line
+                .resurface
+                .and_then(|resurface| self.messages.quiet_until(key, resurface, stamp))
+                .unwrap_or(0);
+            if line.asked != Some(at) {
+                line.asked = Some(at);
+                asks.push(at);
+            }
+        }
+        #[cfg(test)]
+        ACCOUNT_ASKS.with(|asked| asked.borrow_mut().extend(&asks));
+        if let Some(host) = &self.harness {
+            for at in asks {
+                host.look_again_at(at);
+            }
+        }
     }
 
     /// Logs the message center's rule-demotion counter when it advances.

@@ -10,8 +10,10 @@
 //! `verify cells` compiles and lints its cells ([`CELL_TARGETS`]) on it, the web modules'
 //! lanes build on it, and `--linux` adds the Linux lane's guest agent's std
 //! ([`LINUX_LANE_TARGETS`]). This row installs that one toolchain, its stds and its components
-//! ([`PIN_COMPONENTS`]), and beside it the toolchain the release chain still builds its own slices on
-//! ([`RELEASE_TOOLCHAIN`], [`RELEASE_TARGETS`]); no dev lane takes anything from that one.
+//! ([`PIN_COMPONENTS`]), and beside it the release the checkout's `trust.lock` names for the
+//! release chain's own slices ([`release_toolchain`], [`RELEASE_TARGETS`]); no dev lane takes
+//! anything from that one, and nothing here installs rustup's floating `stable`. A public
+//! snapshot ships no `trust.lock` and cuts no release: its row is the stock pin alone.
 
 use std::path::{Path, PathBuf};
 
@@ -24,16 +26,55 @@ use crate::rustup::CELL_TARGETS;
 /// (STOCK EXCEPTION: Trust has no Linux std; docs/DESIGN-vz-guest-2026-10-23.md §6).
 pub const LINUX_LANE_TARGETS: [&str; 1] = ["aarch64-unknown-linux-musl"];
 
-/// The toolchain the release chain builds its STOCK EXCEPTION slices on: `aterm-release`
-/// compiles the universal binary's x86_64 slice, `ship check --compat` (and `verify watch`'s
-/// stage that rehearses it) and a Linux worker's static bootstrap verifier with
-/// `RUSTUP_TOOLCHAIN=stable`, and `ship provision`'s `x86 slice` probes it. This row puts it in
-/// place, so `ship provision`, which runs this row, readies a release host, until the release
-/// chain builds on a pinned release as the dev lanes do.
-pub const RELEASE_TOOLCHAIN: &str = "stable";
+/// The toolchain the release chain builds its STOCK EXCEPTION slices on: the `[stock] toolchain`
+/// of the checkout's `trust.lock` (for a cut, the candidate's). `aterm-release` compiles the
+/// universal binary's x86_64 slice, `ship check --compat` (and `verify watch`'s stage that
+/// rehearses it) and a Linux worker's static bootstrap verifier with that release by name in
+/// `RUSTUP_TOOLCHAIN`, records its `rustc -vV`, and `ship provision`'s `x86 slice` probes it.
+/// This row puts it in place, so `ship provision`, which runs this row, readies a release host.
+///
+/// `Ok(None)`: the checkout carries no `trust.lock`, as a public snapshot does (its manifest ships
+/// none), so the row has no release-chain part there ([`lockless_note`]) and the stock pin is
+/// the row, as [`stock_pin`] rides [`crate::rustup::STOCK_PIN`] alone without `publish/`. Nothing
+/// stands in for the lock: no release toolchain is installed for it, rustup's `stable` least of
+/// all. A release host (`release_host`, `verify provision --release`, which `ship provision` and
+/// a cut run) builds those slices, so there it is refused.
+///
+/// # Errors
+/// A lock that cannot be read or does not parse (among it one with no `[stock] toolchain`), and,
+/// on a release host, a checkout that carries no lock.
+pub fn release_toolchain(repo: &Path, release_host: bool) -> Result<Option<String>, String> {
+    let path = repo.join(aterm_toolchain::trust_lock::LOCK_FILE);
+    if std::fs::symlink_metadata(&path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+        if release_host {
+            return Err(format!(
+                "{} carries no {}, whose `[stock] toolchain` names the release the release \
+                 chain's STOCK EXCEPTION slices build with, and a release host builds them; \
+                 nothing falls back to rustup's `stable`",
+                repo.display(),
+                aterm_toolchain::trust_lock::LOCK_FILE
+            ));
+        }
+        return Ok(None);
+    }
+    aterm_toolchain::trust_lock::read(&path).map(|lock| Some(lock.stock_toolchain))
+}
 
-/// The stds the release chain takes from [`RELEASE_TOOLCHAIN`] past its host's: on a Mac, the
-/// universal binary's x86_64 slice's. A Linux worker builds only for its own host.
+/// What a run says where the checkout at `repo` carries no `trust.lock` ([`release_toolchain`]
+/// answered `Ok(None)`).
+#[must_use]
+pub fn lockless_note(repo: &Path) -> String {
+    format!(
+        "note: {} carries no {} (a public snapshot ships none), so this row puts no release \
+         chain's stock toolchain in place; `verify provision --release` refuses such a checkout",
+        repo.display(),
+        aterm_toolchain::trust_lock::LOCK_FILE
+    )
+}
+
+/// The stds the release chain takes from its stock toolchain ([`release_toolchain`]) past its
+/// host's: on a Mac, the universal binary's x86_64 slice's. A Linux worker builds only for its
+/// own host.
 pub const RELEASE_TARGETS: &[&str] = if cfg!(target_os = "macos") {
     &["x86_64-apple-darwin"]
 } else {
@@ -80,7 +121,7 @@ pub(crate) struct Seen {
     /// The components installed on the pin, as rustup names them
     /// (`clippy-aarch64-apple-darwin`).
     pub pin_components: Vec<String>,
-    /// The std targets installed on [`RELEASE_TOOLCHAIN`].
+    /// The std targets installed on the release chain's toolchain ([`release_toolchain`]).
     pub release_targets: Vec<String>,
 }
 
@@ -97,10 +138,11 @@ pub(crate) enum Step {
     /// `rustup component add --toolchain <pin> <components>`, those of [`PIN_COMPONENTS`] the pin
     /// lacks.
     PinComponents(String, Vec<String>),
-    /// `rustup toolchain install stable --profile minimal [--target <t>]… --no-self-update`.
-    ReleaseToolchain(Vec<String>),
-    /// `rustup target add --toolchain stable <targets>`.
-    ReleaseTargets(Vec<String>),
+    /// `rustup toolchain install <release> --profile minimal [--target <t>]… --no-self-update`,
+    /// the release the checkout's `trust.lock` names ([`release_toolchain`]).
+    ReleaseToolchain(String, Vec<String>),
+    /// `rustup target add --toolchain <release> <targets>`.
+    ReleaseTargets(String, Vec<String>),
 }
 
 /// Whether `seen` holds the toolchain `name` as rustup resolves it on its host
@@ -119,32 +161,49 @@ fn has(listed: &[String], name: &str) -> bool {
 
 /// What a machine that holds `seen` lacks, in order: of the stock pin `pin` with `targets`' stds
 /// and [`PIN_COMPONENTS`] (nothing of it where the checkout's pin could not be read, `None`), then of
-/// [`RELEASE_TOOLCHAIN`] with `release`'s stds.
+/// the release chain's toolchain `release` with `release_targets`' stds (nothing of it where the
+/// checkout has no release-chain part or its lock could not be read, `None`).
 pub(crate) fn plan(
     seen: &Seen,
     pin: Option<&str>,
     targets: &[&str],
-    release: &[&str],
+    release: Option<&str>,
+    release_targets: &[&str],
 ) -> Vec<Step> {
     let mut steps = Vec::new();
     if seen.fresh_home {
         steps.push(Step::AutoInstallOff);
     }
     if let Some(pin) = pin {
-        pin_plan(seen, pin, targets, &mut steps);
+        let mut targets = targets.to_vec();
+        if release == Some(pin) {
+            for target in release_targets {
+                if !targets.contains(target) {
+                    targets.push(target);
+                }
+            }
+        }
+        pin_plan(seen, pin, &targets, &mut steps);
+        if release == Some(pin) {
+            return steps;
+        }
     }
-    if holds(seen, RELEASE_TOOLCHAIN) {
-        let missing: Vec<String> = release
+    let Some(release) = release else {
+        return steps;
+    };
+    if holds(seen, release) {
+        let missing: Vec<String> = release_targets
             .iter()
             .filter(|t| !seen.release_targets.iter().any(|i| i == *t))
             .map(|t| (*t).to_string())
             .collect();
         if !missing.is_empty() {
-            steps.push(Step::ReleaseTargets(missing));
+            steps.push(Step::ReleaseTargets(release.to_string(), missing));
         }
     } else {
         steps.push(Step::ReleaseToolchain(
-            release.iter().map(|t| (*t).to_string()).collect(),
+            release.to_string(),
+            release_targets.iter().map(|t| (*t).to_string()).collect(),
         ));
     }
     steps
@@ -208,12 +267,12 @@ pub(crate) fn argv(step: &Step) -> Vec<String> {
             a.extend(cs.iter().cloned());
             a
         }
-        Step::ReleaseToolchain(ts) => {
+        Step::ReleaseToolchain(release, ts) => {
             let mut a = v(&[
                 "rustup",
                 "toolchain",
                 "install",
-                RELEASE_TOOLCHAIN,
+                release,
                 "--profile",
                 "minimal",
             ]);
@@ -223,8 +282,8 @@ pub(crate) fn argv(step: &Step) -> Vec<String> {
             a.push(NO_SELF_UPDATE.to_string());
             a
         }
-        Step::ReleaseTargets(ts) => {
-            let mut a = v(&["rustup", "target", "add", "--toolchain", RELEASE_TOOLCHAIN]);
+        Step::ReleaseTargets(release, ts) => {
+            let mut a = v(&["rustup", "target", "add", "--toolchain", release]);
             a.extend(ts.iter().cloned());
             a
         }
@@ -328,9 +387,15 @@ fn first_words(stdout: &str) -> Vec<String> {
         .collect()
 }
 
-/// What rustup `bin` holds on this machine; an answer it does not give reads as nothing
-/// held.
-fn observe(homes: &Homes, bin: &Path, rustup: &dyn Rustup, pin: Option<&str>) -> Seen {
+/// What rustup `bin` holds on this machine of the stock pin `pin` and the release chain's
+/// toolchain `release`; an answer it does not give reads as nothing held.
+fn observe(
+    homes: &Homes,
+    bin: &Path,
+    rustup: &dyn Rustup,
+    pin: Option<&str>,
+    release: Option<&str>,
+) -> Seen {
     let lines = |toolchain: Option<&str>, args: &[&str]| {
         let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
         rustup
@@ -348,8 +413,8 @@ fn observe(homes: &Homes, bin: &Path, rustup: &dyn Rustup, pin: Option<&str>) ->
         seen.pin_targets = lines(Some(p), &["target", "list", "--installed"]);
         seen.pin_components = lines(Some(p), &["component", "list", "--installed"]);
     }
-    if holds(&seen, RELEASE_TOOLCHAIN) {
-        seen.release_targets = lines(Some(RELEASE_TOOLCHAIN), &["target", "list", "--installed"]);
+    if let Some(r) = release.filter(|r| holds(&seen, r)) {
+        seen.release_targets = lines(Some(r), &["target", "list", "--installed"]);
     }
     seen
 }
@@ -365,9 +430,10 @@ fn pin_targets(linux: bool) -> Vec<&'static str> {
 }
 
 /// What rustup's home lacks of the row, read only through the rustup the row resolves:
-/// empty when it is in place. `pin` is the checkout's stock pin (`None` where it could not be
-/// read, which asks nothing of it); `linux` (`--linux`) holds the pin to the Linux lane's
-/// targets too.
+/// empty when it is in place. `pin` is the checkout's stock pin and `release` the release its
+/// `trust.lock` names for the release chain ([`release_toolchain`]), each `None` where the
+/// checkout has none to ask for (a pin that could not be read, a checkout with no lock), which
+/// asks nothing of it; `linux` (`--linux`) holds the pin to the Linux lane's targets too.
 ///
 /// # Errors
 /// The row resolves no rustup to read with.
@@ -375,28 +441,34 @@ pub fn missing(
     homes: &Homes,
     rustup: &dyn Rustup,
     pin: Option<&str>,
+    release: Option<&str>,
     linux: bool,
 ) -> Result<Vec<String>, Absent> {
     let bin = homes.rustup()?;
-    let seen = observe(homes, &bin, rustup, pin);
-    Ok(plan(&seen, pin, &pin_targets(linux), RELEASE_TARGETS)
-        .iter()
-        .map(|step| argv(step).join(" "))
-        .collect())
+    let seen = observe(homes, &bin, rustup, pin, release);
+    Ok(
+        plan(&seen, pin, &pin_targets(linux), release, RELEASE_TARGETS)
+            .iter()
+            .map(|step| argv(step).join(" "))
+            .collect(),
+    )
 }
 
 /// Acquire what rustup's home lacks with the rustup the row resolves; each step is said,
 /// and a step that fails is said with why. `linux` (`--linux`) adds the Linux lane's
-/// targets to the pin.
+/// targets to the pin; `release_host` (`--release`) refuses a checkout with no `trust.lock`,
+/// which elsewhere is said ([`lockless_note`]) and asks nothing of the release chain's part.
 ///
 /// # Errors
-/// Returns an error naming every step that failed, the unreadable pin, or the rustup the
-/// row could not resolve.
+/// Returns an error naming every step that failed, the unreadable pin, the checkout's lock that
+/// names no release chain's toolchain (on a release host, its absence too), or the rustup the
+/// row could not resolve, or requirements still absent after successful commands.
 pub fn run(
     repo: &Path,
     homes: &Homes,
     rustup: &dyn Rustup,
     linux: bool,
+    release_host: bool,
     report: &mut dyn FnMut(&str),
 ) -> Result<Vec<String>, String> {
     let mut failed = Vec::new();
@@ -407,18 +479,37 @@ pub fn run(
             None
         }
     };
+    let release = match release_toolchain(repo, release_host) {
+        Ok(Some(release)) => Some(release),
+        Ok(None) => {
+            report(&lockless_note(repo));
+            None
+        }
+        Err(refused) => {
+            failed.push(format!(
+                "the release chain's stock toolchain is not acquired — {refused}"
+            ));
+            None
+        }
+    };
     let bin = homes.rustup().map_err(|absent| {
         failed.push(format!("no rustup to drive — {absent}"));
         failed.join("; ")
     })?;
-    let seen = observe(homes, &bin, rustup, pin.as_deref());
+    let seen = observe(homes, &bin, rustup, pin.as_deref(), release.as_deref());
     let mut acquired = Vec::new();
-    for step in plan(&seen, pin.as_deref(), &pin_targets(linux), RELEASE_TARGETS) {
+    for step in plan(
+        &seen,
+        pin.as_deref(),
+        &pin_targets(linux),
+        release.as_deref(),
+        RELEASE_TARGETS,
+    ) {
         let args = &argv(&step)[1..];
         match rustup.run(homes, &bin, args, None) {
             Ok(_) => {
                 let line = format!("rustup {}", args.join(" "));
-                report(&format!("acquired: {line}"));
+                report(&format!("completed command: {line}"));
                 acquired.push(line);
             }
             Err(why) => failed.push(format!(
@@ -427,6 +518,19 @@ pub fn run(
                 args.join(" ")
             )),
         }
+    }
+    let after = observe(homes, &bin, rustup, pin.as_deref(), release.as_deref());
+    for step in plan(
+        &after,
+        pin.as_deref(),
+        &pin_targets(linux),
+        release.as_deref(),
+        RELEASE_TARGETS,
+    ) {
+        failed.push(format!(
+            "still missing after provisioning: {}",
+            argv(&step).join(" ")
+        ));
     }
     if failed.is_empty() {
         Ok(acquired)

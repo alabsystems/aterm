@@ -154,6 +154,30 @@ fn action_targets_view_and_semantic_key_not_focus() {
     assert!(parse_act("app/v1 view v key set\nsecond-request").is_err());
 }
 
+/// An action is held to the UI key's bound, so a control named by a record's digest, as a
+/// Tables history line is (`tables/history/at/<64 hex>/0`, 85 bytes), is one `act` reaches; a
+/// token past that bound, or one holding a space, is none, and the predicates a page asks of
+/// its own keys and actions answer as the parser does.
+/// NEGATIVE CONTROL (run once, restored with cp and touch): with the action's bound back at 64,
+/// `called \`Result::unwrap()\` on an \`Err\` value: InvalidToken("action")`.
+#[test]
+fn an_action_named_by_a_digest_is_one_act_takes() {
+    let line = format!("tables/history/at/{}/0", "ab".repeat(32));
+    let request = format!("app/v1 view v {line} {line}");
+    let parsed = parse_act(&request).unwrap();
+    assert_eq!(
+        (parsed.ui_key, parsed.action),
+        (line.as_str(), line.as_str())
+    );
+    assert!(is_wire_ui_key(&line) && is_wire_action(&line));
+    let long = "k".repeat(257);
+    assert!(parse_act(&format!("app/v1 view v key {long}")).is_err());
+    assert!(parse_act(&format!("app/v1 view v {long} press")).is_err());
+    assert!(!is_wire_action(&long) && !is_wire_ui_key(&long));
+    assert!(!is_wire_action("two words") && !is_wire_action(""));
+    assert!(is_wire_action(&"k".repeat(256)));
+}
+
 #[test]
 fn open_request_is_parsed_but_not_canonicalized_or_authorized() {
     assert_eq!(parse_open_app("app about"), Ok(OpenAppRequest::About));

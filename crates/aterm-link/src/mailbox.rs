@@ -98,6 +98,22 @@ pub enum Pushed {
     Stale,
 }
 
+/// WHERE THE INBOX FACE STANDS ON THE RECORD AT ONE OFFSET ([`Mailbox::inbox_at`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InboxAt {
+    /// Queued for the loop: read off the bus and not yet handled, with its subject and body.
+    Queued(String, Vec<u8>),
+    /// Not read yet: a reader of the current generation whose tail is marked reads and has not
+    /// read past it, so it may be streamed to that reader and not yet pushed
+    /// (ATERM-KI-1115-1149).
+    Unread,
+    /// Neither: this generation's reader read past it and the loop took whatever it pushed
+    /// there, or no reader whose tail is marked reads (none started since the face's reset,
+    /// the one that read ended, every record it read pushed before its end, or its broker
+    /// declined idle marks, so nothing would say when its tail passed the offset).
+    Read,
+}
+
 /// Which reader source produced an item or closure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -186,6 +202,29 @@ struct Face {
     pushed: u64,
     /// Records taken under this generation.
     taken: u64,
+    /// HOW FAR THIS GENERATION'S READERS HAVE READ (ATERM-KI-1115-1149): every record of the
+    /// filter below this offset was pushed here or told given up, by the highest of one past
+    /// a pushed record, a mark's `next` and a gap notice's start; `None` before the first. A
+    /// record at or above it may be on its way in, streamed to the reader and not yet pushed.
+    /// A gap notice reads nothing of its range: astream delivers a record retention still
+    /// holds inside it after the notice (`astream_broker::Gap`), and marks a tail only once it
+    /// has delivered those.
+    read_to: Option<u64>,
+    /// Whether a reader of this generation reads ([`Mailbox::reader_starts`]) and has not ended
+    /// ([`Mailbox::push_lost`], [`Mailbox::push_refused`]). A reader that paused the face ends
+    /// with neither, and the one its resume starts reads on from where it stopped.
+    reading: bool,
+    /// Whether the tail of this generation's latest reader is MARKED, as its subscription
+    /// negotiated it before it was read ([`Mailbox::reader_starts`]): its broker took idle
+    /// marks, so it marks the tail once it has read its backlog and after every
+    /// `astream_broker::IDLE_MARK` with nothing to deliver, and [`Face::read_to`] passes the
+    /// tail's cursor within one of them. A tail no mark comes to says nothing of where it
+    /// stands past the last record it pushed, so nothing of it is [`InboxAt::Unread`].
+    marks: bool,
+    /// Whether a mark came to this generation's readers ([`Mailbox::push_mark`]): only the
+    /// negative control `Mutant::UnreadOnlyOnceMarked` reads it ([`Mailbox::inbox_marked`]).
+    #[cfg(test)]
+    marked: bool,
 }
 
 impl Face {
@@ -209,6 +248,24 @@ impl Face {
         self.gaps.clear();
         self.pushed = 0;
         self.taken = 0;
+        self.read_to = None;
+        self.reading = false;
+        self.marks = false;
+        #[cfg(test)]
+        {
+            self.marked = false;
+        }
+    }
+
+    /// The reader read every record of the filter below `to`.
+    fn read(&mut self, to: u64) {
+        self.read_to = Some(self.read_to.map_or(to, |at| at.max(to)));
+    }
+
+    /// Whether the record at `off` may still be on its way in: a reader of this generation
+    /// whose tail is marked reads and has not read past it.
+    fn unread(&self, off: u64) -> bool {
+        self.reading && self.marks && self.read_to.is_none_or(|to| to <= off)
     }
 
     /// Whether a gap notice is due now: every record pushed before it was taken.
@@ -224,7 +281,10 @@ impl Face {
         None
     }
 
+    /// Queue gap notice `g`, read at `when`, the face read to the tail's cursor, the notice's
+    /// start ([`Face::read_to`]).
     fn push_gap(&mut self, g: astream_broker::Gap, when: Instant) {
+        self.read(g.from);
         match self.gaps.back_mut() {
             Some((at, before, _)) if *at == self.pushed => *before = before.and(g),
             _ => self.gaps.push_back((self.pushed, g, when)),
@@ -301,6 +361,10 @@ struct Queues {
     /// The rule a negative control switched off.
     #[cfg(test)]
     off: Option<Off>,
+    /// NEGATIVE CONTROL (`Mutant::GapPassesItsRange`, [`Mailbox::gaps_pass_their_range`]): a
+    /// gap notice reads its face to the end of its range.
+    #[cfg(test)]
+    gaps_pass: bool,
 }
 
 /// THE WAIT TALLY'S VIEW OF THE QUEUES ([`crate::wait_tally`]).
@@ -649,35 +713,89 @@ impl Mailbox {
         !self.lock().inbox.records.is_empty()
     }
 
-    /// The subject and body of each inbox-group record queued for the loop whose subject starts
-    /// with `prefix`: read off the bus, not yet handled.
-    pub(crate) fn inbox_queued_on(&self, prefix: &str) -> Vec<(String, Vec<u8>)> {
-        self.lock()
+    /// The offset, subject and body of each inbox-group record queued for the loop whose subject
+    /// starts with `prefix`: read off the bus, not yet handled (`Bridge::answer_queued`, and
+    /// `Bridge::answered_below` below an `expired`'s offset). With
+    /// `below`, also whether a record of the filter under that offset may still be on its way
+    /// in: a reader of the current generation whose tail is marked reads, and has not read to
+    /// `below` ([`Face::read_to`]). A tail its broker does not mark says nothing of where it
+    /// stands past the last record it pushed, so it answers `false` ([`Face::marks`]). Both are
+    /// read under one lock, so a record the reader pushes meanwhile is in the one or the other.
+    pub(crate) fn inbox_queued_on(
+        &self,
+        prefix: &str,
+        below: Option<u64>,
+    ) -> (Vec<(u64, String, Vec<u8>)>, bool) {
+        let q = self.lock();
+        let queued = q
             .inbox
             .records
             .iter()
             .filter(|((_, subject, _), ..)| subject.starts_with(prefix))
-            .map(|((_, subject, body), ..)| (subject.clone(), body.clone()))
-            .collect()
+            .map(|((at, subject, body), ..)| (*at, subject.clone(), body.clone()))
+            .collect();
+        let face = &q.inbox;
+        let unread = below.is_some_and(|to| to > 0 && face.unread(to - 1));
+        (queued, unread)
     }
 
-    /// The subject and body of the inbox-group record queued for the loop at bus offset `off`:
-    /// read off the bus, not yet handled (`Bridge::unhanded_landing`). A reset empties the face
-    /// and a push under an earlier reader's generation is refused, so only the current reader's
-    /// records answer.
-    pub(crate) fn inbox_queued_at(&self, off: u64) -> Option<(String, Vec<u8>)> {
-        self.lock()
-            .inbox
-            .records
-            .iter()
-            .find(|((at, ..), ..)| *at == off)
-            .map(|((_, subject, body), ..)| (subject.clone(), body.clone()))
+    /// Whether a mark came to the inbox face's readers of the current generation: only the
+    /// negative control `Mutant::UnreadOnlyOnceMarked` asks (`Bridge::answer_queued`,
+    /// `Bridge::unhanded_landing`), which takes a reader as marked only from then on.
+    #[cfg(test)]
+    pub(crate) fn inbox_marked(&self) -> bool {
+        self.lock().inbox.marked
+    }
+
+    /// NEGATIVE CONTROL (`Mutant::GapPassesItsRange`, set by `Bridge::subscribe_inbox`): from
+    /// now on a gap notice reads its face to the end of its range, as the first cut of
+    /// ATERM-KI-1115-1149 did, though astream still delivers a record retention holds there.
+    #[cfg(test)]
+    pub(crate) fn gaps_pass_their_range(&self, on: bool) {
+        self.lock().gaps_pass = on;
+    }
+
+    /// WHERE THE INBOX FACE STANDS ON THE RECORD AT BUS OFFSET `off` (`Bridge::unhanded_landing`):
+    /// queued for the loop with its subject and body, unread by the current generation's
+    /// reader, or neither ([`InboxAt`]). One lock answers it, so a record the reader pushes
+    /// meanwhile is queued or not yet read, never neither. A reset empties the face and a push
+    /// under an earlier reader's generation is refused, so only the current reader's records
+    /// answer.
+    pub(crate) fn inbox_at(&self, off: u64) -> InboxAt {
+        let q = self.lock();
+        if let Some(((_, subject, body), ..)) =
+            q.inbox.records.iter().find(|((at, ..), ..)| *at == off)
+        {
+            return InboxAt::Queued(subject.clone(), body.clone());
+        }
+        if q.inbox.unread(off) {
+            InboxAt::Unread
+        } else {
+            InboxAt::Read
+        }
     }
 
     /// Current incarnation of broker source `s` for stamping a new reader.
     #[must_use]
     pub fn broker_generation(&self, s: Source) -> u64 {
         self.lock().face(s).map_or(0, |face| face.generation)
+    }
+
+    /// THE INCARNATION A NEW READER OF BROKER SOURCE `s` STAMPS ITS PUSHES WITH
+    /// ([`Mailbox::broker_generation`]), that reader now reading, its tail `marks`ed or not as
+    /// its subscription negotiated it ([`Face::marks`]: `Client::idle_marks` answered before it
+    /// subscribed; only the inbox's is asked, as only it is read). Where it is, what it has not
+    /// read yet is `InboxAt::Unread` until it ends ([`Mailbox::push_lost`],
+    /// [`Mailbox::push_refused`]) or the source is reset.
+    #[must_use]
+    pub fn reader_starts(&self, s: Source, marks: bool) -> u64 {
+        let mut q = self.lock();
+        let Some(face) = q.face(s) else {
+            return 0;
+        };
+        face.reading = true;
+        face.marks = marks;
+        face.generation
     }
 
     /// Push one record from broker source `s`, with the `origin` its tail stamped, under its
@@ -697,6 +815,7 @@ impl Mailbox {
             return Pushed::Stale;
         };
         let resume_from = r.0.saturating_add(1);
+        face.read(resume_from);
         face.bytes = face.bytes.saturating_add(record_bytes(&r));
         face.pushed = face.pushed.saturating_add(1);
         face.records.push_back((r, origin, at, stamp));
@@ -713,7 +832,9 @@ impl Mailbox {
 
     /// Push one gap notice from broker source `s` under its reader `generation`, in its place
     /// among the source's records ([`Item::Gap`]), read at `at` as [`Mailbox::push`]'s record
-    /// is; `false` for a torn-down generation's.
+    /// is; `false` for a torn-down generation's. The source is read to the notice's start, the
+    /// tail's cursor, and no further: what retention still holds inside its range is delivered
+    /// after it ([`Face::read_to`]).
     pub fn push_gap(
         &self,
         s: Source,
@@ -722,12 +843,36 @@ impl Mailbox {
         at: Instant,
     ) -> bool {
         let mut q = self.lock();
+        #[cfg(test)]
+        let passes = q.gaps_pass;
         let Some(face) = q.face(s).filter(|face| face.generation == generation) else {
             return false;
         };
         face.push_gap(g, at);
+        #[cfg(test)]
+        if passes {
+            face.read(g.to);
+        }
         drop(q);
         self.ready.notify_all();
+        true
+    }
+
+    /// Note a MARK on broker source `s`'s subscription under its reader `generation` (astream's
+    /// `Event::Mark`): its tail resumes from `next`, so every record of its filter below it was
+    /// delivered, or told given up, ahead of the mark (astream marks a tail only once it has
+    /// delivered what it read), and the source has been read to there. It queues nothing for
+    /// the loop. `false` for a torn-down generation's.
+    pub fn push_mark(&self, s: Source, next: u64, generation: u64) -> bool {
+        let mut q = self.lock();
+        let Some(face) = q.face(s).filter(|face| face.generation == generation) else {
+            return false;
+        };
+        face.read(next);
+        #[cfg(test)]
+        {
+            face.marked = true;
+        }
         true
     }
 
@@ -792,9 +937,10 @@ impl Mailbox {
 
     fn push_end(&self, s: Source, generation: u64, item: Item) {
         let mut q = self.lock();
-        if q.face(s).is_none_or(|face| face.generation != generation) {
+        let Some(face) = q.face(s).filter(|face| face.generation == generation) else {
             return;
-        }
+        };
+        face.reading = false;
         q.closed.push_back(item);
         drop(q);
         self.ready.notify_all();

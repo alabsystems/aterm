@@ -1894,7 +1894,8 @@ fn the_readers_print_each_account_by_slug_provider_and_address() {
     assert_eq!(
         several.to_string(),
         format!(
-            "`ann@example.invalid` names 2 accounts; name one by its slug:\n  {}\n  {}",
+            "`ann@example.invalid` names 2 accounts; name one by its slug, its key, or its \
+             provider word and address:\n  {}\n  {}",
             lines[0], lines[1]
         )
     );
@@ -1949,7 +1950,7 @@ fn retire_account_takes_an_accounts_names_and_refuses_a_default_label_or_a_share
         .unwrap_err()
         .to_string();
     assert!(
-        held.contains(&keys::safe_key(&codex)) && held.contains("live preference row"),
+        held.contains(keys::safe_key(&codex)) && held.contains("live preference row"),
         "{held}"
     );
     assert!(live(&claude) && live(&codex));
@@ -2373,7 +2374,6 @@ fn the_address_is_stdins_first_line_without_waiting_for_its_end() {
 #[test]
 fn what_runs_on_a_machine_is_its_preferences_places_facts_and_sum() {
     use crate::alab::{
-        account_names::Names,
         journal::{
             place::{Placed, Places, Why},
             seen::Seen,
@@ -2426,7 +2426,8 @@ fn what_runs_on_a_machine_is_its_preferences_places_facts_and_sum() {
         let email = format!("{pk}@example.test");
         lab.names.insert(
             pk.into(),
-            Names {
+            aterm_file::AccountNames {
+                realm: "claude".into(),
                 slug: format!("claude-{pk}"),
                 name: Some(format!("claude {email}")),
                 email: Some(email.clone()),

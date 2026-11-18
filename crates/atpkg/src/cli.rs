@@ -4898,8 +4898,12 @@ fn list_porcelain_lines(
             }
         } else if live.get(program) == Some(build) {
             notes.push("live".to_string());
+        } else if crate::vendor_direct::is_vendor(program) {
+            notes.push("superseded (kept for a vendor yank)".to_string());
         } else {
-            notes.push("superseded (kept for rollback)".to_string());
+            // The lab fixes forward: gc reclaims it unless a running process or a recent
+            // trust.lock resolution still holds it.
+            notes.push("superseded".to_string());
         }
         if pinned.contains(program) {
             notes.push("pinned".to_string());
@@ -4981,7 +4985,11 @@ fn list_human_lines(
             }
             let older = program_builds.iter().filter(|b| *b != live_build).count();
             if older > 0 {
-                s.push_str(&format!("   ({older} older build(s) kept for rollback)"));
+                s.push_str(&if crate::vendor_direct::is_vendor(program) {
+                    format!("   ({older} older build(s) kept for a vendor yank)")
+                } else {
+                    format!("   ({older} superseded build(s) not yet reclaimed)")
+                });
             }
             s
         } else {
@@ -5483,20 +5491,6 @@ fn rfc3339_at(secs: i64) -> String {
 
 fn reusable_index(index: Option<&crate::TrustedIndex>, now: i64) -> Option<&crate::TrustedIndex> {
     index.filter(|index| crate::flow::index_is_fresh(index, now))
-}
-
-fn recover_missing_roots(
-    layout: &crate::store::Layout,
-    fetcher: &dyn crate::flow::Fetcher,
-    trusted: Option<&crate::TrustedIndex>,
-) {
-    recover_missing_roots_with(
-        layout,
-        fetcher,
-        trusted,
-        &effective_anchor(layout),
-        now_unix(),
-    );
 }
 
 fn recover_missing_roots_with(
@@ -9008,45 +9002,6 @@ fn installed_line(program: &str, build: u64, laid: &[String]) -> String {
     }
 }
 
-fn rollback_line(
-    program: &str,
-    from: u64,
-    to: u64,
-    group: Option<&str>,
-    held_by: &[String],
-    revoked: Option<(&str, u64)>,
-) -> String {
-    let head = format!("atpkg: rolled back {program} from build {from} to {to}");
-    if let Some((member, build)) = revoked {
-        return format!(
-            "{head}; the next update moves it forward again ({} is revoked)",
-            crate::vendor_direct::display_build(member, build)
-        );
-    }
-    if held_by.is_empty() {
-        let hold = match group {
-            Some(g) => format!("holds it, and with it the whole {g} group"),
-            None => String::from("holds it there"),
-        };
-        return format!(
-            "{head}; the next update moves it forward again \u{2014} `aterm pkg pin {program}` \
-             {hold}"
-        );
-    }
-    let who = match held_by {
-        [p] if p == program => String::from("it is"),
-        [p] => format!("{p} is"),
-        _ => format!("{} are", held_by.join(" and ")),
-    };
-    let what = group.map_or_else(|| String::from("it"), |g| format!("the whole {g} group"));
-    let unpins = held_by
-        .iter()
-        .map(|h| format!("`aterm pkg unpin {h}`"))
-        .collect::<Vec<_>>()
-        .join(" and ");
-    format!("{head}; {who} pinned, so updates leave {what} there until {unpins}")
-}
-
 fn cmd_rollback(program: Option<&String>) -> ExitCode {
     let Some(program) = program else {
         return usage_error("rollback", None);
@@ -9058,73 +9013,21 @@ fn cmd_rollback(program: Option<&String>) -> ExitCode {
     let Some(layout) = layout() else {
         return ExitCode::from(1);
     };
-    rollback_in(
-        &layout,
-        crate::config::CHANNEL,
-        program,
-        crate::config::cached().exclude(),
-        &|| resolve_fetcher(&layout),
-    )
+    rollback_in(&layout, program)
 }
 
-fn rollback_in(
-    layout: &crate::store::Layout,
-    channel: &str,
-    program: &str,
-    excluded: &[String],
-    fetcher: &dyn Fn() -> Box<dyn crate::flow::Fetcher>,
-) -> ExitCode {
+/// The words `aterm pkg rollback` refuses a program the signed index serves with.
+pub(crate) const FIX_FORWARD: &str = "fixed by the next release; nothing is kept to roll back to";
+
+/// `aterm pkg rollback <program>`: a vendor-direct program (an upstream binary the lab cannot fix
+/// forward) moves back to its one retained build; a program the lab releases is fixed by its next
+/// release, and gc keeps no older build of it.
+fn rollback_in(layout: &crate::store::Layout, program: &str) -> ExitCode {
     if let Some(spec) = crate::vendor_direct::spec(program) {
         return cmd_rollback_vendor(layout, spec);
     }
-    let floor = build_floor(layout);
-    let fetcher = fetcher();
-    match crate::flow::rollback_returning_index(
-        &*fetcher,
-        layout,
-        &effective_anchor(layout),
-        channel,
-        program,
-        excluded,
-        floor,
-        now_unix(),
-    ) {
-        Ok((r, index)) => {
-            advance_floors(layout, r.index_build, r.roster_seq);
-            record_status(
-                layout,
-                program,
-                crate::ProgramStatus {
-                    installed_build: Some(r.to_build),
-                    state: crate::state::rolled_back(r.to_build, r.from_build),
-                    tree_root: String::new(),
-                },
-                format!("rolled back {program} {} -> {}", r.from_build, r.to_build),
-            );
-            recover_missing_roots(layout, &*fetcher, Some(&index));
-            println!(
-                "{}",
-                rollback_line(
-                    program,
-                    r.from_build,
-                    r.to_build,
-                    r.coherence_group.as_deref(),
-                    &r.held_by,
-                    r.revoked_member.as_ref().map(|(m, b)| (m.as_str(), *b))
-                )
-            );
-            if program == crate::seam::SEAM_PROGRAM {
-                reassert_rustup_seam(layout);
-                let _ = reconcile_exec_roots(layout, crate::seam::Depth::Shallow);
-            }
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("atpkg: rollback {program} failed: {e}");
-            print_unreachable_followup(&e, &format!("aterm pkg rollback {program}"));
-            ExitCode::from(1)
-        }
-    }
+    eprintln!("atpkg: rollback {program}: {FIX_FORWARD}");
+    ExitCode::from(1)
 }
 
 fn cmd_rollback_vendor(

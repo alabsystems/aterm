@@ -325,21 +325,41 @@ impl Fx {
         }
     }
 
-    /// HAND AN OPEN SUBSCRIPTION TO ITS READER ([`crate::bridge::spawn_reader`]).
+    /// WHETHER A TAIL ABOUT TO BE OPENED ON `c` IS MARKED: its broker takes idle marks
+    /// (`Client::idle_marks`, which the subscription asks again and the broker answers alike),
+    /// so it marks the tail once the tail has read its backlog and after every
+    /// `astream_broker::IDLE_MARK` with nothing to deliver. A simulated broker's tails send no
+    /// mark, whatever it answers the request (`sim::bus`, `sim::conform_broker`), so a world's
+    /// tail is not, and nothing is asked.
+    pub(crate) fn tail_marks(&self, c: &mut Conn) -> io::Result<bool> {
+        match &self.world {
+            World::Os => c.idle_marks(),
+            #[cfg(test)]
+            World::Sim(_) => {
+                let _ = c;
+                Ok(false)
+            }
+        }
+    }
+
+    /// HAND AN OPEN SUBSCRIPTION TO ITS READER ([`crate::bridge::spawn_reader`]), with `marks`
+    /// saying whether its tail is marked ([`Fx::tail_marks`], `Mailbox::reader_starts`), and
+    /// the live read `deadline` each mark arms (none where `None`). A simulated reader arms none.
     pub(crate) fn start_reader(
         &self,
         sub: astream_broker::AnySubscription,
         closer: Arc<BusCloser>,
-        deadline: Duration,
+        deadline: Option<Duration>,
         source: Source,
         mailbox: Arc<Mailbox>,
+        marks: bool,
     ) -> io::Result<()> {
         match &self.world {
-            World::Os => crate::bridge::spawn_reader(sub, closer, deadline, source, mailbox),
+            World::Os => crate::bridge::spawn_reader(sub, closer, deadline, source, mailbox, marks),
             #[cfg(test)]
             World::Sim(p) => {
                 let _ = deadline;
-                p.reader(sub, closer, source, mailbox);
+                p.reader(sub, closer, source, mailbox, marks);
                 Ok(())
             }
         }

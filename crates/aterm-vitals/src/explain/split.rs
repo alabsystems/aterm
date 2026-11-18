@@ -4,9 +4,10 @@
 //! Independent published CPU counter accounts over a frontend read separation.
 
 use super::{
-    CoalRow, CoalSample, CoalSplit, CoalUsage, IdMap, Named, Part, ReapLedger, ReapTotals, Via,
+    CoalRow, CoalSample, CoalSplit, CoalUsage, IdMap, MemoryMember, MemoryMembers, Named, Part,
+    ReapLedger, ReapTotals, Via,
 };
-use crate::model::{Membership, ProcSample, Sample, Split, TabRoot, TabView};
+use crate::model::{Membership, ProcSample, ProcState, Sample, Split, TabRoot, TabView};
 
 /// The longest window a split reads, ns.
 pub const WINDOW_MAX_NS: u64 = 60_000_000_000;
@@ -30,6 +31,9 @@ pub struct CoalBase {
     pub procs: IdMap<u32, (Option<u64>, u64)>,
     /// Whether a listed coalition was unread, or the list or the sweep stopped short.
     pub truncated: bool,
+    /// Whether this sample's process census was absent or stopped short, independently of
+    /// unread coalition records or a truncated coalition list.
+    pub procs_truncated: bool,
     /// Whether the list stopped short.
     pub list_truncated: bool,
     /// The reap credit's counters at this reading, where its ledger read the sweep.
@@ -57,6 +61,7 @@ impl CoalBase {
             truncated: read.truncated
                 || s.procs_truncated
                 || read.rows.len() < read.listed as usize,
+            procs_truncated: s.procs_truncated || s.procs.is_none(),
             list_truncated: read.truncated,
             reap: None,
             exclusive: super::IdSet::default(),
@@ -319,6 +324,7 @@ pub fn split(i: &SplitIn) -> CoalSplit {
     // counters, and the sweep found each one's every live member
     // ([`CoalSplit::skew_mc`]).
     let mut kept_members = true;
+    let mut memory_members = memory_members(i.procs, &i.now.coalitions, i.now.procs_truncated);
     let mut rows = Vec::with_capacity(i.now.coalitions.len());
     let mut rows_ns = Vec::with_capacity(i.now.coalitions.len());
     for u in i.now.coalitions.values() {
@@ -377,6 +383,7 @@ pub fn split(i: &SplitIn) -> CoalSplit {
             )
             .unwrap_or(u64::MAX),
             footprint: u.footprint,
+            memory_members: memory_members.remove(&u.id).unwrap_or_default(),
             footprint_aterm: owned_live.get(&u.id).is_some_and(|owned| {
                 *owned > 0
                     && Some(u64::from(*owned)) == u.tasks_started.checked_sub(u.tasks_exited)
@@ -490,6 +497,126 @@ pub fn split(i: &SplitIn) -> CoalSplit {
         skew_mc: mc(skew_ns),
         short_tabs,
         rows,
+    }
+}
+
+/// Index the input census once so a late duplicate cannot survive in an earlier top three.
+/// The reduction then keeps only three borrowed candidates per listed coalition.
+fn memory_members(
+    procs: &[ProcSample],
+    coalitions: &IdMap<u64, CoalUsage>,
+    truncated: bool,
+) -> IdMap<u64, MemoryMembers> {
+    let mut unique: IdMap<u32, Option<&ProcSample>> = IdMap::default();
+    let mut ambiguous = super::IdSet::default();
+    for process in procs {
+        match unique.entry(process.pid) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(process));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if let Some(previous) = entry.get_mut().take()
+                    && let Some(coalition) = previous.coalition
+                {
+                    ambiguous.insert((process.pid, coalition));
+                }
+                if let Some(coalition) = process.coalition {
+                    ambiguous.insert((process.pid, coalition));
+                }
+            }
+        }
+    }
+    let mut members: IdMap<u64, MemberRows<'_>> = coalitions
+        .keys()
+        .map(|id| (*id, MemberRows::default()))
+        .collect();
+    for (_, coalition) in ambiguous {
+        if let Some(rows) = members.get_mut(&coalition) {
+            rows.bump(|facts| &mut facts.observed);
+            rows.bump(|facts| &mut facts.ambiguous);
+        }
+    }
+    for process in unique.values().flatten() {
+        let Some(rows) = process.coalition.and_then(|id| members.get_mut(&id)) else {
+            continue;
+        };
+        rows.bump(|facts| &mut facts.observed);
+        match process.state {
+            ProcState::Zombie | ProcState::Unknown => {
+                rows.bump(|facts| &mut facts.excluded);
+                rows.unknown |= process.state == ProcState::Unknown;
+            }
+            ProcState::Run | ProcState::Uninterruptible | ProcState::Stopped => {
+                rows.active = rows.active.saturating_add(1);
+                if let Some(footprint) = process.footprint {
+                    rows.bump(|facts| &mut facts.readable);
+                    if rows.top.len() < 3
+                        || rows.top.last().is_some_and(|(last, row)| {
+                            footprint > *last || (footprint == *last && process.pid < row.pid)
+                        })
+                    {
+                        if rows.top.len() == 3 {
+                            rows.top.pop();
+                        }
+                        rows.top.push((footprint, process));
+                        rows.top.sort_unstable_by(|a, b| {
+                            b.0.cmp(&a.0).then_with(|| a.1.pid.cmp(&b.1.pid))
+                        });
+                    }
+                } else {
+                    rows.bump(|facts| &mut facts.unread);
+                }
+            }
+        }
+    }
+    members
+        .into_iter()
+        .map(|(id, mut rows)| {
+            let expected = coalitions[&id]
+                .tasks_started
+                .checked_sub(coalitions[&id].tasks_exited);
+            rows.facts.missing = expected.map(|count| count.saturating_sub(rows.active));
+            rows.facts.truncated = truncated;
+            rows.facts.complete = !truncated
+                && expected == Some(rows.active)
+                && rows.facts.unread == 0
+                && rows.facts.ambiguous == 0
+                && !rows.unknown
+                && !rows.saturated;
+            rows.facts.top = rows
+                .top
+                .into_iter()
+                .map(|(footprint, process)| MemoryMember {
+                    pid: process.pid,
+                    start: process.start,
+                    version: process.version,
+                    birth_ms: process.birth_ms,
+                    at_ns: process.at_ns,
+                    name: process.name.clone(),
+                    footprint,
+                })
+                .collect();
+            (id, rows.facts)
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct MemberRows<'a> {
+    facts: MemoryMembers,
+    top: Vec<(u64, &'a ProcSample)>,
+    active: u64,
+    unknown: bool,
+    saturated: bool,
+}
+
+impl MemberRows<'_> {
+    fn bump(&mut self, count: fn(&mut MemoryMembers) -> &mut u32) {
+        let value = count(&mut self.facts);
+        match value.checked_add(1) {
+            Some(next) => *value = next,
+            None => self.saturated = true,
+        }
     }
 }
 

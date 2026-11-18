@@ -3754,8 +3754,11 @@ fn sibling_socket_dirs() -> Vec<std::path::PathBuf> {
 }
 
 #[cfg(unix)]
+#[path = "harness_screen_sibling.rs"]
+mod sibling;
+
+#[cfg(unix)]
 fn sibling_aterm_tabs_in(dirs: Vec<std::path::PathBuf>) -> Vec<TabSpreadsheetRow> {
-    use std::io::{BufRead, BufReader, Write};
     let own_pid = std::process::id();
     let comp_name = local_computer_label();
     let mut rows = Vec::new();
@@ -3791,132 +3794,9 @@ fn sibling_aterm_tabs_in(dirs: Vec<std::path::PathBuf>) -> Vec<TabSpreadsheetRow
         let Some(sock) = sock_path.to_str() else {
             continue;
         };
-        let Ok((mut stream, Ok(token))) = aterm_ctl::connect_then_read_token(sock) else {
-            continue;
-        };
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(150)));
-        let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(150)));
-        let req = format!("AUTH {token}\nsessions\n");
-        if stream.write_all(req.as_bytes()).is_err() {
-            continue;
-        }
-        let _ = stream.flush();
-        let _ = stream.shutdown(std::net::Shutdown::Write);
-        let reader = BufReader::new(stream);
-        let mut pid_rows: Vec<(u64, TabSpreadsheetRow)> = Vec::new();
-        for line in reader.lines().map_while(Result::ok) {
-            if let Some((local_id, row)) = parse_sibling_roster_line(&comp_name, pid, &line) {
-                pid_rows.push((local_id, row));
-            }
-        }
-        if !pid_rows.is_empty()
-            && let Ok((mut stream2, _)) = aterm_ctl::connect_then_read_token(sock)
-        {
-            let _ = stream2.set_read_timeout(Some(std::time::Duration::from_millis(80)));
-            let _ = stream2.set_write_timeout(Some(std::time::Duration::from_millis(80)));
-            let mut batch = format!("AUTH {token}\n");
-            for (local_id, _) in &pid_rows {
-                batch.push_str(&format!("@{local_id} dims\n@{local_id} cwd\n"));
-            }
-            if stream2.write_all(batch.as_bytes()).is_ok() {
-                let _ = stream2.flush();
-                let _ = stream2.shutdown(std::net::Shutdown::Write);
-                let mut r2 = BufReader::new(stream2);
-                for (_, row) in &mut pid_rows {
-                    let mut dims_line = String::new();
-                    let mut dims_opt: Option<(u32, u32)> = None;
-                    if r2.read_line(&mut dims_line).is_ok()
-                        && let Some(rest) = dims_line.trim().strip_prefix("OK ")
-                    {
-                        let mut parts = rest.split_whitespace();
-                        let uint = |s: &str| {
-                            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-                                .then(|| s.parse::<u32>().ok())
-                                .flatten()
-                        };
-                        if let (Some(r), Some(c)) =
-                            (parts.next().and_then(uint), parts.next().and_then(uint))
-                            && c > 0
-                            && r > 0
-                        {
-                            dims_opt = Some((c, r));
-                        }
-                    }
-                    let mut cwd_line = String::new();
-                    let mut cwd_opt: Option<String> = None;
-                    if r2.read_line(&mut cwd_line).is_ok()
-                        && let Some(rest) = cwd_line.trim().strip_prefix("OK ")
-                    {
-                        let decoded = aterm_control::wire::pct_decode(rest.trim());
-                        if !decoded.is_empty() && decoded != "-" {
-                            cwd_opt = Some(shorten_home_dir(&decoded));
-                        }
-                    }
-                    let facts = dims_opt
-                        .map(|(c, r)| format!("{c}\u{d7}{r}"))
-                        .into_iter()
-                        .chain(cwd_opt);
-                    for fact in facts {
-                        row.place.push_str(crate::native_ui::FACT_SEPARATOR);
-                        row.place.push_str(&fact);
-                    }
-                }
-            }
-        }
-        enrich_sibling_tab_vitals(pid, &mut pid_rows);
-        rows.extend(pid_rows.into_iter().map(|(_, r)| r));
+        rows.extend(sibling::read(&comp_name, pid, sock));
     }
     rows
-}
-
-#[cfg(unix)]
-fn enrich_sibling_tab_vitals(aterm_pid: u32, pid_rows: &mut [(u64, TabSpreadsheetRow)]) {
-    if pid_rows.is_empty() {
-        return;
-    }
-    let Some(sweep) = aterm_sysprobe::processes() else {
-        return;
-    };
-    let mut children_by_ppid: std::collections::BTreeMap<
-        u32,
-        Vec<&aterm_sysprobe::ProcessReading>,
-    > = std::collections::BTreeMap::new();
-    for p in &sweep.procs {
-        children_by_ppid.entry(p.ppid).or_default().push(p);
-    }
-    let mut direct_shells: Vec<u32> = children_by_ppid
-        .get(&aterm_pid)
-        .map(|list| list.iter().map(|p| p.pid).collect())
-        .unwrap_or_default();
-    direct_shells.sort_unstable();
-    let subtree_mem_and_cpu = |root_pid: u32| -> (u64, u64) {
-        let mut stack = vec![root_pid];
-        let mut seen = std::collections::BTreeSet::new();
-        let mut mem = 0u64;
-        let mut cpu_ns = 0u64;
-        while let Some(cur) = stack.pop() {
-            if !seen.insert(cur) {
-                continue;
-            }
-            if let Some(p) = sweep.procs.iter().find(|p| p.pid == cur) {
-                mem = mem.saturating_add(p.footprint.unwrap_or(0));
-                cpu_ns = cpu_ns.saturating_add(p.cpu_ns.unwrap_or(0));
-            }
-            if let Some(kids) = children_by_ppid.get(&cur) {
-                for k in kids {
-                    stack.push(k.pid);
-                }
-            }
-        }
-        (mem, cpu_ns)
-    };
-    for (idx, (_, row)) in pid_rows.iter_mut().enumerate() {
-        let target_pid = direct_shells.get(idx).copied().unwrap_or(aterm_pid);
-        let (mem, _cpu_ns) = subtree_mem_and_cpu(target_pid);
-        if mem > 0 {
-            row.vitals = format!("RAM {}", HostVitals::human_bytes(mem));
-        }
-    }
 }
 
 #[cfg(not(unix))]

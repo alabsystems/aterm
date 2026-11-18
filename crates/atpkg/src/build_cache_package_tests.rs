@@ -541,7 +541,7 @@ fn a_late_preserve_request_keeps_every_generation_and_resumed_payload() {
                 &older,
                 workspace,
                 Some(older_policy),
-                false,
+                super::super::Admission::Create,
             )
             .unwrap();
             std::fs::create_dir_all(older.join("debug/deps")).unwrap();

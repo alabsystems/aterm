@@ -49,6 +49,44 @@ fn build_child_env_drops_denylisted_and_keeps_overrides() {
     );
 }
 
+/// A tab never inherits aterm's token wrapper's marker or minted time: an aterm started from the
+/// shell of a session on its account's vault token would otherwise hand them to every tab
+/// without the descriptor Claude Code consumed, and a `claude` started there would read as a
+/// route of its own. A copy the tab is handed on purpose (`env_add`) still reaches it.
+/// NEGATIVE CONTROL (2026-11-16): with both names out of `ENV_DENY_VARS`, the inherited copies
+/// reach the tab and this test fails.
+#[test]
+fn build_child_env_drops_an_inherited_token_marker_and_keeps_one_handed_down() {
+    use aterm_types::domain::{ENV_CLAUDE_TOKEN, ENV_CLAUDE_TOKEN_MINTED};
+    use std::ffi::OsString;
+    let os = |s: &str| OsString::from(s);
+    let value = |out: &[(OsString, OsString)], key: &str| {
+        out.iter()
+            .filter(|(k, _)| k == &os(key))
+            .map(|(_, v)| v.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    };
+    let inherited = || {
+        vec![
+            (os("PATH"), os("/usr/bin")),
+            (os(ENV_CLAUDE_TOKEN), os("aterm-claude-token-work-2")),
+            (os(ENV_CLAUDE_TOKEN_MINTED), os("1790000000")),
+        ]
+        .into_iter()
+    };
+    let out = build_child_env(inherited(), &[]);
+    assert_eq!(value(&out, ENV_CLAUDE_TOKEN), Vec::<String>::new());
+    assert_eq!(value(&out, ENV_CLAUDE_TOKEN_MINTED), Vec::<String>::new());
+    assert_eq!(value(&out, "PATH"), ["/usr/bin"]);
+    let handed = vec![(
+        ENV_CLAUDE_TOKEN.to_string(),
+        "aterm-claude-token-own".to_string(),
+    )];
+    let out = build_child_env(inherited(), &handed);
+    assert_eq!(value(&out, ENV_CLAUDE_TOKEN), ["aterm-claude-token-own"]);
+    assert_eq!(value(&out, ENV_CLAUDE_TOKEN_MINTED), Vec::<String>::new());
+}
+
 /// The default-editor hint is per hop (docs/DESIGN-amacs-2026-10-19.md §8.3, W1): an
 /// aterm started from a tab drops the hint it inherited and hands its own, while the
 /// person's `EDITOR` and `VISUAL` pass through.

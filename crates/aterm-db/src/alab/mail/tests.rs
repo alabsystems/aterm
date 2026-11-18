@@ -763,6 +763,127 @@ mod sign_in {
         );
     }
 
+    /// The holder of a revealed bundle learns, with nothing revealed, whether the registry still
+    /// holds the values it was handed, whichever entries hold them: yes at a second look, at
+    /// another cell's write and where a cell comes to name a second entry of the same value; no
+    /// when a value is replaced, under a new reference or in place under the same one, for
+    /// values in another order and for another count of them; and withheld in a reveal's own
+    /// words where a reveal would be (a binding not accepted, candidates that disagree, an entry
+    /// the store lacks).
+    /// NEGATIVE CONTROL: a compare of the cells' references (the recheck's first form) answers
+    /// yes after the in-place replacement.
+    #[test]
+    fn a_held_bundle_is_the_registrys_only_while_its_values_are() {
+        let Fixture {
+            mut book,
+            store,
+            login,
+            mailbox,
+        } = fixture();
+        let bundle = [Credential::Password, Credential::Totp];
+        let same_under =
+            |table: &str, book: &Book, parts: &[Credential], held: &[&str], accept: bool| {
+                let (addresses, rows) = projections(book);
+                let held: Vec<&[u8]> = held.iter().map(|value| value.as_bytes()).collect();
+                bound_same_in(
+                    &addresses,
+                    &rows,
+                    table,
+                    &store,
+                    &mailbox,
+                    parts,
+                    &held,
+                    |_| accept,
+                )
+                .unwrap()
+            };
+        let same = |book: &Book, parts: &[Credential], held: &[&str], accept: bool| {
+            same_under(TABLE, book, parts, held, accept)
+        };
+        let first = [LOGIN_PASS, TOTP];
+        assert_eq!(same(&book, &bundle, &first, true), Ok(true));
+        assert_eq!(
+            same_under("alab/registry.next", &book, &bundle, &first, true),
+            Ok(true),
+            "another generation's name over the same values is the same bundle"
+        );
+        assert_eq!(
+            same(&book, &bundle, &first, true),
+            Ok(true),
+            "a second look"
+        );
+        assert_eq!(same(&book, &bundle, &[TOTP, LOGIN_PASS], true), Ok(false));
+        assert_eq!(same(&book, &bundle, &[LOGIN_PASS], true), Ok(false));
+        assert_eq!(
+            same(&book, &bundle, &[LOGIN_PASS, TOTP, TOTP], true),
+            Ok(false)
+        );
+        assert_eq!(
+            same(&book, &[Credential::Password], &[LOGIN_PASS], true),
+            Ok(true)
+        );
+        assert_eq!(
+            same(&book, &bundle, &first, false),
+            Err(Withheld::NoMailbox)
+        );
+
+        // A cell outside the bundle names another candidate: the bundle is still held.
+        let elsewhere =
+            crate::typed::secret::test_entry(("mailbox", "mailbox_password", &mailbox), 2);
+        store
+            .put(&elsewhere, &Secret::new(SECOND_PASS.to_owned()))
+            .unwrap();
+        book.write(
+            2,
+            &[],
+            vec![put(
+                &MAILBOX,
+                &mailbox,
+                "mailbox_password",
+                reference(Memory::VAULT, &elsewhere),
+            )],
+        );
+        assert_eq!(same(&book, &bundle, &first, true), Ok(true));
+
+        // The password's cell names a second entry holding the same value: the same values.
+        let twin = crate::typed::secret::test_entry(("address", "password", &login), 3);
+        store
+            .put(&twin, &Secret::new(LOGIN_PASS.to_owned()))
+            .unwrap();
+        book.write(
+            3,
+            &[],
+            vec![put(
+                &ADDRESS,
+                &login,
+                "password",
+                reference(Memory::VAULT, &twin),
+            )],
+        );
+        assert_eq!(same(&book, &bundle, &first, true), Ok(true));
+
+        // One entry's value is replaced in place, as a by-name vault write does: no cell and
+        // no reference changed, the candidates disagree and nothing is answered.
+        store
+            .put(&twin, &Secret::new(SECOND_PASS.to_owned()))
+            .unwrap();
+        assert_eq!(same(&book, &bundle, &first, true), Err(Withheld::TwoValues));
+        // Both hold the new value: still no cell or reference changed, and the held bundle is
+        // no longer the registry's.
+        let own = crate::typed::secret::entry_name("address", "password", &login).unwrap();
+        store
+            .put(&own, &Secret::new(SECOND_PASS.to_owned()))
+            .unwrap();
+        assert_eq!(same(&book, &bundle, &first, true), Ok(false));
+        assert_eq!(same(&book, &bundle, &[SECOND_PASS, TOTP], true), Ok(true));
+
+        store.remove(&twin).unwrap();
+        assert_eq!(
+            same(&book, &bundle, &[SECOND_PASS, TOTP], true),
+            Err(Withheld::NotInStore)
+        );
+    }
+
     /// A reference whose entry this Mac's store lacks is withheld as `NotInStore`: no value is
     /// handed on and nothing is journalled.
     /// NEGATIVE CONTROL: with `open_credential` journalling or consuming before the store read
@@ -919,6 +1040,22 @@ mod sign_in {
             read(Values::Store(&store), Credential::Password),
             Err(Withheld::NotOwnEntry)
         );
+        // A bundle revealed under a sealed generation is rechecked there by its values alone.
+        let held = |password: &str| {
+            same_of(
+                &addresses,
+                &mailboxes_rows,
+                "alab/registry.2",
+                Values::Sealed(&key),
+                &mailbox,
+                &[Credential::Password, Credential::Totp],
+                &[password.as_bytes(), TOTP.as_bytes()],
+                |_| true,
+            )
+            .unwrap()
+        };
+        assert_eq!(held(LOGIN_PASS), Ok(true));
+        assert_eq!(held(SECOND_PASS), Ok(false));
         // The listing a sign-in reads first names the sealed credentials it can open, so the
         // harness asks for them.
         let listed = mailboxes(&addresses, &mailboxes_rows);

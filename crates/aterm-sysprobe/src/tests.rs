@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
+use std::time::Instant;
+
 use super::*;
 use crate::machine;
 
@@ -732,34 +734,6 @@ fn the_swap_counter_reads_on_this_host_and_never_runs_backwards() {
     let first = crate::swapped_kib().expect("HOST_VM_INFO64");
     let second = crate::swapped_kib().expect("HOST_VM_INFO64");
     assert!(second >= first, "{first} KiB then {second} KiB");
-}
-
-#[test]
-fn the_swap_meter_reads_a_rate_over_a_span_of_its_readings() {
-    let t0 = Instant::now();
-    let s = std::time::Duration::from_secs;
-    let mut m = SwapMeter::new();
-    assert_eq!(m.observe(t0, Some(10_000_000)), None, "one reading");
-    let thrash = 10_000_000 + 89 * 1024 * 5;
-    assert_eq!(m.observe(t0 + s(5), Some(thrash)), Some(89 * 1024));
-    let later = t0 + s(5) + std::time::Duration::from_millis(1);
-    assert_eq!(
-        m.observe(later, Some(thrash)),
-        Some(89 * 1024),
-        "a reading inside the shortest span answers the last rate"
-    );
-    assert_eq!(m.observe(t0 + s(10), Some(thrash)), Some(0), "still");
-    assert_eq!(m.observe(t0 + s(15), Some(thrash - 1)), Some(0), "back");
-    let gap = thrash + (1 << 30);
-    assert_eq!(m.observe(t0 + s(200), Some(gap)), None, "a stale base");
-    assert_eq!(m.observe(t0 + s(205), Some(gap + 5 * 4096)), Some(4096));
-    assert_eq!(m.observe(t0 + s(206), None), None, "unknown");
-    assert_eq!(
-        m.observe(t0 + s(211), Some(1)),
-        None,
-        "the base was forgotten"
-    );
-    assert_eq!(m.observe(t0 + s(216), Some(1 + 5 * 8192)), Some(8192));
 }
 
 #[cfg(unix)]

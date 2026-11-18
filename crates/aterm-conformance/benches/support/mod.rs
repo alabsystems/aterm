@@ -44,7 +44,7 @@ pub enum Outcome {
     /// counted red). A row that could not measure at all is `CouldNotRun`.
     #[allow(
         dead_code,
-        reason = "only paint and rewind judge takes a machine's load can leave undecided; spin and aos mount the same runner"
+        reason = "only the paint, rewind and spin judges can leave a take undecided; the other matrices that mount this runner have no such take"
     )]
     Undecided(String),
 }

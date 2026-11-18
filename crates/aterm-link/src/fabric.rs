@@ -1040,8 +1040,9 @@ pub struct BrokerView {
     /// [`GUARD_PROBE_SECRET`]: `Some(true)` when it is refused; `Some(false)` when acknowledged,
     /// so the cap-forced `<src>`, `trust=human` and per-human halts rest on nothing.
     pub guarded: Option<bool>,
-    /// The broker's argv0 when that path now names a different file than the image it runs: an
-    /// update replaced the build after this broker started.
+    /// The broker's argv0 when that absolute path now names a different file than the image it
+    /// runs (an update replaced the build after this broker started), or names no file (the
+    /// build it started from is gone, so its job cannot start it again); [`replaced_from`].
     pub replaced: Option<String>,
     /// What the broker's ack promises, read off the serving process's argv
     /// ([`crate::durability`]): no wire request names the tier, and the argv is what the process
@@ -1272,12 +1273,64 @@ fn runs_this_build(pid: u32, exe: &str) -> bool {
             .is_some_and(|theirs| running_image_inode(std::process::id()) == Some(theirs))
 }
 
+/// [`replaced_from`] for `pid`, started as `exe`, its running image read
+/// ([`running_image_inode`]).
 fn replaced_build(pid: u32, exe: &str) -> Option<String> {
+    replaced_from(exe, || running_image_inode(pid))
+}
+
+/// `Some(exe)` where `exe`, a process's argv0, is an absolute path that now names another regular
+/// file than the image `running` reads it mapping (its inode), or names no regular file
+/// ([`regular_file_at`]: it, or a directory above it, is gone, a dangling link included, as the
+/// file is read through links; or what is there is a directory or another kind of file). `None`
+/// for a relative `exe` (no path to read; `running` is not asked), an image `running` could not
+/// read, the same file, and a path that cannot be read for any other reason (no permission, a
+/// link loop), since what cannot be read is no evidence the build changed.
+fn replaced_from(exe: &str, running: impl FnOnce() -> Option<u64>) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     let exe = Some(exe).filter(|w| w.starts_with('/'))?;
-    let running = running_image_inode(pid)?;
-    let now = std::fs::metadata(exe).ok()?.ino();
-    (now != running).then(|| exe.to_string())
+    let running = running()?;
+    match regular_file_at(Path::new(exe)) {
+        Ok(Some(now)) => (now.ino() != running).then(|| exe.to_string()),
+        Ok(None) => Some(exe.to_string()),
+        Err(_) => None,
+    }
+}
+
+/// The regular file `path` names, read through its links: `Ok(None)` where it names none (it, or
+/// a directory above it, is gone, `ENOENT` or `ENOTDIR`, a dangling link included; or what is
+/// there is not a regular file, a directory say), and the read's error where it cannot be read
+/// for another reason (no permission, a link loop), which is no evidence of either.
+pub(crate) fn regular_file_at(path: &Path) -> io::Result<Option<std::fs::Metadata>> {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => Ok(Some(m)),
+        Ok(_) => Ok(None),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether `exe`, a [`BrokerView::replaced`] path, names no regular file now
+/// ([`regular_file_at`]), rather than another file: what the lines that name a replaced build say
+/// of it. A path that cannot be read for another reason is not said to name none.
+pub(crate) fn names_no_file(exe: &str) -> bool {
+    matches!(regular_file_at(Path::new(exe)), Ok(None))
+}
+
+/// What a replaced build's path `exe` names now, as the lines that name it say it.
+pub(crate) fn replaced_now(exe: &str) -> &'static str {
+    if names_no_file(exe) {
+        "names no file now"
+    } else {
+        "is another file now"
+    }
 }
 
 /// The inode of the executable image `pid` runs, whatever has happened to its path since:
@@ -1551,8 +1604,8 @@ pub fn health_row(b: &BrokerView) -> Option<String> {
 /// The BROKER section's `host` row, and doctor's `host:` line, where the node service serves the
 /// socket ([`Host::NodeService`]): its job and pid, the log it hosts, the tier it was opened at
 /// ([`BrokerView::tier`]), and its build where it is this aterm's ([`BrokerView::build`]), else
-/// the program it runs, said REPLACED where an update replaced that file since it started.
-/// `None` for any other holder, which the `pid` row names.
+/// the program it runs, said REPLACED where an update replaced that file since it started or it
+/// is gone ([`BrokerView::replaced`]). `None` for any other holder, which the `pid` row names.
 #[must_use]
 pub fn host_row(b: &BrokerView) -> Option<String> {
     if b.host != Some(Host::NodeService) {
@@ -1570,8 +1623,9 @@ pub fn host_row(b: &BrokerView) -> Option<String> {
     let build = match (b.build(), b.program.as_deref(), b.replaced.is_some()) {
         (Some(id), _, _) => format!("build {} (this aterm's)", safe(&id, 64)),
         (None, Some(program), true) => format!(
-            "program {} — A REPLACED BUILD: that path is another file now",
-            safe(program, 256)
+            "program {} — A REPLACED BUILD: that path {}",
+            safe(program, 256),
+            replaced_now(program)
         ),
         (None, Some(program), false) => format!("program {}", safe(program, 256)),
         (None, None, _) => "build unknown".to_string(),
@@ -3761,11 +3815,20 @@ pub(crate) fn warning_items(
         };
         push(
             WarningKind::BrokerReplacedBuild,
-            format!(
-                "{who} (pid {pid}) runs a replaced build: {} is another file than the one it \
-                 started from, so the broker-side fixes of the build on disk are not running",
-                safe(exe, 256)
-            ),
+            if names_no_file(exe) {
+                format!(
+                    "{who} (pid {pid}) runs a replaced build: {}, the path it started from, \
+                     names no file now, so nothing can start it from there again",
+                    safe(exe, 256)
+                )
+            } else {
+                format!(
+                    "{who} (pid {pid}) runs a replaced build: {} is another file than the one \
+                     it started from, so the broker-side fixes of the build on disk are not \
+                     running",
+                    safe(exe, 256)
+                )
+            },
         );
     }
     if r.broker.guarded == Some(false) {
@@ -4922,8 +4985,9 @@ pub fn render_text_local(r: &Report, local_at: &dyn Fn(i64) -> Option<i64>) -> S
             b.replaced
                 .as_deref()
                 .map_or_else(String::new, |exe| format!(
-                    " — RUNS A REPLACED BUILD: {} is another file now",
-                    safe(exe, 256)
+                    " — RUNS A REPLACED BUILD: {} {}",
+                    safe(exe, 256),
+                    replaced_now(exe)
                 ))
         ),
     ));

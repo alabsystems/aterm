@@ -164,7 +164,7 @@ fn runtime_case(cli: Cli, case: i64) -> (i64, i64) {
     let original = fixture.records();
     let original_raw = fixture.raw.clone();
     let key = format!("{}:work", cli.id());
-    let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     if matches!(case, 3 | 4 | 8) {
         let mut state = guard.lock().unwrap();
         state.parked.insert(key.clone(), Instant::now());
@@ -563,11 +563,10 @@ fn a_cleanup_read_cannot_erase_a_newer_workflows_claim_or_pending_task() {
             let store = fixture.store.clone();
             let path = fixture.path.clone();
             let key = format!("{}:work", cli.id());
-            let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+            let guard = AutoRenewGuard::default().shared();
             let clock = Instant::now();
             if browser {
-                let unattributed =
-                    std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+                let unattributed = AutoRenewGuard::default().shared();
                 unattributed
                     .lock()
                     .unwrap()

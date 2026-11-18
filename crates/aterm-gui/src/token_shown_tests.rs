@@ -22,7 +22,7 @@ fn fact(kind: TokenState, offer: Option<bool>) -> TokenFact {
         phrase: offer.map(|_| format!("token: {state}")),
         offer: offer.map(|replace| TokenOffer {
             line: "offer".into(),
-            label: "work".into(),
+            word: "claude-work-x".into(),
             replace,
         }),
         ..TokenFact::for_test(Some("work"), "person@example.com", kind)
@@ -159,7 +159,7 @@ fn the_accounts_cards_press_opens_a_tab_that_runs_the_step() {
     app.choose_autopilot_menu_row(at);
     assert_eq!(
         STEPS_ASKED.with(|asked| asked.borrow().clone()),
-        [["harness", "accounts", "token", "work", "--replace"]]
+        [["harness", "accounts", "token", "claude-work-x", "--replace"]]
     );
 
     app.autopilot_menu = None;
@@ -196,13 +196,26 @@ fn the_accounts_cards_press_opens_a_tab_that_runs_the_step() {
 #[cfg(unix)]
 #[test]
 fn a_view_becomes_facts_and_records_its_offer_once() {
+    use aterm_agent::harness::account_names::Named;
     use aterm_agent::harness::accounts_step::Step;
     use aterm_agent::harness::accounts_token_view::{AccountToken, Offer};
     let dir = crate::test_scratch::short_dir("token-shown");
+    let named = Named {
+        pk: KEY.into(),
+        row: None,
+        names: aterm_file::AccountNames {
+            slug: "claude-work-x".into(),
+            name: Some("claude person@example.com".into()),
+            ..aterm_file::AccountNames::default()
+        },
+    };
+    let word = named.word();
     let account = AccountToken {
         key: KEY.into(),
         email: "person@example.com".into(),
         label: Some("work".into()),
+        named,
+        word: word.clone(),
         state: TokenState::None,
         standing: None,
         row: None,
@@ -213,7 +226,7 @@ fn a_view_becomes_facts_and_records_its_offer_once() {
         offer: Some(Offer {
             pair: "none:-/ok:-".into(),
             step: Step::Token {
-                label: "work".into(),
+                word,
                 replace: false,
             },
             since: None,
@@ -249,7 +262,10 @@ fn a_view_becomes_facts_and_records_its_offer_once() {
         "no entry has no dates and no maker"
     );
     let offer = shown.offer.as_ref().expect("the offer stands");
-    assert_eq!(offer.words(), ["harness", "accounts", "token", "work"]);
+    assert_eq!(
+        offer.words(),
+        ["harness", "accounts", "token", "claude-work-x"]
+    );
     assert!(
         shown.phrase.is_some(),
         "the state line's phrase stands with it"
@@ -282,6 +298,23 @@ fn a_held_token_step_is_in_the_accounts_fact() {
         key: key.into(),
         email: format!("{label}@example.com"),
         label: Some(label.into()),
+        named: aterm_agent::harness::account_names::Named {
+            pk: key.into(),
+            row: None,
+            names: aterm_file::AccountNames {
+                slug: format!("claude-{label}-x"),
+                ..aterm_file::AccountNames::default()
+            },
+        },
+        word: aterm_agent::harness::account_names::Named {
+            pk: key.into(),
+            row: None,
+            names: aterm_file::AccountNames {
+                slug: format!("claude-{label}-x"),
+                ..aterm_file::AccountNames::default()
+            },
+        }
+        .word(),
         state: TokenState::None,
         standing: None,
         row: None,
@@ -302,7 +335,7 @@ fn a_held_token_step_is_in_the_accounts_fact() {
         ),
         100,
     );
-    let words = step.words(Some("aterm harness accounts token work"));
+    let words = step.words(Some("aterm harness accounts token claude-work-x"));
     assert_eq!(
         read.of_key(KEY).and_then(|fact| fact.step.as_deref()),
         Some(words.as_str()),
@@ -325,6 +358,13 @@ fn a_fact_keeps_the_views_typed_fields() {
         key: KEY.into(),
         email: "person@example.com".into(),
         label: Some("work".into()),
+        named: aterm_agent::harness::accounts_token_view::named_by_key(
+            &aterm_secrets::claude_token::Key::parse(KEY).expect("a key"),
+        ),
+        word: aterm_agent::harness::accounts_token_view::named_by_key(
+            &aterm_secrets::claude_token::Key::parse(KEY).expect("a key"),
+        )
+        .word(),
         state: TokenState::Soon,
         standing: None,
         row: Some(TokenRow {

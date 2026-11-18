@@ -464,6 +464,7 @@ fn a_claude_row_whose_sign_in_starts_nothing_offers_no_sign_in() {
         store: None,
         roster: None,
         label: "main".to_string(),
+        sign_in_word: None,
         listed: false,
         refused: refused.map(str::to_string),
         unread: None,

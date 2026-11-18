@@ -55,13 +55,18 @@
 //!     checkpoint, every share;
 //!   - and none of the records a settled checkpoint in the cut dropped ([`gone`]): they count
 //!     nowhere, so the prune drops them again, held or stubs, and keeps nothing for their sake,
-//!     as a log pruned at that checkpoint holds only their stubs ([`Stub::gone`]).
-//! - **`dropped`** is [`dropped_digest`] of the sorted ids the cut holds and the keep set does
-//!   not, and, in a log an earlier checkpoint pruned (FL-148c), the ids it dropped in the cut
-//!   but those the whole log's prune keeps ([`keep_set`] reads a stub of an op as its record, by
-//!   the epoch and names its stub keeps: the rep of an op a kept op carries, a kept `Remove`'s
-//!   cutoff, an op under an owed epoch, an op this cut keeps that a later prune dropped), as the
-//!   whole log's prune drops the records they stand for. **`state`** is [`state_digest`]: a
+//!     as a log pruned at that checkpoint holds only their stubs, which read gone in every cut
+//!     that holds it settled and in no other.
+//! - **`dropped`** is [`dropped_digest`] of the stubs ([`Stub::encode`], every field; a
+//!   version-2 record's as its shed frame and a `Delete`'s `carries`) of the records the cut
+//!   holds and the keep set does not, and, in a log an earlier checkpoint
+//!   pruned (FL-148c), of those it dropped in the cut but those the whole log's prune keeps
+//!   ([`keep_set`] reads a stub of an op as its record, by the epoch and names its stub keeps:
+//!   the rep of an op a kept op carries, a kept `Remove`'s cutoff, an op under an owed epoch, an
+//!   op this cut keeps that a later prune dropped), as the whole log's prune drops the records
+//!   they stand for. A stub is a function of its record and the record's past, so every Mac that
+//!   holds the cut digests the same stubs, and one that does not takes a peer's only where they
+//!   digest to the body its shares signed ([`super::served`]). **`state`** is [`state_digest`]: a
 //!   canonical digest of what the frames say at the cut
 //!   (seats, removals with their cutoffs, the kept epochs and their wraps, the register frontier).
 //!   It departs from the design's "the head of step 2": FL-146's head is a per-Mac cache, sealed
@@ -139,7 +144,7 @@ const CHECKPOINT_DOMAIN: &[u8] = b"aterm/members/checkpoint/1\0";
 /// What [`state_digest`] hashes first.
 const STATE_DOMAIN: &[u8] = b"aterm/members/checkpoint-state/1\0";
 /// What [`dropped_digest`] hashes first.
-const DROPPED_DOMAIN: &[u8] = b"aterm/members/checkpoint-dropped/1\0";
+const DROPPED_DOMAIN: &[u8] = b"aterm/members/checkpoint-dropped/3\0";
 
 /// A broken checkpoint, for the tests' negative controls.
 #[cfg(test)]
@@ -208,8 +213,11 @@ pub struct Plan {
     pub body: Body,
     /// The ids of the cut's records a prune at it keeps.
     pub keep: BTreeSet<RecordId>,
-    /// The ids of the cut's records a prune at it drops, sorted: what `dropped` digests.
+    /// The ids of the cut's records a prune at it drops, sorted.
     pub dropped: Vec<RecordId>,
+    /// The stub a prune makes of each of `dropped`, by id: what `dropped` digests
+    /// ([`dropped_digest`]).
+    pub stubs: BTreeMap<RecordId, Stub>,
 }
 
 impl Plan {
@@ -235,6 +243,13 @@ pub struct Judgment {
     pub signed: BTreeSet<MemberId>,
     /// The log recomputes it, and more than half of the recent seats signed it.
     pub is_final: bool,
+    /// The seats whose key signed a share of this body that the log holds or dropped, whether or
+    /// not the share counts ([`settled`]'s signers).
+    pub shared: BTreeSet<MemberId>,
+    /// The log recomputes it, and more than half of the recent seats are among `shared`: it
+    /// holds the checkpoint settled ([`settled`]), which, unlike `is_final`, no later record
+    /// undoes.
+    pub is_settled: bool,
 }
 
 /// A checkpoint's id: SHA-256 of [`CHECKPOINT_DOMAIN`] and its clear fields, which every share of
@@ -535,29 +550,64 @@ fn plan_of(at: &Log, cut_ms: u64, heads: Vec<RecordId>) -> Plan {
             .copied(),
     );
     let dropped: Vec<RecordId> = dropped.into_iter().collect();
+    let stubs = stubs_dropped(at, &dropped);
     let body = Body::Checkpoint {
         predecessor: checkpoints.newest,
         cut_ms,
         heads,
         state: state_digest(at, &keep),
-        dropped: dropped_digest(&dropped),
+        dropped: dropped_digest(&stubs),
     };
     Plan {
         body,
         keep,
         dropped,
+        stubs,
     }
 }
 
-/// SHA-256 of [`DROPPED_DOMAIN`], the number of `dropped` as a big-endian `u64`, then each id in
-/// order: the `dropped` digest of a checkpoint whose prune drops `dropped`, sorted.
+/// The stub of each of `dropped` that a prune of the cut `at` holds whole makes
+/// ([`Log::stub_for`]): what [`dropped_digest`] hashes. A held `Delete` with a statement keeps
+/// the rep its statement reads ([`Log::frame_reps`], a function of its own past, which the cut
+/// holds).
+fn stubs_dropped(at: &Log, dropped: &[RecordId]) -> BTreeMap<RecordId, Stub> {
+    let stated_delete = |id: &RecordId| {
+        at.get(id)
+            .is_some_and(|r| r.kind() == Kind::Delete && r.statement().is_some())
+    };
+    let reps = if dropped.iter().any(stated_delete) {
+        at.frame_reps()
+    } else {
+        BTreeMap::new()
+    };
+    dropped
+        .iter()
+        .filter_map(|id| Some((*id, at.stub_for(id, &reps)?)))
+        .collect()
+}
+
+/// SHA-256 of [`DROPPED_DOMAIN`], the number of `stubs` as a big-endian `u64`, then each stub in
+/// id order in its one encoding ([`Stub::encode`]): the `dropped` digest of a checkpoint whose
+/// prune drops the records these stubs stand for. Every field a stub keeps is bound, so a Mac
+/// that does not hold the cut and takes the stubs from a peer ([`super::served`]) takes those a
+/// checkpoint's shares signed, field for field, or none.
 #[must_use]
-pub fn dropped_digest(dropped: &[RecordId]) -> [u8; 32] {
+pub fn dropped_digest(stubs: &BTreeMap<RecordId, Stub>) -> [u8; 32] {
     let mut hash = aterm_digest::Sha256::new();
     hash.update(DROPPED_DOMAIN);
-    hash.update(&(dropped.len() as u64).to_be_bytes());
-    for id in dropped {
-        hash.update(id);
+    hash.update(&(stubs.len() as u64).to_be_bytes());
+    #[cfg(test)]
+    if super::served::mutant(super::served::Mutant::IdsOnly) {
+        for id in stubs.keys() {
+            hash.update(id);
+        }
+        return hash.finalize();
+    }
+    let mut encoded = Vec::new();
+    for (id, stub) in stubs {
+        encoded.clear();
+        stub.encode(id, &mut encoded);
+        hash.update(&encoded);
     }
     hash.finalize()
 }
@@ -1021,6 +1071,19 @@ impl Checkpoints {
         let newest_heads = cut_of(body)
             .map(|(_, heads)| heads.to_vec())
             .unwrap_or_default();
+        // A rooted log's cuts may end at records its prunes dropped, placed at their stubs, as
+        // [`newest_final`] reads them.
+        #[cfg(test)]
+        let held_nesting = super::rooted::mutant(super::rooted::Mutant::HeldNesting);
+        #[cfg(not(test))]
+        let held_nesting = false;
+        let in_newest = |head: &RecordId| {
+            if at.rooting().is_some() && !held_nesting {
+                at.in_cut_of(&newest_heads, head)
+            } else {
+                at.reaches(&newest_heads, head)
+            }
+        };
         let mut chain = BTreeSet::from([newest]);
         let mut link = predecessor_of(body);
         while let Some(id) = link
@@ -1040,8 +1103,7 @@ impl Checkpoints {
             if mutant(Mutant::NewestByDay) && self.finals.contains(id) {
                 continue;
             }
-            let nested = cut_of(body)
-                .is_some_and(|(_, heads)| heads.iter().all(|h| at.reaches(&newest_heads, h)));
+            let nested = cut_of(body).is_some_and(|(_, heads)| heads.iter().all(in_newest));
             if !nested {
                 kept.extend(shares.iter().copied());
             }
@@ -1082,19 +1144,28 @@ fn dropped_shares(at: &Log) -> impl Iterator<Item = (RecordId, usize, MemberId)>
         .filter_map(|(stub_id, stub)| Some((stub.shares?, at.position(stub_id)?, stub.actor)))
 }
 
-/// The body of the checkpoint `id` as `at` holds it: a held share's, or a root's
-/// ([`super::rooted`]). `None` where it holds neither: a checkpoint every share of which a prune
-/// dropped.
+/// The body of the checkpoint `id` as `at` holds it: a held share's, a root's or an earlier
+/// root's ([`super::rooted`]), or, where a prune dropped every share of it, read off a dropped
+/// share's frame ([`Stub::share_body`]). `None` where `at` holds no share of it, held or dropped.
 fn body_of(at: &Log, id: &RecordId) -> Option<Body> {
     at.records()
         .find(|record| checkpoint_id(record.body()).as_ref() == Some(id))
         .map(|record| record.body().clone())
         .or_else(|| {
-            at.rooting()?
+            let rooting = at.rooting()?;
+            rooting
                 .roots
                 .iter()
+                .chain(&rooting.earlier)
                 .find(|root| root.id == *id)
                 .map(|root| root.body.clone())
+                .or_else(|| {
+                    rooting
+                        .stubs
+                        .values()
+                        .filter(|stub| stub.shares.as_ref() == Some(id))
+                        .find_map(|stub| stub.share_body(at.network()))
+                })
         })
 }
 
@@ -1288,9 +1359,8 @@ fn keep_set(at: &Log, checkpoints: &Checkpoints) -> (BTreeSet<RecordId>, BTreeSe
     };
     // A record a settled checkpoint dropped counts nowhere ([`gone`]): this prune drops it too,
     // held or a stub, and keeps nothing for its sake, as a log pruned at that checkpoint holds
-    // only its stub; a log pruned here reads it at a stub that says so ([`Stub::gone`]), and
-    // need not recompute that checkpoint, which it cannot where this prune drops records that
-    // checkpoint kept.
+    // only its stub; a log pruned here reads it gone where that checkpoint is settled, as the
+    // whole log does.
     let gone = |id: &RecordId| at.position(id).is_some_and(|p| effective.is_gone(p));
     for (i, slot) in keep.iter_mut().enumerate() {
         *slot &= !effective.is_gone(i);
@@ -1457,8 +1527,9 @@ thread_local! {
     pub(super) static PLANS_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The checkpoints `log` holds settled ([`Settled`]): each whose body it knows (a held share's,
-/// or a root's) and computes itself at its heads ([`plan_at`]), and more than half of whose cut's
+/// The checkpoints `log` holds settled ([`Settled`]): each whose body it knows ([`body_of`]: a
+/// held share's, a root's, or a dropped share's, read off its frame) and computes itself at its
+/// heads ([`plan_at`]), and more than half of whose cut's
 /// recent seats signed a share of it that `log` holds or dropped ([`Stub::shares`]), whether or
 /// not the share counts. A share counts for [`judge`]'s finality only where its record does, which
 /// a later `Remove` can undo; settled asks only that a recent seat's key signed it, so it is a
@@ -1513,10 +1584,18 @@ pub(super) fn settled(log: &Log) -> Vec<Settled> {
 }
 
 /// The positions in `log` ([`Log::position`]), held or dropped, of every record a checkpoint
-/// `log` holds settled ([`settled`]) drops, and of every stub whose prune's cut said so
-/// ([`Stub::gone`]): none of them counts, in this log or any other, as in a log rooted at that
-/// checkpoint, which holds none of them. `None` where `log` holds no settled checkpoint and no
-/// such stub, so a log with none reads every record as its evaluation alone says.
+/// `log` holds settled ([`settled`]) drops: none of them counts, in this log or any other, as in
+/// a log rooted at that checkpoint, which holds none of them. `None` where `log` holds no
+/// settled checkpoint, so a log with none reads every record as its evaluation alone says.
+///
+/// A rooted log reads it so too, at every cut: whether a stub counts there is whether a
+/// checkpoint settled there drops it, which the cut's own shares say, held or dropped, as in
+/// the whole log ([`body_of`] reads a checkpoint every share of which a prune dropped off a
+/// share's frame). No stub says it of itself: a stub a later cut holds gone may count in an
+/// earlier cut that the checkpoint making it gone is not settled in (its shares lie between
+/// the two cuts), and an earlier checkpoint's plan keeps it there, as the whole log's does. So
+/// in the log rooted at a settled cut every stub is gone (the root, and each earlier root, is
+/// settled there and drops it), and in an earlier cut each reads as its record does.
 ///
 /// So a `Remove`, or a quorum, whose cutoff lies behind a settled cut revives nothing the prune
 /// at it dropped: it takes out its member and stops counting its records past the cutoff, those
@@ -1533,26 +1612,41 @@ pub(super) fn gone(log: &Log) -> Option<super::eval::Gone> {
         return None;
     }
     let settled = settled(log);
-    let stubs = stubs_of(log);
-    if settled.is_empty() && !stubs.values().any(|stub| stub.gone) {
+    #[cfg(test)]
+    let last_cut: Vec<RecordId> =
+        if super::rooted::mutant(super::rooted::Mutant::GoneFromTheLastCut) {
+            super::rooted::LAST_CUT_GONE.with_borrow(|gone| {
+                stubs_of(log)
+                    .keys()
+                    .filter(|id| gone.contains(*id))
+                    .copied()
+                    .collect()
+            })
+        } else {
+            Vec::new()
+        };
+    #[cfg(not(test))]
+    let last_cut: Vec<RecordId> = Vec::new();
+    if settled.is_empty() && last_cut.is_empty() {
         return None;
     }
     Some(
         settled
             .iter()
             .flat_map(|settled| settled.dropped.iter())
-            .chain(stubs.iter().filter(|(_, stub)| stub.gone).map(|(id, _)| id))
+            .chain(&last_cut)
             .filter_map(|id| log.position(id))
             .collect(),
     )
 }
 
 /// The ids of the records that count nowhere in the cut of the checkpoint `body` in `log`
-/// ([`gone`] of that cut), held or stubs: what a prune at it keeps at each stub
-/// ([`Stub::gone`]).
+/// ([`gone`] of that cut), held or stubs: what FL-148C's prune at it kept at each stub, which
+/// the tests' `GoneFromTheLastCut` reads.
 ///
 /// # Errors
 /// `body` is no checkpoint, or `log` does not hold its cut ([`plan_at`]'s errors).
+#[cfg(test)]
 pub(super) fn gone_in_cut(log: &Log, body: &Body) -> Result<BTreeSet<RecordId>> {
     let (cut_ms, heads) = cut_of(body).ok_or_else(|| Error::new("not a checkpoint"))?;
     let cut = cut_log(log, cut_ms, heads)?;
@@ -1572,7 +1666,8 @@ pub(super) fn gone_in_cut(log: &Log, body: &Body) -> Result<BTreeSet<RecordId>> 
 ///
 /// # Errors
 /// `body` is no checkpoint, or this log cannot compute a body at its heads ([`plan_at`]'s
-/// errors): a Mac without the cut's past judges it by shares alone, which is FL-148c's.
+/// errors): a Mac without the cut's past reads it through the stubs a peer served with it, and
+/// judges it here only once they compute it ([`super::served`]).
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -1593,11 +1688,24 @@ pub fn judge(log: &Log, body: &Body) -> Result<Judgment> {
         .collect();
     let recent = recent_in(&at.log, cut_ms);
     let is_final = recomputed && majority(&recent, &signed);
+    let shared: BTreeSet<MemberId> = log
+        .records()
+        .filter(|record| checkpoint_id(record.body()) == id)
+        .map(|record| *record.actor())
+        .chain(
+            dropped_shares(log)
+                .filter(|&(share, _, _)| Some(share) == id)
+                .map(|(_, _, actor)| actor),
+        )
+        .collect();
+    let is_settled = recomputed && majority(&recent, &shared);
     Ok(Judgment {
         recomputed,
         recent,
         signed,
         is_final,
+        shared,
+        is_settled,
     })
 }
 

@@ -12,6 +12,358 @@ use aterm_vitals::sys::json::contract_violations;
 // relative and so no home `under=` could name).
 use crate::test_host::abs;
 
+thread_local! {
+    static MEMORY_CLOCK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static MEMORY_INSTANT: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+fn memory_clock() -> Option<u64> {
+    MEMORY_CLOCK.with(std::cell::Cell::get)
+}
+
+fn memory_instant() -> Instant {
+    MEMORY_INSTANT.with(|clock| clock.get().unwrap())
+}
+
+fn memory_receipt(snapshot: &Snapshot, observed_at: ObservedAt) -> Arc<memory::Receipt> {
+    let probes = memory::Probes {
+        continuous_ns: memory_clock,
+        context: || {
+            Some(memory::Context {
+                scope: aterm_agent::harness::native_act::BootStamp {
+                    host: "memory-clock-test".into(),
+                    boot: "same-boot".into(),
+                },
+                namespace: None,
+            })
+        },
+        ..memory::Probes::INERT
+    };
+    Arc::new(
+        memory::Pending::begin(probes, observed_at)
+            .finish(&aterm_sysprobe::Sweep {
+                procs: Vec::new(),
+                truncated: false,
+            })
+            .publish(snapshot, Vec::new()),
+    )
+}
+
+#[test]
+fn one_engine_processes_peer_age_keeps_old_census_across_sleep_and_new_machine_frames() {
+    const BEFORE: u64 = 10_000_000_000;
+    const SLEEP: u64 = 6 * 60 * 60 * 1_000_000_000;
+    MEMORY_CLOCK.with(|clock| clock.set(Some(BEFORE)));
+    MEMORY_INSTANT.with(|clock| clock.set(Some(Instant::now())));
+    let shared = Shared::with_clocks(memory_instant, memory_clock);
+    let first = ObservedAt::capture(memory_instant, memory_clock);
+    let snapshot = synthetic(1, 0.1);
+    let receipt = memory_receipt(&snapshot, first);
+    shared.publish(
+        Arc::new(snapshot),
+        &Machine::default(),
+        first,
+        None,
+        None,
+        true,
+        Some(receipt),
+    );
+    let query = SysQuery::parse("aterm --json fresh=60000").unwrap();
+    let read = || {
+        let (held, state) =
+            shared.fresh_for(&query, &Arming::new(), &Arming::new(), &Arming::new());
+        let text = answer(
+            &shared,
+            &query,
+            held.as_ref(),
+            state,
+            &Machine::default(),
+            &gathered(),
+            true,
+        );
+        let json: aterm_json::Value = aterm_json::from_str(text.lines().nth(1).unwrap()).unwrap();
+        (held.unwrap().snap.seq, json)
+    };
+    let (_, fresh) = read();
+    assert_eq!(fresh["as_of"]["state"].as_str(), Some("fresh"));
+    assert!(fresh["as_of"]["age_ms"].as_u64().unwrap() < 60_000);
+
+    MEMORY_CLOCK.with(|clock| clock.set(Some(BEFORE + SLEEP)));
+    let after_sleep = ObservedAt::capture(memory_instant, memory_clock);
+    let mut machine_only = synthetic(2, 0.1);
+    machine_only.machine_only = true;
+    shared.publish(
+        Arc::new(machine_only),
+        &Machine::default(),
+        after_sleep,
+        None,
+        None,
+        true,
+        None,
+    );
+    let (seq, stale) = read();
+    assert_eq!(
+        seq, 1,
+        "a machine-only frame retains the original whole census"
+    );
+    assert_eq!(stale["as_of"]["state"].as_str(), Some("stale"));
+    assert!(stale["as_of"]["age_ms"].as_u64().unwrap() >= SLEEP / 1_000_000);
+
+    let snapshot = synthetic(3, 0.1);
+    let older_receipt = memory_receipt(&snapshot, first);
+    shared.publish(
+        Arc::new(snapshot),
+        &Machine::default(),
+        after_sleep,
+        None,
+        None,
+        true,
+        Some(older_receipt),
+    );
+    let (_, older) = read();
+    assert_eq!(older["as_of"]["state"].as_str(), Some("stale"));
+    assert!(
+        older["as_of"]["age_ms"].as_u64().unwrap() >= SLEEP / 1_000_000,
+        "a late native-lane answer is not timestamped with the newer frame"
+    );
+
+    let snapshot = synthetic(4, 0.1);
+    let receipt = memory_receipt(&snapshot, after_sleep);
+    shared.publish(
+        Arc::new(snapshot),
+        &Machine::default(),
+        after_sleep,
+        None,
+        None,
+        true,
+        Some(receipt),
+    );
+    let (_, recovered) = read();
+    assert_eq!(recovered["as_of"]["state"].as_str(), Some("fresh"));
+    assert!(recovered["as_of"]["age_ms"].as_u64().unwrap() < 60_000);
+    MEMORY_CLOCK.with(|clock| clock.set(None));
+    MEMORY_INSTANT.with(|clock| clock.set(None));
+}
+
+#[test]
+fn one_engine_processes_peer_refuses_unknown_and_regressing_age_without_pull_spin() {
+    MEMORY_CLOCK.with(|clock| clock.set(Some(100)));
+    MEMORY_INSTANT.with(|clock| clock.set(Some(Instant::now())));
+    let shared = Shared::with_clocks(memory_instant, memory_clock);
+    let observed_at = ObservedAt::capture(memory_instant, memory_clock);
+    let snapshot = synthetic(1, 0.1);
+    let receipt = memory_receipt(&snapshot, observed_at);
+    shared.publish(
+        Arc::new(snapshot),
+        &Machine::default(),
+        observed_at,
+        None,
+        None,
+        true,
+        Some(receipt),
+    );
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    shared.install(tx);
+    let query = SysQuery::parse("aterm --json fresh=60000").unwrap();
+    MEMORY_CLOCK.with(|clock| clock.set(None));
+    let (held, state) = shared.fresh_for(&query, &Arming::new(), &Arming::new(), &Arming::new());
+    assert!(matches!(
+        rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    let reply = answer(
+        &shared,
+        &query,
+        held.as_ref(),
+        state,
+        &Machine::default(),
+        &gathered(),
+        true,
+    );
+    assert!(
+        reply.starts_with("ERR "),
+        "missing age is not a numeric zero: {reply}"
+    );
+    MEMORY_CLOCK.with(|clock| clock.set(Some(99)));
+    let held = shared.held_now();
+    let reply = answer(
+        &shared,
+        &query,
+        held.as_ref(),
+        Freshness::Fresh,
+        &Machine::default(),
+        &gathered(),
+        true,
+    );
+    assert!(
+        reply.starts_with("ERR "),
+        "a reset is not zero age: {reply}"
+    );
+    MEMORY_CLOCK.with(|clock| clock.set(None));
+    MEMORY_INSTANT.with(|clock| clock.set(None));
+}
+
+#[test]
+fn one_engine_processes_memory_age_does_not_stale_independent_assessments() {
+    let now = Instant::now() + Duration::from_secs(600);
+    MEMORY_INSTANT.with(|clock| clock.set(Some(now)));
+    MEMORY_CLOCK.with(|clock| clock.set(None));
+    let shared = Shared::with_clocks(memory_instant, memory_clock);
+    let old_frame = ObservedAt {
+        instant: now - Duration::from_secs(600),
+        continuous_ns: None,
+    };
+    let publish = |seq, assessed_at| {
+        let mut snapshot = synthetic(seq, 0.1);
+        snapshot.jobs = Some(Arc::new(aterm_vitals::jobs::JobsView::default()));
+        snapshot.left = Some(Arc::new(aterm_vitals::left::LeftView::default()));
+        shared.publish(
+            Arc::new(snapshot),
+            &Machine::default(),
+            old_frame,
+            Some(assessed_at),
+            Some(assessed_at),
+            true,
+            None,
+        );
+    };
+    publish(1, now - Duration::from_secs(1));
+    for view in ["jobs", "left"] {
+        let query = SysQuery::parse(view).unwrap();
+        let (held, state) =
+            shared.fresh_for(&query, &Arming::new(), &Arming::new(), &Arming::new());
+        assert_eq!(
+            state,
+            Freshness::Fresh,
+            "{view}: its pass is newer than the memory frame"
+        );
+        assert_eq!(
+            held.as_ref().unwrap().observed_at,
+            old_frame,
+            "assessment freshness never restamps the machine or its memory"
+        );
+        let reply = answer(
+            &shared,
+            &query,
+            held.as_ref(),
+            state,
+            &Machine::default(),
+            &gathered(),
+            true,
+        );
+        assert!(
+            reply.starts_with("OK "),
+            "{view}: memory clock is not its age authority: {reply}"
+        );
+        assert!(
+            !reply.lines().next().unwrap().contains("state=stale"),
+            "{reply}"
+        );
+    }
+    publish(2, now - Duration::from_secs(120));
+    for view in ["jobs", "left"] {
+        let query = SysQuery::parse(view).unwrap();
+        let (_, state) = shared.fresh_for(&query, &Arming::new(), &Arming::new(), &Arming::new());
+        assert_eq!(
+            state,
+            Freshness::Stale,
+            "{view}: the independent old pass is still stale"
+        );
+    }
+    assert!(
+        shared
+            .fresh_memory(Duration::from_secs(60), false)
+            .is_none(),
+        "independent assessment freshness never qualifies memory"
+    );
+    MEMORY_INSTANT.with(|clock| clock.set(None));
+}
+
+#[test]
+fn one_engine_processes_forced_wrappers_bound_new_arrivals_by_their_view_default() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    static ELAPSED_NS: AtomicU64 = AtomicU64::new(0);
+    fn instant() -> Instant {
+        *BASE.get().unwrap() + Duration::from_nanos(ELAPSED_NS.load(Ordering::SeqCst))
+    }
+    fn continuous() -> Option<u64> {
+        Some(ELAPSED_NS.load(Ordering::SeqCst))
+    }
+    let _ = BASE.set(Instant::now());
+    MEMORY_CLOCK.with(|clock| clock.set(Some(0)));
+    let run = |view: View, fresh: Duration, force: bool, seconds: u64, expected: bool| {
+        ELAPSED_NS.store(0, Ordering::SeqCst);
+        let shared = Arc::new(Shared::paced_with_clocks(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            instant,
+            continuous,
+        ));
+        let observed_at = ObservedAt::capture(instant, continuous);
+        let mut snapshot = with_hardware(2, true);
+        snapshot.jobs = Some(Arc::new(aterm_vitals::jobs::JobsView::default()));
+        snapshot.left = Some(Arc::new(aterm_vitals::left::LeftView::default()));
+        let receipt = memory_receipt(&snapshot, observed_at);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        shared.install(tx);
+        let probe = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let message = rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+                assert!(match message {
+                    Msg::MemoryPull => view == View::Mem,
+                    Msg::Pull => view != View::Mem,
+                    _ => false,
+                });
+                ELAPSED_NS.store(seconds * 1_000_000_000, Ordering::SeqCst);
+                shared.publish(
+                    Arc::new(snapshot),
+                    &Machine::default(),
+                    observed_at,
+                    Some(observed_at.instant),
+                    Some(observed_at.instant),
+                    true,
+                    Some(receipt),
+                );
+            })
+        };
+        if view == View::Mem {
+            assert_eq!(
+                shared.fresh_memory(fresh, force).map(|h| h.snap.seq),
+                expected.then_some(2),
+                "{view:?}, age={seconds}s, fresh={fresh:?}, force={force}"
+            );
+        } else {
+            let (held, state) = match view {
+                View::Overview => shared.fresh(fresh, force),
+                View::Why => shared.fresh_why(fresh, force),
+                View::Left => shared.fresh_left(fresh, force),
+                _ => unreachable!(),
+            };
+            assert_eq!(held.map(|h| h.snap.seq), Some(2));
+            assert_eq!(
+                state,
+                if expected {
+                    Freshness::Fresh
+                } else {
+                    Freshness::Stale
+                },
+                "{view:?}, age={seconds}s, fresh={fresh:?}, force={force}"
+            );
+        }
+        shared.uninstall();
+        probe.join().unwrap();
+    };
+    for view in [View::Overview, View::Why, View::Left, View::Mem] {
+        run(view, Duration::ZERO, true, 1, true);
+        run(view, Duration::ZERO, true, 10, false);
+    }
+    run(View::Mem, Duration::from_secs(60), true, 10, true);
+    run(View::Mem, Duration::ZERO, false, 1, false);
+    MEMORY_CLOCK.with(|clock| clock.set(None));
+}
+
 fn live_snapshot() -> Snapshot {
     let mut reader = crate::vitals_host::Reader::new(std::sync::Arc::default());
     let req = crate::vitals_host::Request {
@@ -80,6 +432,7 @@ fn gathered() -> Gathered {
             request: None,
         },
         tabs: vec![TabFact {
+            sampled_nonce: None,
             key: 0,
             sid: "s-test".into(),
             window: Some(0),
@@ -120,7 +473,7 @@ fn cursor_of(reply: &str) -> String {
 
 #[test]
 fn every_view_of_a_live_snapshot_answers_and_its_json_keeps_the_contract() {
-    let shared = Shared::new();
+    let shared = Shared::with_clock(|| Some(0));
     shared.publish_for_test(live_snapshot(), Vec::new());
     for view in View::ALL {
         let text = ask(&shared, view.word());
@@ -172,7 +525,12 @@ fn every_view_of_a_live_snapshot_answers_and_its_json_keeps_the_contract() {
 
 #[test]
 fn a_since_cursor_answers_a_delta_and_its_gaps() {
-    let shared = Shared::new();
+    static AT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    fn instant() -> Instant {
+        *AT.get().unwrap()
+    }
+    let _ = AT.set(Instant::now());
+    let shared = Shared::with_clocks(instant, || Some(0));
     shared.publish_for_test(synthetic(3, 0.1), Vec::new());
     let first = ask(&shared, "global");
     let cursor = cursor_of(&first);
@@ -218,7 +576,7 @@ fn a_since_cursor_answers_a_delta_and_its_gaps() {
 
 #[test]
 fn a_why_since_cursor_folds_only_against_the_same_reply() {
-    let shared = Shared::new();
+    let shared = Shared::with_clock(|| Some(0));
     shared.publish_for_test(synthetic(3, 0.1), Vec::new());
     let other = |reply: &str| reply.lines().any(|l| l == "gap why=other-request");
     let mem = cursor_of(&ask(&shared, "why mem"));
@@ -243,7 +601,7 @@ fn a_why_since_cursor_folds_only_against_the_same_reply() {
 
 #[test]
 fn events_since_a_cursor_print_and_the_ring_says_when_it_lost_them() {
-    let shared = Shared::new();
+    let shared = Shared::with_clock(|| Some(0));
     let mut s = synthetic(2, 0.1);
     s.events = vec![aterm_vitals::events::Event {
         seq: 2,
@@ -462,6 +820,28 @@ fn a_why_is_as_fresh_as_its_split() {
 #[test]
 fn a_why_arms_the_split_while_it_waits() {
     static ARMED: Arming = Arming::new();
+    static AT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    fn instant() -> Instant {
+        *AT.get().unwrap()
+    }
+    fn publish(shared: &Shared, snapshot: Snapshot) {
+        let observed_at = ObservedAt::capture(instant, || Some(0));
+        // This independent raw census is paired with the frame even when no row is needed
+        // by the arming assertion. The worker's helper clock is explicitly inert and known.
+        let previous = MEMORY_CLOCK.with(|clock| clock.replace(Some(0)));
+        let receipt = memory_receipt(&snapshot, observed_at);
+        MEMORY_CLOCK.with(|clock| clock.set(previous));
+        shared.publish(
+            Arc::new(snapshot),
+            &Machine::default(),
+            observed_at,
+            None,
+            None,
+            true,
+            Some(receipt),
+        );
+    }
+    let _ = AT.set(Instant::now());
     for (text, armed) in [
         ("why fresh=0", true),
         ("global fresh=0", true),
@@ -471,9 +851,11 @@ fn a_why_arms_the_split_while_it_waits() {
         ("fresh=0", true),
         ("procs fresh=0", false),
     ] {
-        let shared = Arc::new(Shared::paced(
+        let shared = Arc::new(Shared::paced_with_clocks(
             Duration::from_secs(3600),
             Duration::from_secs(60),
+            instant,
+            || Some(0),
         ));
         let (tx, rx) = std::sync::mpsc::sync_channel(2);
         shared.install(tx);
@@ -487,12 +869,12 @@ fn a_why_arms_the_split_while_it_waits() {
                     // A forced `sys why` waits for a CPU Stats sample too.
                     let mut snap = with_split(7301, Some(7301));
                     snap.hardware = Some(aterm_vitals::hardware::Sample::unavailable("warming"));
-                    shared.publish_for_test(snap, Vec::new());
+                    publish(&shared, snap);
                 }
                 seen
             })
         };
-        shared.publish_for_test(with_split(7300, Some(1)), Vec::new());
+        publish(&shared, with_split(7300, Some(1)));
         let q = SysQuery::parse(text).expect("query");
         let (held, state) = shared.fresh_for(&q, &ARMED, &Arming::new(), &Arming::new());
         assert_eq!(
@@ -672,10 +1054,14 @@ fn sys_jobs_is_as_fresh_as_its_jobs_view_and_arms_the_engine_while_it_waits() {
                     shared.publish(
                         Arc::new(offered),
                         &Machine::default(),
-                        observed,
+                        ObservedAt {
+                            instant: observed,
+                            continuous_ns: Some(0),
+                        },
                         jobs_at,
                         if left { jobs_at } else { None },
                         true,
+                        None,
                     );
                 }
                 seen
@@ -690,10 +1076,14 @@ fn sys_jobs_is_as_fresh_as_its_jobs_view_and_arms_the_engine_while_it_waits() {
         shared.publish(
             Arc::new(initial),
             &Machine::default(),
-            now,
+            ObservedAt {
+                instant: now,
+                continuous_ns: Some(0),
+            },
             old,
             if left { old } else { None },
             true,
+            None,
         );
         let q = SysQuery::parse(text).expect("query");
         let (held, state) = shared.fresh_for(&q, &Arming::new(), &JOBS, &Arming::new());
@@ -753,7 +1143,7 @@ fn sys_jobs_is_as_fresh_as_its_jobs_view_and_arms_the_engine_while_it_waits() {
 #[test]
 fn privacys_count_ages_a_carried_view_from_its_pass() {
     use aterm_vitals::jobs::{Findings, JobsView, Named};
-    let shared = Shared::new();
+    let shared = Shared::with_clock(|| Some(0));
     let mut snap = synthetic(2, 0.1);
     snap.jobs = Some(Arc::new(JobsView {
         findings: Findings {
@@ -780,7 +1170,7 @@ fn privacys_count_ages_a_carried_view_from_its_pass() {
 
 #[test]
 fn the_machine_wait_meets_refuses_times_out_and_sees_its_session_exit() {
-    let shared = Shared::new();
+    let shared = Shared::with_clock(|| Some(0));
     shared.publish_for_test(
         synthetic(3, 0.1),
         vec![PaneFact {
@@ -897,6 +1287,7 @@ fn jobs_view(rows: Vec<aterm_vitals::jobs::JobRow>) -> Arc<aterm_vitals::jobs::J
         lanes_off: Vec::new(),
         parked_tabs: Vec::new(),
         at_ms: 0,
+        zombie_facts: None,
     })
 }
 
@@ -904,7 +1295,7 @@ fn jobs_view(rows: Vec<aterm_vitals::jobs::JobRow>) -> Arc<aterm_vitals::jobs::J
 fn a_named_job_that_left_the_view_answers_from_the_ring_or_is_gone() {
     use aterm_vitals::events::{Event, EventKind};
     use aterm_vitals::jobs::{Class, Verdict};
-    let shared = Shared::new();
+    let shared = Shared::with_clock(|| Some(0));
     let empty = jobs_view(Vec::new());
     let mut s = with_jobs(2, &empty);
     s.events = vec![Event {
@@ -1092,7 +1483,7 @@ fn a_wait_naming_the_slots_arms_their_cadence_while_it_stands() {
 
 #[test]
 fn for_holds_across_snapshots_before_the_wait_answers() {
-    let shared = Arc::new(Shared::new());
+    let shared = Arc::new(Shared::with_clock(|| Some(0)));
     shared.publish_for_test(synthetic(1, 0.1), Vec::new());
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let feeder = {
@@ -1968,9 +2359,11 @@ fn a_jobs_view_older_than_a_minute_says_nothing_of_now_unless_read_only_at_edges
 fn a_why_with_the_split_cold_reads_the_services_on_their_own() {
     let held = || {
         Some(Held {
+            processes: None,
             snap: Arc::new(Snapshot::default()),
             unix_ms: 0,
             at: Instant::now(),
+            observed_at: ObservedAt::capture(Instant::now, || Some(0)),
             jobs_at: None,
             left_at: None,
         })
@@ -2012,9 +2405,11 @@ fn a_why_with_the_split_cold_reads_the_services_on_their_own() {
     };
     let warm = || {
         Some(Held {
+            processes: None,
             snap: Arc::new(warm.clone()),
             unix_ms: 0,
             at: Instant::now(),
+            observed_at: ObservedAt::capture(Instant::now, || Some(0)),
             jobs_at: None,
             left_at: None,
         })
@@ -2080,6 +2475,75 @@ fn scope_request_reads_the_request_owning_the_tab() {
         "an unread tree is unread, never 0"
     );
     crate::requests_host::set_dir_for_test(None);
+}
+
+#[test]
+fn one_engine_processes_windowless_session_identity_does_not_depend_on_layout() {
+    let store = crate::session_store::new_store();
+    let visible = crate::session_store::test_handle(60);
+    let hidden = crate::session_store::test_handle(61);
+    store.write().unwrap().register(visible.clone());
+    store.write().unwrap().register(hidden.clone());
+    let snapshot = synthetic(1, 0.1);
+    let receipt = crate::vitals_host::memory::Pending::begin(
+        crate::vitals_host::memory::Probes::INERT,
+        ObservedAt::capture(Instant::now, || None),
+    )
+    .finish(&aterm_sysprobe::Sweep {
+        procs: Vec::new(),
+        truncated: false,
+    })
+    .publish(
+        &snapshot,
+        vec![crate::vitals_host::memory::PaneSource {
+            local: hidden.local_id,
+            sid: hidden.sid.clone(),
+            nonce: hidden.nonce,
+        }],
+    );
+    let layout = [PaneFact {
+        key: visible.local_id,
+        window: 1,
+        tab: 1,
+        tab_id: None,
+    }];
+    let q = SysQuery::parse("aterm --json").unwrap();
+    let gather_now = || {
+        gather(
+            &store,
+            visible.local_id,
+            &visible.term,
+            -1,
+            &layout,
+            &q,
+            Some(&snapshot),
+            Some(&receipt),
+        )
+    };
+    let read = gather_now();
+    let fact = read
+        .tabs
+        .iter()
+        .find(|fact| fact.key == hidden.local_id)
+        .expect("its source identity survives without a visible tab");
+    assert_eq!(fact.sid, hidden.sid.as_str());
+    assert_eq!(fact.sampled_nonce, Some(hidden.nonce.to_hex()));
+    assert_eq!((fact.window, fact.tab), (None, None));
+
+    let mut relaunched = hidden.clone();
+    let first = aterm_session::LaunchNonce::from_bytes([42; 16]);
+    relaunched.nonce = if hidden.nonce == first {
+        aterm_session::LaunchNonce::from_bytes([43; 16])
+    } else {
+        first
+    };
+    assert_ne!(relaunched.nonce, hidden.nonce);
+    store.write().unwrap().register(relaunched);
+    let read = gather_now();
+    assert!(
+        !read.tabs.iter().any(|fact| fact.key == hidden.local_id),
+        "a current live nonce cannot relabel the older sample"
+    );
 }
 
 /// The row of `held` at the fixture path `path`.
@@ -2367,7 +2831,7 @@ fn sys_disk_held_gathers_its_rows_from_build_start_lines_and_the_walkers_board()
     );
     assert_eq!(held.oldest_walk_s, Some(4));
     // The reply prints the rows gathered.
-    let shared = Shared::new();
+    let shared = Shared::with_clock(|| Some(0));
     shared.publish_for_test(synthetic(1, 0.1), Vec::new());
     let (snap, state) = shared.fresh(Duration::from_secs(3600), false);
     let q = SysQuery::parse("disk held").expect("disk held");

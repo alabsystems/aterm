@@ -5,6 +5,7 @@
 
 mod derived_supervise_tape;
 mod models_account_progress_policy;
+mod models_account_upkeep_verdict;
 mod models_bound_recipient_journal;
 mod models_custody;
 mod models_disk_discovery_cycle;

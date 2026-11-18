@@ -5468,6 +5468,10 @@ impl<'a, C: Ctl> Session<'a, C> {
                 open.told_closes,
                 self.fx.mono(),
             );
+            // The row's own second dates the limit the move left (`TurnEndState::limit_left`),
+            // whatever process this loop finds: one relaunched since the move is still the
+            // moved-to account's.
+            self.turn_end.account_made_at(open.at_ms.div_euclid(1000));
         }
         open_wall
     }
@@ -6672,6 +6676,36 @@ impl<C: Ctl> Session<'_, C> {
         handled: bool,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
+        if let Phase::Limited { message, .. } = &point.phase
+            && self.limit_left_at(point.screen.seq)
+        {
+            // THE LIMIT AN ACCOUNT MOVE LEFT (`TurnEndState::limit_left`): the resumed
+            // transcript's notice, written before the move was made, is the left account's. The
+            // session met no limit on the account it runs on, so no episode opens for it: nothing
+            // is escalated or held at a break for it, the host records no wall for it, and no wait
+            // is booked; the move's own continuation goes on past it. An episode a point since the
+            // move opened stood for this same notice (the move closed the one before it, and any
+            // limit met since would be the transcript's newer notice), read there before its time
+            // was known: it ends here.
+            let to = self
+                .turn_end
+                .account_move()
+                .map_or("-", |m| m.to.as_str())
+                .to_string();
+            review.note(&format!(
+                "SKIPPED seq={} rule={} limit left by the move to {to}, written before the move; \
+                 no episode: {}",
+                point.screen.seq,
+                wall_confirm::RULE_WALL_CONFIRM,
+                clip(message)
+            ));
+            self.close_episode(
+                point.screen.seq,
+                &format!("the limit the move to {to} left: no limit of this account's"),
+                review,
+            )?;
+            return self.limit_retimed(point.screen.seq, deadline, review);
+        }
         if let Phase::Limited { message, reset } = &point.phase {
             if let Some(raised) = self.limit.as_ref().map(|ep| ep.raised) {
                 self.refresh_reset(reset.as_deref());

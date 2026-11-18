@@ -611,65 +611,134 @@ pub fn with_pinned_rows(guard: &str, version: &str, desks: &[String]) -> Result<
     Ok(out)
 }
 
-/// Splices release `tag`'s cases from `staged` into `corpus` and returns the updated text and case count.
+/// Admit release `tag`'s successful cases from main's rendered `staged` corpus, preserving
+/// every committed header and historical row byte for byte, and return the text and count.
 ///
 /// # Errors
-/// `staged` holds no case of `tag`, or holds them apart, or first; `corpus` records `tag`
-/// already, or holds no line, or more than one, with the case id they go after.
+/// Either corpus is malformed or has duplicate IDs, `corpus` records `tag` already,
+/// `staged` has no successful contiguous block for `tag`, or removing that block does not
+/// leave the exact committed corpus (including its header, row order and line endings).
 pub fn with_release_answers(corpus: &str, staged: &str, tag: &str) -> Result<(String, usize)> {
     let prefix = format!("{tag}/");
     let refuse = |why: String| Error::new(format!("{tag}'s shipped-state answers: {why}"));
-    fn key(line: &str) -> &str {
-        line.split_once('\t').map_or(line, |(id, _)| id)
+    struct Row<'a> {
+        id: &'a str,
+        verdict: &'a str,
+        raw: &'a str,
+        offset: usize,
     }
-    let lines: Vec<&str> = staged.lines().collect();
-    let first = lines
+
+    fn rows(text: &str) -> std::result::Result<(&str, Vec<Row<'_>>), String> {
+        if !text.ends_with('\n') {
+            return Err("the corpus has no terminal newline".into());
+        }
+        let mut rows = Vec::new();
+        let mut ids = std::collections::BTreeSet::new();
+        let mut header_end = 0;
+        let mut offset = 0;
+        for raw in text.split_inclusive('\n') {
+            if raw.starts_with('#') {
+                if !rows.is_empty() {
+                    return Err("a header line follows a case".into());
+                }
+                header_end += raw.len();
+            } else {
+                let line = raw.strip_suffix('\n').unwrap();
+                let line = line.strip_suffix('\r').unwrap_or(line);
+                let mut fields = line.split('\t');
+                let (Some(id), Some(verdict), Some(answer), None) =
+                    (fields.next(), fields.next(), fields.next(), fields.next())
+                else {
+                    return Err(format!("malformed case row at byte {offset}"));
+                };
+                if id.is_empty()
+                    || id.chars().any(char::is_control)
+                    || answer.chars().any(char::is_control)
+                    || !matches!(verdict, "ok" | "err")
+                {
+                    return Err(format!("malformed case {id:?}"));
+                }
+                if !ids.insert(id) {
+                    return Err(format!("duplicate case {id:?}"));
+                }
+                rows.push(Row {
+                    id,
+                    verdict,
+                    raw,
+                    offset,
+                });
+            }
+            offset += raw.len();
+        }
+        if header_end == 0 || rows.is_empty() {
+            return Err("the corpus needs a header followed by cases".into());
+        }
+        Ok((&text[..header_end], rows))
+    }
+
+    let (header, recorded) = rows(corpus).map_err(|why| refuse(format!("recorded: {why}")))?;
+    let (rendered_header, observed) =
+        rows(staged).map_err(|why| refuse(format!("rendered: {why}")))?;
+    if recorded.iter().any(|row| row.id.starts_with(&prefix)) {
+        return Err(refuse(format!(
+            "{SHIPPED_STATE_CORPUS} records {tag} already"
+        )));
+    }
+    if header != rendered_header {
+        return Err(refuse("the recorded header changed".into()));
+    }
+    let first = observed
         .iter()
-        .position(|line| line.starts_with(&prefix))
+        .position(|row| row.id.starts_with(&prefix))
         .ok_or_else(|| refuse("the staged answers hold no case of its desks".to_string()))?;
-    let count = lines[first..]
+    let count = observed[first..]
         .iter()
-        .take_while(|line| line.starts_with(&prefix))
+        .take_while(|row| row.id.starts_with(&prefix))
         .count();
-    if lines[first + count..]
+    if observed[first + count..]
         .iter()
-        .any(|line| line.starts_with(&prefix))
+        .any(|row| row.id.starts_with(&prefix))
     {
         return Err(refuse(
             "the staged answers hold its cases apart, not as one block".to_string(),
         ));
     }
-    let Some(before) = first.checked_sub(1).map(|at| key(lines[at])) else {
-        return Err(refuse(
-            "the staged answers put its cases before the file's header".to_string(),
-        ));
-    };
-    let mut out: Vec<&str> = corpus.lines().collect();
-    if out.iter().any(|line| line.starts_with(&prefix)) {
-        return Err(refuse(format!(
-            "{SHIPPED_STATE_CORPUS} records {tag} already"
-        )));
+    for row in &observed[first..first + count] {
+        if row.verdict != "ok" {
+            return Err(refuse(format!(
+                "new producer case {:?} was refused",
+                row.id
+            )));
+        }
     }
-    let anchors: Vec<usize> = out
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| key(line) == before)
-        .map(|(at, _)| at)
-        .collect();
-    let [anchor] = anchors.as_slice() else {
-        return Err(refuse(format!(
-            "{SHIPPED_STATE_CORPUS} holds {} lines with the case id they go after ({before:?}), \
-             not one",
-            anchors.len()
-        )));
-    };
-    out.splice(
-        anchor + 1..anchor + 1,
-        lines[first..first + count].iter().copied(),
-    );
-    let mut text = out.join("\n");
-    text.push('\n');
-    Ok((text, count))
+
+    let mut historical = observed.iter().filter(|row| !row.id.starts_with(&prefix));
+    for wanted in &recorded {
+        let got = historical
+            .next()
+            .ok_or_else(|| refuse(format!("historical case {:?} is missing", wanted.id)))?;
+        if wanted.raw != got.raw {
+            return Err(refuse(format!(
+                "historical case {:?} changed or moved (observed {:?})",
+                wanted.id, got.id
+            )));
+        }
+    }
+    if let Some(extra) = historical.next() {
+        return Err(refuse(format!("unexpected historical case {:?}", extra.id)));
+    }
+    // The only removable span is the new release block. Compare the complete remainder too,
+    // so no header, separator, line ending or historical byte can be rewritten incidentally.
+    let start = observed[first].offset;
+    let end = observed
+        .get(first + count)
+        .map_or(staged.len(), |row| row.offset);
+    if [&staged[..start], &staged[end..]].concat() != corpus {
+        return Err(refuse(
+            "the recorded corpus changed outside the new block".into(),
+        ));
+    }
+    Ok((staged.to_owned(), count))
 }
 
 /// Builds a git tree object from `base` with each `(path, blob)` in `files` replaced.

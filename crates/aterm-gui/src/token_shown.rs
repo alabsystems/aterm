@@ -16,7 +16,7 @@
 //! The read records each new offer pair (`note_offers`), so the quiet offer is journaled once per
 //! change of the pair whichever surface shows it first, and asks the lab, never a person, for each
 //! offered token with none verified in use here (`ask_lab_here`). Its one step ([`App::open_token_step`])
-//! opens a tab beside the person's that runs `aterm harness accounts token <label> [--replace]`;
+//! opens a tab beside the person's that runs `aterm harness accounts token <word> [--replace]`;
 //! nothing here raises a modal, a banner or a notification. A platform with no vault tokens reads
 //! none, and every surface then says nothing of them.
 
@@ -30,10 +30,12 @@ use aterm_agent::harness::token_state::TokenState;
 /// The quiet offer's one step, as the window runs it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TokenOffer {
-    /// The card's and the Lab page's one line (`a vault token would keep work signed in: make one`).
+    /// The card's and the Lab page's one line (`a vault token would keep claude ada@x.example
+    /// (claude-ada-x) signed in: make one`).
     pub(crate) line: String,
-    /// The verb's account: the row's label, or the account's email.
-    pub(crate) label: String,
+    /// The verb's account word: its slug, else its key, as the step names it
+    /// ([`aterm_agent::harness::account_names::Word`]).
+    pub(crate) word: String,
     /// `--replace`: the token the step offers for is still in use (`soon`, `exposed`).
     pub(crate) replace: bool,
 }
@@ -42,7 +44,7 @@ impl TokenOffer {
     /// The step's words after `aterm`.
     #[must_use]
     pub(crate) fn words(&self) -> Vec<&str> {
-        let mut words = vec!["harness", "accounts", "token", self.label.as_str()];
+        let mut words = vec!["harness", "accounts", "token", self.word.as_str()];
         if self.replace {
             words.push("--replace");
         }
@@ -345,14 +347,12 @@ pub(crate) fn facts_of_view(
                     peers: used.map(|used| used.peers.clone()).unwrap_or_default(),
                     peers_read_at: used.and_then(|used| used.peers_read_at),
                     step: steps.get(&account.key).map(|step| {
-                        let person = account.label.as_ref().map(|label| {
-                            Step::Token {
-                                label: label.clone(),
-                                replace: false,
-                            }
-                            .to_string()
-                        });
-                        step.words(person.as_deref())
+                        let person = Step::Token {
+                            word: account.word(),
+                            replace: false,
+                        }
+                        .to_string();
+                        step.words(Some(&person))
                     }),
                     key: account.key.clone(),
                     label: account.label.clone(),
@@ -361,9 +361,9 @@ pub(crate) fn facts_of_view(
                     words,
                     phrase: account.phrase(now),
                     offer: account.offer.as_ref().and_then(|offer| match &offer.step {
-                        Step::Token { label, replace } => Some(TokenOffer {
+                        Step::Token { word, replace } => Some(TokenOffer {
                             line: account.offer_line()?,
-                            label: label.clone(),
+                            word: word.to_string(),
                             replace: *replace,
                         }),
                         _ => None,
@@ -385,7 +385,7 @@ impl crate::App {
     }
 
     /// The quiet offer's one step: a tab beside the person's in `window` that runs `aterm
-    /// harness accounts token <label> [--replace]` (§5.9). Nothing else is raised. A platform
+    /// harness accounts token <word> [--replace]` (§5.9). Nothing else is raised. A platform
     /// with no vault tokens offers no step, and opens nothing.
     pub(crate) fn open_token_step(&mut self, window: crate::WindowId, offer: &TokenOffer) {
         let words = offer.words();

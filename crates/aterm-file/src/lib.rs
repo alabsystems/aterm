@@ -9,8 +9,9 @@
 //! snapshot's side: the name grammar ([`Name`]), where the parts live ([`Root`]), the snapshot
 //! and status codecs ([`Snapshot`], [`State`]), the state word every answer carries
 //! ([`Word`], [`Why`]), the read ([`File::read`]), the one resolver every row and account name
-//! passes ([`resolve`]), the outbox of this Mac's unsigned writes ([`outbox`], [`File::write`])
-//! and the verbs of `aterm file` that need no typed table ([`cli`]).
+//! passes ([`resolve`]) with the account layer over it ([`account`]: an account's names and the
+//! account a word names), the outbox of this Mac's unsigned writes ([`outbox`],
+//! [`File::write`]) and the verbs of `aterm file` that need no typed table ([`cli`]).
 //!
 //! It does not depend on aterm-db, aterm-secrets or the transport, so no session, vault or
 //! writer-generation code can reach a read: a read answers from local files in every custody
@@ -24,22 +25,22 @@
 // (crates/aterm-spec-anchor/anchor_rules.rs), which only test and debug builds expand.
 #![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
+pub mod account;
 pub mod cli;
 pub mod file;
 pub mod frontier;
 pub mod layout;
 pub mod name;
 pub mod outbox;
+mod resolver;
 pub mod retain;
 pub mod snapshot;
 pub mod status;
 
+pub use account::AccountNames;
 #[cfg(any(unix, windows))]
 pub use file::Look;
-pub use file::{
-    ACCOUNT_HANDLES, File, Named, Opened, Pass, Projected, Projection, Read, Recorded, Resolved,
-    many_accounts, no_account, resolve,
-};
+pub use file::{File, Opened, Pass, Projected, Projection, Read, Recorded, Restored};
 pub use frontier::Frontier;
 pub use layout::Root;
 pub use name::{Name, NotAName};
@@ -50,6 +51,7 @@ pub use outbox::owner_act_for_test;
 pub use outbox::{
     Accepted, Done, Draft, Dropped, Edit, Held, Intent, Mark, Outbox, OwnerAct, Refused,
 };
+pub use resolver::{ACCOUNT_HANDLES, Named, Resolved, many_accounts, no_account, resolve};
 pub use snapshot::{Column, Row, Snapshot, Source};
 pub use status::{Face, Kept, State, Status, Why, Word};
 

@@ -4,11 +4,14 @@
 //! This machine's name (`docs/DESIGN-machine-names-2026-11-04.md`): its NAME (`m8`, or `unnumbered`
 //! while unnumbered), nickname and earlier numbers, kept in `machine-name.toml` whether or not it
 //! is in a fleet ([`file`]), made at first run by [`ensure`], and, once a number is chosen,
-//! published to its other readers ([`publish`]). A rename's nickname is written to this Mac's
-//! lab registry row too ([`registry`]), and a nickname written to that row from any Mac becomes
-//! this Mac's at its next read that shows it ([`follow_registry`]).
+//! published to its other readers ([`publish`]). A rename's nickname and number are written to
+//! this Mac's lab registry row too ([`registry`]), and a nickname written to that row from any
+//! Mac becomes this Mac's at its next read that shows it ([`follow_registry`]). Who renamed this
+//! Mac, when, and every earlier name are the row's, which History lists and Undo takes back
+//! ([`history`]).
 
 pub mod file;
+pub mod history;
 pub mod publish;
 pub mod registry;
 
@@ -21,7 +24,7 @@ use std::path::Path;
 use aterm_db::file::Renamed;
 use aterm_net::fleet_member::fleet_seed;
 use aterm_net::fleet_member::name_record::{
-    By, ByKind, NickClass, ZERO_DIGEST, nicknames_in_books, node_of, node_word,
+    ByKind, NickClass, ZERO_DIGEST, nicknames_in_books, node_of, node_word,
 };
 use aterm_net::fleet_member::{
     NAME_FILE, NAME_FILE_MAX, PrivateFileError, node_identity, read_node_identity,
@@ -33,7 +36,7 @@ use aterm_types::machine_name::{
     check, renamed, settle,
 };
 
-use file::{Change, MachineName, Migration, Why};
+use file::{MachineName, Migration};
 
 use crate::members_cli::Standing;
 
@@ -169,8 +172,7 @@ pub enum RegistryNameRead {
 
 /// This machine's name, made when no `machine-name.toml` exists in `state` (§3.3). Evidence is
 /// read before taking the name lock, then [`file::read_or_create`] publishes the candidate only
-/// if no other reader created the file first. Every reader returns the winner; a name made here
-/// starts its History with the first name ([`Why::First`]).
+/// if no other reader created the file first. Every reader returns the winner.
 ///
 /// A valid bound registry machine row supplies the name first, as a seeded local mirror with
 /// no pending book migration. Its nickname retains its provenance, or a null nickname draws a
@@ -237,10 +239,8 @@ fn ensure_from(
     };
     let mut origin = Origin::Kept;
     let (name, created) = file::read_or_create(state, || {
-        let (mut candidate, source) = prepared?;
+        let (candidate, source) = prepared?;
         origin = source;
-        let first = Change::first(&candidate, now_ms);
-        candidate.record(first);
         Ok(candidate)
     })?;
     Ok((name, if created { origin } else { Origin::Kept }))
@@ -252,32 +252,32 @@ fn ensure_from(
 /// title, `aterm name`): a live snapshot must match this Mac's own binding and number, and the
 /// current native source is admitted through the atomic name write. Retained display rows
 /// confer no naming authority. The name writer stays held through admission and persistence.
-/// The registry keeps who wrote the row and when; History records the change as
-/// [`Why::Registry`], with no author. An automatic write and an empty or conflicted cell are not
+/// The registry keeps who wrote the row and when, and History is the row's ([`history`]). An
+/// automatic write and an empty or conflicted cell are not
 /// followed, and a name whose row is none of this Mac's ([`registry::row_nick`]) is left as it
 /// is. Answers the name where the file changed.
 ///
 /// # Errors
 /// The file cannot be read or replaced, its lock is held, or its native source refuses admission.
-pub fn follow_registry(state: &Path, now_ms: u64) -> io::Result<Option<MachineName>> {
+pub fn follow_registry(state: &Path) -> io::Result<Option<MachineName>> {
     let Some(kept) = file::read(state)? else {
         return Ok(None);
     };
     // Retained data may avoid work, but never authorize the write below.
-    if row_followed(state, &kept, now_ms).is_none() {
+    if row_followed(state, &kept).is_none() {
         return Ok(None);
     }
     let Some(row) = registry::for_follow(state) else {
         return Ok(None);
     };
-    if !row.names(kept.num) || followed(&kept, row.nickname.as_ref(), now_ms).is_none() {
+    if !row.names(kept.num) || followed(&kept, row.nickname.as_ref()).is_none() {
         return Ok(None);
     }
     let mut writer = file::writer(state)?;
     if !row.names(writer.name().num) {
         return Ok(None);
     }
-    let Some(next) = followed(writer.name(), row.nickname.as_ref(), now_ms) else {
+    let Some(next) = followed(writer.name(), row.nickname.as_ref()) else {
         return Ok(None);
     };
     row.with_admitted(|| writer.replace(next.clone()))?;
@@ -286,33 +286,28 @@ pub fn follow_registry(state: &Path, now_ms: u64) -> io::Result<Option<MachineNa
 
 /// `held` once it has seen this Mac's row as `state`'s name reads it now ([`followed`]), or
 /// `None` where nothing moves.
-fn row_followed(state: &Path, held: &MachineName, now_ms: u64) -> Option<MachineName> {
-    registry::row_nick(state).and_then(|row| followed(held, row.as_ref(), now_ms))
+fn row_followed(state: &Path, held: &MachineName) -> Option<MachineName> {
+    registry::row_nick(state).and_then(|row| followed(held, row.as_ref()))
 }
 
 /// `held` once it has seen its registry row's chosen nickname `row` (`None`: none chosen), or
 /// `None` where it saw that already ([`file::MachineName::row`]). A chosen nickname other than
-/// `held`'s renames it ([`renicked`], with no author, recorded as [`Why::Registry`]) where the
+/// `held`'s renames it ([`renicked`]; the row's own write is what History lists) where the
 /// file saw the row before, and where it never did and its own nickname is a drawn noun, which
 /// nobody chose. A first look at a row from a file whose nickname a person or a program chose
 /// (one an earlier build wrote, or one made while no row was this Mac's) only marks it seen, so
 /// a row value older than that choice does not replace it; so does a row holding `held`'s own
 /// nickname (a rename's own write).
-fn followed(held: &MachineName, row: Option<&Nickname>, now_ms: u64) -> Option<MachineName> {
+fn followed(held: &MachineName, row: Option<&Nickname>) -> Option<MachineName> {
     let seen = file::RowSeen::Saw(row.cloned());
     if held.row == seen {
         return None;
     }
     let looked = held.row != file::RowSeen::Never || held.nick_class == NickClass::Auto;
     let mut next = match row {
-        Some(row) if looked && held.nick != *row => renicked(held, row.clone(), None).map_or_else(
-            || held.clone(),
-            |mut next| {
-                let change = Change::between(held, &next, now_ms, Why::Registry);
-                next.record(change);
-                next
-            },
-        ),
+        Some(row) if looked && held.nick != *row => {
+            renicked(held, row.clone()).unwrap_or_else(|| held.clone())
+        }
         _ => held.clone(),
     };
     next.row = seen;
@@ -325,8 +320,8 @@ fn followed(held: &MachineName, row: Option<&Nickname>, now_ms: u64) -> Option<M
 /// the row's number is the Mac's, so one other than the name's chosen number renumbers it, and
 /// so does the name's own number where it is seeded or automatic, or a migration still waits on
 /// a choice ([`moves`]). The rename is judged as any is ([`change_claim`], against the books and
-/// the vault's labels `lab` reads) and recorded as [`Why::Registry`] with no author, since the
-/// registry keeps who wrote the row and when; `config`'s naming policy is read first, and the
+/// the vault's labels `lab` reads), and the registry keeps who wrote the row and when
+/// ([`history`]); `config`'s naming policy is read first, and the
 /// caller publishes the renamed name under the policy this answers, as a person's rename is
 /// published ([`publish::publish`]). Only a live snapshot that is this Mac's own binding, under
 /// the native source's admission through the write, renumbers it ([`registry::for_number`]); a
@@ -368,11 +363,12 @@ pub fn follow_number(
     };
     let policy = publish::Policy::read(config, num).map_err(io::Error::other)?;
     let lab = read_lab(lab)?;
-    let by = editor(state, ByKind::Auto, false)?;
+    let node = editor(state, false)?;
     let follows = RowWrite::Follows(&row);
     let set = edit_name(
         state,
-        by,
+        node,
+        ByKind::Auto,
         None,
         Origin::Kept,
         now_ms,
@@ -383,7 +379,7 @@ pub fn follow_number(
                 return Ok(base.clone());
             }
             let to = NameTo { num, nick: None };
-            change_claim(base, &to, Some(&lab), locked, None, now_ms, Why::Registry)
+            change_claim(base, &to, Some(&lab), locked, now_ms)
         },
     )?;
     Ok((set.changed && set.name.num == Some(num)).then_some((set.name, policy)))
@@ -592,8 +588,8 @@ pub struct NameSet {
 /// macOS names follow while identity naming is on. `lab` is not read for a request that keeps the
 /// stored number, a nickname change typed with it; should a concurrent local edit change that
 /// number before the name lock is taken, the request is refused rather than checked unread.
-/// The earlier local number is kept in `was` for aliases, and the change in History
-/// ([`Why::Named`]), which **Undo** reads ([`undo_last`]). A dry run makes no node key and
+/// The earlier local number is kept in `was` for aliases; the row's write is what History lists
+/// and **Undo** takes back ([`history`]). A dry run makes no node key and
 /// changes no existing name, though its first read makes the name as any first read does.
 ///
 /// # Errors
@@ -613,25 +609,27 @@ pub fn set_name<'a>(
 ) -> io::Result<NameSet> {
     let asker = asker.into();
     let (_, origin) = ensure_in_view(state, roster, now_ms)?;
-    let by = editor(state, asker.kind, dry_run)?;
+    let node = editor(state, dry_run)?;
     // Whether the request keeps the stored number, as the lock below reads it again.
     let keeps = file::read(state)?.is_some_and(|name| !moves(&name, to.num));
     let lab = if keeps { None } else { Some(read_lab(lab)?) };
     edit_name(
         state,
-        by,
+        node,
+        asker.kind,
         asker.session,
         origin,
         now_ms,
         dry_run,
         RowWrite::Asked(to.num),
-        |held, locked| change_claim(held, to, lab.as_ref(), locked, by, now_ms, Why::Named),
+        |held, locked| change_claim(held, to, lab.as_ref(), locked, now_ms),
     )
 }
 
-/// Who makes an edit for `kind`: this node, its key minted where it has none, or for a dry run
-/// only read, so a keyless dry run answers `None` and mints nothing.
-fn editor(state: &Path, kind: ByKind, dry_run: bool) -> io::Result<Option<By>> {
+/// The node that makes an edit: this one, its key minted where it has none, or for a dry run
+/// only read, so a keyless dry run answers `None` and mints nothing. The rename's checks are
+/// judged as this node's against the books ([`edit_name`]).
+fn editor(state: &Path, dry_run: bool) -> io::Result<Option<NodeId>> {
     let me = if dry_run {
         read_node_identity(state)?
     } else {
@@ -639,9 +637,7 @@ fn editor(state: &Path, kind: ByKind, dry_run: bool) -> io::Result<Option<By>> {
     };
     me.as_ref()
         .map(|me| {
-            node_of(me.node())
-                .map(|node| By { node, kind })
-                .ok_or_else(|| io::Error::other("this machine has no valid node id"))
+            node_of(me.node()).ok_or_else(|| io::Error::other("this machine has no valid node id"))
         })
         .transpose()
 }
@@ -670,8 +666,9 @@ enum RowWrite<'a> {
     /// Nothing: the edit takes the row's number ([`follow_number`]), and the file is written
     /// only under the admission of the source that decision read.
     Follows(&'a registry::Renumber),
-    /// The number the edit moves to: an undo's.
-    Moved,
+    /// An undo's cells, each written whatever the name held, and only while History still gives
+    /// that undo ([`history::fence`]).
+    Undo(&'a history::Undo),
     /// The number a rename asked for: where the edit moves to it, and where the name holds it
     /// already and the row shows another number an owner wrote that no read followed yet, which
     /// the request, the newer of the two, replaces.
@@ -694,12 +691,14 @@ impl RowWrite<'_> {
 /// What `row` says the edit writes to that row, its nickname and a number it moves to, is first
 /// queued as one write, asked in the aterm session `session` ([`registry::queue_rename`]), and a
 /// follow of the row's number is written only under its source's admission
-/// ([`registry::Renumber::with_admitted`]), the name lock held through both.
-/// `by` names this node; a keyless dry run's `None` stands for a node absent from the books
-/// ([`absent_node`]).
+/// ([`registry::Renumber::with_admitted`]), the name lock held through both. An undo first reads
+/// History again and finds it giving that undo ([`history::fence`]), or writes nothing.
+/// `node` is this node, `kind` the kind of caller the row's write names; a keyless dry run's
+/// `None` stands for a node absent from the books ([`absent_node`]).
 ///
 /// # Errors
-/// As `edit`; the row would not take the nickname or the number ([`Cause::Registry`]); a lock
+/// As `edit`; an undo's row no longer shows the rename it takes back ([`Cause::Unseen`]); the
+/// row would not take the nickname or the number ([`Cause::Registry`]); a lock
 /// cannot be taken; the file cannot be replaced, which after the write was queued says so: the
 /// row holds it, and a later read takes it from there ([`follow_registry`], [`follow_number`]).
 #[expect(
@@ -709,7 +708,8 @@ impl RowWrite<'_> {
 )]
 fn edit_name(
     state: &Path,
-    by: Option<By>,
+    node: Option<NodeId>,
+    kind: ByKind,
     session: Option<&str>,
     origin: Origin,
     now_ms: u64,
@@ -719,13 +719,13 @@ fn edit_name(
 ) -> io::Result<NameSet> {
     aterm_net::fleet_member::write_held(state, aterm_net::fleet_member::Began::Here, |_| {
         let books = rename_books(state, now_ms)?;
-        let node = match by {
-            Some(by) => by.node,
+        let me = match node {
+            Some(node) => node,
             None => absent_node(&books.view)?,
         };
-        let taken = books.taken_except(node);
+        let taken = books.taken_except(me);
         let mut locked = Locked {
-            node,
+            node: me,
             view: books.view,
             taken,
         };
@@ -742,7 +742,18 @@ fn edit_name(
             // ([`row_followed`]), so it never writes over a nickname the row was given and no
             // read followed yet, and the row value it replaces counts as seen: the row still
             // holding it until this edit's own write arrives undoes nothing.
-            let base = row_followed(state, stored, now_ms);
+            if let RowWrite::Undo(undo) = label {
+                history::fence(state, undo).map_err(|why| {
+                    io::Error::from(Refused::new(
+                        Cause::Unseen,
+                        format!(
+                            "this Mac's name changed after the undo read it ({why}), so nothing \
+                             was undone: read the name again and undo over what it shows"
+                        ),
+                    ))
+                })?;
+            }
+            let base = row_followed(state, stored);
             let base = base.as_ref().unwrap_or(stored);
             let mut next = edit(base, &mut locked)?;
             // What the request changed, not what the follow did.
@@ -750,16 +761,20 @@ fn edit_name(
             renumbered = next.num != base.num
                 || next.class != base.class
                 || next.migration != base.migration
-                || label.asked_over_row(state, &next);
+                || label.asked_over_row(state, &next)
+                || matches!(label, RowWrite::Undo(undo)
+                    if undo.cells.iter().any(|(cell, _)| *cell == Renamed::Label));
             // The row's name is the Mac's ([`follow_registry`], [`follow_number`]): what a rename
             // changes in the row, its nickname and a number it moves to, is queued as one write
             // before the file holds it, so no read finds the row showing what it replaced with
             // nothing of this Mac's on its way, one operation holds the rename, and a row that
             // would not take it refuses the rename; a dry run asks the row's rules alone. A
             // nickname the edit leaves as it was is no part of it. A follow's values are the
-            // row's already.
+            // row's already; an undo's are what the rename it takes back replaced.
             let mut cells = Vec::with_capacity(2);
-            if !matches!(label, RowWrite::Follows(_)) {
+            if let RowWrite::Undo(undo) = label {
+                cells.clone_from(&undo.cells);
+            } else if !matches!(label, RowWrite::Follows(_)) {
                 if renumbered && let Some(num) = next.num {
                     cells.push((Renamed::Label, num.to_string()));
                 }
@@ -783,8 +798,8 @@ fn edit_name(
                 if let Some(why) = registry::refusal(state, &cells) {
                     return Err(refused(&cells, why));
                 }
-            } else if let Some(by) = by {
-                match registry::queue_rename(state, &cells, by.kind, session) {
+            } else if node.is_some() {
+                match registry::queue_rename(state, &cells, kind, session) {
                     registry::Written::Refused(why) => return Err(refused(&cells, why)),
                     registry::Written::Queued(write) => {
                         // The row shows this nickname once the write lands; should the write
@@ -842,8 +857,8 @@ fn row_cells(cells: &[(Renamed, String)]) -> String {
 /// `held` with its claim on `to.num`, judged against the vault's labels `lab` (unread only for a
 /// request that keeps the number) and the books ([`judge`]): a number that moves makes a new
 /// explicit claim ([`renamed`]), which keeps the earlier number in `was`; a nickname `to` names
-/// is chosen. A change raises `rev`, names `by` and records one [`Change`] for `why`
-/// ([`recorded`]); `held` as it is answers a request that changes nothing.
+/// is chosen. A change raises `rev` ([`revised`]); `held` as it is answers a request that changes
+/// nothing.
 ///
 /// # Errors
 /// [`judge`] refuses the number, another node's record carries the nickname, or the name clock,
@@ -853,9 +868,7 @@ fn change_claim(
     to: &NameTo,
     lab: Option<&client::LabLabels>,
     locked: &mut Locked,
-    by: Option<By>,
     now_ms: u64,
-    why: Why,
 ) -> io::Result<MachineName> {
     let current = current_record(held);
     locked
@@ -918,30 +931,19 @@ fn change_claim(
         next.nick = nick.clone();
         next.nick_class = NickClass::Chosen;
     }
-    recorded(held, next, by, now_ms, why)
+    revised(held, next)
 }
 
-/// `next`, the name `held` becomes, as a change `by` made at `now_ms` for `why`: `rev` raised,
-/// `by` named and the change recorded as History's newest ([`MachineName::record`]); `next`
-/// as it is where it equals `held`.
+/// `next`, the name `held` becomes, with `rev` raised; `next` as it is where it equals `held`.
 ///
 /// # Errors
 /// The revision is exhausted.
-fn recorded(
-    held: &MachineName,
-    mut next: MachineName,
-    by: Option<By>,
-    now_ms: u64,
-    why: Why,
-) -> io::Result<MachineName> {
+fn revised(held: &MachineName, mut next: MachineName) -> io::Result<MachineName> {
     if next != *held {
         next.rev = held
             .rev
             .checked_add(1)
             .ok_or_else(|| io::Error::other("the name revision is exhausted"))?;
-        next.by = by;
-        let change = Change::between(held, &next, now_ms, why);
-        next.record(change);
     }
     Ok(next)
 }
@@ -978,19 +980,16 @@ pub enum Cause {
     Verdict(Verdict),
     /// Another machine's record carries the nickname.
     Nickname,
-    /// Undo: History keeps no change to take back, or only the first name, or its newest change
-    /// kept both the number and the nickname (a claim of the number this Mac already showed).
+    /// Undo: no registry row is this Mac's, its History holds no rename, or none Undo can give
+    /// back ([`history::undo_of`]).
     Nothing,
-    /// Undo: History's newest change is an undo, or was taken back already. Undo is single-level:
-    /// an undo is never undone.
-    Undone,
-    /// Undo: the name no longer stands as History's newest change left it, so a change History
-    /// does not hold came after it.
+    /// Undo: the row no longer stands as its newest rename left it, a later write or one made at
+    /// once with it standing instead, or a write of this Mac's is still on its way to it.
     Superseded,
-    /// Undo: the change gave this Mac its first number, and no rename leaves a Mac unnumbered.
+    /// Undo: the rename gave this Mac its first number, and no rename leaves a Mac unnumbered.
     Unnumbered,
-    /// Undo: History's newest change is not the one the undo was asked over, so the name changed
-    /// after it was read ([`undo_last`]'s `seen`).
+    /// Undo: History no longer gives the undo asked for, so the name changed after it was read
+    /// ([`undo_last`]'s `seen`, [`history::fence`]).
     Unseen,
     /// This Mac's lab registry row would not take the number or the nickname, whose write to it
     /// is queued before the name changes ([`registry::queue_rename`]): the name and the row would
@@ -1283,16 +1282,15 @@ impl RenamePreview {
         self.name.migration == Some(Migration::Waiting)
     }
 
-    /// What [`undo_last`] would answer from this read: where it takes the name back to
-    /// ([`undo_to`]), its number judged as [`set_name`] judges one ([`RenamePreview::judge`]) and
-    /// its nickname refused where another node's record carries it.
+    /// What [`undo_last`] would answer from this read for `undo` ([`history::undo_of`]): its
+    /// number judged as [`set_name`] judges one ([`RenamePreview::judge`]) and its nickname
+    /// refused where another node's record carries it.
     ///
     /// # Errors
-    /// History holds nothing [`undo_last`] takes back ([`undo_to`]), the number is refused, or
-    /// another node's record carries the nickname ([`Cause::Nickname`]).
-    pub fn undo(&self) -> Result<UndoTo, Refused> {
-        let to = undo_to(&self.name)?;
-        let nick = match &to {
+    /// The number is refused, or another node's record carries the nickname
+    /// ([`Cause::Nickname`]).
+    pub fn undo(&self, undo: &history::Undo) -> Result<(), Refused> {
+        let nick = match &undo.to {
             UndoTo::Name(to) => {
                 self.judge(to.num)?;
                 to.nick.as_ref()
@@ -1302,36 +1300,35 @@ impl RenamePreview {
         if let Some(nick) = nick.filter(|nick| self.shared(nick)) {
             return Err(nick_used(nick));
         }
-        Ok(to)
+        Ok(())
     }
 
-    /// What Undo Last Rename offers from this read. It is [`RenamePreview::undo`]'s answer,
-    /// except that a number the vault's labels were not read for is left for [`undo_last`] to
-    /// check. That case answers with why the labels were not read ([`RenamePreview::unchecked`]),
-    /// as the live line leaves Save available over unread labels. The nickname is judged either
-    /// way.
+    /// What Undo Last Rename offers from this read for `undo`. It is [`RenamePreview::undo`]'s
+    /// answer, except that a number the vault's labels were not read for is left for
+    /// [`undo_last`] to check. That case answers with why the labels were not read
+    /// ([`RenamePreview::unchecked`]), as the live line leaves Save available over unread labels.
+    /// The nickname is judged either way.
     ///
     /// # Errors
     /// As [`RenamePreview::undo`], except that a number left unchecked over unread labels is
-    /// never refused ([`Cause::Unread`]): History holds nothing [`undo_last`] takes back, the
-    /// number is refused, or another node's record carries the nickname ([`Cause::Nickname`]).
-    pub fn undo_unchecked(&self) -> Result<(UndoTo, Option<&str>), Refused> {
-        let to = undo_to(&self.name)?;
-        let why = match &to {
+    /// never refused ([`Cause::Unread`]): the number is refused, or another node's record
+    /// carries the nickname ([`Cause::Nickname`]).
+    pub fn undo_unchecked(&self, undo: &history::Undo) -> Result<Option<&str>, Refused> {
+        let why = match &undo.to {
             UndoTo::Name(to) => self.unchecked(to.num),
             UndoTo::Nickname(_) => None,
         };
         let Some(why) = why else {
-            return self.undo().map(|to| (to, None));
+            return self.undo(undo).map(|()| None);
         };
         if let UndoTo::Name(NameTo {
             nick: Some(nick), ..
-        }) = &to
+        }) = &undo.to
             && self.shared(nick)
         {
             return Err(nick_used(nick));
         }
-        Ok((to, Some(why)))
+        Ok(Some(why))
     }
 
     /// Up to `want` numbers above `num`, lowest first, that a rename from this read takes as
@@ -1386,7 +1383,7 @@ pub fn next_free_words(free: &[Number]) -> Option<String> {
     Some(words)
 }
 
-/// Where an undo takes the name back to ([`undo_to`]).
+/// Where an undo takes the name back to ([`history::Undo::to`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UndoTo {
     /// Back to this number, as a new explicit claim on it, and to the nickname where the change
@@ -1414,77 +1411,6 @@ impl UndoTo {
     }
 }
 
-/// Where undoing History's newest change takes `name` back to, read from History alone: the
-/// number it replaced, where it moved the number, and the nickname it replaced, where it
-/// changed the nickname. Who holds that number now is [`judge`]'s to say ([`undo_last`],
-/// [`RenamePreview::undo`]): an undo is a checked rename back, and never restores a claim's class
-/// or rank, since the membership log releases the number a free move leaves and a restored
-/// automatic or seeded class would publish nothing to macOS ([`publish`]).
-///
-/// # Errors
-/// History keeps no change, or only the first name, or a change that kept both number and
-/// nickname ([`Cause::Nothing`]); its newest is an undo or was undone ([`Cause::Undone`]); the
-/// name no longer stands as that change left it ([`Cause::Superseded`]); or the change gave this
-/// Mac its first number ([`Cause::Unnumbered`]).
-pub fn undo_to(name: &MachineName) -> Result<UndoTo, Refused> {
-    let Some(change) = name.history.first() else {
-        return Err(Refused::new(
-            Cause::Nothing,
-            "nothing to undo: no change to this Mac's name is kept".to_owned(),
-        ));
-    };
-    match change.why {
-        Why::First => {
-            return Err(Refused::new(
-                Cause::Nothing,
-                "nothing to undo: the last change is this Mac's first name".to_owned(),
-            ));
-        }
-        Why::Undone => {
-            return Err(Refused::new(
-                Cause::Undone,
-                "the last change was an undo, which is not undone".to_owned(),
-            ));
-        }
-        Why::Named | Why::Nickname | Why::Drawn | Why::Registry if change.undone => {
-            return Err(Refused::new(
-                Cause::Undone,
-                "the last change was undone already".to_owned(),
-            ));
-        }
-        Why::Named | Why::Nickname | Why::Drawn | Why::Registry => {}
-    }
-    if change.to != name.num || change.nick_to != name.shown_nick() {
-        return Err(Refused::new(
-            Cause::Superseded,
-            format!(
-                "this Mac's name changed after its last recorded change, which left it {}: \
-                 there is no change of its to undo",
-                file::title_of(change.to, change.nick_to.as_str())
-            ),
-        ));
-    }
-    let nick = change
-        .nick_from
-        .clone()
-        .filter(|from| *from != change.nick_to);
-    match (change.from, change.to) {
-        (None, Some(_)) => Err(Refused::new(
-            Cause::Unnumbered,
-            "the last change gave this Mac its first number, and an undo leaves no Mac \
-             unnumbered"
-                .to_owned(),
-        )),
-        (Some(from), to) if Some(from) != to => Ok(UndoTo::Name(NameTo { num: from, nick })),
-        _ => nick.map(UndoTo::Nickname).ok_or_else(|| {
-            Refused::new(
-                Cause::Nothing,
-                "nothing to undo: the last change kept this Mac's number and nickname".to_owned(),
-            )
-        }),
-    }
-}
-
 /// The number a change that keeps the claim publishes under ([`publish`]): the stored one while
 /// it is chosen and no migration waits on it, else none, so a nickname on an automatic or seeded
 /// number publishes nothing.
@@ -1494,42 +1420,42 @@ pub fn chosen_number(name: &MachineName) -> Option<Number> {
         .filter(|_| name.class == Class::Chosen && name.migration != Some(Migration::Waiting))
 }
 
-/// The number the undo of `name`'s newest change publishes under ([`publish`]), which its
-/// caller reads the naming policy for before it undoes: the number it takes back, which the undo
-/// claims as chosen, or for a nickname undo the chosen number it keeps ([`chosen_number`]);
-/// `None` where History holds nothing to take back ([`undo_to`]) or the undo publishes nothing.
+/// The number `undo` publishes under ([`publish`]) over `name`, the name it starts from, which
+/// its caller reads the naming policy for before it undoes: the number it takes back, which the
+/// undo claims as chosen, or for a nickname undo the chosen number it keeps ([`chosen_number`]).
 #[must_use]
-pub fn undo_publishes(name: &MachineName) -> Option<Number> {
-    match undo_to(name).ok()? {
+pub fn undo_publishes(name: &MachineName, undo: &history::Undo) -> Option<Number> {
+    match &undo.to {
         UndoTo::Name(to) => Some(to.num),
         UndoTo::Nickname(_) => chosen_number(name),
     }
 }
 
-/// Take back History's newest change for `kind` (**Undo**, single-level): a checked rename back
-/// to the number it replaced ([`change_claim`], judged by [`judge`] as any rename is, so only a
-/// number that is [`Verdict::Same`], [`Verdict::Free`] or [`Verdict::EarlierName`] is taken back,
-/// never one another Mac now holds, by any claim, or the vault gives another Mac), with the
-/// nickname it replaced, or a nickname change back alone ([`change_nick`], which leaves the claim
-/// as it is). The change is marked undone and the undo recorded as [`Why::Undone`]. `seen` is the
-/// newest change the caller read and showed, from a read that followed this Mac's registry row
-/// ([`follow_registry`]) as the undo's own base does ([`edit_name`]): under the locks the undo
-/// takes back only that one,
-/// refusing ([`Cause::Unseen`]) where History's newest is another, so a name changed after the
-/// caller read it is never taken somewhere the caller did not show; `None` (a caller that read no
-/// name) takes back whatever History's newest is. `lab` is
-/// read before any lock, and only for an undo that moves the number, as [`set_name`] reads it; a
-/// number the lock then finds moved is refused rather than checked unread. A dry run makes no
-/// node key and changes no existing name, though its first read makes the name as any first read
-/// does, and its locks leave their lock files, as a rename's dry run does ([`set_name`]).
+/// Take back this Mac's registry row's newest rename, `seen`, the [`history::Undo`] the caller
+/// read and showed ([`history::undo_of`]), as `asker` asks (**Undo**): a new owner write of the
+/// values it replaced, made as any rename is. Its number is a checked rename back ([`change_claim`],
+/// judged by [`judge`] as any rename is, so only a number that is [`Verdict::Same`],
+/// [`Verdict::Free`] or [`Verdict::EarlierName`] is taken back, never one another Mac now holds,
+/// by any claim, or the vault gives another Mac), with the nickname it replaced, or a nickname
+/// change back alone ([`change_nick`], which leaves the claim as it is). Each of `seen`'s cells is
+/// written to the row, whatever the name held, as one write. Under the locks the undo reads
+/// History again and writes only while it gives `seen` ([`history::fence`]: the same newest
+/// rename, the row's whole name standing as it was), refusing ([`Cause::Unseen`]) otherwise, so
+/// a name changed after the caller read it, by either cell, is never taken somewhere the caller
+/// did not show. An undo is a rename like any other, so undoing it again
+/// redoes the rename. `lab` is read before any lock, and only for an undo that moves the number,
+/// as [`set_name`] reads it; a number the lock then finds moved is refused rather than checked
+/// unread. A dry run makes no node key and changes no existing name, though its first read makes
+/// the name as any first read does, and its locks leave their lock files, as a rename's dry run
+/// does ([`set_name`]).
 ///
 /// # Errors
-/// As [`ensure_in_view`]; History's newest change is not `seen`; History holds nothing to take
-/// back ([`undo_to`]); `lab` fails; the number or nickname is refused; a lock cannot be taken, or
-/// the name cannot be written. Each refusal carries its [`Refused`] ([`Refused::of`]).
+/// As [`ensure_in_view`]; the row no longer shows `seen`'s rename; `lab` fails; the number or
+/// nickname is refused; a lock cannot be taken, or the name cannot be written. Each refusal
+/// carries its [`Refused`] ([`Refused::of`]).
 pub fn undo_last<'a>(
     state: &Path,
-    seen: Option<&Change>,
+    seen: &history::Undo,
     lab: impl FnOnce() -> io::Result<client::LabLabels>,
     asker: impl Into<Asker<'a>>,
     roster: impl FnOnce() -> io::Result<Option<String>>,
@@ -1538,65 +1464,38 @@ pub fn undo_last<'a>(
 ) -> io::Result<NameSet> {
     let asker = asker.into();
     let (_, origin) = ensure_in_view(state, roster, now_ms)?;
-    let by = editor(state, asker.kind, dry_run)?;
-    let renumbers = file::read(state)?
-        .as_ref()
-        .and_then(|name| undo_to(name).ok())
-        .is_some_and(|to| matches!(to, UndoTo::Name(_)));
-    let lab = if renumbers {
-        Some(read_lab(lab)?)
-    } else {
-        None
+    let node = editor(state, dry_run)?;
+    let lab = match &seen.to {
+        UndoTo::Name(_) => Some(read_lab(lab)?),
+        UndoTo::Nickname(_) => None,
     };
     edit_name(
         state,
-        by,
+        node,
+        asker.kind,
         asker.session,
         origin,
         now_ms,
         dry_run,
-        RowWrite::Moved,
-        |held, locked| {
-            if let Some(seen) = seen
-                && held.history.first() != Some(seen)
-            {
-                return Err(Refused::new(
-                Cause::Unseen,
-                "this Mac's name changed after the undo read it, so nothing was undone: read the \
-                 name again and undo over what it shows"
-                    .to_owned(),
-            )
-            .into());
-            }
-            let to = undo_to(held)?;
-            let mut marked = held.clone();
-            if let Some(change) = marked.history.first_mut() {
-                change.undone = true;
-            }
-            match to {
-                UndoTo::Name(to) => {
-                    change_claim(&marked, &to, lab.as_ref(), locked, by, now_ms, Why::Undone)
-                }
-                UndoTo::Nickname(nick) => {
-                    change_nick(&marked, nick, locked, by, now_ms, Why::Undone)
-                }
-            }
+        RowWrite::Undo(seen),
+        |held, locked| match &seen.to {
+            UndoTo::Name(to) => change_claim(held, to, lab.as_ref(), locked, now_ms),
+            UndoTo::Nickname(nick) => change_nick(held, nick.clone(), locked),
         },
     )
 }
 
-/// Retire this Mac's earlier number `num` (`retired`), or restore it, in `was` (§5.6 card 3), for
-/// `kind`: a retired earlier number raises `top` only up to a person's cap
-/// ([`aterm_types::machine_name::top`]). The NAME, nickname and History stay as they are; a
-/// change raises `rev` and names this node, its key minted where it has none, as `by`. No
-/// registry row changes.
+/// Retire this Mac's earlier number `num` (`retired`), or restore it, in `was` (§5.6 card 3): a
+/// retired earlier number raises `top` only up to a person's cap
+/// ([`aterm_types::machine_name::top`]). The NAME and nickname stay as they are; a change raises
+/// `rev`, this node's key minted where it has none. No registry row changes.
 ///
 /// # Errors
 /// `num` is none of this Mac's earlier numbers ([`io::ErrorKind::NotFound`]); the node key cannot
 /// be read or minted; the name lock cannot be taken, or the name read or replaced
 /// ([`file::replace`]).
-pub fn retire_was(state: &Path, num: Number, retired: bool, kind: ByKind) -> io::Result<NameSet> {
-    let by = editor(state, kind, false)?;
+pub fn retire_was(state: &Path, num: Number, retired: bool) -> io::Result<NameSet> {
+    let node = editor(state, false)?;
     let mut changed = false;
     let name = file::replace(state, |stored| {
         let was = stored
@@ -1615,12 +1514,11 @@ pub fn retire_was(state: &Path, num: Number, retired: bool, kind: ByKind) -> io:
                 .rev
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("the name revision is exhausted"))?;
-            stored.by = by;
             changed = true;
         }
         Ok(())
     })?;
-    let me = by.map(|by| node_word(by.node));
+    let me = node.map(node_word);
     let shared = in_view(&taken_in(state, me.as_deref()), name.nick.as_str());
     Ok(NameSet {
         name,
@@ -1772,12 +1670,12 @@ fn rename_books(state: &Path, now_ms: u64) -> io::Result<RenameBooks> {
     Ok(RenameBooks { view, names })
 }
 
-/// `name` with the nickname `nick`, set by `by`: `chosen`, and the claim (NAME, class, `since`,
+/// `name` with the nickname `nick`: `chosen`, and the claim (NAME, class, `since`,
 /// `act`) as it was, so a nickname change never weakens the NAME's precedence (§5.4); `rev`
 /// rises for every changed nickname. `None` when `name` holds `nick` as a
 /// chosen nickname already.
 #[must_use]
-pub fn renicked(name: &MachineName, nick: Nickname, by: Option<By>) -> Option<MachineName> {
+pub fn renicked(name: &MachineName, nick: Nickname) -> Option<MachineName> {
     if name.nick == nick && name.nick_class == NickClass::Chosen {
         return None;
     }
@@ -1785,19 +1683,18 @@ pub fn renicked(name: &MachineName, nick: Nickname, by: Option<By>) -> Option<Ma
     next.nick = nick;
     next.nick_class = NickClass::Chosen;
     next.rev = name.rev.saturating_add(1);
-    next.by = by;
     Some(next)
 }
 
-/// Set this machine's nickname to `to` for `kind`, after making the name where none is there
+/// Set this machine's nickname to `to` as `asker` asks, after making the name where none is there
 /// ([`ensure_in_view`], which reads `roster` only then). Up to eight random draws precede a
 /// bounded pool search for a noun neither in view nor held; either nickname is `chosen`,
-/// since a person's press or an agent's act chose it, and so never changes by itself. `by` names
-/// this node, minted where it has none. A dry run changes no nickname and mints no node, though
-/// its read makes the name as any first read does.
-/// The book and name locks serialize edits with incoming records. A chosen name is refused when another
-/// node's signed record carries its canonical key; no book record replaces the local number.
-/// A change is recorded in History: [`Why::Nickname`] for a word, [`Why::Drawn`] for a draw.
+/// since a person's press or an agent's act chose it, and so never changes by itself. This node's
+/// key is minted where it has none. A dry run changes no nickname and mints no node, though its
+/// read makes the name as any first read does. The book and name locks serialize edits with
+/// incoming records. A chosen name is refused when another node's signed record carries its
+/// canonical key; no book record replaces the local number. The row's write of the nickname is
+/// what History lists ([`history`]).
 ///
 /// # Errors
 /// As [`ensure_in_view`]; the node key cannot be read or minted; fleet state or books cannot be
@@ -1814,14 +1711,11 @@ pub fn set_nick<'a>(
 ) -> io::Result<NickSet> {
     let asker = asker.into();
     let (_, origin) = ensure_in_view(state, roster, now_ms)?;
-    let by = editor(state, asker.kind, dry_run)?;
-    let why = match to {
-        NickTo::Word(_) => Why::Nickname,
-        NickTo::Random => Why::Drawn,
-    };
+    let node = editor(state, dry_run)?;
     let set = edit_name(
         state,
-        by,
+        node,
+        asker.kind,
         asker.session,
         origin,
         now_ms,
@@ -1834,7 +1728,7 @@ pub fn set_nick<'a>(
                     in_view(&locked.taken, noun) || noun.eq_ignore_ascii_case(stored.nick.as_str())
                 })?,
             };
-            change_nick(stored, nick, locked, by, now_ms, why)
+            change_nick(stored, nick, locked)
         },
     )?;
     Ok(NickSet {
@@ -1847,27 +1741,13 @@ pub fn set_nick<'a>(
 }
 
 /// `held` with the chosen nickname `nick` ([`renicked`]), refused where another node's record
-/// carries it; a change records one [`Change`] for `why`, and the claim stays as it was.
+/// carries it; the claim stays as it was.
 ///
 /// # Errors
 /// Another node's record carries `nick` ([`Cause::Nickname`]).
-fn change_nick(
-    held: &MachineName,
-    nick: Nickname,
-    locked: &Locked,
-    by: Option<By>,
-    now_ms: u64,
-    why: Why,
-) -> io::Result<MachineName> {
+fn change_nick(held: &MachineName, nick: Nickname, locked: &Locked) -> io::Result<MachineName> {
     require_free_nick(&locked.taken, &nick)?;
-    Ok(renicked(held, nick, by).map_or_else(
-        || held.clone(),
-        |mut next| {
-            let change = Change::between(held, &next, now_ms, why);
-            next.record(change);
-            next
-        },
-    ))
+    Ok(renicked(held, nick).unwrap_or_else(|| held.clone()))
 }
 
 /// The vault whose standing says whether this Mac is in a fleet ([`InFleet::read`]), found where

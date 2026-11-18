@@ -52,7 +52,7 @@ const CLAUDE_TOKEN: &str = "claude-token";
 /// The one verb that makes a Claude Code token ([`Want::producer`]): a person signs in to the
 /// account in a browser, and the verb stores the token in the vault's log
 /// (docs/DESIGN-claude-setup-token-2026-11-05.md §4.6).
-pub const CLAUDE_TOKEN_PRODUCER: &str = "aterm harness accounts token <label|email>";
+pub const CLAUDE_TOKEN_PRODUCER: &str = "aterm harness accounts token <account>";
 
 /// What a request names: never a file path a record could choose.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -60,7 +60,7 @@ fn look<'a>(
         now: NOW,
         tz_s: 0,
         machine: Some(MACHINE),
-        label: "main",
+        name: HomeName::label("main"),
         profile,
         account,
         state_unread: false,

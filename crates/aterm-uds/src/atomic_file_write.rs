@@ -414,7 +414,13 @@ pub mod publication_seam {
 /// digits.
 const SALT_BYTES: usize = 4;
 
+/// The name of a temporary that a write of `name` is made through. Each writer of `atomic_file`
+/// and `private_file` names its temporary here ([`create_temp_beside`], which aterm-agent's
+/// `write_atomic` goes through too, and a private directory's own writer), so this records the
+/// write in a trace scope armed on this thread ([`crate::trace::Effect::Write`]), whether or not
+/// it then lands.
 fn temp_component(name: &str, salt: &str) -> String {
+    crate::trace::effect(crate::trace::Effect::Write);
     format!(".{name}.tmp.{}.{salt}", std::process::id())
 }
 

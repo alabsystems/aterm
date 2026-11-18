@@ -8,7 +8,7 @@ use super::{
     authority::Inert,
     cell::{self, Cells, Projection},
     grid,
-    owned::{self, Op, OwnedRead, Quota, SchemaState},
+    owned::{self, LogRead, Op, OwnedRead, Quota, SchemaState},
 };
 use crate::Result;
 use astream_wire::sync::Digest;
@@ -38,6 +38,9 @@ pub struct View {
     pub inert: Inert,
     /// The owned collections' rows, past-quota records left out, each at its signer's own key.
     pub owned: BTreeMap<&'static str, OwnedRead>,
+    /// The log collections' entries, past-quota records left out, each at its signer's own key
+    /// (`<uuid32>.<n>`, [`owned::read_log`]): a log of a catalog table read as its typed rows.
+    pub logs: BTreeMap<&'static str, LogRead>,
     /// No retained operation could still become visible here (`Log::awaited`: none waits on a
     /// causal parent that has not arrived, and this Mac's own writer has nothing withheld), so
     /// a comparison against these cells misses nothing a later projection would add.
@@ -91,6 +94,7 @@ impl View {
             cells: Cells::new(),
             inert: Inert::default(),
             owned: BTreeMap::new(),
+            logs: BTreeMap::new(),
             complete: true,
             awaiting: Awaiting::NONE,
             refused: Vec::new(),
@@ -160,6 +164,35 @@ impl View {
             )
         } else {
             cell::project(collection, &self.cells)
+        }
+    }
+
+    /// [`Self::project`], with how each of the collection's claimed columns settled there
+    /// ([`typed::claim::Settlement`]), which a page asks before a Write what a value staged in
+    /// such a column will read as once written. A collection that claims nothing has none.
+    pub fn project_settled(
+        &self,
+        collection: &Collection,
+    ) -> (Projection, typed::claim::Settlements) {
+        let collection = self.collection(collection);
+        if collection
+            .columns
+            .iter()
+            .any(|column| column.claim.is_some())
+        {
+            typed::claim::settled(
+                collection,
+                &self.cells,
+                self.ops
+                    .iter()
+                    .filter(|op| !self.quota.over.contains(&op.id)),
+                &self.causal,
+            )
+        } else {
+            (
+                cell::project(collection, &self.cells),
+                typed::claim::Settlements::new(),
+            )
         }
     }
 

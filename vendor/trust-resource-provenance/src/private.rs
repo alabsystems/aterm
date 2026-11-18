@@ -37,9 +37,15 @@ pub(crate) fn owned(file: &File, directory: bool) -> io::Result<()> {
         return Err(refused("provenance backing belongs to another account"));
     }
     if m.mode() & 0o7077 != 0 {
-        return Err(refused("provenance backing has public or special mode bits"));
+        return Err(refused(
+            "provenance backing has public or special mode bits",
+        ));
     }
-    if if directory { !m.is_dir() } else { !m.is_file() || m.nlink() != 1 } {
+    if if directory {
+        !m.is_dir()
+    } else {
+        !m.is_file() || m.nlink() != 1
+    } {
         return Err(refused("provenance backing has wrong kind or link count"));
     }
     require_no_acl_grants(file)?;
@@ -141,7 +147,11 @@ pub(crate) fn directory(path: &Path) -> io::Result<File> {
     if !path.is_absolute() {
         return Err(refused("absolute provenance path required"));
     }
-    let mut dir = open_at(libc::AT_FDCWD, OsStr::new("/"), libc::O_RDONLY | libc::O_DIRECTORY)?;
+    let mut dir = open_at(
+        libc::AT_FDCWD,
+        OsStr::new("/"),
+        libc::O_RDONLY | libc::O_DIRECTORY,
+    )?;
     for part in path.components() {
         match part {
             Component::RootDir => {}
@@ -157,7 +167,10 @@ pub(crate) fn directory(path: &Path) -> io::Result<File> {
 pub(crate) fn open_private(dir: &File, name: &OsStr) -> io::Result<File> {
     if name.is_empty()
         || Path::new(name).components().count() != 1
-        || !matches!(Path::new(name).components().next(), Some(Component::Normal(_)))
+        || !matches!(
+            Path::new(name).components().next(),
+            Some(Component::Normal(_))
+        )
     {
         return Err(refused("private filename must be one component"));
     }
@@ -184,31 +197,38 @@ pub(crate) fn read_private(dir: &File, name: &OsStr, max: usize) -> io::Result<(
 }
 
 #[cfg(target_os = "macos")]
-fn acl_forbids(file: &File, policy: AclPolicy) -> io::Result<bool> {
+struct Acl(*mut std::ffi::c_void);
+#[cfg(target_os = "macos")]
+impl Drop for Acl {
+    fn drop(&mut self) {
+        unsafe extern "C" {
+            fn acl_free(object: *mut std::ffi::c_void) -> std::ffi::c_int;
+        }
+        // This snapshot came from acl_get_fd_np and is freed exactly once.
+        unsafe {
+            acl_free(self.0);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn original_acl(file: &File) -> io::Result<Option<Acl>> {
     use std::ffi::{c_int, c_void};
     // ABI and constants are the maintained astream-sys owner.rs declarations
     // from Apple's sys/acl.h, not a filesystem permission inference.
     unsafe extern "C" {
         fn acl_get_fd_np(fd: c_int, kind: c_int) -> *mut c_void;
-        fn acl_get_entry(acl: *mut c_void, which: c_int, entry: *mut *mut c_void) -> c_int;
-        fn acl_get_tag_type(entry: *mut c_void, tag: *mut c_int) -> c_int;
-        fn acl_free(object: *mut c_void) -> c_int;
         fn acl_valid(acl: *mut c_void) -> c_int;
-    }
-    struct Acl(*mut c_void);
-    impl Drop for Acl {
-        fn drop(&mut self) {
-            // SAFETY: this handle came from acl_get_fd_np and is freed once.
-            unsafe {
-                acl_free(self.0);
-            }
-        }
     }
     // SAFETY: the file is held through the call; success returns an owned ACL.
     let raw = unsafe { acl_get_fd_np(file.as_raw_fd(), 0x100) };
     if raw.is_null() {
         let error = io::Error::last_os_error();
-        return if error.raw_os_error() == Some(libc::ENOENT) { Ok(false) } else { Err(error) };
+        return if error.raw_os_error() == Some(libc::ENOENT) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
     }
     let acl = Acl(raw);
     // SAFETY: acl is this owned, live ACL snapshot. Validate it before treating
@@ -216,13 +236,72 @@ fn acl_forbids(file: &File, policy: AclPolicy) -> io::Result<bool> {
     if unsafe { acl_valid(acl.0) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    Ok(Some(acl))
+}
+
+/// Exact bounded descriptor ACL DATA, not an access verdict or owner. Search
+/// custody must bind deny-only changes too: accepting their admission policy
+/// alone does not prove an unchanged kernel access input.
+pub(crate) fn acl_snapshot(file: &File) -> io::Result<Vec<u8>> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::c_void;
+        // Apple's sys/acl.h external representation, no name resolution or
+        // alternate ACL evaluator. The original admission rules remain below.
+        unsafe extern "C" {
+            fn acl_size(acl: *mut c_void) -> isize;
+            fn acl_copy_ext(buffer: *mut c_void, acl: *mut c_void, size: isize) -> isize;
+        }
+        let Some(acl) = original_acl(file)? else {
+            return Ok(Vec::new());
+        };
+        let size = unsafe { acl_size(acl.0) };
+        if size < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if size == 0 || size > 64 * 1024 {
+            return Err(refused("descriptor ACL snapshot exceeds bound"));
+        }
+        let mut bytes = vec![0; size as usize];
+        let copied = unsafe { acl_copy_ext(bytes.as_mut_ptr().cast(), acl.0, size) };
+        if copied < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if copied != size {
+            return Err(refused("descriptor ACL external size changed"));
+        }
+        Ok(bytes)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // No unqualified platform ACL serializer: retain the maintained
+        // strictly-empty policy on Linux; other unsupported hosts still refuse.
+        require_no_acl_entries(file)?;
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn acl_forbids(file: &File, policy: AclPolicy) -> io::Result<bool> {
+    use std::ffi::{c_int, c_void};
+    unsafe extern "C" {
+        fn acl_get_entry(acl: *mut c_void, which: c_int, entry: *mut *mut c_void) -> c_int;
+        fn acl_get_tag_type(entry: *mut c_void, tag: *mut c_int) -> c_int;
+    }
+    let Some(acl) = original_acl(file)? else {
+        return Ok(false);
+    };
     let mut which = 0; // ACL_FIRST_ENTRY, then ACL_NEXT_ENTRY=-1
     loop {
         let mut entry = std::ptr::null_mut();
         // SAFETY: acl is live and entry is one writable output pointer.
         if unsafe { acl_get_entry(acl.0, which, &mut entry) } != 0 {
             let error = io::Error::last_os_error();
-            return if error.raw_os_error() == Some(libc::EINVAL) { Ok(false) } else { Err(error) };
+            return if error.raw_os_error() == Some(libc::EINVAL) {
+                Ok(false)
+            } else {
+                Err(error)
+            };
         }
         if matches!(policy, AclPolicy::NoEntries) {
             return Ok(true);
@@ -260,7 +339,10 @@ fn acl_forbids(file: &File, policy: AclPolicy) -> io::Result<bool> {
                 return Ok(true);
             }
             let error = io::Error::last_os_error();
-            if !matches!(error.raw_os_error(), Some(libc::ENODATA) | Some(libc::ENOTSUP)) {
+            if !matches!(
+                error.raw_os_error(),
+                Some(libc::ENODATA) | Some(libc::ENOTSUP)
+            ) {
                 return Err(error);
             }
         }

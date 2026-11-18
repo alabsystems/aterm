@@ -57,6 +57,41 @@ fn a_store_lease_io_failure_is_not_reported_as_an_unmanaged_compiler() {
     assert_eq!(who.len(), 1);
 }
 
+#[cfg(unix)]
+#[test]
+fn a_managed_offer_binds_the_exact_build_and_physical_lease_namespace() {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = aterm_tempfile::tempdir().unwrap();
+    let outer = root.path().canonicalize().unwrap();
+    let inner = outer.join("store/trust/9192/nested");
+    let bin = inner.join("store/trust/9192/bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(atpkg::lease::dir(&inner)).unwrap();
+    fs::set_permissions(atpkg::lease::dir(&inner), fs::Permissions::from_mode(0o700)).unwrap();
+    let bin = bin.canonicalize().unwrap();
+    // A generic holder can name an inner path as part of the outer build. Both subjects
+    // spell trust/9192, but only the inner namespace can protect its independently managed slot.
+    let mut wrong_namespace = ToolchainLeases::new();
+    retain_cut_lease(&mut wrong_namespace, &outer, &bin).unwrap();
+    assert!(offer_managed_cut_lease(&mut wrong_namespace, &inner, &bin, 9192).is_err());
+    assert_eq!(wrong_namespace.len(), 1, "the original hold remains owned");
+
+    let mut right_namespace = ToolchainLeases::new();
+    let offer = offer_managed_cut_lease(&mut right_namespace, &inner, &bin, 9192).unwrap();
+    assert_eq!(right_namespace.len(), 1);
+    assert!(offer.descriptor.as_raw_fd() >= 3);
+    assert!(offer_managed_cut_lease(&mut right_namespace, &inner, &bin, 9193).is_err());
+    let atpkg::lease::Holders::Held(holders) = atpkg::lease::holders(
+        &inner,
+        &atpkg::lease::Subject::build("trust", 9192).unwrap(),
+    ) else {
+        panic!("the matching namespace has an actual native holder");
+    };
+    assert_eq!(holders.len(), 1);
+}
+
 #[test]
 fn a_cut_leases_the_toolchain_it_pinned_and_nothing_else_does() {
     assert!(

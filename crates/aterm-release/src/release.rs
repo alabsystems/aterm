@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::check_record::{Half, VerifyRun};
 use crate::provision::{AskWords, Audited, Finding};
 
+pub use crate::trust_lock::CompilerPin;
+
 /// How an operator runs a release: the one spelling every remedy names.
 pub const RELEASE_COMMAND: &str = crate::ledger::RELEASE_COMMAND;
 
@@ -516,6 +518,10 @@ pub struct Journal {
     pub prover: String,
     /// Its `trustc -vV` commit-hash.
     pub trustc: String,
+    /// The complete compiler declaration read from this exact candidate's original lock.
+    /// Historical journals without it retain no authority to reuse compiler-dependent work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiler: Option<CompilerPin>,
     /// R is the bump this release committed.
     #[serde(default)]
     pub bumped: bool,
@@ -582,6 +588,9 @@ pub struct Prepared {
     pub prover: String,
     /// That prover's `trustc -vV` commit-hash.
     pub trustc: String,
+    /// The exact source declaration whose compiler and stock roles were prepared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiler: Option<CompilerPin>,
     /// The build number it reserved (the journal's reservation), built and verified.
     pub build: u64,
     /// SHA-256 of the executable `verify release` judged (the record it passed on).
@@ -1000,6 +1009,8 @@ pub struct Prover {
     pub commit: String,
     /// Where it came from, for the plan line.
     pub source: String,
+    /// The complete immutable source declaration, present for a candidate-owned release.
+    pub compiler: Option<CompilerPin>,
 }
 
 /// The cut journal (`dist/cut-state.toml`) as the release reads it.
@@ -1749,6 +1760,19 @@ pub trait Backend {
     fn record_time(&mut self, version: &str, row: &str, secs: u64);
 
     fn prover(&mut self, journaled: Option<&str>) -> Result<Prover, String>;
+    /// Resolve a release compiler from the exact selected source, independently of HEAD,
+    /// current store selectors and historical physical prover paths.
+    fn candidate_prover(
+        &mut self,
+        _commit: &str,
+        journal: Option<&Journal>,
+    ) -> Result<Prover, String> {
+        self.prover(journal.map(|journal| journal.prover.as_str()))
+    }
+    /// Inspect the exact source declaration without selecting or probing a compiler.
+    fn compiler_pin(&mut self, _commit: &str) -> Result<Option<CompilerPin>, String> {
+        Ok(None)
+    }
     fn lease(&mut self, prover: &Prover) -> Result<(), String>;
     /// Take or adopt the release's one build-inputs seal, under the toolchain lease, and keep it
     /// for every later step and child ([`crate::build_inputs::arm`]); never in a dry run.
@@ -1922,6 +1946,15 @@ pub trait Backend {
     /// so its test signature runs before the publish. An explicitly selected credentials
     /// profile is the one audited and authorized against the current roster.
     fn audit(&mut self, machine_id: &str, profile: Option<&Path>, dry: bool) -> Vec<Finding>;
+    fn audit_candidate(
+        &mut self,
+        _commit: &str,
+        machine_id: &str,
+        profile: Option<&Path>,
+        dry: bool,
+    ) -> Vec<Finding> {
+        self.audit(machine_id, profile, dry)
+    }
     /// What this machine lacks to make the writes of the publish, cut and after-cut steps
     /// ([`crate::provision::distribution`]): the site checkout, its deployer key and push, and
     /// the push rights on the repositories and the tap, each proved by a read or a dry run.
@@ -3671,7 +3704,63 @@ impl Run<'_> {
     }
 
     fn same_prover(p: &Prover, prep: &Prepared) -> bool {
-        p.bin.display().to_string() == prep.prover && p.commit == prep.trustc
+        p.bin.display().to_string() == prep.prover
+            && p.commit == prep.trustc
+            && p.compiler == prep.compiler
+    }
+
+    /// Historical paths and compiler commits cannot establish the source lock that judged
+    /// prepared work. Re-preparation may judge it anew, retaining no old compiler-dependent
+    /// verdicts; a mismatched recorded declaration is always a refusal before journal writes.
+    fn selected_prover(&mut self) -> Result<Prover, String> {
+        let commit = self.commit_r();
+        let previous = self
+            .journal
+            .as_ref()
+            .filter(|journal| journal.commit == commit && !journal.finished())
+            .cloned();
+        let prover = self.b.candidate_prover(&commit, previous.as_ref())?;
+        if let Some(pin) = &prover.compiler
+            && let Some(journal) = previous
+        {
+            if journal.compiler.as_ref().is_some_and(|old| old != pin) {
+                return Err("the selected candidate's compiler declaration differs from its journal; preserve the journal and inspect the selected source".into());
+            }
+            if journal.compiler.is_none()
+                && (!journal.done.is_empty()
+                    || journal.reserved.is_some()
+                    || journal.artifact.is_some()
+                    || journal.prepared.is_some())
+            {
+                if !self.opts.prepare || self.claimed() {
+                    return Err("the historical journal has no candidate compiler declaration; rejudge it with --prepare before reusing prepared work".into());
+                }
+                if let Some(journal) = self.journal.as_mut() {
+                    journal.done.clear();
+                    journal.reserved = None;
+                    journal.artifact = None;
+                    journal.prepared = None;
+                }
+            }
+        }
+        Ok(prover)
+    }
+
+    fn hold_selected_prover(&mut self) -> Flow {
+        let prover = self.selected_prover().map_err(|why| {
+            self.halted(
+                Refusal::new(why, "restore the candidate's locked compiler").could_not_run(),
+            )
+        })?;
+        if !self.dry {
+            self.b.lease(&prover).map_err(|why| {
+                self.halted(
+                    Refusal::new(why, "restore the candidate compiler lease").could_not_run(),
+                )
+            })?;
+        }
+        self.prover = Some(prover);
+        Ok(())
     }
 
     /// Steps 4 and 5: whether the bundle half ran and passed.
@@ -3994,6 +4083,7 @@ impl Run<'_> {
                 at: now,
                 prover: p.bin.display().to_string(),
                 trustc: p.commit.clone(),
+                compiler: p.compiler.clone(),
                 build: reserved.build,
                 macho_sha256: artifact.macho_sha256.clone(),
                 engine: engine.clone(),
@@ -4120,12 +4210,7 @@ impl Run<'_> {
             self.refuse_hard(refusal)?;
         }
 
-        let journaled = self
-            .journal
-            .as_ref()
-            .filter(|j| !j.finished())
-            .map(|j| j.prover.clone());
-        match self.b.prover(journaled.as_deref()) {
+        match self.selected_prover() {
             Ok(p) => {
                 if !self.dry
                     && let Err(error) = self.b.lease(&p)
@@ -4189,6 +4274,7 @@ impl Run<'_> {
         }
 
         self.choose_candidate(false)?;
+        self.hold_selected_prover()?;
         if self.cand.as_ref().is_some_and(|c| c.bump_from.is_none()) {
             self.public_state();
         }
@@ -4971,7 +5057,7 @@ impl Run<'_> {
         };
         self.tip = tip;
         self.open_next_candidate(true)?;
-        let prover = match self.b.prover(None) {
+        let prover = match self.selected_prover() {
             Ok(prover) => prover,
             Err(why) => {
                 return self.refuse_hard(
@@ -5006,6 +5092,20 @@ impl Run<'_> {
             Err(refusal) => return self.refuse_hard(refusal),
         };
         self.open_next_candidate(false)?;
+        let fresh_tip = self.tip.clone();
+        let fresh_pin = self.b.compiler_pin(&fresh_tip).map_err(|why| {
+            self.halted(
+                Refusal::new(why, "restore origin/main's original compiler lock").could_not_run(),
+            )
+        })?;
+        if fresh_pin != prover.compiler {
+            if let Some(candidate) = self.cand.as_mut() {
+                candidate.commit = fresh_tip;
+            }
+            self.hold_selected_prover()?;
+            self.own_cutter()?;
+        }
+        let prover = self.prover.clone().ok_or(Halt::Said(1))?;
         let candidate = self.cand.clone().ok_or(Halt::Said(1))?;
         let from = candidate.bump_from.clone().ok_or(Halt::Said(1))?;
         let tip = self.tip.clone();
@@ -5278,12 +5378,7 @@ impl Run<'_> {
                 self.cand = Some(self.fix_candidate(journal.as_ref(), false)?);
             }
         }
-        let journaled = self
-            .journal
-            .as_ref()
-            .filter(|j| !j.finished())
-            .map(|j| j.prover.clone());
-        self.prover = Some(self.b.prover(journaled.as_deref()).map_err(|why| {
+        self.prover = Some(self.selected_prover().map_err(|why| {
             self.halted(Refusal::new(why, "restore the locked Trust toolchain").could_not_run())
         })?);
         let mut candidate = self.cand.clone().ok_or(Halt::Said(1))?;
@@ -5325,9 +5420,10 @@ impl Run<'_> {
             // Give the frozen image the same pending identity as real preparation. It must
             // judge that identity through the ordinary acceptance path, never a dry-only
             // ancestry exemption. Nothing saves this in-memory journal.
+            self.cand = Some(candidate.clone());
+            self.hold_selected_prover()?;
             let prover = self.prover.clone().ok_or(Halt::Said(1))?;
             self.journal = Some(self.carried_journal(&candidate, line, &prover));
-            self.cand = Some(candidate);
         }
         self.own_cutter()
     }
@@ -5384,12 +5480,7 @@ impl Run<'_> {
         self.host_fits(held)?;
         self.stop_if_held()?;
         let r = self.commit_r();
-        let journaled = self
-            .journal
-            .as_ref()
-            .filter(|j| !j.finished())
-            .map(|j| j.prover.clone());
-        let prover = match self.b.prover(journaled.as_deref()) {
+        let prover = match self.selected_prover() {
             Ok(prover) => prover,
             Err(why) => {
                 let refusal = Refusal::new(
@@ -5461,6 +5552,7 @@ impl Run<'_> {
         {
             self.tip = self.b.fetch().map_err(|r| self.halted(r))?;
             self.choose_candidate(false)?;
+            self.hold_selected_prover()?;
             // A resumed R whose journal holds its passed preflight is asked once. Step 1 asks
             // an unclaimed R: it carries the recorded verdict where it stands and judges again
             // where it does not, so asking here too only repeated the judgment before every
@@ -5676,8 +5768,7 @@ impl Run<'_> {
                 return self.refuse_hard(refusal);
             }
             let prover = self
-                .b
-                .prover(None)
+                .selected_prover()
                 .map_err(|why| self.halted(Refusal::new(why, "restore the selected toolchain")))?;
             if let Err(why) = self.b.lease(&prover) {
                 return self.refuse_hard(Refusal::new(why, "restore the selected toolchain lease"));
@@ -6355,6 +6446,7 @@ impl Run<'_> {
             commit: candidate.commit.clone(),
             prover: prover.bin.display().to_string(),
             trustc: prover.commit.clone(),
+            compiler: prover.compiler.clone(),
             started: self.b.now(),
             linux: self.linux.clone(),
             windows: self.carried_windows(),
@@ -6506,6 +6598,8 @@ impl Run<'_> {
                 Err(r) => self.refuse(r)?,
             }
         }
+        self.hold_selected_prover()?;
+        let prover = self.prover.clone().ok_or(Halt::Said(1))?;
         // A carried head is private until its content-neutral record merge lands. Persist its
         // complete retry identity before moving main: move_to can change HEAD and then refuse
         // while synchronizing the submodule or proving the checkout clean.
@@ -6559,6 +6653,7 @@ impl Run<'_> {
                 commit: cand.commit.clone(),
                 prover: prover.bin.display().to_string(),
                 trustc: prover.commit.clone(),
+                compiler: prover.compiler.clone(),
                 bumped,
                 started,
                 linux: self.linux.clone(),
@@ -6582,6 +6677,7 @@ impl Run<'_> {
         {
             j.prover = prover.bin.display().to_string();
             j.trustc = prover.commit.clone();
+            j.compiler = prover.compiler.clone();
             if self.linux.declared() {
                 j.linux = self.linux.clone();
             }
@@ -6640,6 +6736,7 @@ impl Run<'_> {
     }
 
     fn own_cutter(&mut self) -> Flow {
+        self.hold_selected_prover()?;
         self.announce_line_selection(false);
         let r = self.commit_r();
         match self.b.own_cutter(&r) {
@@ -8346,9 +8443,13 @@ impl Run<'_> {
             let found = match (&self.dry_audit, self.dry) {
                 (Some(found), true) => found.clone(),
                 _ => {
-                    let mut found =
-                        self.b
-                            .audit(&id, self.opts.release_credentials.as_deref(), self.dry);
+                    let commit = self.commit_r();
+                    let mut found = self.b.audit_candidate(
+                        &commit,
+                        &id,
+                        self.opts.release_credentials.as_deref(),
+                        self.dry,
+                    );
                     if !self.opts.qualify {
                         found.extend(self.b.distribution(self.dry));
                     }

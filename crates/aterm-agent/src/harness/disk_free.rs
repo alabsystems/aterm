@@ -180,6 +180,10 @@ pub struct Admitted {
     pub path: PathBuf,
     /// The root it lies under, as resolved.
     pub root: PathBuf,
+    /// Resolved Cargo home when any Cargo cache root contains this target,
+    /// including aliases overlapping another safelisted root. This is only
+    /// classification DATA; removal still acquires the actual protocol locks.
+    pub cargo_home: Option<PathBuf>,
     /// The file allocation counted before removal ([`super::target::cache_bytes`]).
     pub bytes: u64,
     /// Whether the count stopped short, so `bytes` is a lower bound.
@@ -485,6 +489,43 @@ struct Placed {
     id: FileId,
     /// The home folder, resolved.
     home: PathBuf,
+    /// Cargo protocol home retained through placement and automatic selection.
+    cargo_home: Option<PathBuf>,
+}
+
+/// Keep Cargo classification even when its root is reached through another
+/// cache root. A whole Cargo root or its ancestor is never reclaimed here.
+fn cargo_home_for(path: &Path, home: &Path) -> Result<Option<PathBuf>, String> {
+    let mut contains = false;
+    for candidate in ROOTS
+        .iter()
+        .filter(|candidate| matches!(candidate.rel, ".cargo/registry" | ".cargo/git"))
+    {
+        let named = candidate.under(home);
+        match real_path(&named) {
+            Ok(resolved) => {
+                if same(path, &resolved) || strictly_under(&resolved, path) {
+                    return Err(
+                        "it contains a Cargo cache root: only the root's children may be reclaimed"
+                            .to_owned(),
+                    );
+                }
+                contains |= strictly_under(path, &resolved);
+            }
+            Err(error)
+                if std::fs::symlink_metadata(&named).is_ok_and(|m| m.file_type().is_symlink()) =>
+            {
+                return Err(format!(
+                    "Cargo cache root cannot be resolved for reclamation: {error}"
+                ));
+            }
+            Err(_) => {}
+        }
+    }
+    contains
+        .then(|| real_path(&home.join(".cargo")))
+        .transpose()
+        .map_err(|error| format!("Cargo home cannot be resolved for reclamation: {error}"))
 }
 
 /// The fences of [`judge`] that read nothing under `path`: it is absolute, strictly under a
@@ -506,6 +547,10 @@ fn placed(path: &Path, home: &Path, mounts: Option<&Table>) -> Result<Placed, St
         )
     })?;
     let (root, root_real) = root_of(path, given, &home)?;
+    let cargo_home = cargo_home_for(path, given)?;
+    if matches!(root.rel, ".cargo/registry" | ".cargo/git") && cargo_home.is_none() {
+        return Err("Cargo cache root changed while its classification was read".to_owned());
+    }
     let rest = path
         .components()
         .nth(root_real.components().count())
@@ -551,6 +596,7 @@ fn placed(path: &Path, home: &Path, mounts: Option<&Table>) -> Result<Placed, St
         root: root_real,
         id,
         home,
+        cargo_home,
     })
 }
 
@@ -585,6 +631,7 @@ fn unmanaged(path: &Path, at: Placed) -> Result<Admitted, String> {
     Ok(Admitted {
         path: path.to_path_buf(),
         root: at.root,
+        cargo_home: at.cargo_home,
         bytes: used.bytes,
         partial: used.partial,
         id: at.id,
@@ -724,12 +771,28 @@ fn one(
         Err(why) => return Verdict::Refused(why),
     };
     if dry_run {
+        let _cargo = match reclaim_cargo(&a) {
+            Ok(guard) => guard,
+            Err(why) => return Verdict::Refused(why),
+        };
         return Verdict::Would {
             bytes: a.bytes,
             partial: a.partial,
         };
     }
     remove(&a, world, journal, Removal::InPlace)
+}
+
+/// An absence of open crate files does not mean Cargo has finished using
+/// its sources. Both removal paths and previews use the original protocol.
+fn reclaim_cargo(
+    a: &Admitted,
+) -> Result<Option<aterm_toolchain::cargo_cache::SourceCacheReclaimGuard>, String> {
+    a.cargo_home
+        .as_deref()
+        .map(aterm_toolchain::cargo_cache::SourceCacheReclaimGuard::try_acquire)
+        .transpose()
+        .map_err(|error| format!("Cargo source-cache reclamation custody unavailable: {error}"))
 }
 
 /// How [`remove`] takes the path it admitted.
@@ -779,6 +842,10 @@ fn remove(
     journal: &mut dyn FnMut(&str) -> bool,
     how: Removal,
 ) -> Verdict {
+    let cargo = match reclaim_cargo(a) {
+        Ok(guard) => guard,
+        Err(why) => return Verdict::Refused(why),
+    };
     let why = format!(
         "a cache under {} that tools rebuild or download again: no link, on the root's volume, \
          no mount point and no process under it",
@@ -811,11 +878,15 @@ fn remove(
         return Verdict::Refused(why);
     }
     let mut permit = || {
-        if clearance.current() {
-            Ok(())
-        } else {
-            Err("registered-cache index changed during removal".to_owned())
+        if !clearance.current() {
+            return Err("registered-cache index changed during removal".to_owned());
         }
+        if let Some(guard) = &cargo {
+            guard.check_current().map_err(|error| {
+                format!("Cargo cache lock identity changed during removal: {error}")
+            })?;
+        }
+        Ok(())
     };
     let at = match how {
         Removal::InPlace => a.path.clone(),
@@ -936,13 +1007,22 @@ fn finish_one(
         Err(why) => return Verdict::Refused(why),
     };
     let used = released(path, id.dev, None);
+    let cargo_home = match cargo_home_for(path, home) {
+        Ok(home) => home,
+        Err(why) => return Verdict::Refused(why),
+    };
     let a = Admitted {
         path: path.to_path_buf(),
         root: path.parent().unwrap_or(home).to_path_buf(),
+        cargo_home,
         bytes: used.bytes,
         partial: used.partial,
         id,
         last_use: used.newest,
+    };
+    let cargo = match reclaim_cargo(&a) {
+        Ok(guard) => guard,
+        Err(why) => return Verdict::Refused(why),
     };
     let why = "what an earlier pass set aside and could not finish removing";
     if !journal(&row(
@@ -956,11 +1036,15 @@ fn finish_one(
         return Verdict::Refused(UNJOURNALLED.to_owned());
     }
     let mut permit = || {
-        if clearance.current() {
-            Ok(())
-        } else {
-            Err("registered-cache index changed during removal".to_owned())
+        if !clearance.current() {
+            return Err("registered-cache index changed during removal".to_owned());
         }
+        if let Some(guard) = &cargo {
+            guard.check_current().map_err(|error| {
+                format!("Cargo cache lock identity changed during removal: {error}")
+            })?;
+        }
+        Ok(())
     };
     let result = super::target::remove_unmanaged_tree(path, id, &mut permit);
     record_removal(&a, path, result, world, journal, why)

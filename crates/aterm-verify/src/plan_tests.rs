@@ -17,7 +17,11 @@ pub(super) fn ctx(checks: &[Check], scope: Scope) -> Ctx {
 }
 
 fn ids(ctx: &Ctx) -> Vec<StageId> {
-    plan(ctx).into_iter().map(|s| s.id).collect()
+    plan(ctx)
+        .expect("complete graph and plan")
+        .into_iter()
+        .map(|s| s.id)
+        .collect()
 }
 
 #[test]
@@ -27,7 +31,7 @@ fn linux_vm_wait_keeps_no_lab_compiler_reservation() {
         Some(32 << 30),
         Some(28 << 30),
     ));
-    let stages = plan(&c);
+    let stages = plan(&c).expect("complete graph and plan");
     let build = stages
         .iter()
         .position(|s| s.id == StageId::LinuxLabBuild)
@@ -282,11 +286,12 @@ fn an_old_lanes_stuck_aside_is_tried_again_once_the_lane_is_gone() {
 fn compile_only_uses_the_normal_test_compile_without_running_tests() {
     let normal = ctx(&[Check::Test], Scope::Workspace);
     let expected = plan(&normal)
+        .expect("complete graph and plan")
         .into_iter()
         .find(|s| s.id == StageId::TestCompile)
         .unwrap();
     let focused = normal.with_compile_only(true);
-    let planned = plan(&focused);
+    let planned = plan(&focused).expect("complete graph and plan");
     assert_eq!(planned.len(), 1);
     assert_eq!(planned[0].id, expected.id);
     assert_eq!(planned[0].mem, expected.mem);
@@ -296,6 +301,7 @@ fn compile_only_uses_the_normal_test_compile_without_running_tests() {
     );
     assert!(
         plan(&ctx(&[Check::Test], Scope::Workspace))
+            .expect("complete graph and plan")
             .iter()
             .any(|s| s.id == StageId::Test)
     );
@@ -310,7 +316,7 @@ fn compile_only_measure_builds_its_matrix_without_a_product_or_timing_admission(
         crate::cli::parse(["measure", "--app", "a", "--compile-only", "--cursor-pacing"]).is_err()
     );
     let prepare = ctx(&[Check::Measure], Scope::Workspace).with_compile_only(true);
-    let planned = plan(&prepare);
+    let planned = plan(&prepare).expect("complete graph and plan");
     assert_eq!(planned.len(), 1);
     assert_eq!(planned[0].id, StageId::MeasurePrebuild);
     assert!(!planned[0].id.timed());
@@ -320,10 +326,16 @@ fn compile_only_measure_builds_its_matrix_without_a_product_or_timing_admission(
         .with_measure_artifact(Some(crate::MeasureArtifact::unnamed("/a/aterm.app")));
     assert!(
         plan(&normal)
+            .expect("complete graph and plan")
             .iter()
             .any(|s| s.id == StageId::MeasuringTests)
     );
-    assert!(plan(&normal).iter().any(|s| s.id == StageId::GuiSmoke));
+    assert!(
+        plan(&normal)
+            .expect("complete graph and plan")
+            .iter()
+            .any(|s| s.id == StageId::GuiSmoke)
+    );
     assert_ne!(
         crate::disk::selection_of(&prepare),
         crate::disk::selection_of(&normal)
@@ -402,12 +414,14 @@ fn a_cones_red_lint_row_reruns_the_cone_by_its_base() {
 fn compile_only_keeps_the_shared_test_graph_and_neither_runtime() {
     let full = ctx(&[Check::Test, Check::Checkers], Scope::Workspace);
     let expected: Vec<_> = plan(&full)
+        .expect("complete graph and plan")
         .into_iter()
         .filter(|s| s.id == StageId::TestCompile)
         .map(|s| (s.id, s.mem, s.lane))
         .collect();
     let focused = full.with_compile_only(true);
     let actual: Vec<_> = plan(&focused)
+        .expect("complete graph and plan")
         .into_iter()
         .map(|s| (s.id, s.mem, s.lane))
         .collect();
@@ -416,6 +430,7 @@ fn compile_only_keeps_the_shared_test_graph_and_neither_runtime() {
     assert!(focused.rerun(Check::Checkers).ends_with(" --compile-only"));
     assert!(
         plan(&ctx(&[Check::Test, Check::Checkers], Scope::Workspace))
+            .expect("complete graph and plan")
             .iter()
             .any(|s| s.id == StageId::SpecCheckers)
     );
@@ -443,8 +458,13 @@ fn a_run_that_measures_memory_plans_each_stages_claim_from_its_book() {
     let checks = [Check::Test, Check::Lint, Check::Fmt];
     let key = crate::memory::Key::of_run(compile.id, &ctx(&checks, scope.clone()));
     book.keep(&compile, &key, 10 * GIB).expect("kept");
-    let claims =
-        |c: &Ctx| -> Vec<(StageId, u64)> { plan(c).into_iter().map(|s| (s.id, s.mem)).collect() };
+    let claims = |c: &Ctx| -> Vec<(StageId, u64)> {
+        plan(c)
+            .expect("complete graph and plan")
+            .into_iter()
+            .map(|s| (s.id, s.mem))
+            .collect()
+    };
     assert_eq!(
         claims(&ctx(&checks, scope.clone()).with_memory(book)),
         [
@@ -484,8 +504,8 @@ fn a_heavy_test_compile_is_planned_as_its_calls_in_its_place() {
         1,
     );
     records.save(&path).expect("saved");
-    fn members(_: &Ctx) -> crate::changed::Members {
-        crate::changed::Members::new(
+    fn members(_: &Ctx) -> Result<crate::changed::Members, String> {
+        Ok(crate::changed::Members::new(
             crate::shape::tests::s1()
                 .into_iter()
                 .map(|name| crate::changed::Member {
@@ -494,7 +514,7 @@ fn a_heavy_test_compile_is_planned_as_its_calls_in_its_place() {
                     has_lib: true,
                 })
                 .collect(),
-        )
+        ))
     }
     let checks = [Check::Test];
     for scope in [
@@ -506,7 +526,7 @@ fn a_heavy_test_compile_is_planned_as_its_calls_in_its_place() {
         let mut c = ctx(&checks, scope.clone()).with_memory(book);
         c.unit_graph = crate::shape::tests::fixture_graph;
         c.workspace_members = members;
-        let planned = plan(&c);
+        let planned = plan(&c).expect("complete graph and plan");
         let compiles: Vec<(usize, &StageSpec)> = planned
             .iter()
             .enumerate()
@@ -544,7 +564,7 @@ fn a_heavy_test_compile_is_planned_as_its_calls_in_its_place() {
         );
         crate::sched::check_waits(&planned).expect("each awaits only earlier stages");
 
-        let whole = plan(&ctx(&checks, scope));
+        let whole = plan(&ctx(&checks, scope)).expect("complete graph and plan");
         assert_eq!(
             whole
                 .iter()
@@ -584,7 +604,7 @@ fn an_unshaped_test_compile_claims_at_least_its_estimate() {
         );
         let crates: Vec<String> = crates.iter().map(|c| (*c).to_owned()).collect();
         let c = ctx(&[Check::Test], Scope::packages(&crates)).with_memory(book);
-        let p = plan(&c);
+        let p = plan(&c).expect("complete graph and plan");
         let s = p
             .iter()
             .find(|s| s.id == StageId::TestCompile)
@@ -647,7 +667,7 @@ fn the_test_compile_claims_its_estimate_where_the_lint_claims_the_lesser() {
     );
     let crates = ["a".to_owned(), "b".to_owned()];
     let c = ctx(&[Check::Test, Check::Lint], Scope::packages(&crates)).with_memory(book);
-    let p = plan(&c);
+    let p = plan(&c).expect("complete graph and plan");
     let of = |id: StageId| {
         let s = p.iter().find(|s| s.id == id).expect("planned");
         (s.mem, s.part.as_ref().map(|p| p.said.clone()))
@@ -679,7 +699,11 @@ fn a_named_skip_plans_no_memory() {
         let c = ctx(&[Check::Appkit], Scope::workspace())
             .with_no_windows(no_windows)
             .with_memory(book());
-        plan(&c).into_iter().map(|s| (s.id, s.mem)).collect()
+        plan(&c)
+            .expect("complete graph and plan")
+            .into_iter()
+            .map(|s| (s.id, s.mem))
+            .collect()
     };
     assert_eq!(
         claims(true),
@@ -713,8 +737,13 @@ fn an_empty_cone_plans_no_memory_for_the_stages_over_its_selection() {
             Some(43 * GIB / 2),
         ))
     };
-    let claims =
-        |c: &Ctx| -> Vec<(StageId, u64)> { plan(c).into_iter().map(|s| (s.id, s.mem)).collect() };
+    let claims = |c: &Ctx| -> Vec<(StageId, u64)> {
+        plan(c)
+            .expect("complete graph and plan")
+            .into_iter()
+            .map(|s| (s.id, s.mem))
+            .collect()
+    };
     let empty = run(Vec::new());
     assert_eq!(
         claims(&empty),
@@ -747,7 +776,7 @@ fn a_selection_plans_exactly_its_checks_stages_and_never_deadlocks() {
         ids(&ctx(&[Check::Test], Scope::workspace())),
         [StageId::TestCompile, StageId::Test]
     );
-    let lone_fmt = plan(&ctx(&[Check::Fmt], Scope::workspace()));
+    let lone_fmt = plan(&ctx(&[Check::Fmt], Scope::workspace())).expect("complete graph and plan");
     assert!(
         lone_fmt[0].after_stages.is_empty(),
         "a stage never waits on one the run does not plan"
@@ -761,7 +790,7 @@ fn a_selection_plans_exactly_its_checks_stages_and_never_deadlocks() {
             } else {
                 ctx(&checks, Scope::workspace())
             };
-            let p = plan(&c);
+            let p = plan(&c).expect("complete graph and plan");
             crate::sched::check_waits(&p)
                 .unwrap_or_else(|e| panic!("{checks:?} could deadlock: {e}"));
             let mut want = crate::checks::stages_of(&checks, c.checkers_in_tests);
@@ -786,12 +815,12 @@ fn pooled_codegen_waits_for_every_preflight() {
     let c = ctx(&RELEASE, Scope::workspace())
         .with_release(true)
         .with_pool(Some(pool));
-    let p = plan(&c);
+    let p = plan(&c).expect("complete graph and plan");
     let compile = p.iter().position(|s| s.id == StageId::TestCompile).unwrap();
     let mut done = vec![false; p.len()];
     for id in [
-        StageId::Formatting,
         StageId::Census,
+        StageId::Formatting,
         StageId::ExportScan,
         StageId::Tippy,
     ] {
@@ -811,7 +840,7 @@ fn pooled_codegen_waits_for_every_preflight() {
 fn source_and_type_preflight_finish_before_test_codegen() {
     use crate::sched::{awaited, ready};
     let c = ctx(&RELEASE, Scope::workspace()).with_release(true);
-    let p = plan(&c);
+    let p = plan(&c).expect("complete graph and plan");
     let at = |id| p.iter().position(|s| s.id == id).expect("planned");
     let (compile, test) = (at(StageId::TestCompile), at(StageId::Test));
     assert_eq!(
@@ -819,8 +848,8 @@ fn source_and_type_preflight_finish_before_test_codegen() {
         lane_dir(&c, Lane::MainTarget)
     );
     let preflight: Vec<_> = [
-        StageId::Formatting,
         StageId::Census,
+        StageId::Formatting,
         StageId::ExportScan,
         StageId::Tippy,
     ]
@@ -854,47 +883,44 @@ fn source_and_type_preflight_finish_before_test_codegen() {
     assert!(ready(&p, &done, &done, 0, test, u64::MAX));
 }
 
-/// THE GUARDS RUN TOGETHER. In the dev set the released shim, whose build's lane is its own, is
-/// first and alone; formatting, the source guards, the export scan and the lint then wait for it
-/// and for none of each other, so all four start beside one another. The test compile and the
-/// test run wait for the shim and the three guards, and the compile starts beside a lint still
-/// running (`docs/DESIGN-landing-economy.md` §2.2b).
+/// Census precedes the bootstrap build. Formatting, export and lint then wait for the shim
+/// and for none of each other. The test compile waits for every source guard and the shim,
+/// and starts beside a lint still running (`docs/DESIGN-landing-economy.md` §2.2b).
 /// NEGATIVE CONTROL: with any one of the shim and the guards unfinished the test compile does not
-/// start, so no source red is found after test code generation began; and a plan without the
-/// released shim starts the four at once.
+/// start; a plan without the released shim retains the independent guards' overlap.
 #[test]
-fn the_guards_and_the_lint_run_together_once_the_released_shim_is_done() {
+fn census_precedes_the_shim_and_the_remaining_guards_still_overlap() {
     use crate::sched::{awaited, ready};
     let p = plan(&ctx(
         &DEV,
         Scope::changed("origin/main", vec!["seed".into()], true),
-    ));
+    ))
+    .expect("complete graph and plan");
     let at = |id| p.iter().position(|s| s.id == id).expect("planned");
+    let census = at(StageId::Census);
     let shim = at(StageId::ReleasedShim);
-    let together = [
-        StageId::Formatting,
-        StageId::Census,
-        StageId::ExportScan,
-        StageId::Tippy,
-    ]
-    .map(at);
+    let together = [StageId::Formatting, StageId::ExportScan, StageId::Tippy].map(at);
     let compile = at(StageId::TestCompile);
     let lint = at(StageId::Tippy);
-    assert!(p[shim].after_stages.is_empty());
+    assert!(p[census].after_stages.is_empty());
+    assert_eq!(awaited(&p, shim).collect::<Vec<_>>(), [census]);
     for i in together {
         assert_eq!(p[i].after_stages, [StageId::ReleasedShim], "{:?}", p[i].id);
         assert_eq!(awaited(&p, i).collect::<Vec<_>>(), [shim]);
     }
-    let mut all = vec![shim];
+    let mut all = vec![census, shim];
     all.extend(together.into_iter().filter(|&i| i != lint));
     assert_eq!(awaited(&p, compile).collect::<Vec<_>>(), all);
 
     let none = vec![false; p.len()];
-    assert!(ready(&p, &none, &none, 0, shim, u64::MAX));
+    assert!(ready(&p, &none, &none, 0, census, u64::MAX));
+    assert!(!ready(&p, &none, &none, 0, shim, u64::MAX));
     for i in together {
         assert!(!ready(&p, &none, &none, 0, i, u64::MAX), "{:?}", p[i].id);
     }
     let mut done = none.clone();
+    done[census] = true;
+    assert!(ready(&p, &done, &done, 0, shim, u64::MAX));
     done[shim] = true;
     let mut started = done.clone();
     for (running, i) in together.into_iter().enumerate() {
@@ -927,7 +953,8 @@ fn the_guards_and_the_lint_run_together_once_the_released_shim_is_done() {
     let no_shim = plan(&ctx(
         &[Check::Fmt, Check::Census, Check::ExportScan, Check::Lint],
         Scope::changed("origin/main", vec!["seed".into()], true),
-    ));
+    ))
+    .expect("complete graph and plan");
     let none = vec![false; no_shim.len()];
     let mut started = none.clone();
     for i in 0..no_shim.len() {
@@ -946,9 +973,9 @@ fn the_guards_and_the_lint_run_together_once_the_released_shim_is_done() {
 #[test]
 fn outside_a_release_the_test_compile_runs_beside_the_lint() {
     let guards = [
+        StageId::Census,
         StageId::ReleasedShim,
         StageId::Formatting,
-        StageId::Census,
         StageId::ExportScan,
     ];
     let checks = [
@@ -962,8 +989,9 @@ fn outside_a_release_the_test_compile_runs_beside_the_lint() {
         Check::Appkit,
     ];
     let scope = || Scope::changed("origin/main", vec!["seed".into()], true);
-    let ordinary = plan(&with_app(&checks, scope()));
-    let release = plan(&with_app(&checks, scope()).with_release(true));
+    let ordinary = plan(&with_app(&checks, scope())).expect("complete graph and plan");
+    let release =
+        plan(&with_app(&checks, scope()).with_release(true)).expect("complete graph and plan");
     for p in [&ordinary, &release] {
         crate::sched::check_waits(p).unwrap_or_else(|e| panic!("{e}"));
     }
@@ -982,15 +1010,26 @@ fn outside_a_release_the_test_compile_runs_beside_the_lint() {
     }
     for p in [&ordinary, &release] {
         for id in [
+            StageId::TestCompile,
             StageId::ForeignCells,
             StageId::RedrawConformance,
             StageId::ObjcDrives,
         ] {
             let w = waits(p, id);
             assert!(
-                w.contains(&StageId::Tippy) && guards.iter().all(|g| w.contains(g)),
+                (id == StageId::TestCompile || w.contains(&StageId::Tippy))
+                    && guards.iter().all(|g| w.contains(g)),
                 "{id:?}: {w:?}"
             );
+            // Even a green census and every other completed prerequisite grant no work
+            // before the required installed-shim acknowledgement.
+            let at = |id| p.iter().position(|s| s.id == id).expect("planned");
+            let mut done = vec![true; p.len()];
+            done[at(id)] = false;
+            done[at(StageId::ReleasedShim)] = false;
+            assert!(!crate::sched::ready(p, &done, &done, 0, at(id), u64::MAX));
+            done[at(StageId::ReleasedShim)] = true;
+            assert!(crate::sched::ready(p, &done, &done, 0, at(id), u64::MAX));
         }
     }
     assert_eq!(
@@ -1040,7 +1079,8 @@ fn outside_a_release_the_test_compile_runs_beside_the_lint() {
 fn export_reuses_the_main_target_after_the_test_compile() {
     use crate::sched::awaited;
 
-    let p = plan(&ctx(&[Check::Test, Check::Export], Scope::workspace()));
+    let p = plan(&ctx(&[Check::Test, Check::Export], Scope::workspace()))
+        .expect("complete graph and plan");
     let at = |id| p.iter().position(|s| s.id == id).expect("planned");
     let compile = at(StageId::TestCompile);
     let export = at(StageId::Export);
@@ -1048,7 +1088,7 @@ fn export_reuses_the_main_target_after_the_test_compile() {
     assert_eq!(p[export].after_stages, [StageId::TestCompile]);
     assert_eq!(awaited(&p, export).collect::<Vec<_>>(), [compile]);
 
-    let alone = plan(&ctx(&[Check::Export], Scope::workspace()));
+    let alone = plan(&ctx(&[Check::Export], Scope::workspace())).expect("complete graph and plan");
     assert_eq!(alone.len(), 1);
     assert_eq!(alone[0].lane, Lane::MainTarget);
     assert!(alone[0].after_stages.is_empty());
@@ -1061,7 +1101,8 @@ fn with_app(checks: &[Check], scope: Scope) -> Ctx {
 
 #[test]
 fn the_measuring_compile_precedes_the_barrier_and_appkit_drives_the_main_target() {
-    let p = plan(&with_app(&RELEASE, Scope::workspace()).with_release(true));
+    let p = plan(&with_app(&RELEASE, Scope::workspace()).with_release(true))
+        .expect("complete graph and plan");
     let at = |id| p.iter().position(|s| s.id == id).expect("planned");
     let barrier = p.iter().position(|s| s.exclusive).expect("a barrier");
     assert_eq!(p[barrier].id, StageId::RedrawConformance);
@@ -1077,7 +1118,7 @@ fn the_measuring_compile_precedes_the_barrier_and_appkit_drives_the_main_target(
         assert!(p[at(id)].exclusive);
         assert_eq!(p[at(id)].lane, Lane::MainTarget, "{id:?}");
     }
-    let appkit = plan(&ctx(&[Check::Appkit], Scope::workspace()));
+    let appkit = plan(&ctx(&[Check::Appkit], Scope::workspace())).expect("complete graph and plan");
     for stage in &appkit {
         assert!(
             stage.id.timed() && stage.id.opens_windows(),
@@ -1089,7 +1130,8 @@ fn the_measuring_compile_precedes_the_barrier_and_appkit_drives_the_main_target(
             "an ordinary AppKit run needs the quiet/window reservations, not a global barrier"
         );
     }
-    let alone = plan(&with_app(&[Check::Measure], Scope::workspace()));
+    let alone =
+        plan(&with_app(&[Check::Measure], Scope::workspace())).expect("complete graph and plan");
     let alone_ids: Vec<StageId> = alone.iter().map(|s| s.id).collect();
     assert_eq!(
         alone_ids,
@@ -1156,7 +1198,8 @@ fn only_the_releases_test_compile_builds_the_measuring_benches() {
 
 #[test]
 fn appkit_failure_is_observed_before_measurements_and_all_checks_still_run() {
-    let stages = plan(&ctx(&[Check::Appkit, Check::Measure], Scope::workspace()));
+    let stages = plan(&ctx(&[Check::Appkit, Check::Measure], Scope::workspace()))
+        .expect("complete graph and plan");
     let seen = std::sync::Mutex::new(Vec::new());
     let reports = crate::sched::run_stages(
         &stages,
@@ -1184,7 +1227,7 @@ fn appkit_failure_is_observed_before_measurements_and_all_checks_still_run() {
 #[test]
 fn checkers_reuse_the_test_compile_and_wait_for_the_plain_run() {
     for checks in [vec![Check::Checkers], vec![Check::Test, Check::Checkers]] {
-        let p = plan(&ctx(&checks, Scope::workspace()));
+        let p = plan(&ctx(&checks, Scope::workspace())).expect("complete graph and plan");
         assert_eq!(
             p.iter().filter(|s| crate::memory::compiles(s.id)).count(),
             1
@@ -1199,7 +1242,27 @@ fn checkers_reuse_the_test_compile_and_wait_for_the_plain_run() {
     }
     assert!(
         plan(&ctx(&RELEASE, Scope::workspace()))
+            .expect("complete graph and plan")
             .iter()
             .all(|s| s.id != StageId::SpecCheckers)
     );
+}
+
+#[test]
+fn unavailable_workspace_graph_stops_planning_before_admission_or_unit_queries() {
+    let mut context = ctx(&[Check::Test], Scope::workspace()).with_memory(crate::memory::Book::at(
+        None,
+        Some(32 << 30),
+        Some(28 << 30),
+    ));
+    context.workspace_members = |_| Err("original graph status/stdout/stderr".to_owned());
+    context.unit_graph = |_, _, _, _| panic!("unavailable members authorize no compiler query");
+    assert_eq!(
+        plan(&context).unwrap_err(),
+        "original graph status/stdout/stderr"
+    );
+    match crate::RunPlan::capture(&context, crate::LIVE) {
+        Err(why) => assert_eq!(why, "original graph status/stdout/stderr"),
+        Ok(_) => panic!("an unavailable graph cannot reach disk, turn or memory admission"),
+    }
 }

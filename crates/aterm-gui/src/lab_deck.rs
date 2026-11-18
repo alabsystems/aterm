@@ -3,7 +3,7 @@
 
 //! The Stats deck's lab account rows (`docs/DESIGN-alab-lab-model-2026-11-01.md` §8, step 11):
 //! one cell per account on the Network State band's Shared State line, and one row per account
-//! in its lens. Each row is the account's lab label (never an address), who last used it and on
+//! in its lens. Each row is the account's slug (never an address), who last used it and on
 //! which Mac, its quota left with the age of the reading that says so, and its retained sign-in
 //! records with their ages.
 //!
@@ -37,7 +37,7 @@ pub(crate) enum Cell {
 pub(crate) struct DeckAccount {
     /// A stable selection id ([`id_of`] of its account key), never a vector index.
     pub(crate) id: u64,
-    /// The lab's label for it; never an address.
+    /// Its slug, else its key ([`label_of`]); never an address.
     pub(crate) label: String,
     /// This Mac prefers it.
     pub(crate) here: bool,
@@ -131,21 +131,16 @@ pub(crate) fn id_of(pk: &str) -> u64 {
     h.max(1)
 }
 
-/// What the lens calls the account: its label, or §0's default (`<cli>-<6 hex>`) where a label
-/// holds an address's `@`, so no address reaches the glass even from a mistyped label.
-fn label_of(account: &alab_roster::LabAccount) -> String {
-    if !account.label.contains('@') && !account.label.trim().is_empty() {
-        return account.label.clone();
-    }
-    let hex: String = account
-        .pk
-        .strip_prefix("ac-")
+/// What the lens calls the account: its slug, the lab's one word for it
+/// ([`Lab::names`]), else its key where the lab has none for it. Never its roster label, a
+/// local key, and never an address: neither word holds one.
+fn label_of(lab: &Lab, account: &alab_roster::LabAccount) -> String {
+    lab.names
+        .get(&account.pk)
+        .map(|names| names.slug.as_str())
+        .filter(|slug| !slug.is_empty())
         .unwrap_or(&account.pk)
-        .chars()
-        .filter(char::is_ascii_hexdigit)
-        .take(6)
-        .collect();
-    format!("{}-{hex}", account.cli.connector().id)
+        .to_owned()
 }
 
 fn percent(x10: u16) -> String {
@@ -195,13 +190,14 @@ fn left_line(w: &alab_seen::WindowSeen, now: i64) -> String {
 /// One account's row. `read`: whether the journal has been read at all, so a row with nothing
 /// from it says the journal is not read yet rather than that the journal holds nothing.
 fn row_of(
+    lab: &Lab,
     account: &alab_roster::LabAccount,
     here: bool,
     seen: Option<&AccountSeen>,
     read: bool,
     now: i64,
 ) -> DeckAccount {
-    let label = label_of(account);
+    let label = label_of(lab, account);
     let seen = seen.map_or_else(AccountSeen::default, |seen| AccountSeen {
         windows: seen.windows.iter().map(|w| w.as_of(now)).collect(),
         ..seen.clone()
@@ -334,26 +330,26 @@ pub(crate) fn project(lab: Option<&Lab>, seen: Option<&Seen>, now: i64) -> LabDe
         .filter(|a| a.joinable)
         .filter_map(|a| Some((me.and_then(|me| a.preferred_on(me))?, a)))
         .collect();
-    mine.sort_by(|(ra, a), (rb, b)| {
-        (ra.is_none(), *ra, &a.label).cmp(&(rb.is_none(), *rb, &b.label))
-    });
+    // Ties break on the word each row prints ([`label_of`]), never on the roster label, a
+    // local key no reader sees (`claude-<16 hex of its key>` for a row a sync added).
+    mine.sort_by_cached_key(|(rank, a)| (rank.is_none(), *rank, label_of(lab, a)));
     let mut others: Vec<_> = lab
         .accounts
         .iter()
         .filter(|a| a.joinable && me.and_then(|me| a.preferred_on(me)).is_none())
         .filter_map(|a| Some((found(&a.pk).filter(|s| says(s))?, a)))
         .collect();
-    others.sort_by(|(sa, a), (sb, b)| {
-        let t = |s: &AccountSeen| s.last_use.as_ref().map_or(i64::MIN, |l| l.t);
-        t(sb).cmp(&t(sa)).then_with(|| a.label.cmp(&b.label))
+    others.sort_by_cached_key(|(s, a)| {
+        let t = s.last_use.as_ref().map_or(i64::MIN, |l| l.t);
+        (std::cmp::Reverse(t), label_of(lab, a))
     });
     let mut rows: Vec<DeckAccount> = mine
         .into_iter()
-        .map(|(_, a)| row_of(a, true, found(&a.pk), read, now))
+        .map(|(_, a)| row_of(lab, a, true, found(&a.pk), read, now))
         .chain(
             others
                 .into_iter()
-                .map(|(s, a)| row_of(a, false, Some(s), read, now)),
+                .map(|(s, a)| row_of(lab, a, false, Some(s), read, now)),
         )
         .collect();
     let more = rows.len().saturating_sub(MAX_ROWS);
@@ -366,45 +362,53 @@ pub(crate) fn project(lab: Option<&Lab>, seen: Option<&Seen>, now: i64) -> LabDe
     }
 }
 
-/// Fixed rows for the feed's dev seam (`ATERM_DEV_LAB_DECK_FIXTURE`): three accounts, one preferred here, one at its limit and
-/// one with no reading, with labels that name no machine and no address. The second account's
-/// reading and last use are ahead of the local clock.
+/// Fixed rows for the feed's dev seam (`ATERM_DEV_LAB_DECK_FIXTURE`): three accounts, one
+/// preferred here, one at its limit and one with no reading, with slugs that name no machine and
+/// no address. The second account's reading and last use are ahead of the local clock.
 fn fixture(now: i64) -> LabDeck {
     use aterm_agent::harness::accounts::Cli;
     use aterm_agent::harness::alab_seen::{LastUse, SignedIn, WindowSeen};
     let machine = |label: &str| {
         alab_roster::MachineRef::from_registry(format!("fixture-{label}"), Some(label.to_owned()))
     };
-    let account =
-        |pk: &str, label: &str, preferred: Vec<(alab_roster::MachineRef, Option<u64>)>| {
-            alab_roster::LabAccount {
-                pk: pk.into(),
-                cli: Cli::Claude,
-                vendor: aterm_agent::harness::accounts::Vendor::default(),
-                label: label.into(),
-                legacy_label: None,
-                email: String::new(),
-                identity: None,
-                browser: None,
-                joinable: true,
-                preferred,
-            }
+    // Each roster row is labelled with its account's reserved slug, as a sync adds one; the
+    // deck prints the slug the lab gives.
+    let account = |pk: &str, preferred: Vec<(alab_roster::MachineRef, Option<u64>)>| {
+        alab_roster::LabAccount {
+            pk: pk.into(),
+            cli: Cli::Claude,
+            vendor: aterm_agent::harness::accounts::Vendor::default(),
+            label: format!("claude-{}", pk.trim_start_matches("ac-")),
+            legacy_label: None,
+            email: String::new(),
+            identity: None,
+            browser: None,
+            joinable: true,
+            preferred,
+        }
+    };
+    let slugged = |pk: &str, slug: &str| {
+        let names = aterm_file::AccountNames {
+            realm: "claude".into(),
+            slug: slug.into(),
+            live: true,
+            ..aterm_file::AccountNames::default()
         };
+        (pk.to_owned(), names)
+    };
     let lab = Lab {
         me: Some(machine("m1")),
         accounts: vec![
-            account(
-                "ac-0a1b2c3d4e5f60718293a4",
-                "claude-0a1b2c",
-                vec![(machine("m1"), Some(1))],
-            ),
-            account(
-                "ac-1b2c3d4e5f60718293a4b5",
-                "claude-1b2c3d",
-                vec![(machine("m2"), Some(1))],
-            ),
-            account("ac-2c3d4e5f60718293a4b5c6", "claude-2c3d4e", Vec::new()),
+            account("ac-0a1b2c3d4e5f60718293a4", vec![(machine("m1"), Some(1))]),
+            account("ac-1b2c3d4e5f60718293a4b5", vec![(machine("m2"), Some(1))]),
+            account("ac-2c3d4e5f60718293a4b5c6", Vec::new()),
         ],
+        names: [
+            slugged("ac-0a1b2c3d4e5f60718293a4", "claude-0a1b2c"),
+            slugged("ac-1b2c3d4e5f60718293a4b5", "claude-1b2c3d"),
+            slugged("ac-2c3d4e5f60718293a4b5c6", "claude-2c3d4e"),
+        ]
+        .into(),
         ..Lab::default()
     };
     let window = |pct: u16, wall: bool| WindowSeen {

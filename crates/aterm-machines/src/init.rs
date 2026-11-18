@@ -1633,6 +1633,10 @@ fn tab(
 /// could not be waited for or a tally standard output could not take ([`answer_to`]). A
 /// subscriber's pass from a program that is not the installed release app (a held copy) is the
 /// installed app's to run ([`hand_off`]).
+/// When their starter negotiates it, automatic apply runners carry independent positive
+/// identity completion in their terminal status
+/// ([`aterm_secrets::converge::runner_exit_code`]); other invocations keep the whole-pass
+/// statuses above.
 fn converge_entry(options: &Options, ports: &dyn crate::sync::Ports) -> ExitCode {
     let trigger = options.trigger.unwrap_or(crate::sync::Trigger::Init);
     ports.background(trigger);
@@ -1694,12 +1698,25 @@ fn converge_entry(options: &Options, ports: &dyn crate::sync::Ports) -> ExitCode
     let failed = pass.rows.iter().any(|row| row.outcome.is_failure());
     let complete = pass.complete();
     let waits_for_input = pass.waits_for_input();
+    let identity_complete = pass.identity_complete();
+    let exit = |status| {
+        ExitCode::from(
+            if mode == Mode::Apply
+                && trigger != crate::sync::Trigger::Init
+                && ports.identity_result_requested()
+            {
+                aterm_secrets::converge::runner_exit_code(status, identity_complete)
+            } else {
+                status
+            },
+        )
+    };
     let answered = if options.json {
         match report_json(action, complete, pass.rows, &laps) {
             Ok(report) => answer(&format!("{report}\n")),
             Err(why) => {
                 say_after_run(format_args!("aterm init: cannot encode report: {why}"));
-                return ExitCode::FAILURE;
+                return exit(1);
             }
         }
     } else {
@@ -1715,23 +1732,18 @@ fn converge_entry(options: &Options, ports: &dyn crate::sync::Ports) -> ExitCode
             "aterm init: the pass's record was not written: {why}"
         ));
     }
-    if pass.unrecorded.is_some() {
-        ExitCode::FAILURE
+    if pass.unrecorded.is_some() || answered.is_err() {
+        exit(1)
     } else {
-        answered.map_or_else(
-            |failed| failed,
-            |()| {
-                if mode == Mode::Apply && waits_for_input {
-                    ExitCode::from(aterm_secrets::converge::STANDING)
-                } else if failed {
-                    ExitCode::FAILURE
-                } else if mode == Mode::Apply && !complete {
-                    ExitCode::from(aterm_secrets::converge::UNFINISHED)
-                } else {
-                    ExitCode::SUCCESS
-                }
-            },
-        )
+        exit(if mode == Mode::Apply && waits_for_input {
+            aterm_secrets::converge::STANDING
+        } else if failed {
+            1
+        } else if mode == Mode::Apply && !complete {
+            aterm_secrets::converge::UNFINISHED
+        } else {
+            0
+        })
     }
 }
 
@@ -2160,6 +2172,9 @@ pub enum OwedClone {
     /// One is owed, and the token it waits for, or the git every clone runs, is not on this Mac
     /// yet: why it waits.
     Waiting(String),
+    /// A recorded refusal still names the same token and settings: why a changed input is
+    /// required before the step can run again, without asking a person.
+    Inputs(String),
     /// One is owed, and its token is here: what the pass finds.
     Due(String),
     /// One is owed, but its last run stopped at a step only a person can take, and neither
@@ -2608,7 +2623,7 @@ fn owed_clone_with(
     let record = match aterm_uds::private_file::read_private(&dir, CLONE_OWED, 4096) {
         Ok(record) => String::from_utf8_lossy(&record).into_owned(),
         Err(aterm_uds::private_file::PrivateFileError::Missing) => {
-            return automatic_clone(sys, now, inputs, readback);
+            return automatic_clone(sys, now, inputs, readback, work);
         }
         Err(why) => return Err(format!("{}: {why}", dir.join(CLONE_OWED).display())),
     };
@@ -2694,7 +2709,7 @@ fn owed_clone_with(
         .zip(record.lines().skip(1))
         .find(|(_, mark)| mark.strip_prefix(REFUSED_MARK) == Some(read.mark.as_str()))
     {
-        return Ok(OwedClone::Waiting(why.to_owned()));
+        return Ok(OwedClone::Inputs(why.to_owned()));
     }
     if let Some((how, _)) = record
         .lines()
@@ -2787,6 +2802,7 @@ fn automatic_clone(
     now: &Holds,
     inputs: Option<&crate::init_github::InitialRepositoryInputs>,
     readback: Option<&crate::init_github::RepositoryReadback>,
+    work: aterm_secrets::converge::RepositoryWork,
 ) -> Result<OwedClone, String> {
     let nothing = || OwedClone::Nothing("aterm init owes no clone".into());
     let Ok(ctx) = repository_context(sys) else {
@@ -2857,9 +2873,9 @@ fn automatic_clone(
         ));
     }
     let counted = match inputs {
-        Some(inputs) => {
-            crate::init_github::automatic_inventory_counts_captured(sys, &ctx, inputs, readback)
-        }
+        Some(inputs) => crate::init_github::automatic_inventory_counts_captured(
+            sys, &ctx, inputs, readback, work,
+        ),
         None => crate::init_github::automatic_inventory_counts(sys, &ctx),
     };
     match counted {

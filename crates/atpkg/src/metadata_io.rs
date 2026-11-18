@@ -140,14 +140,48 @@ pub(crate) fn open_regular_with_meta(
 pub(crate) fn open_regular_with_meta(
     path: &Path,
 ) -> io::Result<(std::fs::File, std::fs::Metadata)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    open_regular_windows(path, &mut options)
+}
+
+/// [`open_regular_with_meta`] through a handle that may set the file's times as well. Windows
+/// sets a time only through a handle that may write attributes, which a read-only one may not
+/// (`set_times` fails there, access denied): this one opens the attributes alone, to read and
+/// to write, so the open reads no data, moves no access time and takes no share another opener
+/// could be refused by.
+#[cfg(windows)]
+pub(crate) fn open_regular_to_time(path: &Path) -> io::Result<(std::fs::File, std::fs::Metadata)> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES);
+    open_regular_windows(path, &mut options)
+}
+
+/// [`open_regular_with_meta`] through a handle that may set the file's times: any open may, off
+/// Windows.
+#[cfg(not(windows))]
+pub(crate) fn open_regular_to_time(path: &Path) -> io::Result<(std::fs::File, std::fs::Metadata)> {
+    open_regular_with_meta(path)
+}
+
+/// `path` opened with `options` as [`open_regular_with_meta`] admits it on Windows.
+#[cfg(windows)]
+fn open_regular_windows(
+    path: &Path,
+    options: &mut std::fs::OpenOptions,
+) -> io::Result<(std::fs::File, std::fs::Metadata)> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 
-    let file = std::fs::OpenOptions::new()
-        .read(true)
+    let file = options
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)?;
     let metadata = file.metadata()?;

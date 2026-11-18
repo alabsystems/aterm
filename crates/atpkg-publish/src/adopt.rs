@@ -590,11 +590,12 @@ fn facts(prefix: &Path, build: u64) -> Result<(Facts, atpkg::lease::Lease)> {
             })?,
     };
     let lineage = Lineage::read(&dir)?;
-    let reported = trust_lock::compiler_commit(&bin).ok_or_else(|| {
-        Error::refused(format!(
-            "{} answers `-vV` with no commit-hash: no lock can name its compiler",
-            tool("trustc").display()
-        ))
+    let reported = trust_lock::compiler_commit(&bin).map_err(|error| {
+        let message = format!("identify {}: {error}", tool("trustc").display());
+        match error {
+            trust_lock::CompilerCommitError::Probe(_) => Error::cannot_run(message),
+            trust_lock::CompilerCommitError::MissingCommitHash => Error::refused(message),
+        }
     })?;
     if reported != lineage.compiler_commit {
         return Err(Error::refused(format!(
@@ -1011,9 +1012,9 @@ fn compiler_at(
     };
     trust_lock::compiler_commit(&toolchain.stage2_dir)
         .map(|commit| (commit, what))
-        .ok_or_else(|| {
+        .map_err(|error| {
             format!(
-                "{}'s trustc reports no commit-hash",
+                "identify {}'s trustc: {error}",
                 toolchain.stage2_dir.display()
             )
         })

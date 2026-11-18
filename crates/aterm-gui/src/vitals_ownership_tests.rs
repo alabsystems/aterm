@@ -221,6 +221,87 @@ fn an_unchanged_kernel_version_reuses_the_image_proof_and_exec_invalidates_it() 
     assert!(IMAGES.get() > read);
 }
 
+/// A GENERATION KNOWN UNOWNED IS READ ONCE: a row the cache holds unowned under its sweep version
+/// costs no read of its own on the next `roots()` (no version, start, image or signature), while
+/// a row cached owned keeps its version bracket, and the roots, every row's write-back and the
+/// cache are a fresh `Images`' over the same world. NEGATIVE CONTROLS: without the skip each
+/// unowned row reads its version again here; with the skip widened to rows cached owned,
+/// `an_unchanged_kernel_version_reuses_the_image_proof_and_exec_invalidates_it` lets the old sweep
+/// claim an exec.
+#[test]
+fn a_generation_known_unowned_reads_each_generation_once() {
+    type Reads = std::collections::BTreeMap<(&'static str, u32), u32>;
+    thread_local! {
+        static READS: std::cell::RefCell<Reads> = const {
+            std::cell::RefCell::new(std::collections::BTreeMap::new())
+        };
+    }
+    fn count(kind: &'static str, pid: u32) {
+        READS.with_borrow_mut(|reads| *reads.entry((kind, pid)).or_default() += 1);
+    }
+    let world = || Images {
+        image: |pid| {
+            count("image", pid);
+            image(pid)
+        },
+        start: |pid| {
+            count("start", pid);
+            start(pid)
+        },
+        signature: |pid| {
+            count("signature", pid);
+            None
+        },
+        version: |pid| {
+            count("version", pid);
+            i32::try_from(pid).ok()
+        },
+        ..Images::INERT
+    };
+    // 100 is this instance and 700 its child; 200 runs its image elsewhere (shared); 400 and
+    // 500 run other images and 600 none that reads: unowned.
+    let mut procs = [100, 200, 400, 500, 600, 700].map(|pid| ProcSample {
+        version: i32::try_from(pid).ok(),
+        ..process(pid, if pid == 700 { 100 } else { 1 }, 501)
+    });
+    let mut probe = world();
+    let first = probe.roots(100, &mut procs, &[]);
+    assert_eq!(
+        first.iter().map(|r| r.pid).collect::<Vec<_>>(),
+        [200],
+        "{first:?}"
+    );
+    let read_first = READS.take();
+    for pid in [200, 400, 500, 600] {
+        assert_eq!(
+            read_first.get(&("version", pid)),
+            Some(&1),
+            "first sight brackets {pid}: {read_first:?}"
+        );
+    }
+    let unchanged = procs.clone();
+    let second = probe.roots(100, &mut procs, &[]);
+    let read_second = READS.take();
+    assert_eq!(
+        read_second,
+        Reads::from([
+            (("image", 100), 2),
+            (("signature", 100), 1),
+            (("start", 100), 2),
+            (("version", 100), 2),
+            (("version", 200), 1),
+        ]),
+        "only this instance's own bracket and the owned row's version: no read of 400, 500 or 600"
+    );
+    let mut fresh = world();
+    let mut fresh_procs = unchanged;
+    let fresh_roots = fresh.roots(100, &mut fresh_procs, &[]);
+    assert_eq!(second, fresh_roots, "the roots");
+    assert_eq!(procs, fresh_procs, "each row's write-back");
+    assert_eq!(probe.cache, fresh.cache, "the cache");
+    assert_eq!(second, first);
+}
+
 fn root(key: u64, pid: u32) -> TabRoot {
     TabRoot {
         key,

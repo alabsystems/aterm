@@ -10,6 +10,49 @@ pub(super) fn primary_advances(before: &State, envelope: &Envelope, pinned: Pin)
     matches!(pinned, Pin::Replaced(_)) || envelope.seq > before.seq
 }
 
+/// Whether [`select`] admits a peer's head at exactly the version this Mac holds (`before`'s
+/// seq and digest) beside the source's answer `primary`, `primary_is_held` saying the source's
+/// own body verified as that very version: never then, since that body is the version and its
+/// receipt; always where the pass does not repair its source (`repairs_primary`); otherwise where
+/// the source failed, served a body that is no older version of this vault, or answered with no
+/// such vault, an older version or a `204` while this Mac holds no verified copy of its own to
+/// stand on or publish back. A pass that asks its peers only for newer versions (`?after`) hears
+/// no such head, so it asks so only where this is false ([`super::sync_repairing_inner`]).
+pub(super) fn admits_exact(
+    paths: &Paths,
+    config: &Config,
+    before: &State,
+    primary: &crate::Result<Fetched>,
+    primary_is_held: bool,
+    repairs_primary: bool,
+) -> bool {
+    if primary_is_held {
+        // This response already supplies the exact body and its configured-source
+        // receipt. An identical peer adds no recovery and must not replace it.
+        false
+    } else if !repairs_primary {
+        true
+    } else {
+        match primary {
+            Err(_) => true,
+            Ok(Fetched::Missing) => publishable_copy(paths, config, before).is_none(),
+            Ok(Fetched::Body(bytes)) => {
+                // The served body may predate a signer rotation. As in apply,
+                // its parsed sequence identifies the repair target; only our
+                // verified held copy is eligible for publication back to it.
+                !matches!(config.source, Source::Url(_))
+                    || !envelope::parse(bytes)
+                        .is_ok_and(|e| e.name == config.name && e.seq < before.seq)
+                    || publishable_copy(paths, config, before).is_none()
+            }
+            // A 204 (or a held request with no body) cannot reconstruct a lost
+            // cache. Keep normal no-change/older-source handling only while
+            // the exact verified envelope is still available locally.
+            Ok(Fetched::NoNewer(_)) => verified_cached_envelope(paths, config, before).is_none(),
+        }
+    }
+}
+
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
@@ -173,31 +216,14 @@ pub(super) fn select(
     let primary_is_held = verified_primary
         .as_ref()
         .is_some_and(|(e, _)| e.seq == before.seq && before.digest == Some(e.digest()));
-    let allow_exact = if primary_is_held {
-        // This response already supplies the exact body and its configured-source
-        // receipt. An identical peer adds no recovery and must not replace it.
-        false
-    } else if !repairs_primary {
-        true
-    } else {
-        match primary {
-            Err(_) => true,
-            Ok(Fetched::Missing) => publishable_copy(paths, config, before).is_none(),
-            Ok(Fetched::Body(bytes)) => {
-                // The served body may predate a signer rotation. As in apply,
-                // its parsed sequence identifies the repair target; only our
-                // verified held copy is eligible for publication back to it.
-                !matches!(config.source, Source::Url(_))
-                    || !envelope::parse(bytes)
-                        .is_ok_and(|e| e.name == config.name && e.seq < before.seq)
-                    || publishable_copy(paths, config, before).is_none()
-            }
-            // A 204 (or a held request with no body) cannot reconstruct a lost
-            // cache. Keep normal no-change/older-source handling only while
-            // the exact verified envelope is still available locally.
-            Ok(Fetched::NoNewer(_)) => verified_cached_envelope(paths, config, before).is_none(),
-        }
-    };
+    let allow_exact = admits_exact(
+        paths,
+        config,
+        before,
+        primary,
+        primary_is_held,
+        repairs_primary,
+    );
     let held = floor(paths, before, &config.name, config);
     // Recover the exact body before comparing any advancing peer. An exact
     // peer is useful evidence even when ordinary source repair suppresses its

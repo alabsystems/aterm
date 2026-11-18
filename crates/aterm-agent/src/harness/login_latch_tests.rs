@@ -172,6 +172,91 @@ fn the_rows_carried_are_those_a_tab_signs_in_now() {
     assert!(l.carried_rows().is_empty(), "its worker ended");
 }
 
+/// The rows carried have a generation that a traced read of them records: a carry of a row, a
+/// login back, a closed carrier and an ended worker each move it once and ring the bell once on
+/// the thread that made it, so a trace that read the rows before stops standing, while a tab
+/// that only waits, a carry that names no row and a refused carry move nothing.
+///
+/// NEGATIVE CONTROL (2026-11-15): `LoginLatches::gone` locking the table itself instead of
+/// through `change` (no bump) failed with "closed carrier: the rows read before it still stood",
+/// left `Ok(())`, right `Err(Memory("login_latch/carried_rows"))`. Restored.
+#[test]
+fn the_rows_carried_move_their_generation_only_when_another_set_is_carried() {
+    use aterm_uds::trace::{self, Moved, Now};
+    let l = LoginLatches::default();
+    let owner = Arc::new(AtomicBool::new(false));
+    let read = || trace::scope(|| l.carried_rows()).1;
+    let stands = |trace: &trace::Trace| trace.stands(Now::at(0), std::time::Instant::now());
+    let moved = Err(Moved::Memory("login_latch/carried_rows"));
+    let rung = trace::rung_here;
+
+    let none = read();
+    assert_eq!(
+        none.memory().collect::<Vec<_>>(),
+        [("login_latch/carried_rows", 0)]
+    );
+    let before = rung();
+    assert_eq!(l.carry_for("default", "@1", &owner, None), Ok(()));
+    assert_eq!(
+        l.shared("default", "@2"),
+        Some(LoginShared::Carried { by: "@1".into() })
+    );
+    assert_eq!(
+        l.carry_for("default", "@3", &owner, None),
+        Err("@1".to_string())
+    );
+    assert_eq!(
+        stands(&none),
+        Ok(()),
+        "a carry that named no row moved the rows read"
+    );
+    assert_eq!(rung(), before, "a carry that named no row rang");
+
+    for (what, change) in [
+        (
+            "a row carried",
+            Box::new(|| {
+                assert_eq!(l.carry_for("dir:/a", "@4", &owner, Some("work-a")), Ok(()));
+            }) as Box<dyn Fn()>,
+        ),
+        ("login back", Box::new(|| l.back("dir:/a", "@4"))),
+        (
+            "a row carried again",
+            Box::new(|| {
+                assert_eq!(l.carry_for("dir:/a", "@4", &owner, Some("work-a")), Ok(()));
+            }),
+        ),
+        ("closed carrier", Box::new(|| l.gone("@4"))),
+        (
+            "a row carried once more",
+            Box::new(|| {
+                assert_eq!(l.carry_for("dir:/a", "@4", &owner, Some("work-a")), Ok(()));
+            }),
+        ),
+        (
+            "its worker ended",
+            Box::new(|| assert!(l.abandon_for("@4", &owner))),
+        ),
+    ] {
+        let seen = read();
+        let _waiting = l.shared("dir:/a", "@5");
+        assert_eq!(
+            stands(&seen),
+            Ok(()),
+            "{what}: a waiting tab moved the rows read before it"
+        );
+        let before = rung();
+        change();
+        assert_eq!(
+            stands(&seen),
+            moved,
+            "{what}: the rows read before it still stood"
+        );
+        assert_eq!(rung() - before, 1, "{what}: rang {} times", rung() - before);
+    }
+    assert!(l.carried_rows().is_empty());
+}
+
 #[test]
 fn a_release_says_whether_a_rows_carry_ended() {
     let l = LoginLatches::default();

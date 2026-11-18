@@ -15,6 +15,11 @@ use aterm_vitals::ring::{GapKind, TimeGap};
 use aterm_vitals::words::{self, Locale, Platform};
 use strip::{BASE_FILE, LEGACY_FILE, StripStore, TAIL_FILE, strip_dir};
 
+// Scripted sources retain a boundary before reading; their getters never resample it.
+fn mock_observed_at() -> memory::ObservedAt {
+    memory::ObservedAt::capture(Instant::now, || Some(0))
+}
+
 fn saved_cpu_anomaly() -> Snapshot {
     use aterm_vitals::hardware::{Bundle, Frame};
     let mut hardware = aterm_vitals::hardware::Sample::unavailable("not_sampled");
@@ -874,6 +879,10 @@ struct ArmedMidPull<'a> {
 }
 
 impl Source for ArmedMidPull<'_> {
+    fn observed_at(&self) -> Option<memory::ObservedAt> {
+        self.reader.observed_at()
+    }
+
     fn reading(&mut self, req: &Request) -> Snapshot {
         let arming = self.reader.hardware_armed;
         self.armed.get_or_insert_with(|| arming.arm());
@@ -1676,6 +1685,7 @@ fn a_busy_reader_keeps_its_pending_messages_and_forgoes_newer_work() {
     let pid_of = |m: Msg| match m {
         Msg::Read(r) | Msg::Facts(r) => r.self_pid,
         Msg::Pull
+        | Msg::MemoryPull
         | Msg::AssessmentReady
         | Msg::BootReady
         | Msg::CpuPolicy(_)
@@ -2945,11 +2955,13 @@ fn each_journal_row_reads_as_its_writer_wrote_it() {
 }
 
 struct Fills {
+    observed_at: memory::ObservedAt,
     vitals: aterm_vitals::Vitals,
 }
 
 impl Source for Fills {
     fn reading(&mut self, _req: &Request) -> Snapshot {
+        self.observed_at = mock_observed_at();
         self.vitals.absorb(&Sample {
             at_unix_ms: unix_ms_now(),
             volume: Some(VolumeSample {
@@ -2962,6 +2974,9 @@ impl Source for Fills {
         })
     }
 
+    fn observed_at(&self) -> Option<memory::ObservedAt> {
+        Some(self.observed_at)
+    }
     fn model(&mut self) -> &mut aterm_vitals::Vitals {
         &mut self.vitals
     }
@@ -2983,6 +2998,7 @@ fn the_probe_thread_reads_on_from_the_kept_history_and_writes_it_at_quit() {
     let mut host = VitalsHost::default();
     host.start(
         || Fills {
+            observed_at: mock_observed_at(),
             vitals: aterm_vitals::Vitals::new(),
         },
         || true,
@@ -3005,15 +3021,20 @@ fn the_probe_thread_reads_on_from_the_kept_history_and_writes_it_at_quit() {
 /// A source that says what the thread handed it of the host's tellings: each `note_told`, and the
 /// stop's (`true`).
 struct Tells {
+    observed_at: memory::ObservedAt,
     vitals: aterm_vitals::Vitals,
     heard: std::sync::mpsc::Sender<(bool, Vec<u64>)>,
 }
 
 impl Source for Tells {
     fn reading(&mut self, _req: &Request) -> Snapshot {
+        self.observed_at = mock_observed_at();
         Snapshot::default()
     }
 
+    fn observed_at(&self) -> Option<memory::ObservedAt> {
+        Some(self.observed_at)
+    }
     fn model(&mut self) -> &mut aterm_vitals::Vitals {
         &mut self.vitals
     }
@@ -3037,6 +3058,7 @@ fn the_probe_thread_hands_the_pass_the_hosts_tellings() {
     let mut host = VitalsHost::default();
     host.start(
         move || Tells {
+            observed_at: mock_observed_at(),
             vitals: aterm_vitals::Vitals::new(),
             heard,
         },
@@ -3059,6 +3081,7 @@ fn the_probe_thread_hands_the_pass_the_hosts_tellings() {
 }
 
 struct Moves {
+    observed_at: memory::ObservedAt,
     vitals: aterm_vitals::Vitals,
     peaks: Peaks,
     ended: Option<std::sync::mpsc::Sender<()>>,
@@ -3074,10 +3097,14 @@ impl Drop for Moves {
 
 impl Source for Moves {
     fn reading(&mut self, _req: &Request) -> Snapshot {
+        self.observed_at = mock_observed_at();
         self.vitals.restore_peaks(self.peaks.clone());
         Snapshot::default()
     }
 
+    fn observed_at(&self) -> Option<memory::ObservedAt> {
+        Some(self.observed_at)
+    }
     fn model(&mut self) -> &mut aterm_vitals::Vitals {
         &mut self.vitals
     }
@@ -3093,6 +3120,7 @@ fn the_quit_writes_the_peaks_that_moved() {
     let moved = peaks.clone();
     host.start(
         move || Moves {
+            observed_at: mock_observed_at(),
             vitals: aterm_vitals::Vitals::new(),
             peaks: moved,
             ended: None,
@@ -3114,7 +3142,7 @@ fn the_quit_writes_the_peaks_that_moved() {
     assert!(idle.stop_at_exit(Duration::ZERO), "nothing to wait for");
 
     static LATE_COPY: std::sync::LazyLock<crate::sys_host::Shared> =
-        std::sync::LazyLock::new(crate::sys_host::Shared::new);
+        std::sync::LazyLock::new(|| crate::sys_host::Shared::with_clock(|| Some(0)));
     let late_path = dir.path().join("late-peaks.json");
     let mut late = VitalsHost::default();
     let (entered, ready) = std::sync::mpsc::channel();
@@ -3128,6 +3156,7 @@ fn the_quit_writes_the_peaks_that_moved() {
                 .recv_timeout(Duration::from_secs(60))
                 .expect("construction released");
             Moves {
+                observed_at: mock_observed_at(),
                 vitals: aterm_vitals::Vitals::new(),
                 peaks: moved,
                 ended: Some(ended),
@@ -3168,6 +3197,7 @@ fn a_probe_past_its_event_loop(dir: &Path, sys: &'static crate::sys_host::Shared
     let (posted, failed) = std::sync::mpsc::channel();
     host.start(
         || Fills {
+            observed_at: mock_observed_at(),
             vitals: aterm_vitals::Vitals::new(),
         },
         move || {
@@ -3227,9 +3257,9 @@ fn strip_bytes(home: &Path) -> (Vec<u8>, Vec<u8>) {
 #[test]
 fn a_probe_thread_writes_its_stop_clean_only_where_the_app_quit() {
     static QUIT_COPY: std::sync::LazyLock<crate::sys_host::Shared> =
-        std::sync::LazyLock::new(crate::sys_host::Shared::new);
+        std::sync::LazyLock::new(|| crate::sys_host::Shared::with_clock(|| Some(0)));
     static DOWN_COPY: std::sync::LazyLock<crate::sys_host::Shared> =
-        std::sync::LazyLock::new(crate::sys_host::Shared::new);
+        std::sync::LazyLock::new(|| crate::sys_host::Shared::with_clock(|| Some(0)));
     let quit = aterm_tempfile::tempdir().expect("scratch state");
     let mut host = a_probe_past_its_event_loop(quit.path(), &QUIT_COPY);
     assert!(
@@ -5720,10 +5750,12 @@ fn engine_reads(
     seq: u64,
 ) {
     let sweep = aterm_sysprobe::processes().expect("this machine's process table");
+    let facts =
+        crate::vitals_jobs::ProcessFacts::new(Some(sweep.procs), !sweep.truncated, None, None);
     let jobs = jobs_step(
         pass,
         &req.tab_reads(epoch_of(at_ms), Instant::now),
-        Some(&sweep.procs),
+        &facts,
         req,
         false,
     );
@@ -5983,6 +6015,7 @@ type Between = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 /// with `jobs_now` off), looks at every one.
 #[cfg(target_os = "macos")]
 struct ThreadEngine {
+    observed_at: memory::ObservedAt,
     vitals: aterm_vitals::Vitals,
     pass: crate::vitals_jobs::JobsPass,
     t0: Instant,
@@ -5997,6 +6030,7 @@ struct ThreadEngine {
 impl ThreadEngine {
     fn new(saw: Arc<Mutex<Vec<EngineSaw>>>) -> Self {
         Self {
+            observed_at: mock_observed_at(),
             vitals: aterm_vitals::Vitals::new(),
             pass: crate::vitals_jobs::JobsPass::new(),
             t0: Instant::now(),
@@ -6021,13 +6055,16 @@ impl ThreadEngine {
 #[cfg(target_os = "macos")]
 impl Source for ThreadEngine {
     fn reading(&mut self, req: &Request) -> Snapshot {
+        self.observed_at = mock_observed_at();
         self.seq += 1;
         let sweep = aterm_sysprobe::processes().expect("this machine's process table");
+        let facts =
+            crate::vitals_jobs::ProcessFacts::new(Some(sweep.procs), !sweep.truncated, None, None);
         let at_ms = self.seq * 60_000 + u64::try_from(self.t0.elapsed().as_millis()).unwrap_or(0);
         let jobs = jobs_step(
             &mut self.pass,
             &req.tab_reads(epoch_of(at_ms), Instant::now),
-            Some(&sweep.procs),
+            &facts,
             req,
             false,
         );
@@ -6059,6 +6096,9 @@ impl Source for ThreadEngine {
             jobs,
             ..Snapshot::default()
         }
+    }
+    fn observed_at(&self) -> Option<memory::ObservedAt> {
+        Some(self.observed_at)
     }
     fn model(&mut self) -> &mut aterm_vitals::Vitals {
         &mut self.vitals
@@ -6529,12 +6569,14 @@ fn a_line_the_tab_printed_between_passes_is_its_jobs_progress() {
     let epoch = Instant::now();
     let ms = |ms| epoch + Duration::from_millis(ms);
     let sweep = aterm_sysprobe::processes().expect("this machine's process table");
+    let facts =
+        crate::vitals_jobs::ProcessFacts::new(Some(sweep.procs), !sweep.truncated, None, None);
     let mut pass = crate::vitals_jobs::JobsPass::new();
     let mut quiet = |at_ms| {
         let view = jobs_step(
             &mut pass,
             &req.tab_reads(epoch, || ms(at_ms)),
-            Some(&sweep.procs),
+            &facts,
             &req,
             false,
         )
@@ -7020,14 +7062,19 @@ fn the_hand_over_keeps_job_events_for_the_loop_and_says_when_one_moved() {
 #[test]
 fn a_pull_looks_at_jobs_only_when_a_sys_jobs_arms_it() {
     struct Looks {
+        observed_at: memory::ObservedAt,
         vitals: aterm_vitals::Vitals,
         armed: bool,
         looked: Vec<bool>,
     }
     impl Source for Looks {
         fn reading(&mut self, req: &Request) -> Snapshot {
+            self.observed_at = mock_observed_at();
             self.looked.push(req.jobs_now);
             Snapshot::default()
+        }
+        fn observed_at(&self) -> Option<memory::ObservedAt> {
+            Some(self.observed_at)
         }
         fn model(&mut self) -> &mut aterm_vitals::Vitals {
             &mut self.vitals
@@ -7038,6 +7085,7 @@ fn a_pull_looks_at_jobs_only_when_a_sys_jobs_arms_it() {
     }
     let looked = |armed: bool, last_whole: Option<Instant>, force: bool| {
         let mut source = Looks {
+            observed_at: mock_observed_at(),
             vitals: aterm_vitals::Vitals::new(),
             armed,
             looked: Vec::new(),
@@ -7079,18 +7127,23 @@ fn a_pull_looks_at_jobs_only_when_a_sys_jobs_arms_it() {
 #[test]
 fn the_after_publish_hook_adds_no_main_loop_wake() {
     struct Hooked<'a> {
+        observed_at: memory::ObservedAt,
         model: aterm_vitals::Vitals,
         log: Arc<Mutex<Vec<String>>>,
         latest: &'a Mutex<Handover>,
     }
     impl Source for Hooked<'_> {
         fn reading(&mut self, request: &Request) -> Snapshot {
+            self.observed_at = mock_observed_at();
             self.log.lock().unwrap().push("read".into());
             Snapshot {
                 seq: 1,
                 machine_only: request.machine_only,
                 ..Snapshot::default()
             }
+        }
+        fn observed_at(&self) -> Option<memory::ObservedAt> {
+            Some(self.observed_at)
         }
         fn model(&mut self) -> &mut aterm_vitals::Vitals {
             &mut self.model
@@ -7126,6 +7179,7 @@ fn the_after_publish_hook_adds_no_main_loop_wake() {
                 true
             },
             Hooked {
+                observed_at: mock_observed_at(),
                 model: aterm_vitals::Vitals::new(),
                 log: Arc::clone(&log),
                 latest: &latest,
@@ -7155,12 +7209,14 @@ fn naming_requests_observe_forced_jobs_and_reply_only_after_publication() {
     use aterm_vitals::sys::query::NameTarget;
 
     struct NamingSource {
+        observed_at: memory::ObservedAt,
         model: aterm_vitals::Vitals,
         log: Arc<Mutex<Vec<String>>>,
         seq: u64,
     }
     impl Source for NamingSource {
         fn reading(&mut self, request: &Request) -> Snapshot {
+            self.observed_at = mock_observed_at();
             self.log
                 .lock()
                 .unwrap()
@@ -7170,6 +7226,9 @@ fn naming_requests_observe_forced_jobs_and_reply_only_after_publication() {
                 seq: self.seq,
                 ..Snapshot::default()
             }
+        }
+        fn observed_at(&self) -> Option<memory::ObservedAt> {
+            Some(self.observed_at)
         }
         fn model(&mut self) -> &mut aterm_vitals::Vitals {
             &mut self.model
@@ -7211,6 +7270,7 @@ fn naming_requests_observe_forced_jobs_and_reply_only_after_publication() {
             true
         },
         NamingSource {
+            observed_at: mock_observed_at(),
             model: aterm_vitals::Vitals::new(),
             log: Arc::clone(&log),
             seq: 0,
@@ -7284,14 +7344,16 @@ fn a_reading_says_how_old_the_jobs_view_it_carries_is() {
 #[test]
 fn a_pull_reads_whole_and_the_quit_takes_the_workers_sender_back() {
     static COPY: std::sync::LazyLock<crate::sys_host::Shared> =
-        std::sync::LazyLock::new(crate::sys_host::Shared::new);
+        std::sync::LazyLock::new(|| crate::sys_host::Shared::with_clock(|| Some(0)));
     struct Whole {
+        observed_at: memory::ObservedAt,
         vitals: aterm_vitals::Vitals,
         seen: Arc<Mutex<Vec<(bool, bool)>>>,
         seq: u64,
     }
     impl Source for Whole {
         fn reading(&mut self, req: &Request) -> Snapshot {
+            self.observed_at = mock_observed_at();
             self.seen
                 .lock()
                 .unwrap()
@@ -7302,6 +7364,9 @@ fn a_pull_reads_whole_and_the_quit_takes_the_workers_sender_back() {
                 ..Snapshot::default()
             }
         }
+        fn observed_at(&self) -> Option<memory::ObservedAt> {
+            Some(self.observed_at)
+        }
         fn model(&mut self) -> &mut aterm_vitals::Vitals {
             &mut self.vitals
         }
@@ -7311,6 +7376,7 @@ fn a_pull_reads_whole_and_the_quit_takes_the_workers_sender_back() {
     let held = Arc::clone(&seen);
     host.start(
         move || Whole {
+            observed_at: mock_observed_at(),
             vitals: aterm_vitals::Vitals::new(),
             seen: held,
             seq: 0,
@@ -8817,6 +8883,7 @@ fn one_reading_after(dir: &Path, launch: impl FnOnce(&mut VitalsHost)) -> Arc<Sn
     launch(&mut host);
     host.start(
         || Fills {
+            observed_at: mock_observed_at(),
             vitals: aterm_vitals::Vitals::new(),
         },
         || true,
@@ -8944,6 +9011,7 @@ fn the_quit_leaves_the_peaks_a_live_peer_writes() {
     let mut host = VitalsHost::default();
     host.start(
         move || Moves {
+            observed_at: mock_observed_at(),
             vitals: aterm_vitals::Vitals::new(),
             peaks,
             ended: None,
@@ -9535,12 +9603,14 @@ fn a_strip_lock_that_cannot_be_had_leaves_the_crash_and_the_writes_as_they_were(
 #[test]
 fn cold_pull_feeds_noted_gaps_and_events_once_and_facts_preserves_them() {
     struct CountingSource {
+        observed_at: memory::ObservedAt,
         model: aterm_vitals::Vitals,
         noted_batches: Vec<(usize, usize)>,
         step: u64,
     }
     impl Source for CountingSource {
         fn reading(&mut self, req: &Request) -> Snapshot {
+            self.observed_at = mock_observed_at();
             self.noted_batches
                 .push((req.note_gaps.len(), req.note_events.len()));
             self.step += 1;
@@ -9553,6 +9623,9 @@ fn cold_pull_feeds_noted_gaps_and_events_once_and_facts_preserves_them() {
                 note_events: req.note_events.clone(),
                 ..Sample::default()
             })
+        }
+        fn observed_at(&self) -> Option<memory::ObservedAt> {
+            Some(self.observed_at)
         }
         fn model(&mut self) -> &mut aterm_vitals::Vitals {
             &mut self.model
@@ -9592,6 +9665,7 @@ fn cold_pull_feeds_noted_gaps_and_events_once_and_facts_preserves_them() {
     assert_eq!(req.note_events, vec![ev_a, ev_b]);
 
     let mut src = CountingSource {
+        observed_at: mock_observed_at(),
         model: aterm_vitals::Vitals::new(),
         noted_batches: Vec::new(),
         step: 0,
@@ -9787,5 +9861,88 @@ fn a_sill_window_in_view_keeps_the_reading_pace_while_the_band_window_is_occlude
         app.vitals_audience().cadence(false),
         Some((HIDDEN_PERIOD, true)),
         "10 s, the machine counters alone"
+    );
+}
+
+/// SD-93: the Spotlight family's day keeps a file of its own beside the free history's, whose
+/// text restores the same day; a damaged file, one of another schema and the free history's own
+/// file restore nothing, and a full day of the widest buckets fits in 75 % of the read bound.
+#[test]
+fn the_spotlight_familys_day_round_trips_through_its_kept_file() {
+    use aterm_vitals::spotlight::{Reading, State};
+    let at0: i64 = 1_791_936_000_000;
+    let ten = 600_000;
+    let family = |at: i64, cpu_mc: i64, footprint: u64| Reading {
+        at_unix_ms: at,
+        window_ms: 5_000,
+        cpu_mc,
+        read_bps: 7_000_000,
+        footprint: aterm_vitals::model::MemoryCharge {
+            bytes: footprint,
+            members: 1,
+            unread: 0,
+        },
+        shares: Vec::new(),
+        volumes: None,
+        volumes_age_ms: None,
+        state: State::Indexing,
+    };
+    let mut day = SpotlightHistory::default();
+    assert_eq!(spotlight_json(&day), None, "nothing read, nothing written");
+    for k in 0..3 {
+        day.note(&family(at0 + k * ten + 10_000, 250 + k, 800 << 20));
+    }
+    let now = at0 + 2 * ten + 20_000;
+    let text = spotlight_json(&day).expect("text");
+    assert_eq!(
+        spotlight_of(&text, now).map(|h| h.day(now)),
+        Some(day.day(now)),
+        "the kept text restores the day"
+    );
+    let free = {
+        let mut h = FreeHistory::default();
+        h.note_on(
+            FREE_MOUNT,
+            FREE_SIZE,
+            aterm_vitals::Taken::at(now, 1_000),
+            1,
+        );
+        free_json(&h).expect("free text")
+    };
+    for refused in [
+        "kept",
+        free.as_str(),
+        &text.replace("\"schema\":1", "\"schema\":2"),
+    ] {
+        assert!(spotlight_of(refused, now).is_none(), "{refused}");
+    }
+    let widest = SavedSpotlight {
+        cpu_mc: (0..144)
+            .map(|k| {
+                (
+                    at0 + k * ten,
+                    aterm_vitals::Agg {
+                        tau_ms: u32::MAX,
+                        n: u16::MAX,
+                        over_ms: u32::MAX,
+                        mean: -f64::MAX,
+                        min: -f64::MAX,
+                        max: -f64::MIN_POSITIVE,
+                    },
+                )
+            })
+            .collect(),
+        ..SavedSpotlight::default()
+    };
+    let full = SavedSpotlight {
+        read_bps: widest.cpu_mc.clone(),
+        footprint: widest.cpu_mc.clone(),
+        ..widest
+    };
+    let wide = spotlight_json(&SpotlightHistory::restored(&full, at0 + 143 * ten)).expect("text");
+    assert!(
+        wide.len() as u64 * 100 <= SPOTLIGHT_MAX_BYTES * 75,
+        "a full day of the widest rows fits in 75 % of the read bound: {}",
+        wide.len()
     );
 }

@@ -192,6 +192,45 @@ fn snapshot() -> Snapshot {
 }
 
 #[test]
+fn one_engine_processes_a_sampled_session_without_a_tab_keeps_its_identity() {
+    let mut w = world();
+    w.tabs[0].sid = "t0000000001".into();
+    w.tabs[0].window = None;
+    w.tabs[0].tab = None;
+    w.tabs[0].sampled_nonce = Some("11111111111111111111111111111111".into());
+    let s = snapshot();
+    let c = ctx(&w, Some(&s), true, true);
+    let Jv::Arr(parts) = parts_json(&c, &s) else {
+        panic!("sampled process parts")
+    };
+    let part = parts
+        .iter()
+        .find(|part| part.get("name") == Some(&Jv::s("tab")))
+        .unwrap();
+    assert_eq!(part.get("sid"), Some(&Jv::s("t0000000001")));
+    assert_eq!(
+        part.get("nonce"),
+        Some(&Jv::s("11111111111111111111111111111111"))
+    );
+    assert_eq!(part.get("tab"), Some(&Jv::why("not_shown")));
+
+    w.tabs[0].sampled_nonce = None;
+    let c = ctx(&w, Some(&s), true, true);
+    let Jv::Arr(parts) = parts_json(&c, &s) else {
+        panic!("sampled process parts")
+    };
+    let part = parts
+        .iter()
+        .find(|part| part.get("name") == Some(&Jv::s("tab")))
+        .unwrap();
+    assert_eq!(
+        part.get("nonce"),
+        None,
+        "missing host proof is never inferred from the SID"
+    );
+}
+
+#[test]
 fn global_monitor_summaries_show_used_available_and_total_capacity() {
     let mut s = snapshot();
     s.volume = Some(VolumeSample {
@@ -526,6 +565,7 @@ fn world() -> World {
             request: None,
         },
         tabs: vec![TabFact {
+            sampled_nonce: None,
             key: 7,
             sid: "s-ab12".into(),
             window: Some(1),
@@ -628,6 +668,314 @@ fn all_text(r: &Reply) -> String {
         .map(|l| l.text.as_str())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+const NAMED_OWN_SID: &str = "t0000000001";
+const NAMED_OTHER_SID: &str = "t0000000002";
+
+fn named_sessions_world() -> World {
+    use crate::jobs::{Class, Verdict};
+    let mut w = world();
+    w.target.sid = NAMED_OWN_SID.into();
+    w.tabs[0].sid = NAMED_OWN_SID.into();
+    w.tabs.push(TabFact {
+        key: 99,
+        sid: NAMED_OTHER_SID.into(),
+        window: Some(1),
+        tab: Some(2),
+        ..TabFact::default()
+    });
+    for (seq, tab, id) in [(3, 7, "own-event"), (4, 99, "foreign-event")] {
+        w.events.push(Event {
+            seq,
+            at_ns: 11_000_000_000,
+            kind: EventKind::Job {
+                tab,
+                id: id.into(),
+                from: Some(Verdict::Fine),
+                to: Verdict::Stuck,
+                class: Class::Waiting,
+                task: None,
+                exit: None,
+            },
+        });
+    }
+    w
+}
+
+fn named_object<'a>(value: &'a Jv, field: &str, expected: &Jv) -> Option<&'a Jv> {
+    if value.get(field) == Some(expected) {
+        return Some(value);
+    }
+    match value {
+        Jv::Arr(values) => values.iter().find_map(|v| named_object(v, field, expected)),
+        Jv::Obj(fields) => fields
+            .iter()
+            .find_map(|(_, v)| named_object(v, field, expected)),
+        _ => None,
+    }
+}
+
+fn named_identity_records<'a>(value: &'a Jv, out: &mut Vec<&'a Jv>) {
+    match value {
+        Jv::Arr(values) => {
+            for v in values {
+                named_identity_records(v, out);
+            }
+        }
+        Jv::Obj(fields) => {
+            // Scope-measure maps also have a numeric `tab` entry. Identity records have a
+            // process, job, event, local session or folder identity beside their place.
+            let identity = [
+                "local",
+                "pid",
+                "id",
+                "job",
+                "path",
+                "window",
+                "role",
+                "footprint_bytes",
+            ]
+            .iter()
+            .any(|key| value.get(key).is_some())
+                || value.get("scope") == Some(&Jv::s("tab"))
+                || value.get("name") == Some(&Jv::s("tab"));
+            let place = value
+                .get("tab")
+                .is_some_and(|tab| matches!(tab, Jv::Int(_)) || tab.get("why").is_some());
+            if identity && place {
+                out.push(value);
+            }
+            for (_, v) in fields {
+                named_identity_records(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn sys_names_keep_sampled_keys_when_rosters_reorder_and_places_are_reused() {
+    let s = snapshot_with_jobs();
+    let mut w = named_sessions_world();
+    for change in 0..3 {
+        match change {
+            1 => w.tabs.reverse(),
+            2 => {
+                for fact in &mut w.tabs {
+                    fact.tab = Some(if fact.key == 7 { 2 } else { 1 });
+                }
+                w.target.tab = Some(2);
+            }
+            _ => {}
+        }
+        let c = ctx(&w, Some(&s), true, true);
+        for view in View::ALL {
+            let mut q = query(view, false);
+            if view.default_scope().is_some() {
+                q.scope = Some(ScopeArg::Global);
+            }
+            let reply = render_text(&q, &c);
+            for row in &reply.lines {
+                let words: Vec<_> = row.text.split_whitespace().collect();
+                if words
+                    .iter()
+                    .any(|w| w.starts_with("tab=") || w.starts_with("local="))
+                {
+                    assert!(
+                        words.iter().any(|w| w.starts_with("sid=")),
+                        "{view:?}: {}",
+                        row.text
+                    );
+                }
+            }
+            let json = render_json(&SysQuery { json: true, ..q }, &c);
+            let mut records = Vec::new();
+            named_identity_records(&json, &mut records);
+            for record in records {
+                assert!(
+                    record.get("sid").is_some(),
+                    "{view:?}: {}",
+                    record.to_text()
+                );
+            }
+        }
+        for (view, field, id, sid) in [
+            (View::Jobs, "id", Jv::s("a40977"), NAMED_OWN_SID),
+            (View::Jobs, "id", Jv::s("a9"), NAMED_OTHER_SID),
+            (View::Procs, "pid", Jv::u(201), NAMED_OWN_SID),
+            (View::Disk, "path", Jv::s("/Users//a/my proj"), NAMED_OWN_SID),
+            (View::Aterm, "name", Jv::s("tab"), NAMED_OWN_SID),
+        ] {
+            let mut q = query(view, true);
+            q.scope = Some(ScopeArg::Global);
+            let json = render_json(&q, &c);
+            let record = named_object(&json, field, &id).expect("functional identity record");
+            assert_eq!(record.get("sid"), Some(&Jv::s(sid)), "{}", record.to_text());
+            if view == View::Procs {
+                assert_eq!(record.get("footprint_bytes"), Some(&Jv::u(300 << 20)));
+            }
+        }
+        for view in [View::Overview, View::Tab] {
+            let json = render_json(&query(view, true), &c);
+            let tab = json.get("tab").expect("the target's functional tab record");
+            assert_eq!(tab.get("sid"), Some(&Jv::s(NAMED_OWN_SID)));
+            assert_eq!(tab.get("tab"), Some(&Jv::u(w.target.tab.unwrap() as u64)));
+            let text = all_text(&render_text(&query(view, false), &c));
+            let sid_word = format!("sid={NAMED_OWN_SID}");
+            assert!(
+                text.lines().any(|line| {
+                    line.starts_with("tab ") && line.split_whitespace().any(|word| word == sid_word)
+                }),
+                "the complete SID stays separate from the measurements: {view:?}: {text}"
+            );
+        }
+        let text = all_text(&render_text(
+            &SysQuery::parse("jobs scope=global").unwrap(),
+            &c,
+        ));
+        for (id, sid) in [("a40977", NAMED_OWN_SID), ("a9", NAMED_OTHER_SID)] {
+            let record = text
+                .lines()
+                .find(|line| line.starts_with(&format!("job id={id} ")))
+                .unwrap();
+            let sid_word = format!("sid={sid}");
+            assert!(
+                record.split_whitespace().any(|word| word == sid_word),
+                "{record}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sys_names_refuse_missing_or_ambiguous_bindings_without_dropping_the_reading() {
+    let s = snapshot_with_jobs();
+    for absence in ["missing", "empty", "duplicate_key", "duplicate_sid"] {
+        let mut w = named_sessions_world();
+        match absence {
+            "missing" => w.tabs.retain(|fact| fact.key != 7),
+            "empty" => w.tabs[0].sid.clear(),
+            "duplicate_key" => w.tabs.push(TabFact {
+                key: 7,
+                sid: "t0000000003".into(),
+                ..TabFact::default()
+            }),
+            "duplicate_sid" => w.tabs[1].sid = NAMED_OWN_SID.into(),
+            _ => unreachable!(),
+        }
+        let c = ctx(&w, Some(&s), true, true);
+        let q = SysQuery::parse("jobs scope=global").unwrap();
+        let text = all_text(&render_text(&q, &c));
+        let job = text
+            .lines()
+            .find(|line| line.starts_with("job id=a40977 "))
+            .unwrap();
+        assert!(
+            job.contains("sid=unavailable(not_sampled)") && job.contains("verdict=stuck"),
+            "{absence}: {job}"
+        );
+        let disk_text = all_text(&render_text(&query(View::Disk, false), &c));
+        assert!(
+            disk_text.contains("sid=unavailable(not_sampled)")
+                && !disk_text.contains(NAMED_OWN_SID),
+            "an unproved target SID cannot bypass the roster through the disk heading: {absence}: {disk_text}"
+        );
+        for (view, field, id) in [
+            (View::Jobs, "id", Jv::s("a40977")),
+            (View::Procs, "pid", Jv::u(201)),
+            (View::Disk, "path", Jv::s("/Users//a/my proj")),
+        ] {
+            let mut q = query(view, true);
+            q.scope = Some(ScopeArg::Global);
+            let json = render_json(&q, &c);
+            let record = named_object(&json, field, &id).expect("reading survives absent identity");
+            assert_eq!(
+                record.get("sid"),
+                Some(&Jv::why("not_sampled")),
+                "{absence}: {}",
+                record.to_text()
+            );
+        }
+        for view in [View::Overview, View::Tab] {
+            let json = render_json(&query(view, true), &c);
+            assert_eq!(
+                json.get("tab").and_then(|tab| tab.get("sid")),
+                Some(&Jv::why("not_sampled")),
+                "{absence}: {}",
+                json.to_text()
+            );
+        }
+        let json = render_json(&SysQuery { json: true, ..q }, &c);
+        let other = named_object(&json, "id", &Jv::s("a9")).expect("other job retained");
+        let expected = if absence == "duplicate_sid" {
+            Jv::why("not_sampled")
+        } else {
+            Jv::s(NAMED_OTHER_SID)
+        };
+        assert_eq!(
+            other.get("sid"),
+            Some(&expected),
+            "{absence}: {}",
+            other.to_text()
+        );
+    }
+}
+
+#[test]
+fn sys_names_do_not_turn_identity_into_access_to_foreign_rows() {
+    let mut s = snapshot_with_jobs();
+    let mut foreign = s.procs.iter().find(|row| row.pid == 201).unwrap().clone();
+    foreign.pid = 991;
+    foreign.name = "foreign-private-exe".into();
+    foreign.scope = RowScope::Tab(99);
+    s.procs.push(foreign);
+    let mut w = named_sessions_world();
+    w.roots.push(Root {
+        path: "/Users//a/foreign-private-path".into(),
+        keys: vec![99],
+        tab: Some(2),
+        ..Root::default()
+    });
+    let c = ctx(&w, Some(&s), false, true);
+    for view in [
+        View::Overview,
+        View::Tab,
+        View::Jobs,
+        View::Procs,
+        View::Disk,
+        View::Mem,
+        View::Why,
+    ] {
+        let q = query(view, false);
+        let text = all_text(&render_text(&q, &c));
+        let json = render_json(&SysQuery { json: true, ..q }, &c).to_text();
+        for output in [&text, &json] {
+            assert!(
+                !output.contains("foreign-private-exe")
+                    && !output.contains("foreign-private-path")
+                    && !output.contains("foreign-event"),
+                "{view:?}: {output}"
+            );
+        }
+    }
+    let own = render_json(&query(View::Jobs, true), &c);
+    let job = named_object(&own, "id", &Jv::s("a40977")).expect("own job remains visible");
+    assert_eq!(job.get("sid"), Some(&Jv::s(NAMED_OWN_SID)));
+    assert!(named_object(&own, "id", &Jv::s("a9")).is_none());
+    let owner = ctx(&w, Some(&s), true, true);
+    let procs = render_json(&SysQuery::parse("procs scope=global").unwrap(), &owner);
+    assert!(
+        named_object(&procs, "pid", &Jv::u(991)).is_some(),
+        "owner control: {}",
+        procs.to_text()
+    );
+    let jobs = render_json(&SysQuery::parse("jobs scope=global").unwrap(), &owner);
+    assert!(
+        named_object(&jobs, "id", &Jv::s("a9")).is_some(),
+        "owner control: {}",
+        jobs.to_text()
+    );
 }
 
 #[test]
@@ -1440,12 +1788,15 @@ fn a_wide_disk_scope_prints_only_the_callers_own_folders() {
         assert!(!out.contains("ignore"), "tab 2's folder name leaked: {out}");
         assert!(!out.contains("secret"), "tab 2's subtree leaked: {out}");
     }
-    assert!(text.contains("tab=2 under=tmp"), "{text}");
+    assert!(
+        text.contains("tab=2 sid=unavailable(not_sampled) under=tmp"),
+        "{text}"
+    );
     assert!(text.contains("dir root=2 rank=1"), "{text}");
     let (text, _) = read(Some(&[8]));
     assert!(text.contains("ignore%20previous%20instructions"), "{text}");
     assert!(!text.contains("my%20proj"), "{text}");
-    assert!(text.contains("tab=1 under=home"), "{text}");
+    assert!(text.contains("tab=1 sid=s-ab12 under=home"), "{text}");
     let (text, json) = read(None);
     for out in [&text, &json] {
         assert!(
@@ -1722,9 +2073,13 @@ fn procs_carry_each_age_and_each_programs_oldest() {
             .find(|l| l.starts_with(&format!("proc pid={pid} ")))
             .unwrap_or_else(|| panic!("{pid}: {text}"))
     };
-    assert!(row(201).ends_with(" age_ms=2820000"), "{}", row(201));
     assert!(
-        row(202).ends_with(" age_ms=unavailable(not_sampled)"),
+        row(201).ends_with(" age_ms=2820000 sid=s-ab12"),
+        "{}",
+        row(201)
+    );
+    assert!(
+        row(202).ends_with(" age_ms=unavailable(not_sampled) sid=s-ab12"),
         "{}",
         row(202)
     );
@@ -1782,7 +2137,7 @@ fn procs_carry_each_age_and_each_programs_oldest() {
         !rows.is_empty()
             && rows
                 .iter()
-                .all(|l| l.ends_with(" age_ms=unavailable(not_sampled)")),
+                .all(|l| l.ends_with(" age_ms=unavailable(not_sampled) sid=s-ab12")),
         "{text}"
     );
     let j = render_json(&query(View::Procs, true), &c);
@@ -2007,7 +2362,7 @@ fn sys_disk_prints_what_the_walker_measured_through_the_seam() {
         "{text}"
     );
     assert!(
-        text.contains("root n=1 kinds=cwd,repo tab=1 path=/Users//a/my%20proj state=complete alloc_bytes=7050000000 entries=63039 growth_bps=7400000 walked_s=3 shared_with=2 counted_in=tab1"),
+        text.contains("root n=1 kinds=cwd,repo tab=1 sid=s-ab12 path=/Users//a/my%20proj state=complete alloc_bytes=7050000000 entries=63039 growth_bps=7400000 walked_s=3 shared_with=2 shared_with_sids=unavailable(not_sampled) counted_in=tab1 counted_in_sid=unavailable(not_sampled)"),
         "{text}"
     );
     assert!(
@@ -2425,7 +2780,7 @@ fn another_tabs_events_and_machine_names_print_only_for_the_owner() {
         "{scoped}"
     );
     assert!(
-        scoped.contains("scope=tab tab=1 from_mc=100 to_mc=3000 top=cc1plus"),
+        scoped.contains("scope=tab tab=1 sid=s-ab12 from_mc=100 to_mc=3000 top=cc1plus"),
         "{scoped}"
     );
     assert!(!scoped.contains("node"), "{scoped}");
@@ -2486,6 +2841,7 @@ fn snapshot_with_jobs() -> Snapshot {
         lanes_off: vec!["lane_off:kqueue_detail"],
         parked_tabs: Vec::new(),
         at_ms: s.at_ns / 1_000_000,
+        zombie_facts: None,
     }));
     s
 }
@@ -2562,7 +2918,7 @@ fn sys_jobs_reads_the_engines_rows_of_the_scope_in_both_shapes() {
     let first = text.lines().next().unwrap();
     assert_eq!(
         first,
-        "jobs  tab 1 · 2 jobs · 1 running · 1 stuck · worst: silent 19m12s, about 19× the assumed 60 s gap, φ 8.34"
+        "jobs  tab 1 sid=s-ab12 · 2 jobs · 1 running · 1 stuck · worst: silent 19m12s, about 19× the assumed 60 s gap, φ 8.34"
     );
     for (id, fields) in [
         (
@@ -2732,8 +3088,8 @@ fn sys_jobs_scope_global_is_every_row_and_finding() {
     );
     assert!(text.contains("verdict=stuck tab=1"), "{text}");
     assert!(
-        text.lines()
-            .any(|l| l.starts_with("job id=a9 ") && l.ends_with("verdict=stuck")),
+        text.lines().any(|l| l.starts_with("job id=a9 ")
+            && l.ends_with("verdict=stuck sid=unavailable(not_sampled)")),
         "{text}"
     );
     assert!(
@@ -2760,6 +3116,7 @@ fn sys_jobs_scope_global_is_every_row_and_finding() {
     other.jobs = Some(std::sync::Arc::new(view));
     let mut w2 = world();
     w2.tabs.push(TabFact {
+        sampled_nonce: None,
         key: 99,
         sid: "s-cd34".into(),
         window: Some(1),
@@ -2907,7 +3264,9 @@ fn a_first_sweeps_procs_are_warming_never_zero() {
     assert!(overview.contains("4 cores total"), "{overview}");
     let text = all_text(&render_text(&query(View::Procs, false), &c));
     assert!(
-        text.starts_with("procs  tab 1 · unavailable(warming): one process sweep has no interval"),
+        text.starts_with(
+            "procs  tab 1 sid=s-ab12 · unavailable(warming): one process sweep has no interval"
+        ),
         "{text}"
     );
     let j = render_json(&query(View::Procs, true), &c);
@@ -3060,7 +3419,7 @@ fn gpu_client_time_fills_the_lanes_slots_in_text_and_json() {
         [
             "client pid=100 exe=aterm scope=self share_ppm=15000",
             "client pid=88 exe=WindowServer scope=services share_ppm=8000",
-            "client pid=201 exe=cargo scope=tab tab=1 share_ppm=5000",
+            "client pid=201 exe=cargo scope=tab tab=1 sid=s-ab12 share_ppm=5000",
             "client pid=900 exe=Safari scope=others share_ppm=2000",
         ],
         "{gpu}"
@@ -3112,7 +3471,7 @@ fn gpu_client_time_fills_the_lanes_slots_in_text_and_json() {
     let rows: Vec<&str> = gpu.lines().filter(|l| l.starts_with("client ")).collect();
     assert_eq!(
         rows,
-        ["client pid=201 exe=cargo scope=tab tab=1 share_ppm=5000"]
+        ["client pid=201 exe=cargo scope=tab tab=1 sid=s-ab12 share_ppm=5000"]
     );
     assert!(
         gpu.contains("withheld=3") && !gpu.contains("Safari") && !gpu.contains("WindowServer"),
@@ -3345,9 +3704,9 @@ fn sys_disk_names_each_programs_hour_with_its_coverage() {
     assert_eq!(
         programs,
         [
-            "program exe=cargo n=1 scope=tab tab=1 write_bytes_per_h=3240000000 covered_s=70",
+            "program exe=cargo n=1 scope=tab tab=1 sid=s-ab12 write_bytes_per_h=3240000000 covered_s=70",
             "program exe=Safari n=1 scope=others write_bytes_per_h=1080000000 covered_s=70",
-            "program exe=- n=1 scope=tab tab=1 write_bytes_per_h=1080000000 covered_s=70",
+            "program exe=- n=1 scope=tab tab=1 sid=s-ab12 write_bytes_per_h=1080000000 covered_s=70",
             "program exe=aterm n=1 scope=aterm write_bytes_per_h=720000000 covered_s=70",
             "program exe=aterm-helper n=1 scope=aterm write_bytes_per_h=180000000 covered_s=70",
         ],
@@ -3372,7 +3731,7 @@ fn sys_disk_names_each_programs_hour_with_its_coverage() {
     let text = all_text(&render_text(&q, &c));
     assert!(
         text.contains(
-            "program exe=cargo n=1 scope=tab tab=1 write_bytes_per_h=unavailable(warming) covered_s=1"
+            "program exe=cargo n=1 scope=tab tab=1 sid=s-ab12 write_bytes_per_h=unavailable(warming) covered_s=1"
         ),
         "{text}"
     );
@@ -3403,12 +3762,12 @@ fn covered_seconds_never_claim_the_minute_a_warming_figure_lacks() {
     s.facts.writes_covered_s = 59.6;
     assert_eq!(
         first_program(&s),
-        "program exe=cargo n=1 scope=tab tab=1 write_bytes_per_h=unavailable(warming) covered_s=59"
+        "program exe=cargo n=1 scope=tab tab=1 sid=s-ab12 write_bytes_per_h=unavailable(warming) covered_s=59"
     );
     s.facts.writes_covered_s = 60.0;
     assert_eq!(
         first_program(&s),
-        "program exe=cargo n=1 scope=tab tab=1 write_bytes_per_h=3780000000 covered_s=60"
+        "program exe=cargo n=1 scope=tab tab=1 sid=s-ab12 write_bytes_per_h=3780000000 covered_s=60"
     );
 }
 
@@ -3839,7 +4198,7 @@ fn a_stalled_lane_prints_its_read_and_since_in_overview_procs_why_and_jobs() {
         "{overview}"
     );
     assert!(
-        overview.contains("tab 1   unavailable(stalled)"),
+        overview.contains("tab 1 sid=s-ab12 unavailable(stalled)"),
         "{overview}"
     );
     assert!(
@@ -3850,7 +4209,9 @@ fn a_stalled_lane_prints_its_read_and_since_in_overview_procs_why_and_jobs() {
     assert!(!overview.contains("measuring"), "{overview}");
     let procs = all_text(&render_text(&query(View::Procs, false), &c));
     assert!(
-        procs.contains("procs  tab 1 · unavailable(stalled): the process sweep did not answer"),
+        procs.contains(
+            "procs  tab 1 sid=s-ab12 · unavailable(stalled): the process sweep did not answer"
+        ),
         "{procs}"
     );
     let jobs = all_text(&render_text(&query(View::Jobs, false), &c));
@@ -4530,6 +4891,7 @@ fn the_overview_json_carries_heat_queue_blockage_situation_and_type() {
                         ("count", Jv::u(3)),
                         ("per_min_deci", Jv::u(30)),
                         ("local", Jv::u(7)),
+                        ("sid", Jv::s("s-ab12")),
                         ("tab", Jv::u(1)),
                     ]),
                     Jv::obj([
@@ -4538,6 +4900,7 @@ fn the_overview_json_carries_heat_queue_blockage_situation_and_type() {
                         ("count", Jv::u(2)),
                         ("per_min_deci", Jv::u(10)),
                         ("local", Jv::u(8)),
+                        ("sid", Jv::why("not_sampled")),
                     ]),
                 ]),
             ),
@@ -4631,6 +4994,7 @@ fn the_overview_json_carries_heat_queue_blockage_situation_and_type() {
                 ("count", Jv::u(3)),
                 ("per_min_deci", Jv::u(30)),
                 ("local", Jv::u(7)),
+                ("sid", Jv::s("s-ab12")),
                 ("tab", Jv::u(1)),
             ])]),
             "own_tab={own_tab}",
@@ -5081,4 +5445,132 @@ fn an_unread_heat_or_situation_reading_prints_its_word_never_zero() {
     assert_eq!(at(&j, "procs.dstate_count"), &Jv::u(0));
     assert_eq!(at(&j, "global.queue.threads_m"), &Jv::u(0));
     assert_eq!(at(&j, "heat.watts.ane_mw"), &Jv::u(0));
+}
+
+/// THE SPOTLIGHT LINE (SD-93): `sys` prints the family's state, CPU, reads and footprint with
+/// each volume's indexing, and `sys --json` carries the same in `global.spotlight`, inside the
+/// contract; before the first split by coalition the line says `unread` and the block is an
+/// unknown. CONTROL: an OS with no coalition lane prints no spotlight line, and a block whose
+/// state is no level breaks the contract.
+#[test]
+fn the_spotlight_line_and_block_say_the_family_and_its_volumes() {
+    use crate::spotlight::{Indexing, Reading, Share, State, Volume};
+    let w = world();
+    let mut s = snapshot();
+    s.coal_lane = crate::explain::CoalLane::On;
+    let text = |s: &Snapshot| {
+        all_text(&render_text(
+            &query(View::Overview, false),
+            &ctx(&w, Some(s), true, true),
+        ))
+    };
+    let json = |s: &Snapshot| {
+        let j = render_json(&query(View::Overview, true), &ctx(&w, Some(s), true, true));
+        assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+        j
+    };
+    assert!(
+        text(&s).contains("spotlight unavailable(unread)"),
+        "{}",
+        text(&s)
+    );
+    assert_eq!(at(&json(&s), "global.spotlight"), &Jv::why("unread"));
+
+    s.spotlight = Some(Reading {
+        at_unix_ms: 0,
+        window_ms: 5000,
+        cpu_mc: 2,
+        read_bps: 0,
+        footprint: crate::model::MemoryCharge {
+            bytes: 774 << 20,
+            members: 1,
+            unread: 0,
+        },
+        shares: vec![Share {
+            signing_id: "com.apple.mds_stores",
+            lead_pid: 91920,
+            cpu_mc: 2,
+            read_bps: 0,
+            footprint: Some(551 << 20),
+        }],
+        volumes: Some(vec![
+            Volume {
+                path: "/".into(),
+                indexing: Indexing::Enabled,
+            },
+            Volume {
+                path: "/System/Volumes/Data".into(),
+                indexing: Indexing::Disabled,
+            },
+        ]),
+        volumes_age_ms: Some(4200),
+        state: State::Idle,
+    });
+    let t = text(&s);
+    assert!(
+        t.contains(
+            "spotlight idle · 0.00c reported · 0.0 MB/s reads · 774 MiB · / on, /System/Volumes/Data off"
+        ),
+        "{t}"
+    );
+    let j = json(&s);
+    assert_eq!(at(&j, "global.spotlight.state"), &Jv::s("idle"));
+    assert_eq!(
+        at(&j, "global.spotlight.cpu_basis"),
+        &Jv::s("published_counters")
+    );
+    assert_eq!(
+        at(&j, "global.spotlight.footprint_bytes"),
+        &Jv::u(774 << 20)
+    );
+    assert_eq!(at(&j, "global.spotlight.volumes_read_ms_ago"), &Jv::u(4200));
+    let Jv::Arr(vols) = at(&j, "global.spotlight.volumes") else {
+        panic!("{}", j.to_text())
+    };
+    assert_eq!(at(&vols[1], "indexing"), &Jv::s("disabled"));
+
+    // A footprint some share left unread is a lower bound; one none read is not measured.
+    let read = s.clone();
+    let footprint = |s: &mut Snapshot, members, unread| {
+        let r = s.spotlight.as_mut().expect("read");
+        r.footprint.members = members;
+        r.footprint.unread = unread;
+    };
+    footprint(&mut s, 2, 1);
+    assert!(text(&s).contains("reads · ≥774 MiB · "), "{}", text(&s));
+    assert_eq!(
+        at(&json(&s), "global.spotlight.footprint_bytes"),
+        &Jv::at_least(774 << 20, "not_read")
+    );
+    footprint(&mut s, 2, 2);
+    assert!(
+        text(&s).contains("reads · unavailable(not_read) · "),
+        "{}",
+        text(&s)
+    );
+    assert_eq!(
+        at(&json(&s), "global.spotlight.footprint_bytes"),
+        &Jv::why("not_read")
+    );
+    s = read;
+
+    let mut bad = j.clone();
+    if let Some(Jv::Obj(g)) = bad.get("global").cloned().as_mut() {
+        for (k, v) in g.iter_mut() {
+            if k == "spotlight"
+                && let Jv::Obj(p) = v
+            {
+                p[0].1 = Jv::s("busy");
+            }
+        }
+        bad.set("global", Jv::Obj(g.clone()));
+    }
+    assert!(!contract_violations(&bad).is_empty(), "CONTROL");
+    let global = all_text(&render_text(
+        &query(View::Global, false),
+        &ctx(&w, Some(&s), true, true),
+    ));
+    assert!(global.contains("spotlight idle · "), "{global}");
+    s.coal_lane = crate::explain::CoalLane::Unsupported;
+    assert!(!text(&s).contains("spotlight"), "CONTROL");
 }

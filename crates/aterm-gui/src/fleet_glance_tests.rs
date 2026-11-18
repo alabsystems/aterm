@@ -3835,3 +3835,607 @@ fn a_read_names_two_tabs_sharing_five_characters_apart_once_their_ids_are_known(
         "each twin is named as far as tells it apart; a role is kept"
     );
 }
+
+/// A 0.198.0 window's reply at the facts level, as that release's writers made it (`v0.198.0`:
+/// `aterm-gui/src/survey.rs` `survey_rows` and `session_row`, `aterm-agent/src/survey_facts.rs`
+/// `header_tokens`): its header has no look, no `access=`, no home size and no updater words;
+/// its session row has no turn, output or token keys, no `pinned=` and no stamp of its own. Frozen:
+/// it never changes with this build's writers, so a reader of it is held to what a fleet of
+/// mixed builds still sends.
+#[cfg(unix)]
+const REPLY_0198: &str = "OK 2\n\
+instance pid=4198 host=old.local version=0.198.0 sessions=1 level=facts cut=0 \
+at_ms=1800000060000 node=n0198 instances=1 label=m198 window=1 window_last=1800000000 \
+ssh_host_key=- accounts=0 accounts_unread=- moves_7d=- move_tries_7d=- last_move=- \
+roster_unread=0\n\
+session local=1 sid=s-mixed state=alive program=claude program_kind=agent wait=- wait_gib=- \
+wait_ahead=- agent=busy agent_detail=- agent_ms=4000 human_ms=- bg=1 task=- task_rev=0 \
+task_from=- task_ms=- task_conclusion=- model=claude-opus effort=- ctx_left_pct=62 \
+usage_5h_pct=40 usage_7d_pct=55 account=- auth=- token=- detail=- doing=- role=- \
+supervisor=- attention=- goal=- needs=- needs_by=- hold_by=- held_from=- typed_by=- \
+typed_ms=- bells=0 bells_sounded=0 last_bell=-\n";
+
+/// This build's reply of the same session at [`look_header`]'s figures, made by this build's own
+/// writers where a test can reach them: the header by the survey facts'
+/// (`SwarmSurveyFacts::to_survey_reply_at`, the tokens a window's `survey_rows` sends), with a
+/// whole look, the updater's words, the home build and the worst store; the row's turn, output
+/// and token keys by the row's own (`survey::Progress::fields`), the rest of the row as
+/// `session_row` writes it for a session with no request, and the stamp a node's merge gives a
+/// row its window answered at another time (`node_serve::row_stamp`).
+#[cfg(unix)]
+fn reply_now(at_ms: u64) -> String {
+    reply_now_with(at_ms, PROGRESS_NOW)
+}
+
+/// The turn, output and token figures [`reply_now`]'s row sends: a turn open on a step, a job
+/// running (the row's `bg=1`) and transcript output 42 s old.
+#[cfg(unix)]
+const PROGRESS_NOW: crate::survey::Progress = crate::survey::Progress {
+    turn: Some(true),
+    turn_ms: Some(250_000),
+    turn_end_ms: Some(900_000),
+    step_ms: Some(30_000),
+    out_ms: Some(42_000),
+    out_src: Some("transcript"),
+    tok_in: Some(1_200_000),
+    tok_out: Some(56_000),
+    tok_for_ms: Some(3_600_000),
+    turns: Some(14),
+    tools: Some(203),
+};
+
+/// The updater standing [`reply_now`]'s header says, every field of it said: a downloaded build
+/// held after a network failure, tried twice, with automatic checks off.
+#[cfg(unix)]
+fn update_now() -> aterm_types::update_standing::UpdateFact {
+    use aterm_types::update_standing::{StandingWord, UpdateFact, UpdateStanding};
+    UpdateFact {
+        standing: StandingWord::Known(UpdateStanding::Downloaded),
+        checked_at: Some(1_800_000_000),
+        to: Some("0.206.0".to_owned()),
+        until: Some(1_800_003_600),
+        why: Some("network"),
+        tries: Some(2),
+        checks: Some(false),
+        said_at: None,
+    }
+}
+
+/// [`reply_now`] with its row's turn, output and token figures `progress`.
+#[cfg(unix)]
+fn reply_now_with(at_ms: u64, progress: crate::survey::Progress) -> String {
+    use aterm_agent::survey_facts::{HomeBuild, MachineFacts, StoreWorst, SwarmSurveyFacts};
+    use aterm_capacity::machine_look::{Limits, LoadScore, MachineLook};
+    let look = MachineLook {
+        at_unix_ms: Some(at_ms - 1_500),
+        cores: Some(12),
+        load_x100: Some([1_530, 900, 700]),
+        cpu_busy_x100: Some(1_140),
+        rate_win_ms: Some(61_000),
+        mem_total_mb: Some(65_536),
+        mem_used_mb: Some(40_000),
+        mem_avail_mb: Some(25_536),
+        mem_pressure: Some(aterm_sysprobe::MemoryLevel::Warn),
+        mem_psi60_x100: None,
+        swap_used_mb: Some(0),
+        swap_total_mb: Some(4_096),
+        disk_total_mb: Some(953_000),
+        disk_free_mb: Some(51_234),
+        gpu_cores: Some(38),
+        gpu_busy_pct: Some(97),
+        net_link_kbps: Some(10_000_000),
+        net_rx_kbps: Some(81_234),
+        net_tx_kbps: Some(2_345),
+        net_other_kbps: Some(12),
+        limits: Limits {
+            cpu: Some(true),
+            mem: Some(true),
+            disk: Some(false),
+            gpu: Some(true),
+        },
+        load: Some(LoadScore {
+            level_x100: 88,
+            over_x100: Some(21),
+        }),
+        ..MachineLook::UNREAD
+    };
+    let facts = SwarmSurveyFacts {
+        operation_lines: Vec::new(),
+        node: Some("n-now".to_owned()),
+        label: Some("m-now".to_owned()),
+        roster_unread: false,
+        version: "0.204.0".to_owned(),
+        window: true,
+        window_last: Some(1_800_000_000),
+        sessions: 1,
+        ssh_host_key: None,
+        accounts: Vec::new(),
+        accounts_unread: Vec::new(),
+        session_accounts: std::collections::BTreeMap::new(),
+        moves: None,
+        server_heard: Vec::new(),
+        home: None,
+        home_dir: None,
+        home_free_mb: Some(51_234),
+        home_total_mb: Some(953_000),
+        home_build: Some(HomeBuild {
+            mb: 2_048,
+            at_ms: at_ms - 60_000,
+            partial: false,
+        }),
+        store_worst: Some(StoreWorst {
+            name: "journal".to_owned(),
+            pct: 12,
+        }),
+        machine: Some(MachineFacts {
+            look,
+            up_since_ms: Some(at_ms - 3_600_000),
+            os: Some("macos"),
+            target: Some("aarch64-apple-darwin".to_owned()),
+        }),
+        repos: None,
+        update: Some(update_now()),
+    };
+    let header = facts.to_survey_reply_at(
+        false,
+        4204,
+        Some("now.local"),
+        at_ms,
+        1,
+        (aterm_types::fleet_access::FleetAccess::Full, true),
+    );
+    let row = format!(
+        "session local=1 sid=s-mixed state=alive program=claude program_kind=agent wait=- \
+         wait_gib=- wait_ahead=- agent=busy agent_detail=- agent_ms=4000 human_ms=- bg=1 \
+         task=- task_rev=0 task_from=- task_ms=- task_conclusion=- model=claude-opus effort=- \
+         ctx_left_pct=62 usage_5h_pct=40 usage_7d_pct=55 account=- auth=- token=- upgrade=- \
+         detail=- doing=- role=- supervisor=- attention=- goal=- needs=- needs_by=- hold_by=- \
+         held_from=- typed_by=- typed_ms=- request=- request_from=- request_why=- bells=0 \
+         bells_sounded=0 last_bell=- {} pinned=1 opened_ms={} at_ms={}",
+        progress.fields(),
+        at_ms - 7_200_000,
+        at_ms - 5_000,
+    );
+    // The header's count names the lines after it; the row is one more.
+    let (count, rest) = header
+        .strip_prefix("OK ")
+        .and_then(|reply| reply.split_once('\n'))
+        .expect("an OK reply");
+    let count: usize = count.parse().expect("a line count");
+    let (instance, extra) = rest.split_once('\n').expect("an instance line");
+    format!("OK {}\n{instance}\n{row}\n{extra}", count + 1)
+}
+
+/// The keys of a reply's `instance` and `session` lines, each with the word its line starts with.
+#[cfg(unix)]
+fn reply_keys(reply: &str) -> Vec<(&str, &str)> {
+    reply
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter(|(kind, _)| matches!(*kind, "instance" | "session"))
+        .flat_map(|(kind, rest)| {
+            rest.split(' ')
+                .filter_map(|token| token.split_once('='))
+                .map(move |(key, _)| (kind, key))
+        })
+        .collect()
+}
+
+/// `reply` with `key` of its `kind` line given `value`, or left out where `value` is `None`.
+#[cfg(unix)]
+fn reply_with(reply: &str, kind: &str, key: &str, value: Option<&str>) -> String {
+    let mut out = String::new();
+    for line in reply.lines() {
+        if line.split_once(' ').is_some_and(|(k, _)| k == kind) {
+            let tokens: Vec<String> = line
+                .split(' ')
+                .filter_map(|token| match token.split_once('=') {
+                    Some((k, _)) if k == key => value.map(|value| format!("{key}={value}")),
+                    _ => Some(token.to_owned()),
+                })
+                .collect();
+            out.push_str(&tokens.join(" "));
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// What the sightings read of a fleet whose peers sent `replies`, each through the survey's JSON
+/// form as this build's `aterm ctl survey --fleet --json` prints it.
+#[cfg(unix)]
+fn read_of_replies(replies: &[(&str, &str)]) -> Vec<aterm_db::fleet::read::Answered> {
+    let json = aterm_ctl::survey_json_of_replies(true, replies);
+    let read = sightings(&json, 9).expect("a survey");
+    assert_eq!(read.machines.len(), replies.len(), "{json}");
+    read.machines
+        .iter()
+        .map(|seen| answer_of(seen).clone())
+        .collect()
+}
+
+/// THE WIRE'S MIXED-VERSION PROMISE: a fleet of this build and of 0.198.0 reads both ways. Each
+/// reply goes through the survey's JSON form and the sightings, as a fleet read takes it. This
+/// build's reply, made by its own writers, reads every figure it sends. The frozen 0.198.0 reply
+/// reads every field newer than it unread and everything else as this build's. And each key this
+/// build sends that 0.198.0 did not, left out in turn, reads as exactly the figure it carries
+/// unread (never 0 or false) and every other figure as sent: `m_at_ms=` unreads the whole look,
+/// `access=` the access and the drive grant, `turn=` marks the row older, a row's `at_ms=` leaves
+/// it its header's time, and a key the sightings do not read leaves the read whole. A key it
+/// names no expectation for fails it. Each agent's class is stated, through a row for each of its
+/// branches; and on this Mac, a newer window that answers after an older one is read whole.
+#[cfg(unix)]
+#[test]
+fn a_mixed_version_fleet_reads_both_ways_and_an_unsent_field_is_unread_never_zero() {
+    use aterm_db::fleet::read::{Access, Look, OutSrc, TurnFacts, Work, WorkTally};
+    const AT: u64 = 1_800_000_060_000;
+    // A machine of one agent counts that agent's class. Each class below is stated, never
+    // derived by the rule the reader uses (`Work::of`), so a default inside that rule fails too.
+    let tally_of = |class: Work| {
+        let mut tally = WorkTally::default();
+        tally.add(class);
+        Some(tally)
+    };
+    let now = reply_now(AT);
+    let [mixed_now, mixed_old] = read_of_replies(&[("m1.local", &now), ("m2.local", REPLY_0198)])
+        .try_into()
+        .expect("two machines");
+
+    // This build: every figure its writers sent.
+    assert_eq!(mixed_now.build.as_deref(), Some("0.204.0"));
+    assert_eq!(mixed_now.answer_at_ms, Some(AT));
+    assert_eq!(mixed_now.home_free_mb, Some(51_234));
+    // Its standing, said at its header's `at_ms=`, every field read.
+    let update = aterm_types::update_standing::UpdateFact {
+        said_at: Some(AT / 1_000),
+        ..update_now()
+    };
+    assert_eq!(mixed_now.update.as_ref(), Some(&update));
+    assert_eq!(mixed_now.look, whole_look(AT));
+    assert_eq!(
+        (mixed_now.access, mixed_now.drive),
+        (Some(Access::Full), Some(true))
+    );
+    let [agent] = mixed_now.agents.as_slice() else {
+        panic!("one agent: {:?}", mixed_now.agents);
+    };
+    let turn = TurnFacts {
+        turn_open: Some(true),
+        turn_age_ms: Some(250_000),
+        turn_end_age_ms: Some(900_000),
+        step_age_ms: Some(30_000),
+        out_age_ms: Some(42_000),
+        out_src: Some(OutSrc::Transcript),
+        bg: Some(1),
+        older: false,
+        word_turn: true,
+    };
+    assert_eq!(
+        (
+            agent.turn,
+            agent.tok_in,
+            agent.tok_out,
+            agent.tok_for_ms,
+            agent.turns,
+            agent.tools,
+            agent.pinned,
+        ),
+        (
+            turn,
+            Some(1_200_000),
+            Some(56_000),
+            Some(3_600_000),
+            Some(14),
+            Some(203),
+            Some(true),
+        )
+    );
+    assert_eq!(agent.work, Work::Tool, "a turn open on a background job");
+    assert_eq!(
+        agent.answer_at_ms,
+        Some(AT - 5_000),
+        "a row its node stamped says its own window's time"
+    );
+
+    // 0.198.0: what it sent reads as this build's does; every field newer than it is unread.
+    let mut want = mixed_now.clone();
+    want.build = Some("0.198.0".to_owned());
+    want.home_free_mb = None;
+    want.update = None;
+    want.look = Look::UNREAD;
+    (want.access, want.drive) = (None, None);
+    let agent = &mut want.agents[0];
+    // It stamps no row: each was read at its header's time.
+    agent.answer_at_ms = Some(AT);
+    agent.turn = TurnFacts {
+        turn_open: None,
+        turn_age_ms: None,
+        turn_end_age_ms: None,
+        step_age_ms: None,
+        out_age_ms: None,
+        out_src: None,
+        older: true,
+        ..turn
+    };
+    (agent.tok_in, agent.tok_out, agent.tok_for_ms) = (None, None, None);
+    (agent.turns, agent.tools, agent.pinned) = (None, None, None);
+    // No turn word, step or output age: its agent's `busy` opens a turn whose output is unread.
+    agent.work = Work::OutputUnread;
+    want.work = tally_of(Work::OutputUnread);
+    assert_eq!(
+        mixed_old, want,
+        "a 0.198.0 reply: its newer fields unread, never 0"
+    );
+    assert_eq!(
+        mixed_old.agents[0].work,
+        Work::OutputUnread,
+        "a row with no output key is output unread, never no output"
+    );
+
+    // Each key since 0.198.0, left out of this build's reply in turn, reads as that one figure
+    // unread and every other as before. A key the sightings read names the figure it carries; a
+    // key they do not read leaves the read whole. A key named nowhere here fails the test, so a
+    // key a later build sends is placed here before that build ships.
+    // The keys the sightings leave to other readers: the home build, the other load averages,
+    // the pressure stall share, the worst store, and a row's upgrade, request and open time.
+    const NOT_READ: &[(&str, &str)] = &[
+        ("instance", "home_build_mb"),
+        ("instance", "home_build_at_ms"),
+        ("instance", "home_build_partial"),
+        ("instance", "load5_x100"),
+        ("instance", "load15_x100"),
+        ("instance", "mem_psi60_x100"),
+        ("instance", "store_worst"),
+        ("instance", "store_worst_pct"),
+        ("session", "upgrade"),
+        ("session", "request"),
+        ("session", "request_from"),
+        ("session", "request_why"),
+        ("session", "opened_ms"),
+    ];
+    let old: std::collections::BTreeSet<(&str, &str)> =
+        reply_keys(REPLY_0198).into_iter().collect();
+    let since: Vec<(&str, &str)> = reply_keys(&now)
+        .into_iter()
+        .filter(|key| !old.contains(key))
+        .collect();
+    for key in [
+        ("instance", "m_at_ms"),
+        ("instance", "load"),
+        ("instance", "access"),
+        ("instance", "update"),
+        ("session", "turn"),
+        ("session", "tok_in"),
+        ("session", "pinned"),
+        ("session", "at_ms"),
+    ] {
+        assert!(
+            since.contains(&key),
+            "{key:?} is a key since 0.198.0: {since:?}"
+        );
+    }
+    let [full] = read_of_replies(&[("m1.local", &now)])
+        .try_into()
+        .expect("one");
+    fn update_of(
+        answer: &mut aterm_db::fleet::read::Answered,
+    ) -> &mut aterm_types::update_standing::UpdateFact {
+        answer
+            .update
+            .as_mut()
+            .expect("this build says its standing")
+    }
+    let mut unplaced = Vec::new();
+    for (kind, key) in since {
+        let [left_out] = read_of_replies(&[("m1.local", &reply_with(&now, kind, key, None))])
+            .try_into()
+            .expect("one");
+        let mut want = full.clone();
+        let look = &mut want.look;
+        match (kind, key) {
+            ("instance", "m_at_ms") => *look = Look::UNREAD,
+            ("instance", "cores") => look.cores = None,
+            ("instance", "load1_x100") => look.load1_x100 = None,
+            ("instance", "cpu_busy_x100") => look.cpu_busy_x100 = None,
+            ("instance", "rate_win_ms") => look.rate_win_ms = None,
+            ("instance", "mem_total_mb") => look.mem_total_mb = None,
+            ("instance", "mem_used_mb") => look.mem_used_mb = None,
+            ("instance", "mem_avail_mb") => look.mem_avail_mb = None,
+            ("instance", "swap_used_mb") => look.swap_used_mb = None,
+            ("instance", "swap_total_mb") => look.swap_total_mb = None,
+            ("instance", "home_total_mb") => look.disk_total_mb = None,
+            ("instance", "gpu_cores") => look.gpu_cores = None,
+            ("instance", "gpu_busy_pct") => look.gpu_busy_pct = None,
+            ("instance", "net_link_kbps") => look.net_link_kbps = None,
+            ("instance", "net_rx_kbps") => look.net_rx_kbps = None,
+            ("instance", "net_tx_kbps") => look.net_tx_kbps = None,
+            ("instance", "net_other_kbps") => look.net_other_kbps = None,
+            ("instance", "mem_pressure") => look.mem_pressure = None,
+            ("instance", "cpu_lim") => look.limits.cpu = None,
+            ("instance", "mem_lim") => look.limits.mem = None,
+            ("instance", "disk_lim") => look.limits.disk = None,
+            ("instance", "gpu_lim") => look.limits.gpu = None,
+            ("instance", "load") => look.load = None,
+            ("instance", "up_since_ms") => (look.up_since_own_ms, look.up_for_ms) = (None, None),
+            ("instance", "os") => look.os = None,
+            ("instance", "target") => look.target = None,
+            ("instance", "home_free_mb") => want.home_free_mb = None,
+            ("instance", "update") => want.update = None,
+            ("instance", "update_at") => update_of(&mut want).checked_at = None,
+            ("instance", "update_to") => update_of(&mut want).to = None,
+            ("instance", "update_until") => update_of(&mut want).until = None,
+            ("instance", "update_why") => update_of(&mut want).why = None,
+            ("instance", "update_tries") => update_of(&mut want).tries = None,
+            ("instance", "update_checks") => update_of(&mut want).checks = None,
+            ("instance", "access") => (want.access, want.drive) = (None, None),
+            // Its writer spells no drive grant as no key (`survey_rows`).
+            ("instance", "drive") => want.drive = Some(false),
+            ("session", "turn") => {
+                want.agents[0].turn.turn_open = None;
+                want.agents[0].turn.older = true;
+            }
+            ("session", "turn_ms") => want.agents[0].turn.turn_age_ms = None,
+            ("session", "turn_end_ms") => want.agents[0].turn.turn_end_age_ms = None,
+            ("session", "step_ms") => want.agents[0].turn.step_age_ms = None,
+            ("session", "out_ms") => want.agents[0].turn.out_age_ms = None,
+            ("session", "out_src") => want.agents[0].turn.out_src = None,
+            ("session", "tok_in") => want.agents[0].tok_in = None,
+            ("session", "tok_out") => want.agents[0].tok_out = None,
+            ("session", "tok_for_ms") => want.agents[0].tok_for_ms = None,
+            ("session", "turns") => want.agents[0].turns = None,
+            ("session", "tools") => want.agents[0].tools = None,
+            ("session", "pinned") => want.agents[0].pinned = None,
+            // A row with no stamp of its own was read at its header's time.
+            ("session", "at_ms") => want.agents[0].answer_at_ms = full.answer_at_ms,
+            key if NOT_READ.contains(&key) => {}
+            key => {
+                unplaced.push(key);
+                continue;
+            }
+        }
+        // A step open keeps the row on its tool whatever else is unread; without the step, its
+        // transcript output 42 s old is output.
+        let class = if (kind, key) == ("session", "step_ms") {
+            Work::WithOutput
+        } else {
+            Work::Tool
+        };
+        want.agents[0].work = class;
+        want.work = tally_of(class);
+        assert_eq!(
+            left_out, want,
+            "{kind} {key} left out: that figure alone unread, never 0, the rest as sent"
+        );
+    }
+    assert!(
+        unplaced.is_empty(),
+        "keys since 0.198.0 with no expectation here: {unplaced:?}"
+    );
+
+    // Each branch of an agent's class, through rows this build's writer spells.
+    let open = |out_ms: Option<u64>| crate::survey::Progress {
+        step_ms: None,
+        out_ms,
+        ..PROGRESS_NOW
+    };
+    let closed = |turn_end_ms: Option<u64>| crate::survey::Progress {
+        turn: Some(false),
+        step_ms: None,
+        turn_end_ms,
+        ..PROGRESS_NOW
+    };
+    for (progress, class, why) in [
+        (
+            closed(None),
+            Work::WithOutput,
+            "a closed turn with a job running and output since, where no close time reads, is in a turn",
+        ),
+        (
+            closed(Some(30_000)),
+            Work::NoTurn,
+            "output older than the turn's close is that turn's own",
+        ),
+        (
+            open(None),
+            Work::OutputUnread,
+            "a turn with no output age (its writer's clock unread) is output unread, never output",
+        ),
+        (
+            open(Some(700_000)),
+            Work::NoOutput,
+            "output older than ten minutes",
+        ),
+        (
+            open(Some(42_000)),
+            Work::WithOutput,
+            "transcript output within ten minutes",
+        ),
+    ] {
+        let [answer] = read_of_replies(&[("m1.local", &reply_now_with(AT, progress))])
+            .try_into()
+            .expect("one");
+        assert_eq!(
+            (answer.agents[0].work, answer.work),
+            (class, tally_of(class)),
+            "{why}: {}",
+            progress.fields()
+        );
+    }
+
+    // This Mac's windows with an older one answering first, as an update leaves them: the newer
+    // window's figures are read, never left unread by the older one's silence.
+    let older_window = REPLY_0198.replace("sid=s-mixed", "sid=s-older");
+    let json = aterm_ctl::survey_json_of_replies(
+        false,
+        &[("pid 4198", &older_window), ("pid 4204", &now)],
+    );
+    let read = sightings(&json, 9).expect("a survey");
+    let [own] = read.machines.as_slice() else {
+        panic!("this Mac alone: {json}");
+    };
+    let own = answer_of(own);
+    assert_eq!(own.look, whole_look(AT), "the newer window's look");
+    assert_eq!(own.home_free_mb, Some(51_234));
+    // A local read asks for no drive grant, so this Mac's is unread whatever its windows say.
+    assert_eq!((own.access, own.drive), (Some(Access::Full), None));
+    let tokens: Vec<(&str, Option<u64>)> = own
+        .agents
+        .iter()
+        .map(|agent| (agent.sid.as_str(), agent.tok_in))
+        .collect();
+    assert_eq!(tokens, [("s-mixed", Some(1_200_000)), ("s-older", None)]);
+}
+
+/// A ROW'S ACTIVITY WORD AND ITS NEED ARE READ AS IT SENT THEM: a `word=` (CX-09's, which no
+/// build sends yet) is kept as sent, and a word outside the activity grammar, or none sent, is
+/// unread; `needs=-` is no need, a need word is that need, and a word outside the need grammar
+/// is unread. CONTROLS: a word invented where none was sent (from the agent's own word) and a
+/// `needs=-` read as unread are caught.
+#[cfg(unix)]
+#[test]
+fn a_rows_activity_word_and_its_need_are_read_as_it_sent_them() {
+    use aterm_types::needs::NeedWord;
+    const AT: u64 = 1_800_000_060_000;
+    let now = reply_now(AT);
+    assert!(
+        now.contains(" needs=-"),
+        "this build's row says no need: {now}"
+    );
+    let agent_of = |reply: &str| {
+        let [answer] = read_of_replies(&[("m1.local", reply)])
+            .try_into()
+            .expect("one");
+        let agent = answer.agents.first().expect("an agent").clone();
+        (agent.activity, agent.need)
+    };
+    assert_eq!(agent_of(&now), (None, Some(None)), "no word sent, no need");
+    let with = |key: &str, value: &str| now.replacen(" needs=-", &format!(" {key}={value}"), 1);
+    let with_word = |word: &str| now.replacen(" needs=-", &format!(" word={word} needs=-"), 1);
+    for word in ["busy", "wall:usage-weekly", "on-track"] {
+        assert_eq!(
+            agent_of(&with_word(word)).0.as_deref(),
+            Some(word),
+            "{word} as sent"
+        );
+    }
+    for word in ["-", "Busy", "42", &"w".repeat(33)] {
+        assert_eq!(
+            agent_of(&with_word(word)).0,
+            None,
+            "{word} is no activity word"
+        );
+    }
+    assert_eq!(
+        agent_of(&with("needs", "question")).1,
+        Some(Some(NeedWord::Question))
+    );
+    assert_eq!(
+        agent_of(&with("needs", "rebuilding")).1,
+        None,
+        "a newer need word"
+    );
+    let without = reply_with(&now, "session", "needs", None);
+    assert_eq!(agent_of(&without).1, None, "no needs= key");
+}

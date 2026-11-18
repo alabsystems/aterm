@@ -13,8 +13,13 @@
 //! keeps no light run at all while its key's heaviest peak is young ([`Records::light`]): it is
 //! run over an unchanged tree far more often than verify runs a stage.
 //!
-//! Two files hold records, one beside the other in this user's aterm state directory: verify's
-//! stages ([`VERIFY_RECORD`]) and plain `targo` builds ([`TARGO_RECORD`]). Verify reads its own
+//! Independent files in this user's aterm state directory retain verify's stages
+//! ([`VERIFY_RECORD`]), weaker meter-derived shaping units ([`VERIFY_SHAPING_RECORD`]), and
+//! plain `targo` builds ([`TARGO_RECORD`]). Each keeps its own row/peak/byte bounds. A typed
+//! [`ShapingHistory`] composes stage and shaping observations for estimates and unit floors;
+//! compiler-unit admission reads a different, success-proven book. The versioned stage and
+//! shaping files can import retained rows from [`LEGACY_VERIFY_RECORD`] without changing that
+//! old mixed file, so an old writer cannot erase new history. Verify reads its stages
 //! with [`Records::learned`]: the key's record, else the most of a wider selection's in the same
 //! checkout. A plain build reads further ([`chain`]): the most of every record of the same work,
 //! its key's own, its key's in another checkout (a new worktree is the common case), and verify's
@@ -32,6 +37,12 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 use aterm_json::{Map, Value};
+
+#[path = "verify_history.rs"]
+mod verify_history;
+pub use verify_history::{
+    ShapingHistory, ShapingSource, keep_shaping_unit, keep_stage, stage_records,
+};
 
 /// The peaks one record keeps, newest last.
 pub const KEPT: usize = 8;
@@ -58,7 +69,13 @@ pub const HEAVY_STANDS_MS: u64 = 14 * 24 * 60 * 60 * 1000;
 pub const LIGHT_SHARE: u64 = 4;
 
 /// Verify's stages' records, under this user's aterm state directory.
-pub const VERIFY_RECORD: &str = "verify/stage-memory.json";
+pub const VERIFY_RECORD: &str = "verify/stage-memory-v3.json";
+
+/// Weaker meter-derived shaping units, kept apart from stages and from wrapper-proven admission.
+pub const VERIFY_SHAPING_RECORD: &str = "verify/shaping-unit-memory-v1.json";
+
+/// The old mixed stage/shaping book. New writers never change it.
+pub const LEGACY_VERIFY_RECORD: &str = "verify/stage-memory.json";
 
 /// Plain `targo` builds' records, beside verify's ([`VERIFY_RECORD`]).
 pub const TARGO_RECORD: &str = "verify/targo-memory.json";
@@ -578,6 +595,10 @@ impl Records {
     /// schema, or with any row it cannot read whole.
     #[must_use]
     pub fn decode(text: &str) -> Records {
+        Self::decode_checked(text).unwrap_or_default()
+    }
+
+    fn decode_checked(text: &str) -> Option<Records> {
         let decoded = || -> Option<Records> {
             let file: Value = aterm_json::from_str(text).ok()?;
             if file.get("schema").and_then(Value::as_u64) != Some(SCHEMA) {
@@ -605,7 +626,7 @@ impl Records {
                 .collect::<Option<Vec<_>>>()?;
             Some(Records { rows })
         };
-        decoded().unwrap_or_default()
+        decoded()
     }
 
     /// The records kept in `path`; none where it is absent or unreadable, including a file
@@ -751,7 +772,11 @@ pub struct Found {
 /// nothing kept would. `None` where nothing is kept: the build claims the cold figure. A tie is
 /// read as the build's own.
 #[must_use]
-pub fn chain(own: &Records, key: &Key, analogue: Option<(&Records, &Key)>) -> Option<Found> {
+pub fn chain(
+    own: &Records,
+    key: &Key,
+    analogue: Option<(&dyn ShapingSource, &Key)>,
+) -> Option<Found> {
     let found = |peak: u64, runs: usize, via: Via| Found { peak, runs, via };
     let like = analogue.and_then(|(records, like)| {
         records
@@ -824,7 +849,7 @@ pub struct BuildNeed {
 pub fn need(
     own: &Records,
     key: &Key,
-    analogue: Option<(&Records, &Key)>,
+    analogue: Option<(&dyn ShapingSource, &Key)>,
     physical: Option<u64>,
 ) -> BuildNeed {
     match chain(own, key, analogue) {

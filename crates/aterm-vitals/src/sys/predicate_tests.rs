@@ -224,6 +224,7 @@ fn a_job_that_left_the_view_is_read_from_the_ring() {
         lanes_off: Vec::new(),
         parked_tabs: Vec::new(),
         at_ms: 0,
+        zombie_facts: None,
     }));
     let ended = [
         EndedJob {
@@ -265,6 +266,7 @@ fn a_job_that_left_the_view_is_read_from_the_ring() {
         lanes_off: Vec::new(),
         parked_tabs: Vec::new(),
         at_ms: 0,
+        zombie_facts: None,
     }));
     assert!(evaluate(&machine("sys job=a5 done"), &s2, &[7]).holds);
     assert_eq!(
@@ -294,6 +296,7 @@ fn job_terms_read_the_engines_rows_of_the_target_tab_only() {
         lanes_off: Vec::new(),
         parked_tabs: Vec::new(),
         at_ms: 0,
+        zombie_facts: None,
     }));
     let o = evaluate(&machine("sys jobs.stuck=1 and jobs.running>=1"), &s, &[7]);
     assert!(o.holds, "{o:?}");
@@ -1047,4 +1050,115 @@ fn a_slots_wait_for_twenty_minutes_holds_only_across_stamps_that_span_them() {
     assert_eq!(feed(at(20 * min, 1)), None);
     assert_eq!(feed(at(39 * min, 1)), None);
     assert_eq!(feed(at(40 * min, 1)), Some(1_200_000));
+}
+
+/// The family at `cpu_mc` and `read_bps`, with `volumes` (path, disabled) read a minute before.
+fn spotlight(cpu_mc: i64, read_bps: u64, volumes: &[(&str, bool)]) -> Snapshot {
+    use crate::spotlight::{Indexing, Reading, State, Volume, VolumesRead};
+    let read = VolumesRead {
+        volumes: volumes
+            .iter()
+            .map(|&(path, off)| Volume {
+                path: path.into(),
+                indexing: if off {
+                    Indexing::Disabled
+                } else {
+                    Indexing::Enabled
+                },
+            })
+            .collect(),
+        at_ms: 0,
+    };
+    let reading = Reading {
+        at_unix_ms: 0,
+        window_ms: 5_000,
+        cpu_mc,
+        read_bps,
+        footprint: crate::model::MemoryCharge::default(),
+        shares: Vec::new(),
+        volumes: None,
+        volumes_age_ms: None,
+        state: State::Idle,
+    }
+    .with_volumes(Some(&read), 60_000);
+    Snapshot {
+        spotlight: Some(reading),
+        coal_lane: crate::explain::CoalLane::On,
+        ..snap(0.1)
+    }
+}
+
+/// `spotlight=idle` holds only while the family is under both bars (200 millicores, 5 MB/s):
+/// a busy family reads `indexing`, a quiet one `idle`, and a quiet one with every volume off
+/// reads `off`. A busy family reads `indexing` even with every volume off, so
+/// `spotlight!=indexing` is the wait for a family under its bars on any Mac.
+/// `spotlight` takes `=` and `!=` with a comma list, and no other comparison.
+/// NEGATIVE CONTROL: the family at the CPU bar exactly, and at the read bar exactly, does not
+/// hold; nor does a snapshot whose family is unread, which waits rather than refuses.
+#[test]
+fn await_sys_spotlight_idle_holds_only_while_the_family_is_under_its_bars() {
+    let w = machine("sys spotlight=idle for=60s timeout=600000");
+    assert_eq!(w.terms[0].metric, Metric::Spotlight);
+    assert_eq!(w.for_ms, 60_000);
+    let vols = [("/", false), ("/System/Volumes/Data", false)];
+    let busy = evaluate(&w, &spotlight(250, 0, &vols), &[]);
+    assert_eq!(
+        (busy.holds, busy.values.as_slice()),
+        (false, &["spotlight=indexing".to_owned()][..])
+    );
+    let quiet = evaluate(&w, &spotlight(100, 1_000_000, &vols), &[]);
+    assert_eq!(
+        (quiet.holds, quiet.values.as_slice()),
+        (true, &["spotlight=idle".to_owned()][..])
+    );
+    let all_off = [("/", true), ("/System/Volumes/Data", true)];
+    let off = spotlight(0, 0, &all_off);
+    let read = evaluate(&w, &off, &[]);
+    assert_eq!(
+        (read.holds, read.values.as_slice()),
+        (false, &["spotlight=off".to_owned()][..])
+    );
+    assert!(evaluate(&machine("sys spotlight=off"), &off, &[]).holds);
+    assert!(evaluate(&machine("sys spotlight!=indexing"), &off, &[]).holds);
+    let busy_off = spotlight(250, 0, &all_off);
+    assert_eq!(
+        evaluate(&w, &busy_off, &[]).values,
+        ["spotlight=indexing".to_owned()],
+        "indexing wins over every volume off"
+    );
+    for quiet_wait in ["sys spotlight!=indexing", "sys spotlight=idle,off"] {
+        assert!(
+            !evaluate(&machine(quiet_wait), &busy_off, &[]).holds,
+            "{quiet_wait} over a busy family"
+        );
+    }
+    for at_a_bar in [spotlight(200, 0, &vols), spotlight(0, 5_000_000, &vols)] {
+        assert!(!evaluate(&w, &at_a_bar, &[]).holds);
+    }
+    assert!(
+        evaluate(
+            &machine("sys spotlight!=off,indexing"),
+            &spotlight(0, 0, &vols),
+            &[]
+        )
+        .holds
+    );
+    assert!(evaluate(&machine("sys spotlight=idle,off"), &off, &[]).holds);
+    assert!(AwaitSys::parse("sys spotlight>idle").is_err());
+    assert!(AwaitSys::parse("sys spotlight<=off").is_err());
+    assert!(AwaitSys::parse("sys spotlight=busy").is_err());
+    let unread = Snapshot {
+        coal_lane: crate::explain::CoalLane::On,
+        ..snap(0.1)
+    };
+    let waits = evaluate(&w, &unread, &[]);
+    assert_eq!(
+        (waits.holds, waits.refused, waits.values.as_slice()),
+        (false, None, &["spotlight=warming".to_owned()][..])
+    );
+    let linux = evaluate(&w, &snap(0.1), &[]);
+    assert_eq!(
+        linux.refused.as_deref(),
+        Some("ERR unavailable spotlight why=unsupported\n")
+    );
 }

@@ -32,12 +32,105 @@ pub struct RefreshState {
     /// The passes' own Git writes to the checkouts ([`CheckoutWrites`]).
     #[serde(default)]
     own: CheckoutWrites,
+    /// Empty-origin observations, bound to their account/source and exact local storage.
+    #[serde(default, skip_serializing_if = "EmptyCheckouts::is_empty")]
+    empty: EmptyCheckouts,
+}
+
+/// Durable empty-origin observations. The keys contain only digests; consuming one still
+/// requires fresh account/source admission and the exact checkout's physical and ref identity.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmptyCheckouts {
+    scope: Option<RefreshScope>,
+    subjects: std::collections::BTreeMap<CheckoutDigest, CheckoutDigest>,
+}
+
+impl EmptyCheckouts {
+    fn is_empty(&self) -> bool {
+        self.subjects.is_empty()
+    }
+
+    pub(crate) fn has_checkout(&self, scope: RefreshScope, checkout: CheckoutDigest) -> bool {
+        self.scope == Some(scope) && self.subjects.contains_key(&checkout)
+    }
+
+    pub(crate) fn contains(
+        &self,
+        scope: RefreshScope,
+        checkout: CheckoutDigest,
+        subject: CheckoutDigest,
+    ) -> bool {
+        self.scope == Some(scope) && self.subjects.get(&checkout) == Some(&subject)
+    }
+}
+
+/// Read empty-origin observations from the account's admitted private alignment record.
+/// Missing or unreadable evidence proves nothing and requires a new remote observation.
+#[must_use]
+pub fn empty_checkouts(state: &Path) -> EmptyCheckouts {
+    read_record(state)
+        .and_then(|record| record.repositories)
+        .map_or_else(EmptyCheckouts::default, |record| record.empty)
+}
+
+/// Encode one readable receipt. Optional empty-origin observations may be evicted to keep
+/// the record within its reader's budget; scheduling epochs, rows and own writes are retained.
+/// The file and in-memory backends keep the same reduced evidence.
+pub(super) fn encode_record(record: &mut Record) -> Result<String, String> {
+    let encode = |record: &Record| aterm_json::to_string(record).map_err(|why| why.to_string());
+    let mut text = encode(record)?;
+    if text.len().saturating_add(1) > super::RECORD_BYTES
+        && let Some(state) = record
+            .repositories
+            .as_mut()
+            .filter(|state| !state.empty.is_empty())
+    {
+        let scope = state.empty.scope;
+        let subjects: Vec<_> = std::mem::take(&mut state.empty.subjects)
+            .into_iter()
+            .collect();
+        let keep = |record: &mut Record, count: usize| {
+            record
+                .repositories
+                .as_mut()
+                .expect("the record retains its repository state")
+                .empty = if count == 0 {
+                EmptyCheckouts::default()
+            } else {
+                EmptyCheckouts {
+                    scope,
+                    subjects: subjects.iter().take(count).copied().collect(),
+                }
+            };
+        };
+        let (mut lower, mut upper) = (0, subjects.len() - 1);
+        while lower < upper {
+            let middle = lower + (upper - lower).div_ceil(2);
+            keep(record, middle);
+            if encode(record)?.len().saturating_add(1) <= super::RECORD_BYTES {
+                lower = middle;
+            } else {
+                upper = middle - 1;
+            }
+        }
+        keep(record, lower);
+        text = encode(record)?;
+    }
+    if text.len().saturating_add(1) > super::RECORD_BYTES {
+        return Err(format!(
+            "converge record exceeds its read budget of {} bytes",
+            super::RECORD_BYTES
+        ));
+    }
+    text.push('\n');
+    Ok(text)
 }
 
 /// A digest of one checkout's Git metadata as the repository input observer reads it
 /// ([`crate::init_github::RepositoryCheckoutMetadata`]), or of the folder that names a checkout
 /// ([`Self::folder`]): never a path, and nothing read from inside a file.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CheckoutDigest([u8; 32]);
 
 impl CheckoutDigest {
@@ -392,6 +485,17 @@ pub struct Memory {
 }
 
 impl Memory {
+    /// Empty-origin evidence kept by this persistent in-memory account record.
+    #[must_use]
+    pub fn empty_checkouts(&self) -> EmptyCheckouts {
+        self.record
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .and_then(|record| record.repositories.as_ref())
+            .map_or_else(EmptyCheckouts::default, |record| record.empty.clone())
+    }
+
     /// [`running`] for an in-memory record: its refresh claim, read without the lease.
     #[must_use]
     pub fn running(&self) -> bool {
@@ -497,10 +601,11 @@ impl RepositoryPass {
         Access { observed, pass }
     }
 
-    fn persist(&self, record: &Record) -> Result<(), String> {
+    fn persist(&self, record: &mut Record) -> Result<(), String> {
         match &self.storage {
             Storage::File { state, .. } => write_record(&state.join(FileJournal::DIR), record),
             Storage::Memory(memory) => {
+                drop(encode_record(record)?);
                 *memory.record.lock().unwrap_or_else(PoisonError::into_inner) =
                     Some(record.clone());
                 Ok(())
@@ -523,8 +628,37 @@ impl RepositoryPass {
     pub fn record_pass(&self, mut newer: Record) -> Result<(), String> {
         let mut record = self.record.lock().unwrap_or_else(PoisonError::into_inner);
         newer.repositories = record.repositories.clone();
-        self.persist(&newer)?;
+        self.persist(&mut newer)?;
         *record = newer;
+        Ok(())
+    }
+
+    /// Replace the admitted source's empty-origin evidence under this pass's alignment lease.
+    /// Unchanged evidence writes nothing. A fresh remote observation may clear old evidence
+    /// before it starts; a failed observation then cannot revive an older empty result.
+    pub(crate) fn record_empty(
+        &self,
+        scope: RefreshScope,
+        subjects: Vec<(CheckoutDigest, CheckoutDigest)>,
+    ) -> Result<(), String> {
+        let empty = if subjects.is_empty() {
+            EmptyCheckouts::default()
+        } else {
+            EmptyCheckouts {
+                scope: Some(scope),
+                subjects: subjects.into_iter().collect(),
+            }
+        };
+        let mut record = self.record.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = record.repositories.clone().unwrap_or_default();
+        if state.empty == empty {
+            return Ok(());
+        }
+        state.empty = empty;
+        let mut candidate = record.clone();
+        candidate.repositories = Some(state);
+        self.persist(&mut candidate)?;
+        *record = candidate;
         Ok(())
     }
 
@@ -587,7 +721,7 @@ impl RepositoryPass {
         if waiting {
             let mut candidate = record.clone();
             candidate.repositories = Some(state);
-            self.persist(&candidate)?;
+            self.persist(&mut candidate)?;
             *record = candidate;
             return Ok(Admission::Waiting);
         }
@@ -611,7 +745,7 @@ impl RepositoryPass {
         state.running = Some(attempt);
         let mut candidate = record.clone();
         candidate.repositories = Some(state);
-        self.persist(&candidate)?;
+        self.persist(&mut candidate)?;
         *record = candidate;
         Ok(Admission::Refresh(Ticket(attempt)))
     }
@@ -645,7 +779,7 @@ impl RepositoryPass {
                 delay_ms,
             });
         }
-        self.persist(&candidate)?;
+        self.persist(&mut candidate)?;
         *record = candidate;
         Ok(())
     }
@@ -690,7 +824,7 @@ impl RepositoryPass {
             after: None,
             made: false,
         });
-        self.persist(&candidate)?;
+        self.persist(&mut candidate)?;
         *record = candidate;
         if first {
             let _ = self.writes.set(pass);
@@ -770,7 +904,7 @@ impl RepositoryPass {
                 own.writes.remove(oldest);
             }
         }
-        self.persist(&candidate)?;
+        self.persist(&mut candidate)?;
         *record = candidate;
         Ok(())
     }

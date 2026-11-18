@@ -66,15 +66,16 @@ pub struct Activity {
 pub const ACTIVITIES: &[Activity] = &[Activity {
     id: ActivityId::Spotlight,
     word: "Spotlight",
-    members: &[
-        "com.apple.mds",
-        "com.apple.mds_stores",
-        "com.apple.mdworker_shared",
-        "com.apple.corespotlightd",
-    ],
+    members: crate::spotlight::MEMBERS,
     holds: &[
-        &[Term::CpuAtLeast(200), Term::DeferredAtLeast(500)],
-        &[Term::ReadAtLeast(5_000_000), Term::DeferredAtLeast(500)],
+        &[
+            Term::CpuAtLeast(crate::spotlight::CPU_BAR_MC),
+            Term::DeferredAtLeast(500),
+        ],
+        &[
+            Term::ReadAtLeast(crate::spotlight::READ_BAR_BPS),
+            Term::DeferredAtLeast(500),
+        ],
     ],
     cannot: &[
         ("index_progress", "unsupported"),

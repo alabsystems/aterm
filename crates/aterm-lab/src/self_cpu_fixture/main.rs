@@ -2,25 +2,36 @@
 // Copyright 2026 Andrew Yates
 
 //! Dev-only SD-72 workload: the kernel must identify this process's machine as a VM first.
+//! Unix's: on Windows it is NOT RUN.
 
+#[cfg(unix)]
 #[path = "../self_cpu_qualification.rs"]
 mod qualification;
 
+#[cfg(unix)]
 use aterm_uds::spawnfd::{Child, Stdio};
+#[cfg(unix)]
 use std::io::{Read as _, Write as _};
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use std::sync::mpsc::{self, Receiver, Sender};
+#[cfg(unix)]
 use std::thread::JoinHandle;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 const HANG: Duration = Duration::from_secs(60);
 
+#[cfg(unix)]
 struct Worker {
     start: Option<Sender<()>>,
     release: Option<Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
 
+#[cfg(unix)]
 impl Drop for Worker {
     fn drop(&mut self) {
         drop(self.start.take());
@@ -31,12 +42,14 @@ impl Drop for Worker {
     }
 }
 
+#[cfg(unix)]
 fn receive<T>(channel: &Receiver<T>, what: &str) -> Result<T, String> {
     channel
         .recv_timeout(HANG)
         .map_err(|error| format!("{what}: {error}"))
 }
 
+#[cfg(unix)]
 fn qualify_child() -> Result<qualification::ChildProof, String> {
     // This precedes worker creation, every reader call and every instruction of CPU load.
     qualification::require_guest(aterm_sysprobe::hv_vmm_present()).map_err(str::to_owned)?;
@@ -102,8 +115,10 @@ fn qualify_child() -> Result<qualification::ChildProof, String> {
     Ok(proof)
 }
 
+#[cfg(unix)]
 struct OwnedChild(Option<Child>);
 
+#[cfg(unix)]
 impl Drop for OwnedChild {
     fn drop(&mut self) {
         if let Some(mut child) = self.0.take() {
@@ -115,6 +130,7 @@ impl Drop for OwnedChild {
     }
 }
 
+#[cfg(unix)]
 fn private_output(path: &Path) -> Result<std::fs::File, String> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -126,6 +142,7 @@ fn private_output(path: &Path) -> Result<std::fs::File, String> {
     options.open(path).map_err(|e| e.to_string())
 }
 
+#[cfg(unix)]
 fn complete_file(path: &Path) -> Result<Vec<u8>, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let metadata = file.metadata().map_err(|e| e.to_string())?;
@@ -146,11 +163,12 @@ fn complete_file(path: &Path) -> Result<Vec<u8>, String> {
 fn kernel_timebase() -> Option<(u32, u32)> {
     aterm_sysprobe::procs::kernel_timebase()
 }
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn kernel_timebase() -> Option<(u32, u32)> {
     None
 }
 
+#[cfg(unix)]
 fn supervise() -> Result<qualification::Proof, String> {
     qualification::require_guest(aterm_sysprobe::hv_vmm_present()).map_err(str::to_owned)?;
     let (numer, denom) = kernel_timebase().ok_or("kernel_timebase_unavailable")?;
@@ -211,6 +229,7 @@ fn supervise() -> Result<qualification::Proof, String> {
     Ok(proof)
 }
 
+#[cfg(unix)]
 fn emit(value: &impl serde::Serialize, limit: u64) -> Result<(), String> {
     let bytes = aterm_json::to_vec(value).map_err(|e| e.to_string())?;
     if bytes.len() as u64 >= limit {
@@ -223,6 +242,7 @@ fn emit(value: &impl serde::Serialize, limit: u64) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+#[cfg(unix)]
 fn run() -> Result<bool, String> {
     // Both roles refuse physical/unknown hosts before process or worker creation.
     qualification::require_guest(aterm_sysprobe::hv_vmm_present()).map_err(str::to_owned)?;
@@ -239,6 +259,7 @@ fn run() -> Result<bool, String> {
     }
 }
 
+#[cfg(unix)]
 fn main() -> std::process::ExitCode {
     match run() {
         Ok(true) => std::process::ExitCode::SUCCESS,
@@ -260,4 +281,12 @@ fn main() -> std::process::ExitCode {
             )
         }
     }
+}
+
+/// Off Unix the workload is NOT RUN (its exit 3): its supervisor reads the guest child's CPU
+/// from the exit's `rusage`, which only a Unix kernel reports.
+#[cfg(not(unix))]
+fn main() -> std::process::ExitCode {
+    eprintln!("self CPU fixture NOT RUN: it reads a Unix guest child's exit rusage");
+    std::process::ExitCode::from(3)
 }

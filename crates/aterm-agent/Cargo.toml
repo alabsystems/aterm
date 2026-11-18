@@ -211,6 +211,10 @@ aterm-secrets = { workspace = true }
 # Portable immutable account-publication metadata; live database I/O remains
 # behind aterm-db's platform gates.
 aterm-db.workspace = true
+# The account layer every command resolves an account word through (`aterm_file::account`):
+# an account's names and the account a word names, pure, with no session or vault code. Not a
+# new package in the shipped graph: aterm-db links it on every target.
+aterm-file.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # Local authenticated native receipts use the same durable astream journal as secrets.

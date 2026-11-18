@@ -51,6 +51,7 @@ pub mod private_edit;
 #[cfg(not(target_family = "wasm"))]
 pub mod reach;
 pub mod retry_schedule;
+pub mod shared_file;
 pub mod vault_entry;
 
 mod cursor;

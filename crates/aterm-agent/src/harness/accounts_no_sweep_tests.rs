@@ -174,7 +174,7 @@ impl Mac {
     /// then dropped unrun (no provider is contacted), and each sign-in it started: when, and which
     /// account the Mac's spacing record says it was.
     fn upkeep_until(&self, from: i64, until: i64, step: impl Fn(i64) -> i64) -> Vec<(i64, String)> {
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         let queued: Arc<Mutex<Vec<Work>>> = Arc::new(Mutex::new(Vec::new()));
         let into_queue = Arc::clone(&queued);
         let spawn = move |work| {
@@ -184,8 +184,8 @@ impl Mac {
         let fetch = |_: &Env, source: &str| -> Result<String, String> {
             Err(format!("no fetch in a test: {source}"))
         };
-        let cooldown = Mutex::new(None);
-        let rediscovery = Mutex::new(Rediscovery::default());
+        let cooldown = Watched::new("accounts_sync/sync_cooldown", None);
+        let rediscovery = Watched::new("accounts_sync/rediscovery", Rediscovery::default());
         let fx = UpkeepEffects {
             scope: None,
             fetch: &fetch,
@@ -212,7 +212,7 @@ impl Mac {
             let _ = upkeep(
                 &self.home,
                 &self.state,
-                (&self.roster(), now, UpkeepStep::Renew),
+                (&self.roster(), trace::Now::at(now), UpkeepStep::Renew),
                 &fx,
             );
             let ran: Vec<Work> = queued.lock().unwrap().drain(..).collect();

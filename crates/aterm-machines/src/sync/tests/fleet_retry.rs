@@ -98,12 +98,13 @@ fn coordination_before_clone_finishes(fault: Fault) {
     let clone = HeldClone::new();
     let held = || None;
     let owed = |_: Option<&crate::init_github::RepositoryReadback>| clone.owed();
-    let effect = || clone.run();
+    let effect = |_| clone.run();
     let ports = owed_clone::Hooked {
         inner: Inert::new(scratch.path()),
         held: &held,
         owed: &owed,
         clone: &effect,
+        observe: None,
         control: None,
         forget: &|| Ok(()),
     };
@@ -148,7 +149,10 @@ fn coordination_before_clone_finishes(fault: Fault) {
                 from: "the node lacks the new fleet".into(),
                 to: "the node serves the new fleet".into(),
             };
-            *ports.inner.fabric.lock().unwrap() = FabricRead::Due("the fleet changed".into());
+            *ports.inner.fabric.lock().unwrap() = FabricRead::Due {
+                from: "the fleet changed".into(),
+                to: "the broker serves the new fleet".into(),
+            };
             if repair_failure {
                 *ports.inner.renewed.lock().unwrap() = Err("the broker was briefly busy".into());
             } else {
@@ -275,12 +279,13 @@ fn a_current_stop_or_off_prevents_another_fleet_attempt_beside_the_clone() {
         let hold = Mutex::new(None);
         let held = || hold.lock().unwrap().clone();
         let owed = |_: Option<&crate::init_github::RepositoryReadback>| clone.owed();
-        let effect = || clone.run();
+        let effect = |_| clone.run();
         let ports = owed_clone::Hooked {
             inner: Inert::new(scratch.path()),
             held: &held,
             owed: &owed,
             clone: &effect,
+            observe: None,
             control: None,
             forget: &|| Ok(()),
         };
@@ -363,12 +368,13 @@ fn repository_completion_ends_in_pass_retries_without_delaying_acquisition() {
     let clone = HeldClone::new();
     let held = || None;
     let owed = |_: Option<&crate::init_github::RepositoryReadback>| clone.owed();
-    let effect = || clone.run();
+    let effect = |_| clone.run();
     let ports = owed_clone::Hooked {
         inner: Inert::new(scratch.path()),
         held: &held,
         owed: &owed,
         clone: &effect,
+        observe: None,
         control: None,
         forget: &|| Ok(()),
     };
@@ -434,12 +440,13 @@ fn an_interrupted_repository_helper_is_joined_without_another_fleet_attempt() {
         Ok(OwedClone::Due("one missing clone".into()))
     };
     let effect =
-        || -> Result<CloneOwedOutcome, String> { panic!("injected repository interruption") };
+        |_| -> Result<CloneOwedOutcome, String> { panic!("injected repository interruption") };
     let ports = owed_clone::Hooked {
         inner: Inert::new(scratch.path()),
         held: &held,
         owed: &owed,
         clone: &effect,
+        observe: None,
         control: None,
         forget: &|| Ok(()),
     };

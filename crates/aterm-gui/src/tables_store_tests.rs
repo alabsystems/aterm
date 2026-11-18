@@ -209,3 +209,122 @@ fn a_plans_limits_read_in_words() {
         "only a plan's limits read so"
     );
 }
+
+/// An owned or log row's whole value says, opened, how many fields it holds, and written over
+/// one row, which fields changed, in words; the counter that orders a Mac's statements is none
+/// of them, and no value is said.
+/// NEGATIVE CONTROL: with the counter kept among the fields (`!= COUNTER` filter taken out), ``
+/// left: "Location, N changed" right: "Location changed" ``.
+#[test]
+fn a_whole_rows_change_names_the_fields_it_changed() {
+    let now = aterm_json::json!({"n": 3, "location": "rack b", "ram_gb": 8});
+    let was = aterm_json::json!({"n": 2, "location": "rack a", "ram_gb": 8});
+    assert_eq!(super::whole_row_words(&now, Some(&was)), "Location changed");
+    assert_eq!(super::whole_row_words(&now, None), "a row of 2 fields");
+    assert_eq!(super::whole_row_words(&now, Some(&now)), "no field changed");
+    assert_eq!(
+        super::whole_row_words(&aterm_json::json!("x"), None),
+        "a row"
+    );
+}
+
+/// History can list records of every collection of a generation, the rail's first in its
+/// order, then those the rail does not list (a carried face) by their faces' titles: what its
+/// table filter offers.
+/// NEGATIVE CONTROL: with only the rail's listed (the `extend` taken out), `` left: 17 right: 19
+/// ``.
+#[test]
+fn history_lists_every_table_of_a_generation_the_rails_first() {
+    let table = &aterm_db::alab::registry::REGISTRY_4;
+    let rail: Vec<String> = super::listed(table)
+        .iter()
+        .map(|listed| listed.name.to_owned())
+        .collect();
+    let tables = super::history_tables(table);
+    assert_eq!(tables.len(), table.collections.len());
+    let names: Vec<&str> = tables.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names[..rail.len()], rail);
+    assert!(
+        tables[rail.len()..]
+            .iter()
+            .any(|(name, title)| name == "archived" && title == "Archived rows"),
+        "{tables:?}"
+    );
+}
+
+/// History's reads keep the registry's order between them (tracker LT-25B): the first read
+/// keeps the order at the registry's revision, Read older at that revision is cut from it,
+/// reading the registry no more (`Kept::reads`; that such a page decodes no record is the
+/// store's own test,
+/// `aterm_db::att::tests::a_history_page_at_a_held_revision_reads_no_record_again`), and lists
+/// what a reader that keeps nothing lists; once a record is written the next read reads the new
+/// revision, says the registry moved, and lists the new record at its top.
+/// NEGATIVE CONTROL, observed: with `history` reading each store page into a `Kept` of its own
+/// (the reader's never filled), `` the first read keeps the registry's order left: None right:
+/// Some(..) ``. With the kept order never matched (`aterm_db::att`'s `Order::of` answering
+/// `false`), Read older reads the registry again: `Read older at the held revision read the
+/// registry again left: 2 right: 1`.
+#[test]
+fn historys_reads_keep_the_registrys_order_until_it_moves() {
+    use crate::native_tables::Asked;
+    use aterm_db::alab::registry::MACHINE;
+    let lab = Lab::new(&[Role::Writer]);
+    let here = Registry::at(lab.paths[0].clone());
+    here.open().unwrap();
+    let label = |pk: &str, label: &str| vec![put_in(&MACHINE, pk, "label", json!(label))];
+    here.write(
+        (1..=5)
+            .map(|n| label(&format!("mc-000000000000000{n}"), &format!("m{n}")))
+            .collect(),
+    )
+    .unwrap();
+    let paths = &lab.paths[0];
+    let asked = Asked {
+        seq: 1,
+        filter: Default::default(),
+        names: std::collections::BTreeMap::new(),
+        before: None,
+        revision: None,
+        through: None,
+        limit: 2,
+    };
+    let mut kept = super::Kept::default();
+    let first = super::history(paths, &asked, &mut kept).unwrap();
+    assert_eq!(
+        kept.revision().map(|revision| revision.0),
+        Some(first.revision),
+        "the first read keeps the registry's order"
+    );
+    assert_eq!(super::mark(paths).unwrap().digest(), first.revision);
+    assert_eq!(kept.reads(), 1);
+    let older = Asked {
+        before: first.next,
+        revision: Some(first.revision),
+        ..asked.clone()
+    };
+    let read_older = super::history(paths, &older, &mut kept).unwrap();
+    assert_eq!(
+        kept.reads(),
+        1,
+        "Read older at the held revision read the registry again"
+    );
+    assert!(!read_older.moved);
+    assert_eq!(read_older.records.len(), 2);
+    assert_eq!(
+        read_older,
+        super::history(paths, &older, &mut super::Kept::default()).unwrap(),
+        "kept or not, one page"
+    );
+
+    here.write(vec![label("mc-0000000000000006", "m6")])
+        .unwrap();
+    let moved = super::history(paths, &older, &mut kept).unwrap();
+    assert!(moved.moved, "asked at the old revision");
+    assert_ne!(moved.revision, first.revision);
+    assert_eq!(
+        kept.revision().map(|revision| revision.0),
+        Some(moved.revision)
+    );
+    assert_eq!(kept.reads(), 2);
+    assert_eq!(moved.records[0].cells[0].pk, "mc-0000000000000006");
+}

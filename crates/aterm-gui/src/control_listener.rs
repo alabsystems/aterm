@@ -13,6 +13,10 @@
 //! look's included, so a parked thread that missed its wake is caught by the watchdog's own poll
 //! of the listener, and a queue whose readiness never fires at all by the rest look. It disarms
 //! at its next tick once the thread is parked over an empty queue.
+//!
+//! The listener holds one descriptor in reserve ([`Reserve`]) and gives it up for each accept it
+//! makes while it holds it, so a client the process has no descriptor for is told busy rather than
+//! hung up (save in the races and failures [`Reserve`] names).
 
 #[cfg(unix)]
 use std::os::fd::{AsFd as _, AsRawFd as _, RawFd};
@@ -71,7 +75,8 @@ const STALL_PACE: Duration = Duration::from_millis(100);
 const DRAIN_MAX: usize = 256;
 
 struct ListenerHealth {
-    /// Connections `accept` returned, since start.
+    /// Connections `accept` returned, since start, those [`Reserve::accept`] turned away
+    /// included.
     accepts: AtomicU64,
     /// The metrics clock (`metrics::now_us`) at the last successful accept, or
     /// at supervisor start before the first one.
@@ -88,7 +93,9 @@ struct ListenerHealth {
     accept_errors: AtomicU64,
     /// Peers answered `ERR control server busy; retry` at admission: every
     /// request lane taken by work, or the open-connection cap reached with no
-    /// parked connection to give way (the parker's turn-aways counted too).
+    /// parked connection to give way (the parker's turn-aways counted too), or
+    /// no descriptor left (`EMFILE` or `ENFILE`) for the listener's reserve once
+    /// the connection was accepted ([`Reserve::accept`]).
     busy_replies: AtomicU64,
 }
 
@@ -229,8 +236,8 @@ fn stamp_accept() {
 #[cfg(unix)]
 #[derive(Default)]
 struct Beat {
-    /// Bumped after every turn of the accept loop and every accepted peer: a
-    /// value that stands still means the thread is stuck in some call.
+    /// Bumped after every turn of the accept loop and every accepted peer, served or
+    /// turned away: a value that stands still means the thread is stuck in some call.
     progress: AtomicU64,
     /// Connections this generation's thread accepted.
     accepts: AtomicU64,
@@ -415,6 +422,207 @@ impl Watch {
 /// The connection handler every accept thread shares.
 #[cfg(unix)]
 type Serve = Arc<dyn Fn(CtlStream) + Send + Sync>;
+
+/// What every accept thread says to a connection [`Reserve::accept`] turns away. It borrows the
+/// connection: the listener closes it after, which frees the descriptor the reserve is taken
+/// again from.
+#[cfg(unix)]
+type TurnAway = Arc<dyn Fn(&CtlStream) + Send + Sync>;
+
+/// What an accept thread does with the connections its listener queues, shared by every
+/// generation's thread.
+#[cfg(unix)]
+struct Admission {
+    serve: Serve,
+    turn_away: TurnAway,
+    reserve: Arc<Reserve>,
+}
+
+/// One descriptor the listener holds in reserve (`/dev/null`, opened close-on-exec and kept out
+/// of children by [`aterm_uds::kept_out`]), so that a process out of descriptors still answers a
+/// client rather than hanging it up. Every accept made while the reserve is held gives it up
+/// first, so a queued connection has a descriptor to be accepted into: an `accept(2)` that finds
+/// none fails with `EMFILE` (or `ENFILE`), and macOS has then already taken the connection off the
+/// queue and closed it, so its client reads EOF. The reserve is then opened again before the
+/// connection is served. Where that open succeeds the reserve is held again. Where it fails with
+/// `EMFILE` or `ENFILE` (no descriptor left), the connection is handed to the [`TurnAway`] (the
+/// control server tells it busy) and closed, and the descriptor it freed is taken as the reserve
+/// again. Where it fails otherwise the reserve is lost and the connection is served. One reserve
+/// serves every generation's accept thread, and its lock makes their accepts one at a time.
+///
+/// The reserve's close, the accept and the open after it are made inside one
+/// [`aterm_uds::kept_out`], as are a turned-away connection's close and the take after it. On
+/// Apple platforms that is one exclusive hold of the spawn lock: no spawn in flight keeps the
+/// reserve given up while the accept waits for the lock, and no descriptor another thread makes
+/// through `kept_out` comes between (elsewhere no spawn takes the lock and nothing waits). A
+/// descriptor another thread makes otherwise (a plain `open(2)`, and off Apple any), or at the
+/// system's limit one another process opens, can still take the freed one in between: the accept
+/// then fails (macOS drops that connection), or the reserve is lost. A lost reserve is taken again
+/// before the next accept; while no descriptor is free to take it, no accept is made
+/// ([`Accepted::Deferred`]), so every queued connection waits, with no answer, until one is free,
+/// rather than being closed unanswered, and the caller backs off. Where the reserve cannot be
+/// opened for another reason than a want of descriptors, the accept is made without it, and a
+/// connection that accept finds no descriptor for is dropped as with no reserve.
+#[cfg(unix)]
+struct Reserve {
+    held: Mutex<Held>,
+}
+
+#[cfg(unix)]
+struct Held {
+    /// The reserve, while held.
+    file: Option<std::fs::File>,
+    /// The reserve was lost, the loss logged, and it has not been taken again since.
+    lost: bool,
+}
+
+/// What one [`Reserve::accept`] did, short of an accept that failed.
+#[cfg(unix)]
+#[derive(Debug)]
+enum Accepted {
+    /// A connection to serve, with the reserve taken again (where it could be opened at all).
+    Serve(CtlStream),
+    /// A connection accepted with no descriptor left for the reserve: told what the
+    /// [`TurnAway`] says, then closed.
+    TurnedAway,
+    /// No accept was made: the reserve was lost and no descriptor is free to take it again
+    /// (the open's error).
+    Deferred(std::io::Error),
+}
+
+/// Whether `error` says the process (`EMFILE`) or the system (`ENFILE`) has no descriptor free.
+#[cfg(unix)]
+fn out_of_descriptors(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+}
+
+#[cfg(unix)]
+impl Reserve {
+    /// A reserve taken now (its loss logged where it cannot be opened).
+    fn take() -> Self {
+        let mut held = Held {
+            file: None,
+            lost: false,
+        };
+        let _ = held.retake();
+        Self {
+            held: Mutex::new(held),
+        }
+    }
+
+    /// Accept one connection from `listener`, made with the reserve given up, and open the
+    /// reserve again before the connection is served, the three steps inside one
+    /// [`aterm_uds::kept_out`]; one accepted with no descriptor left for the reserve is handed to
+    /// `turn_away`, closed, and the reserve taken from the descriptor it freed. Where the reserve
+    /// cannot be opened for another reason than a want of descriptors, the connection is served
+    /// with the reserve lost, and later accepts go on without it.
+    ///
+    /// # Errors
+    /// The accept's own error (`WouldBlock` once the queue is empty).
+    fn accept(
+        &self,
+        listener: &CtlListener,
+        turn_away: &dyn Fn(&CtlStream),
+    ) -> std::io::Result<Accepted> {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        if held.file.is_none()
+            && let Err(error) = held.retake()
+            && out_of_descriptors(&error)
+        {
+            return Ok(Accepted::Deferred(error));
+        }
+        // Inside one `kept_out` (on Apple one hold of the spawn lock): the reserve given up (the
+        // descriptor the connection is accepted into), the accept, and the reserve opened again
+        // where it was given up.
+        let mut reopened = None;
+        let accepted = aterm_uds::kept_out(|| {
+            let reserved = held.file.take().is_some();
+            let accepted = aterm_uds::accept(
+                listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            );
+            if reserved {
+                reopened = Some(aterm_uds::kept_out(open_reserve));
+            }
+            accepted
+        });
+        let (stream, _) = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                if let Some(opened) = reopened {
+                    let _ = held.hold(opened);
+                }
+                return Err(error);
+            }
+        };
+        match reopened {
+            None => Ok(Accepted::Serve(stream)),
+            Some(Ok(file)) => {
+                held.file = Some(file);
+                Ok(Accepted::Serve(stream))
+            }
+            Some(Err(error)) if out_of_descriptors(&error) => {
+                turn_away(&stream);
+                // Its close and the reserve's take inside one `kept_out` too.
+                let _ = held.hold(aterm_uds::kept_out(|| {
+                    drop(stream);
+                    open_reserve()
+                }));
+                Ok(Accepted::TurnedAway)
+            }
+            Some(Err(error)) => {
+                held.lose(&error);
+                Ok(Accepted::Serve(stream))
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Held {
+    /// Take the reserve again ([`Held::hold`] of an open inside [`aterm_uds::kept_out`]).
+    fn retake(&mut self) -> std::io::Result<()> {
+        self.hold(aterm_uds::kept_out(open_reserve))
+    }
+
+    /// Hold the reserve `opened` gave, logging the take that ends a loss; or, where its open
+    /// failed, record the reserve lost ([`Held::lose`]) and return the open's error.
+    fn hold(&mut self, opened: std::io::Result<std::fs::File>) -> std::io::Result<()> {
+        match opened {
+            Ok(file) => {
+                self.file = Some(file);
+                if std::mem::take(&mut self.lost) {
+                    aterm_log::info!("control listener: its descriptor reserve is held again");
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.lose(&error);
+                Err(error)
+            }
+        }
+    }
+
+    /// Record the reserve lost to `error`, logging it the first time since it was last held.
+    fn lose(&mut self, error: &std::io::Error) {
+        if !std::mem::replace(&mut self.lost, true) {
+            aterm_log::warn!(
+                "control listener: its descriptor reserve could not be taken ({error}); until \
+                 it is, a client arriving while the process has no descriptor free is not told \
+                 busy"
+            );
+        }
+    }
+}
+
+/// The reserve's descriptor: `/dev/null`, opened close-on-exec, so no child inherits it past its
+/// `exec`. Every caller opens it inside [`aterm_uds::kept_out`], which keeps it out of forked
+/// children too.
+#[cfg(unix)]
+fn open_reserve() -> std::io::Result<std::fs::File> {
+    std::fs::File::open("/dev/null")
+}
 
 /// The way a supervisor mints a replacement listening socket at its path
 /// ([`rebind_socket`] behind the caller's own bookkeeping).
@@ -852,7 +1060,16 @@ impl<R: FnMut() -> Option<CtlListener> + Send + 'static> Supervisor<R> {
     /// queue's count where its readiness never fired. A thread parked over a queued connection
     /// (one that missed its wake) stands still while armed, which [`Watch`] judges a wedge as it
     /// judges one stuck in a call.
-    pub(crate) fn run(self, serve: impl Fn(CtlStream) + Send + Sync + 'static, stop: &Stop) {
+    ///
+    /// Every accept thread accepts through one [`Reserve`], taken here: a connection accepted
+    /// with no descriptor left for the reserve (`EMFILE` or `ENFILE`) is handed to `turn_away`
+    /// and closed, never to `serve`.
+    pub(crate) fn run(
+        self,
+        serve: impl Fn(CtlStream) + Send + Sync + 'static,
+        turn_away: impl Fn(&CtlStream) + Send + Sync + 'static,
+        stop: &Stop,
+    ) {
         let Self {
             listener,
             rebind,
@@ -862,6 +1079,8 @@ impl<R: FnMut() -> Option<CtlListener> + Send + 'static> Supervisor<R> {
         } = self;
         endpoint.adopt(Box::new(rebind));
         let serve: Serve = Arc::new(serve);
+        let turn_away: TurnAway = Arc::new(turn_away);
+        let reserve = Arc::new(Reserve::take());
         let current = Arc::new(AtomicU64::new(0));
         let mut generation = 0;
         let mut quit = Arc::new(Stop::new());
@@ -874,7 +1093,11 @@ impl<R: FnMut() -> Option<CtlListener> + Send + 'static> Supervisor<R> {
                     listener.clone(),
                     generation,
                     &current,
-                    &serve,
+                    Admission {
+                        serve: serve.clone(),
+                        turn_away: turn_away.clone(),
+                        reserve: reserve.clone(),
+                    },
                     &quit,
                     &endpoint,
                     #[cfg(test)]
@@ -991,7 +1214,11 @@ impl<R: FnMut() -> Option<CtlListener> + Send + 'static> Supervisor<R> {
                 fresh.clone(),
                 generation,
                 &current,
-                &serve,
+                Admission {
+                    serve: serve.clone(),
+                    turn_away: turn_away.clone(),
+                    reserve: reserve.clone(),
+                },
                 &quit,
                 &endpoint,
                 #[cfg(test)]
@@ -1089,7 +1316,7 @@ struct AcceptThread {
     listener: Arc<CtlListener>,
     generation: u64,
     current: Arc<AtomicU64>,
-    serve: Serve,
+    admission: Admission,
     beat: Arc<Beat>,
     /// Set when this generation is replaced or retired: it ends the park.
     quit: Arc<Stop>,
@@ -1105,7 +1332,7 @@ impl AcceptThread {
         listener: Arc<CtlListener>,
         generation: u64,
         current: &Arc<AtomicU64>,
-        serve: &Serve,
+        admission: Admission,
         quit: &Arc<Stop>,
         endpoint: &Endpoint,
         #[cfg(test)] seams: Option<Seams>,
@@ -1115,7 +1342,7 @@ impl AcceptThread {
             listener,
             generation,
             current: current.clone(),
-            serve: serve.clone(),
+            admission,
             beat: beat.clone(),
             quit: quit.clone(),
             endpoint: endpoint.clone(),
@@ -1205,9 +1432,14 @@ impl AcceptThread {
 
     fn run(self) {
         let serve = |stream: CtlStream| {
-            (self.serve)(stream);
+            (self.admission.serve)(stream);
             self.beat.progress.fetch_add(1, Ordering::Release);
         };
+        let turn_away = |stream: &CtlStream| {
+            (self.admission.turn_away)(stream);
+            self.beat.progress.fetch_add(1, Ordering::Release);
+        };
+        let reserve = &*self.admission.reserve;
         let mut stalled = false;
         #[cfg(test)]
         let tick = self.seams.as_ref().map_or(TICK, |s| s.pace.tick);
@@ -1230,7 +1462,9 @@ impl AcceptThread {
             let accepted = if self.withheld() {
                 0
             } else {
-                let Some(accepted) = drain(&self.listener, &serve, &mut backoff) else {
+                let Some(accepted) =
+                    drain(&self.listener, reserve, &serve, &turn_away, &mut backoff)
+                else {
                     return;
                 };
                 accepted
@@ -1250,7 +1484,7 @@ impl AcceptThread {
             stalled = accepted == 0 && pending.is_some_and(|n| n > 0);
         }
         if !self.withheld() {
-            let _ = drain(&self.listener, &serve, &mut backoff);
+            let _ = drain(&self.listener, reserve, &serve, &turn_away, &mut backoff);
         }
     }
 }
@@ -1280,28 +1514,42 @@ pub(crate) fn poll_readable(fd: RawFd, timeout: Duration) -> std::io::Result<boo
     }
 }
 
-/// Accept until the queue reports empty (or [`DRAIN_MAX`]). Returns how many
-/// connections were handed to `serve`, or `None` once the descriptor names no
-/// socket at all (a retired endpoint's, [`close_listening`]).
+/// Accept through `reserve` ([`Reserve::accept`]) until the queue reports empty (or
+/// [`DRAIN_MAX`]). Returns how many connections were taken off the queue, those handed to
+/// `serve` and those turned away (to `turn_away`) alike, or `None` once the descriptor names no
+/// socket at all (a retired endpoint's, [`close_listening`]). A failed accept other than
+/// `EWOULDBLOCK`/`EINTR`, and an accept the reserve deferred, end the drain, after a backoff
+/// where the error says resources are exhausted ([`crate::control::accept_error_backoff`]).
 #[cfg(unix)]
 fn drain(
     listener: &CtlListener,
+    reserve: &Reserve,
     serve: &impl Fn(CtlStream),
+    turn_away: &dyn Fn(&CtlStream),
     backoff: &mut Option<Duration>,
 ) -> Option<usize> {
-    let mut accepted = 0;
-    while accepted < DRAIN_MAX {
-        match aterm_uds::accept(
-            listener,
-            aterm_uds::AcceptWait::Ready,
-            aterm_uds::AcceptedMode::Blocking,
-        ) {
-            Ok((stream, _)) => {
-                accepted += 1;
+    let mut taken = 0;
+    while taken < DRAIN_MAX {
+        match reserve.accept(listener, turn_away) {
+            Ok(Accepted::Serve(stream)) => {
+                taken += 1;
                 *backoff = None;
                 HEALTH.accepts.fetch_add(1, Ordering::Relaxed);
                 stamp_accept();
                 serve(stream);
+            }
+            Ok(Accepted::TurnedAway) => {
+                taken += 1;
+                HEALTH.accepts.fetch_add(1, Ordering::Relaxed);
+                stamp_accept();
+            }
+            Ok(Accepted::Deferred(error)) => {
+                back_off(
+                    "accept deferred, no descriptor free for its reserve",
+                    &error,
+                    backoff,
+                );
+                break;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -1311,20 +1559,25 @@ fn drain(
                 if n.is_power_of_two() || n == 0 {
                     aterm_log::warn!("control listener accept failed ({} so far): {error}", n + 1);
                 }
-                if let Some(wait) = crate::control::accept_error_backoff(&error, *backoff) {
-                    if backoff.is_none() {
-                        crate::logging::stderr_line!(
-                            "aterm-gui: control socket accept failing ({error}); backing off"
-                        );
-                    }
-                    *backoff = Some(wait);
-                    std::thread::sleep(wait);
-                }
+                back_off("accept failing", &error, backoff);
                 break;
             }
         }
     }
-    Some(accepted)
+    Some(taken)
+}
+
+/// Sleep the next step of the backoff `error` calls for, if it calls for one, saying on stderr at
+/// the first step of a streak `what` the drain met and `error`.
+#[cfg(unix)]
+fn back_off(what: &str, error: &std::io::Error, backoff: &mut Option<Duration>) {
+    if let Some(wait) = crate::control::accept_error_backoff(error, *backoff) {
+        if backoff.is_none() {
+            crate::logging::stderr_line!("aterm-gui: control socket {what} ({error}); backing off");
+        }
+        *backoff = Some(wait);
+        std::thread::sleep(wait);
+    }
 }
 
 /// Read the listening socket's completed-connection queue length.

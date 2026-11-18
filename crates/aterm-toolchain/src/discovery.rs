@@ -34,7 +34,8 @@ pub fn is_executable_file(path: &Path) -> bool {
 
 pub(crate) fn is_pending_stub(path: &Path) -> bool {
     use std::io::Read as _;
-    const HEAD: u64 = 256;
+    // An absolute interpreter line can precede the marker; keep both within a bounded head.
+    const HEAD: u64 = 1024;
     const MARKER: &str = "atpkg pending-program stub";
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -564,11 +565,15 @@ impl Probe<'_> {
             self.error = Some(error);
             return None;
         }
-        bounded_stdout(&executable, args, bound)
+        bounded_stdout(&executable, args, bound).ok()
     }
 }
 
-pub(crate) fn bounded_stdout(program: &Path, args: &[&str], bound: Duration) -> Option<String> {
+pub(crate) fn bounded_stdout(
+    program: &Path,
+    args: &[&str],
+    bound: Duration,
+) -> Result<String, String> {
     #[cfg(unix)]
     {
         let mut command = aterm_uds::spawnfd::command(program);
@@ -580,12 +585,12 @@ pub(crate) fn bounded_stdout(program: &Path, args: &[&str], bound: Duration) -> 
                 format!("compiler identity {}", program.display()),
                 64 << 10,
             )
-            .ok()?;
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8(output.stdout).ok())
-            .flatten()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(format!("probe exited with {}", output.status));
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|error| format!("probe stdout is not UTF-8: {error}"))
     }
     #[cfg(not(unix))]
     bounded_stdout_at(program, args, bound, std::time::Instant::now())
@@ -597,12 +602,12 @@ fn bounded_stdout_at(
     args: &[&str],
     bound: Duration,
     started: std::time::Instant,
-) -> Option<String> {
+) -> Result<String, String> {
     use std::io::Read as _;
     use std::process::Stdio;
     const MAX_STDOUT: u64 = 64 << 10;
     if started.elapsed() >= bound {
-        return None;
+        return Err("probe deadline elapsed before launch".to_owned());
     }
     // A file that is no program for this machine (a script, a truncated download) makes
     // Windows' CreateProcess raise a system box ("This version of %1 is not compatible") and
@@ -622,19 +627,28 @@ fn bounded_stdout_at(
         .stderr(Stdio::null())
         .spawn();
     drop(quiet);
-    let mut child = started_child.ok()?;
-    let pipe = child.stdout.take()?;
+    let mut child = started_child.map_err(|error| format!("start probe: {error}"))?;
+    let Some(pipe) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("probe stdout pipe is missing".to_owned());
+    };
     let (tx, rx) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let read = pipe
             .take(MAX_STDOUT.saturating_add(1))
             .read_to_end(&mut buf);
-        let _ = tx.send(
-            read.ok()
-                .filter(|_| (buf.len() as u64) <= MAX_STDOUT)
-                .and_then(|_| String::from_utf8(buf).ok()),
-        );
+        let output = read
+            .map_err(|error| format!("read probe stdout: {error}"))
+            .and_then(|_| {
+                if (buf.len() as u64) > MAX_STDOUT {
+                    return Err(format!("probe stdout exceeded {MAX_STDOUT} bytes"));
+                }
+                String::from_utf8(buf)
+                    .map_err(|error| format!("probe stdout is not UTF-8: {error}"))
+            });
+        let _ = tx.send(output);
     });
     let status = loop {
         match child.try_wait() {
@@ -642,19 +656,27 @@ fn bounded_stdout_at(
             Ok(None) if started.elapsed() < bound => {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            _ => {
+            waiting => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return Err(match waiting {
+                    Err(error) => format!("wait for probe: {error}"),
+                    _ => "probe deadline elapsed waiting for exit".to_owned(),
+                });
             }
         }
     };
     let rem = bound
         .saturating_sub(started.elapsed())
         .max(Duration::from_millis(10));
-    let out = rx.recv_timeout(rem).ok().flatten()?;
+    let out = rx
+        .recv_timeout(rem)
+        .map_err(|error| format!("wait for probe stdout: {error}"))?;
     let _ = reader.join();
-    status.success().then_some(out)
+    if !status.success() {
+        return Err(format!("probe exited with {status}"));
+    }
+    out
 }
 
 fn older_than_store(

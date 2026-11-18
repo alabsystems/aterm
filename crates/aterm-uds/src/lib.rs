@@ -596,6 +596,8 @@ pub mod tally;
 pub mod test_binary;
 /// A child that ends with the process that started it, killed outright included: Linux's parent-death signal, and this executable's [`tether::VERB`] (every tethered spawn on Darwin, a group leader's on Linux), which leaves a watcher behind as it execs the child ([`spawnfd::Tether`]).
 pub mod tether;
+/// What a run read and compared while a thread's scope was armed (file stamps, listings, owners' standings, watched generations, wall and monotonic bounds), whether running it again could answer otherwise ([`trace::Trace::stands`]), and when it may stop standing on its own ([`trace::Trace::horizon`]).
+pub mod trace;
 
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
 mod retained_image_store;

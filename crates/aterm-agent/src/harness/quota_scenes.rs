@@ -167,6 +167,7 @@ impl Fx {
                 account: label.into(),
                 at,
                 held: None,
+                owner: None,
             },
         );
     }

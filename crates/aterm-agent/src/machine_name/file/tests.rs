@@ -63,10 +63,6 @@ fn full() -> MachineName {
                 lost: true,
             },
         ],
-        by: Some(By {
-            node: NodeId::new(&[9; 8]).expect("a mesh id"),
-            kind: ByKind::Person,
-        }),
         nick: nick("Heron"),
         nick_class: NickClass::Chosen,
         row: RowSeen::Saw(Some(nick("Otter"))),
@@ -78,31 +74,6 @@ fn full() -> MachineName {
             lost: vec![num(5)],
             synced: true,
         }],
-        history: vec![
-            Change {
-                at_ms: NOW,
-                from: Some(num(7)),
-                to: Some(num(8)),
-                nick_from: Some(nick("Otter")),
-                nick_to: nick("Heron"),
-                by: Some(By {
-                    node: NodeId::new(&[9; 8]).expect("a mesh id"),
-                    kind: ByKind::Person,
-                }),
-                why: Why::Named,
-                undone: true,
-            },
-            Change {
-                at_ms: NOW - 20,
-                from: None,
-                to: Some(num(7)),
-                nick_from: None,
-                nick_to: nick("Otter"),
-                by: None,
-                why: Why::First,
-                undone: false,
-            },
-        ],
     }
 }
 
@@ -153,9 +124,6 @@ fn a_field_outside_its_grammar_is_refused() {
             "digest = \"ABABABABABABABAB\"",
         ),
         ("digest = \"abababababababab\"", "digest = \"abab\""),
-        ("why = \"named\"", "why = \"later\""),
-        ("nick_to = \"Heron\"", "nick_to = \"m12\""),
-        ("to = 8", "to = 1000000"),
     ] {
         assert!(good.contains(from), "the file spells {from}:\n{good}");
         let bad = good.replacen(from, to, 1);
@@ -171,37 +139,19 @@ fn a_field_outside_its_grammar_is_refused() {
         .collect();
     let text = nine.to_toml().expect("serializes");
     assert!(MachineName::from_toml(&text).is_err(), "nine `was` entries");
-    let mut long = full();
-    long.history = vec![long.history[1].clone(); HISTORY_MAX + 1];
-    let text = long.to_toml().expect("serializes");
-    assert!(
-        MachineName::from_toml(&text).is_err(),
-        "seventeen History entries"
-    );
-    long.history.truncate(HISTORY_MAX);
-    let text = long.to_toml().expect("serializes");
-    assert!(MachineName::from_toml(&text).is_ok(), "sixteen: control");
 }
 
-/// History reads back whole at its widest: [`HISTORY_MAX`] entries, each reason and kind of
-/// author, the first name's entry with no `from`, the widest nickname (21 fullwidth letters,
-/// 63 bytes) on both sides and the longest node word, beside a full `was` and every fleet,
-/// within [`FILE_MAX`].
-#[test]
-fn history_round_trips() {
+/// The widest nickname (21 fullwidth letters, 63 bytes).
+fn widest() -> Nickname {
     let widest = nick(&"\u{ff21}".repeat(21));
     assert_eq!(widest.as_str().len(), 63);
-    let whys = [
-        Why::First,
-        Why::Named,
-        Why::Nickname,
-        Why::Drawn,
-        Why::Undone,
-        Why::Registry,
-    ];
-    let kinds = [ByKind::Person, ByKind::Agent, ByKind::Auto];
+    widest
+}
+
+/// The file at its widest: the widest nickname, a full `was` and every fleet.
+fn widest_name() -> MachineName {
     let mut name = full();
-    name.nick = widest.clone();
+    name.nick = widest();
     name.was = (0..WAS_MAX)
         .map(|i| Was {
             num: num(999_000 + u32::try_from(i).expect("small")),
@@ -218,39 +168,67 @@ fn history_round_trips() {
             synced: true,
         })
         .collect();
-    name.history = (0..HISTORY_MAX)
-        .map(|i| {
-            let step = u32::try_from(i).expect("small");
-            let why = whys[i % whys.len()];
-            Change {
-                at_ms: NOW - u64::from(step),
-                from: (why != Why::First).then(|| num(Number::MAX - step - 1)),
-                to: Some(num(Number::MAX - step)),
-                nick_from: (why != Why::First).then(|| widest.clone()),
-                nick_to: widest.clone(),
-                by: Some(By {
-                    node: NodeId::new(&[u8::try_from(i).expect("small"); 16]).expect("a node id"),
-                    kind: kinds[i % kinds.len()],
-                }),
-                why,
-                undone: i % 2 == 1,
-            }
-        })
-        .collect();
+    name
+}
+
+/// The file reads back whole at its widest, within [`FILE_MAX`].
+#[test]
+fn the_widest_file_round_trips() {
+    let name = widest_name();
     let text = name.to_toml().expect("serializes");
     assert!(text.len() <= FILE_MAX, "{} bytes:\n{text}", text.len());
-    assert_eq!(MachineName::from_toml(&text), Ok(name.clone()), "{text}");
-    for why in whys {
-        assert!(
-            text.contains(&format!("why = \"{}\"", why_word(why))),
-            "{why:?}"
-        );
+    assert_eq!(MachineName::from_toml(&text), Ok(name), "{text}");
+}
+
+/// An older build kept who made the last change (`by`) and the newest 16 changes (`[[history]]`)
+/// in the file; History and who asked are this Mac's registry row's now (FL-171). Such a file,
+/// at its widest (16 changes of the widest nickname, each with its author), reads within
+/// [`FILE_MAX`] as the same name, its `by` and History passed over, never refused, and the next
+/// write drops both.
+/// NEGATIVE CONTROL: with `#[serde(deny_unknown_fields)]` on the file's wire form, the read
+/// fails.
+#[test]
+fn an_older_files_history_and_by_read_and_the_next_write_drops_them() {
+    let root = state();
+    let name = widest_name();
+    let by = |kind: &str| format!("node = \"{}\"\nkind = \"{kind}\"\n", node_word(node(9)));
+    let wide = widest();
+    let widest = wide.as_str();
+    let mut older = name.to_toml().expect("serializes");
+    older.push_str(&format!("\n[by]\n{}", by("person")));
+    for (i, why) in ["undone", "named", "nickname", "drawn", "registry", "first"]
+        .iter()
+        .cycle()
+        .take(16)
+        .enumerate()
+    {
+        let at = NOW - u64::try_from(i).expect("small");
+        let from = if *why == "first" {
+            String::new()
+        } else {
+            format!("from = 999998\nnick_from = \"{widest}\"\n")
+        };
+        older.push_str(&format!(
+            "\n[[history]]\nat_ms = {at}\n{from}to = 999999\nnick_to = \"{widest}\"\nwhy = \
+             \"{why}\"\nundone = {}\n\n[history.by]\n{}",
+            i % 2 == 1,
+            by(["person", "agent", "auto"][i % 3])
+        ));
     }
-    let mut none = name;
-    none.history.clear();
-    let text = none.to_toml().expect("serializes");
-    assert!(!text.contains("history"), "an empty History writes nothing");
-    assert_eq!(MachineName::from_toml(&text), Ok(none));
+    assert!(older.len() <= FILE_MAX, "{} bytes:\n{older}", older.len());
+    assert_eq!(MachineName::from_toml(&older), Ok(name.clone()), "{older}");
+    write_private(root.path(), FILE, older.as_bytes()).expect("an older build's file");
+    assert_eq!(read(root.path()).expect("reads"), Some(name));
+    replace(root.path(), |held| {
+        held.rev += 1;
+        Ok(())
+    })
+    .expect("replaces");
+    let written = std::fs::read_to_string(root.path().join(FILE)).expect("reads");
+    assert!(
+        !written.contains("[by]") && !written.contains("history"),
+        "{written}"
+    );
 }
 
 /// An older build kept an `[undo]` table, which nothing read: such a file reads as the same name

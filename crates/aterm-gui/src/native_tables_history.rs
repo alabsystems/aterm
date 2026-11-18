@@ -4,7 +4,8 @@
 //! The Tables page's history drawer (tracker package LT-39): under the grid, every cell a record
 //! set in the shown table, at one of three scopes: the selected cell, the selected row, or the
 //! whole table. It is a view over what the page already read ([`Sheet::written`]): it makes no
-//! read of its own and writes nothing.
+//! read of its own and writes nothing. Its fourth scope, Registry (LT-25), lists every record of
+//! the registry, which it reads a page at a time ([`registry`]).
 //!
 //! - **Closed,** as the page opens, it is one line: the newest record of the table (who, where
 //!   the history places it, how many cells it set) and Show history.
@@ -58,7 +59,9 @@
 //!   words in the primary ink, never the accent.
 //! - **Not written.** The staged cells the scope holds come first, under `NOT WRITTEN`, in the
 //!   page's one blue ([`StyleRef::Unwritten`]), each with Undo; one the table's rules refuse
-//!   says `refused` in the danger ink, as its grid cell does; a reference staged reads as the
+//!   says `refused` in the danger ink, as its grid cell does; a label another row claims says
+//!   `in use` in the note's ink and, after its words, what the label already names and what the
+//!   row reads as once written (LT-46, [`super::claims`]); a reference staged reads as the
 //!   row it names, as its cell does (LT-30). A row's retire, end or restore is its lifecycle
 //!   cell staged and lists as one, its Undo the pane's under the fields. A new row added here
 //!   leads with its birth, `Row → added` at its lifecycle's cell, named `New <row>` as its pane
@@ -99,18 +102,39 @@ use super::{
     AS_OF, At, Author, Sheet, TablesApp, TablesViewState, Written, button, field_words, fitted,
     grid_chrome, group, press, row_height, rows, scale, styled, value_words, writer,
 };
+use crate::native_text_input::TextInputState;
 use crate::native_ui::{
     ActionId, ButtonSpec, Control, ControlState, GroupSpec, Insets, Layout, Length, SemanticRole,
     SemanticValue, StyleRef, UiContent, UiNode, native_button_label_width,
 };
 use crate::native_workers::text_width;
 
+#[path = "native_tables_history_registry.rs"]
+pub(crate) mod registry;
+use registry::{Part, Which};
+
 /// The drawer, and the start of every key under it: a wheel over any of them scrolls its list.
 pub(super) const KEY: &str = "tables/history";
 const SHOW: &str = "tables/history/show";
 const HIDE: &str = "tables/history/hide";
-/// A scope's segment: `cell`, `row` or `table` follows.
+/// A scope's segment: `cell`, `row`, `table` or `registry` follows.
 const SCOPE: &str = "tables/history/scope/";
+/// A record's line at Registry scope: its digest follows.
+const RECORD: &str = "tables/history/record/";
+/// A fold of records at Registry scope: its oldest record's digest follows.
+const RUN: &str = "tables/history/run/";
+/// A selected record's line of one cell: its digest, the cell's place and the part follow.
+const WROTE: &str = "tables/history/wrote/";
+/// Read older records, at the foot of the Registry scope's list.
+const MORE: &str = "tables/history/more";
+/// A filter of the Registry scope that lists its choices: `table` or `machine` follows.
+const FILTER: &str = "tables/history/filter/";
+/// One of a filter's choices: the filter's slug and the choice's place follow.
+const CHOOSE: &str = "tables/history/choose/";
+/// The kind filter's segment: a kind's slug follows ([`registry::KINDS`]).
+const KIND: &str = "tables/history/kind/";
+/// The Registry scope's Find.
+pub(super) const FIND_RECORDS: &str = "tables/history/find";
 /// A cell's line: the record's digest and the cell's place among those it set follow.
 const LINE: &str = "tables/history/at/";
 /// A folded record's head: the record's digest follows.
@@ -140,16 +164,19 @@ pub(crate) enum Scope {
     /// Every write to the shown table.
     #[default]
     Table,
+    /// Every record of the registry, read in pages ([`registry`]).
+    Registry,
 }
 
 impl Scope {
-    const ALL: [Self; 3] = [Self::Cell, Self::Row, Self::Table];
+    const ALL: [Self; 4] = [Self::Cell, Self::Row, Self::Table, Self::Registry];
 
     const fn word(self) -> &'static str {
         match self {
             Self::Cell => "Cell",
             Self::Row => "Row",
             Self::Table => "Table",
+            Self::Registry => "Registry",
         }
     }
 
@@ -158,6 +185,7 @@ impl Scope {
             Self::Cell => "cell",
             Self::Row => "row",
             Self::Table => "table",
+            Self::Registry => "registry",
         }
     }
 
@@ -166,6 +194,7 @@ impl Scope {
             Self::Cell => "History of the selected cell",
             Self::Row => "History of the selected row",
             Self::Table => "History of this table",
+            Self::Registry => "History of the whole registry",
         }
     }
 }
@@ -240,14 +269,73 @@ pub(crate) enum Line {
     Unselected,
     /// The last line: nothing older was read.
     Start,
+    /// Registry scope: one record of the registry.
+    Record {
+        operation: [u8; 32],
+        by: Author,
+        /// The tables, and the row or the count of rows ([`registry::place_words`]).
+        place: String,
+        /// What changed, in words.
+        changed: String,
+        cells: usize,
+        /// It projects nothing: not counted.
+        inert: bool,
+        /// The page shows the tables as of this record.
+        here: bool,
+        /// It is the record selected.
+        ringed: bool,
+        /// Its claim is more than a day from its causal neighbours': shown as claimed.
+        apart: bool,
+        /// It stands in an open fold, set in under the fold's line.
+        within: bool,
+    },
+    /// Registry scope: a fold of consecutive records of one machine and kind, for display.
+    Run {
+        /// Its oldest record, which names it: newer records joining it leave it the same fold.
+        oldest: [u8; 32],
+        by: Author,
+        records: usize,
+        /// Where the causal order places its newest and its oldest record.
+        newest_ms: u64,
+        oldest_ms: u64,
+        open: bool,
+        /// Folded over the record selected.
+        ringed: bool,
+    },
+    /// Registry scope: one cell the selected record wrote, one line of what it wrote over what
+    /// it replaced, what it had not seen, or what has written there since. Its press leads to
+    /// the cell's row where the rail lists its table.
+    Wrote {
+        operation: [u8; 32],
+        n: usize,
+        part: Part,
+        words: String,
+        /// The rail lists its table, so its press shows the row; a log or a carried face's is
+        /// not one the page shows, and its spoken name says so.
+        shows: bool,
+    },
+    /// Registry scope: words that stand for no record (reading, a failed read, the start).
+    Note(String),
+    /// Registry scope: Read older records.
+    More,
+    /// Registry scope: one of a filter's choices, in the list's place.
+    Choice {
+        which: Which,
+        n: usize,
+        chosen: bool,
+        words: String,
+    },
 }
 
 impl Line {
-    /// Whether the line wears the selected cell's ring.
+    /// Whether the line wears the selected cell's ring, or at Registry scope the selected
+    /// record's.
     const fn ringed(&self) -> bool {
         match self {
             Self::One { cell, .. } | Self::Cell { cell, .. } => cell.ringed,
-            Self::Head { ringed, .. } => *ringed,
+            Self::Head { ringed, .. } | Self::Record { ringed, .. } | Self::Run { ringed, .. } => {
+                *ringed
+            }
             _ => false,
         }
     }
@@ -310,7 +398,7 @@ fn cells_words(n: usize) -> String {
 /// Whether the scope holds the cell at `pk`, `column` (no column for a row's birth).
 fn holds(scope: Scope, selection: Selection<'_>, pk: &str, column: Option<&str>) -> bool {
     match (scope, selection) {
-        (Scope::Table, _) => true,
+        (Scope::Table | Scope::Registry, _) => true,
         (Scope::Row, Some((row, _))) => row == pk,
         (Scope::Cell, Some((row, Some(of)))) => row == pk && column == Some(of),
         _ => false,
@@ -327,7 +415,9 @@ pub(crate) fn born(pk: &str, column: &str) -> bool {
 /// Whether the scope has what it lists by: a row for Row, a cell for Cell.
 const fn selected(scope: Scope, selection: Selection<'_>) -> bool {
     match (scope, selection) {
-        (Scope::Table, _) | (Scope::Row, Some(_)) | (Scope::Cell, Some((_, Some(_)))) => true,
+        (Scope::Table | Scope::Registry, _)
+        | (Scope::Row, Some(_))
+        | (Scope::Cell, Some((_, Some(_)))) => true,
         _ => false,
     }
 }
@@ -587,6 +677,29 @@ pub(crate) fn lines(
     (tally, out)
 }
 
+/// The open drawer's list as the next layout lays it out, with its counts: the shown table's
+/// lines at Cell, Row and Table scope ([`lines`]); the registry's records at Registry scope
+/// ([`registry::lines`]), whose counts its head says apart ([`registry::count_words`]).
+fn scope_lines(
+    app: &TablesApp,
+    view: &TablesViewState,
+    sheet: &Sheet,
+    staged: &BTreeMap<At, String>,
+) -> (Tally, Vec<Line>) {
+    let state = &view.history;
+    if state.scope.registry() {
+        return (Tally::default(), registry::lines(app, view, &state.runs));
+    }
+    lines(
+        sheet,
+        state.scope,
+        view.history_selection(),
+        staged,
+        &state.folds,
+        app.as_of().map(|at| at.operation),
+    )
+}
+
 /// The closed drawer's words: the newest record that set a cell the grid shows, by who, where
 /// the history places it and how many cells; `No records` of a table with none.
 pub(crate) fn newest_words(sheet: &Sheet, now: u64) -> String {
@@ -723,7 +836,25 @@ fn key_of(line: &Line) -> Option<String> {
             aterm_codec::hex::encode_lower(operation)
         )),
         Line::NotWritten { pk, column, .. } => Some(format!("{STAGED}{pk}/{column}")),
-        Line::NotWrittenHead | Line::Day(_) | Line::Unselected | Line::Start => None,
+        Line::Record { operation, .. } => Some(format!(
+            "{RECORD}{}",
+            aterm_codec::hex::encode_lower(operation)
+        )),
+        Line::Run { oldest, .. } => {
+            Some(format!("{RUN}{}", aterm_codec::hex::encode_lower(oldest)))
+        }
+        Line::Wrote {
+            operation, n, part, ..
+        } => Some(format!(
+            "{WROTE}{}/{n}/{}",
+            aterm_codec::hex::encode_lower(operation),
+            part.slug()
+        )),
+        Line::More => Some(MORE.to_owned()),
+        Line::Choice { which, n, .. } => Some(format!("{CHOOSE}{}/{n}", which.slug())),
+        Line::NotWrittenHead | Line::Day(_) | Line::Unselected | Line::Start | Line::Note(_) => {
+            None
+        }
     }
 }
 
@@ -753,8 +884,21 @@ fn controls(line: &Line) -> Vec<String> {
                 format!("{UNDO}{pk}/{column}"),
             ]
         }
-        Line::Cell { .. } => key_of(line).into_iter().collect(),
-        Line::NotWrittenHead | Line::Day(_) | Line::Unselected | Line::Start => Vec::new(),
+        Line::Record { operation, .. } => {
+            let hex = aterm_codec::hex::encode_lower(operation);
+            key_of(line)
+                .into_iter()
+                .chain([format!("{AS_OF}{hex}")])
+                .collect()
+        }
+        Line::Cell { .. }
+        | Line::Run { .. }
+        | Line::Wrote { .. }
+        | Line::More
+        | Line::Choice { .. } => key_of(line).into_iter().collect(),
+        Line::NotWrittenHead | Line::Day(_) | Line::Unselected | Line::Start | Line::Note(_) => {
+            Vec::new()
+        }
     }
 }
 
@@ -766,7 +910,6 @@ struct Placed {
 }
 
 /// The drawer's state: the view's alone, kept nowhere and written nowhere.
-#[derive(Default)]
 pub(crate) struct Drawer {
     pub(super) open: bool,
     /// Whether the last layout drew the drawer, as the page judged it from the window and the
@@ -799,6 +942,37 @@ pub(crate) struct Drawer {
     /// The first control of each line that has one, top down: Up and Down move among them.
     stops: RefCell<Vec<String>>,
     missing: Option<Missing>,
+    /// Registry scope: the folds a person opened or closed, by their oldest record's digest.
+    runs: BTreeMap<[u8; 32], bool>,
+    /// Registry scope: the filter whose choices the list shows in its place.
+    pub(super) choosing: Option<Which>,
+    /// Registry scope: Find, as typed.
+    pub(super) find: TextInputState,
+}
+
+impl Default for Drawer {
+    fn default() -> Self {
+        Self {
+            open: false,
+            drawn: Cell::default(),
+            scope: Scope::default(),
+            scroll: Cell::default(),
+            limit: Cell::default(),
+            room: Cell::default(),
+            folds: BTreeMap::new(),
+            followed: RefCell::default(),
+            read: Cell::default(),
+            top: RefCell::default(),
+            ring: RefCell::default(),
+            fitted: RefCell::default(),
+            places: RefCell::default(),
+            stops: RefCell::default(),
+            missing: None,
+            runs: BTreeMap::new(),
+            choosing: None,
+            find: TextInputState::new(String::new()),
+        }
+    }
 }
 
 impl Drawer {
@@ -810,6 +984,17 @@ impl Drawer {
             self.scroll.set(0.0);
         }
         self.missing = None;
+        self.choosing = None;
+    }
+
+    /// What the list follows for the table, the scope and the selection in force: at Registry
+    /// scope none of them, since it lists the registry's records whatever is selected.
+    fn follows(&self, sheet: &'static str, selection: Selection<'_>) -> Follow {
+        if self.scope.registry() {
+            Follow::of("", Scope::Registry, None)
+        } else {
+            Follow::of(sheet, self.scope, selection)
+        }
     }
 
     /// Another table is shown: its list starts at its top, and a note on the last one goes.
@@ -859,11 +1044,7 @@ impl Drawer {
         now: u64,
     ) -> (f32, f32) {
         // A Table scope's list is the table's, whichever cell is selected.
-        let list = Follow::of(
-            sheet,
-            self.scope,
-            selection.filter(|_| self.scope != Scope::Table),
-        );
+        let list = self.follows(sheet, selection.filter(|_| self.scope != Scope::Table));
         let room = self.room.get();
         let (by, place) = fit(lines, |n| painted(n, scroll, room), now);
         let mut fitted = self.fitted.borrow_mut();
@@ -886,7 +1067,7 @@ impl Drawer {
     /// read moved to another line, a record that set the selected cell, brings that line into
     /// view.
     fn follow(&self, sheet: &'static str, selection: Selection<'_>, lines: &[Line], read: u64) {
-        let now = Follow::of(sheet, self.scope, selection);
+        let now = self.follows(sheet, selection);
         let ring = lines.iter().position(Line::ringed).and_then(|at| {
             Some(Placed {
                 key: key_of(&lines[at])?,
@@ -998,9 +1179,11 @@ impl TablesViewState {
         let Some(focus) = self.common.last_focus.as_ref().map(|key| key.as_str()) else {
             return false;
         };
-        if ![LINE, STAGED, UNDO, FOLD, AS_OF]
-            .iter()
-            .any(|control| focus.starts_with(control))
+        if ![
+            LINE, STAGED, UNDO, FOLD, AS_OF, RECORD, RUN, WROTE, MORE, CHOOSE,
+        ]
+        .iter()
+        .any(|control| focus.starts_with(control))
         {
             return false;
         }
@@ -1015,14 +1198,7 @@ impl TablesViewState {
             .filter(|((table, ..), _)| table == sheet.name)
             .map(|(at, text)| (at.clone(), text.clone()))
             .collect();
-        let (_, lines) = lines(
-            sheet,
-            self.history.scope,
-            self.history_selection(),
-            &staged,
-            &self.history.folds,
-            app.as_of().map(|at| at.operation),
-        );
+        let (_, lines) = scope_lines(app, self, sheet, &staged);
         if lines
             .iter()
             .any(|line| controls(line).iter().any(|key| key == focus))
@@ -1040,6 +1216,7 @@ impl TablesApp {
     pub(super) fn history_act(&mut self, view: &mut TablesViewState, key: &str) -> Option<bool> {
         if key == OF_ROW {
             view.history.show(Scope::Row);
+            self.registry_shown(false);
             return Some(true);
         }
         // Pressed from the keyboard, the keys stay in the drawer; after a pointer's press they
@@ -1048,14 +1225,110 @@ impl TablesApp {
         if key == SHOW {
             let scope = view.history.scope;
             view.history.show(scope);
+            self.registry_shown(scope.registry());
             view.history_rest(HIDE, keyboard);
         } else if key == HIDE {
             view.history.open = false;
             view.history.missing = None;
+            self.registry_shown(false);
             view.history_rest(SHOW, keyboard);
         } else if let Some(slug) = key.strip_prefix(SCOPE) {
             let scope = Scope::ALL.into_iter().find(|scope| scope.slug() == slug)?;
             view.history.show(scope);
+            // The registry's records are read once they are first asked for, a page at a time,
+            // and again where they moved while History was not shown or its read failed.
+            self.registry_shown(scope.registry());
+            view.history_rest(key, keyboard);
+        } else if let Some(hex) = key.strip_prefix(RECORD) {
+            let operation = self.registry_operation(hex)?;
+            self.registry_select(operation);
+            // A record a person selected stays in sight: a fold that Read older records or a
+            // re-read forms around it is open, as one they opened by it ([`registry::open`]).
+            if self.registry.selected == Some(operation) {
+                view.history.runs.insert(operation, true);
+            }
+            view.history_rest(key, keyboard);
+        } else if let Some(hex) = key.strip_prefix(RUN) {
+            let oldest = self.registry_operation(hex)?;
+            let records = &self.registry.records;
+            let (range, _) = registry::groups(records)
+                .into_iter()
+                .find(|(range, _)| records[range.clone()].iter().any(|r| r.operation == oldest))?;
+            let run = &records[range];
+            let runs = &mut view.history.runs;
+            // Closed, every record it was opened by is forgotten; opened, it is by its oldest.
+            if registry::open(run, runs) {
+                for record in run {
+                    runs.remove(&record.operation);
+                }
+            } else {
+                runs.insert(oldest, true);
+            }
+            view.history_rest(key, keyboard);
+        } else if let Some(rest) = key.strip_prefix(WROTE) {
+            let mut parts = rest.split('/');
+            let operation = self.registry_operation(parts.next()?)?;
+            let n = parts.next()?.parse::<usize>().ok()?;
+            // The way to the cell's row: the table chosen and the row shown and selected, as
+            // Check's Show row shows one.
+            let cell = match (&self.registry.selected, &self.registry.opened) {
+                (Some(selected), Some(Ok(opened))) if *selected == operation => {
+                    opened.cells.get(n).cloned()
+                }
+                _ => None,
+            }?;
+            let shown = self
+                .listed()
+                .iter()
+                .map(|listed| listed.name)
+                .find(|name| *name == cell.collection);
+            if let Some(name) = shown {
+                view.close_edit(self, false);
+                view.show_row(self, name, &cell.pk, cell.column.as_deref());
+            }
+            view.history_rest(key, keyboard);
+        } else if key == MORE {
+            self.registry_older();
+            view.history_rest(key, keyboard);
+        } else if let Some(slug) = key.strip_prefix(FILTER) {
+            let which = [Which::Table, Which::Machine]
+                .into_iter()
+                .find(|which| which.slug() == slug)?;
+            let state = &mut view.history;
+            state.choosing = (state.choosing != Some(which)).then_some(which);
+            state.scroll.set(0.0);
+            view.history_rest(key, keyboard);
+        } else if let Some(rest) = key.strip_prefix(CHOOSE) {
+            let (slug, n) = rest.split_once('/')?;
+            let which = [Which::Table, Which::Machine]
+                .into_iter()
+                .find(|which| which.slug() == slug)?;
+            let n = n.parse::<usize>().ok()?;
+            let offered = match which {
+                Which::Table => self.registry_tables(),
+                Which::Machine => self.registry_machines(),
+            };
+            // The first choice is every one; the rest are the offered ones, in order.
+            let chosen = match n.checked_sub(1) {
+                None => None,
+                Some(n) => Some(offered.get(n)?.0.clone()),
+            };
+            let mut filter = self.registry.filter.clone();
+            match which {
+                Which::Table => filter.table = chosen,
+                Which::Machine => filter.machine = chosen,
+            }
+            view.history.choosing = None;
+            view.history.scroll.set(0.0);
+            self.registry_filter(filter);
+            // The choices go: the keys rest on the filter's button, a control still drawn.
+            view.history_rest(&format!("{FILTER}{slug}"), keyboard);
+        } else if let Some(slug) = key.strip_prefix(KIND) {
+            let (kind, ..) = registry::KINDS.iter().find(|(_, _, of)| *of == slug)?;
+            let mut filter = self.registry.filter.clone();
+            filter.kind = *kind;
+            view.history.scroll.set(0.0);
+            self.registry_filter(filter);
             view.history_rest(key, keyboard);
         } else if let Some(hex) = key.strip_prefix(FOLD) {
             let operation = self.history_operation(view, hex)?;
@@ -1114,6 +1387,28 @@ impl TablesApp {
             return None;
         }
         Some(true)
+    }
+
+    /// History's Find changed: read again from the top where the words it keeps did.
+    pub(super) fn history_found(&mut self, view: &TablesViewState) {
+        let find = view.history.find.value().trim().to_lowercase();
+        if find != self.registry.filter.find {
+            let filter = registry::Filter {
+                find,
+                ..self.registry.filter.clone()
+            };
+            view.history.scroll.set(0.0);
+            self.registry_filter(filter);
+        }
+    }
+
+    /// The record History lists whose digest reads `hex`.
+    fn registry_operation(&self, hex: &str) -> Option<[u8; 32]> {
+        self.registry
+            .records
+            .iter()
+            .map(|record| record.operation)
+            .find(|operation| aterm_codec::hex::encode_lower(operation) == hex)
     }
 
     /// The record of the shown table whose digest reads `hex`.
@@ -1293,6 +1588,9 @@ struct Look {
     /// The staged cells of the shown table whose value its rules refuse, by row and column,
     /// with the rule ([`TablesApp::refusal`]).
     refused: BTreeMap<(String, String), String>,
+    /// The staged labels of the shown table another row claims, by row and column, with what
+    /// the cell says of it ([`super::claims`]).
+    claimed: BTreeMap<(String, String), String>,
     /// Whether a Write is out: a new row's Undo waits for it.
     writing: bool,
 }
@@ -1415,16 +1713,29 @@ fn nodes(lines: &[Line], look: &Look) -> (Vec<UiNode>, BTreeMap<String, usize>, 
                 let key = format!("{STAGED}{pk}/{column}");
                 let undo = format!("{UNDO}{pk}/{column}");
                 stops.push(key.clone());
-                // A staged value the table's rules refuse says so in the grid's word and ink.
+                // A staged value the table's rules refuse says so in the grid's word and ink; a
+                // label another row claims, in the grid's word and the note's ink.
                 let refused = look.refused.get(&(pk.clone(), column.clone()));
+                let claimed = look
+                    .claimed
+                    .get(&(pk.clone(), column.clone()))
+                    .filter(|_| refused.is_none());
                 let mut spoken = format!("{place}: {text}, not written");
                 if let Some(rule) = refused {
                     spoken.push_str(&format!(", refused: {rule}"));
                 }
+                if let Some(words) = claimed {
+                    spoken.push_str(&format!(", {}: {words}", super::claims::IN_USE));
+                }
                 let mut over_press = vec![press(&key, spoken)];
                 if near {
-                    let tag_w = refused.map_or(0.0, |_| {
-                        text_width("refused", SemanticRole::Text, StyleRef::Danger) + 6.0
+                    let tag = refused
+                        .map(|_| ("refused", "refused", StyleRef::Danger))
+                        .or_else(|| {
+                            claimed.map(|_| ("claimed", super::claims::IN_USE, StyleRef::Note))
+                        });
+                    let tag_w = tag.map_or(0.0, |(_, word, style)| {
+                        text_width(word, SemanticRole::Text, style) + 6.0
                     });
                     let mut words = vec![
                         fitted(format!("{key}/place"), place, StyleRef::Unwritten, w.place),
@@ -1435,13 +1746,8 @@ fn nodes(lines: &[Line], look: &Look) -> (Vec<UiNode>, BTreeMap<String, usize>, 
                             (w.under - tag_w).max(1.0),
                         ),
                     ];
-                    if refused.is_some() {
-                        words.push(fitted(
-                            format!("{key}/refused"),
-                            "refused",
-                            StyleRef::Danger,
-                            tag_w,
-                        ));
+                    if let Some((slug, word, style)) = tag {
+                        words.push(fitted(format!("{key}/{slug}"), word, style, tag_w));
                     }
                     over_press.push(face(format!("{key}/face"), 8.0 + INDENT, words));
                 }
@@ -1625,19 +1931,272 @@ fn nodes(lines: &[Line], look: &Look) -> (Vec<UiNode>, BTreeMap<String, usize>, 
                     vec![seat(format!("{key}/seat"), w.seat, over_press)],
                 )
             }
+            Line::Note(text) => note(format!("tables/history/note/{n}"), text),
+            Line::Record { .. }
+            | Line::Run { .. }
+            | Line::Wrote { .. }
+            | Line::More
+            | Line::Choice { .. } => registry_node(each, look, near, &mut stops),
         });
     }
     (out, places, stops)
 }
 
-/// The three-way scope control: one segment for each scope, the current one selected.
+/// One line of the Registry scope's list: a record, a fold of records, a line of the selected
+/// record's cells, Read older records, or a filter's choice. Each is one press with a spoken
+/// name, the list's stop for its line; a record's line also offers As of.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one line of each kind, laid out in one pass"
+)]
+fn registry_node(each: &Line, look: &Look, near: bool, stops: &mut Vec<String>) -> UiNode {
+    let line = line_height();
+    let w = &look.widths;
+    let key = key_of(each).unwrap_or_default();
+    stops.push(key.clone());
+    let row = |children: Vec<UiNode>| {
+        group(format!("{key}/line"))
+            .layout(Layout::row().gap(8.0).height(Length::Fixed(line)))
+            .children(children)
+    };
+    let ring = |over_press: &mut Vec<UiNode>, ringed: bool| {
+        if near && ringed {
+            over_press.push(styled(format!("{key}/focus"), StyleRef::CellSelected).paint_only());
+        }
+    };
+    let width = |text: &str, style: StyleRef| text_width(text, SemanticRole::Text, style) + 2.0;
+    match each {
+        Line::Record {
+            operation,
+            by,
+            place,
+            changed,
+            cells,
+            inert,
+            here,
+            ringed,
+            apart,
+            within,
+        } => {
+            let hex = aterm_codec::hex::encode_lower(operation);
+            // A claim far from its neighbours' is shown as claimed, its whole date said.
+            let when = if *apart {
+                format!(
+                    "{} \u{b7} claimed {}",
+                    by.placed(look.now),
+                    super::stamp_words(by.at_ms)
+                )
+            } else {
+                by.when(look.now)
+            };
+            let mut tail = registry::cells_words(*cells);
+            let mut spoken = format!("{} \u{b7} {when}, {tail}, {place}: {changed}", by.who());
+            if *inert {
+                tail.push_str(" \u{b7} not counted");
+                spoken.push_str(", not counted");
+            }
+            let mut over_press = vec![press(&key, spoken)];
+            if near {
+                let left = 8.0 + if *within { INDENT } else { 0.0 };
+                let room = (w.seat - left - 8.0).max(1.0);
+                let style = if *here {
+                    StyleRef::Primary
+                } else {
+                    StyleRef::Plain
+                };
+                let tail_w = width(&tail, StyleRef::Note).min(room * 0.2);
+                let by_w = (width(&by.who(), by.style(style))
+                    + 8.0
+                    + width(&format!("\u{b7} {when}"), style))
+                .min(room * 0.4);
+                let place_w = width(place, StyleRef::Note).min(room * 0.25);
+                let changed_w = (room - by_w - place_w - tail_w - 30.0).max(1.0);
+                let mut words: Vec<UiNode> = writer(&key, by, &when, style, by_w).into();
+                words.push(fitted(
+                    format!("{key}/place"),
+                    place,
+                    StyleRef::Note,
+                    place_w,
+                ));
+                words.push(fitted(
+                    format!("{key}/changed"),
+                    changed,
+                    StyleRef::Plain,
+                    changed_w,
+                ));
+                words.push(fitted(
+                    format!("{key}/count"),
+                    &tail,
+                    StyleRef::Note,
+                    tail_w,
+                ));
+                over_press.push(face(format!("{key}/face"), left, words));
+            }
+            ring(&mut over_press, *ringed);
+            row(vec![
+                seat(format!("{key}/seat"), w.seat, over_press),
+                as_of_button(&hex, by, *here, look),
+            ])
+        }
+        Line::Run {
+            by,
+            records,
+            newest_ms,
+            oldest_ms,
+            open,
+            ringed,
+            ..
+        } => {
+            let (newest, oldest) = (
+                super::when_words(*newest_ms, look.now),
+                super::when_words(*oldest_ms, look.now),
+            );
+            let span = if newest == oldest {
+                newest
+            } else {
+                format!("{oldest} to {newest}")
+            };
+            // A fold for display, never one write: its words say how many records it holds.
+            let count = if *open {
+                format!("\u{b7} a fold of {records} records")
+            } else {
+                format!("\u{b7} a fold of {records} records, folded")
+            };
+            let spoken = format!(
+                "A fold of {records} records by {}, {span}{}",
+                by.who(),
+                if *open { "" } else { ", folded" }
+            );
+            let mut over_press = vec![UiNode::new(
+                key.clone(),
+                UiContent::Button(
+                    Control::new(
+                        ButtonSpec::new(spoken).visual_label(String::new()),
+                        ActionId::new(key.clone()),
+                    )
+                    .state(ControlState {
+                        expanded: Some(*open),
+                        ..ControlState::default()
+                    }),
+                ),
+            )];
+            if near {
+                let room = (w.seat - 8.0 - 34.0).max(1.0);
+                let count_w = width(&count, StyleRef::Note).min(room * 0.5);
+                let by_w = (room - count_w - 6.0).max(1.0);
+                let mut words: Vec<UiNode> = writer(&key, by, &span, StyleRef::Plain, by_w).into();
+                words.push(fitted(
+                    format!("{key}/count"),
+                    &count,
+                    StyleRef::Note,
+                    count_w,
+                ));
+                over_press.push(face(format!("{key}/face"), 8.0, words));
+            }
+            ring(&mut over_press, *ringed);
+            row(vec![seat(format!("{key}/seat"), w.seat, over_press)])
+        }
+        Line::Wrote {
+            part, words, shows, ..
+        } => {
+            let lead = if *shows {
+                "shows its row"
+            } else {
+                "a table the page does not show"
+            };
+            let mut over_press = vec![press(&key, format!("{words}; {lead}"))];
+            if near {
+                let left = 8.0 + 2.0 * INDENT;
+                let style = if *part == Part::Was {
+                    StyleRef::Plain
+                } else {
+                    StyleRef::Note
+                };
+                over_press.push(face(
+                    format!("{key}/face"),
+                    left,
+                    vec![fitted(
+                        format!("{key}/words"),
+                        words,
+                        style,
+                        (w.seat - left - 8.0).max(1.0),
+                    )],
+                ));
+            }
+            row(vec![seat(format!("{key}/seat"), w.seat, over_press)])
+        }
+        Line::Choice { chosen, words, .. } => {
+            let spoken = if *chosen {
+                format!("{words}, chosen")
+            } else {
+                words.clone()
+            };
+            let mut over_press = vec![press(&key, spoken)];
+            if near {
+                let (text, style) = if *chosen {
+                    (format!("\u{2713} {words}"), StyleRef::Primary)
+                } else {
+                    (words.clone(), StyleRef::Plain)
+                };
+                over_press.push(face(
+                    format!("{key}/face"),
+                    8.0 + INDENT,
+                    vec![fitted(
+                        format!("{key}/words"),
+                        &text,
+                        style,
+                        (w.seat - 8.0 - INDENT - 8.0).max(1.0),
+                    )],
+                ));
+            }
+            row(vec![seat(format!("{key}/seat"), w.seat, over_press)])
+        }
+        _ => row(vec![
+            group(format!("{key}/lead")).layout(Layout::default().width(Length::Fixed(0.0))),
+            button(
+                MORE,
+                "Read older records",
+                "Read older records",
+                StyleRef::Secondary,
+                true,
+            ),
+        ]),
+    }
+}
+
+/// The scope control: one segment for each scope, the current one selected.
 fn scope_control(current: Scope, width: f32) -> UiNode {
-    let each = ((width - 4.0) / 3.0).max(1.0);
-    let segments = Scope::ALL
+    segmented(
+        "tables/history/scope",
+        "History of",
+        Scope::ALL
+            .into_iter()
+            .map(|scope| {
+                (
+                    format!("{SCOPE}{}", scope.slug()),
+                    scope.word().to_owned(),
+                    scope.spoken().to_owned(),
+                    scope == current,
+                )
+            })
+            .collect(),
+        width,
+    )
+}
+
+/// A segmented control `width` wide named `label`: one segment for each of `segments` (its key,
+/// its word, its spoken name and whether it is the one chosen).
+fn segmented(
+    group_key: &'static str,
+    label: &str,
+    segments: Vec<(String, String, String, bool)>,
+    width: f32,
+) -> UiNode {
+    let n = segments.len().max(1) as f32;
+    let each = ((width - 2.0 * (n - 1.0)) / n).max(1.0);
+    let segments = segments
         .into_iter()
-        .map(|scope| {
-            let key = format!("{SCOPE}{}", scope.slug());
-            let on = scope == current;
+        .map(|(key, word, spoken, on)| {
             let mut seat = Vec::with_capacity(3);
             if on {
                 seat.push(styled(format!("{key}/band"), StyleRef::Code));
@@ -1649,7 +2208,7 @@ fn scope_control(current: Scope, width: f32) -> UiNode {
                 key.clone(),
                 UiContent::Button(
                     Control::new(
-                        ButtonSpec::new(scope.spoken()).visual_label(String::new()),
+                        ButtonSpec::new(spoken).visual_label(String::new()),
                         ActionId::new(key.clone()),
                     )
                     .value(SemanticValue::Bool(on))
@@ -1661,14 +2220,13 @@ fn scope_control(current: Scope, width: f32) -> UiNode {
             } else {
                 StyleRef::Plain
             };
-            let word_w =
-                (text_width(scope.word(), SemanticRole::Text, style) + 2.0).min(each - 8.0);
+            let word_w = (text_width(&word, SemanticRole::Text, style) + 2.0).min(each - 8.0);
             seat.push(
                 group(format!("{key}/face"))
                     .layout(Layout::row())
                     .children(vec![
                         group(format!("{key}/lead")).layout(Layout::default().width(Length::Fill)),
-                        fitted(format!("{key}/word"), scope.word(), style, word_w.max(0.0)),
+                        fitted(format!("{key}/word"), &word, style, word_w.max(0.0)),
                         group(format!("{key}/trail")).layout(Layout::default().width(Length::Fill)),
                     ])
                     .paint_only_tree(),
@@ -1679,9 +2237,9 @@ fn scope_control(current: Scope, width: f32) -> UiNode {
         })
         .collect();
     UiNode::new(
-        "tables/history/scope",
+        group_key,
         UiContent::Group(GroupSpec {
-            label: Some("History of".to_owned()),
+            label: Some(label.to_owned()),
             role: SemanticRole::Group,
             style: StyleRef::Secondary,
         }),
@@ -1775,21 +2333,22 @@ pub(super) fn drawer(
             (at.clone(), reads)
         })
         .collect();
-    let (tally, lines) = lines(
-        sheet,
-        state.scope,
-        selection,
-        &staged,
-        &state.folds,
-        app.as_of().map(|at| at.operation),
-    );
+    let (tally, lines) = scope_lines(app, view, sheet, &staged);
     let line = line_height();
-    let room = (height - row_height() - FOOT).max(0.0);
+    // At Registry scope its filters stand on one line of the list's room, over the list.
+    let registry = state.scope.registry();
+    let filters_h = if registry { line } else { 0.0 };
+    let room = (height - row_height() - FOOT - filters_h).max(0.0);
     let whole = lines.len() as f32 * line;
     let limit = (whole - room).max(0.0);
     state.room.set(room);
     state.limit.set(limit);
-    state.follow(sheet.name, selection, &lines, app.reads);
+    let read = if registry {
+        app.registry.reads
+    } else {
+        app.reads
+    };
+    state.follow(sheet.name, selection, &lines, read);
     let scroll = state.scroll.get().min(limit);
     state.scroll.set(scroll);
     state.settle(&lines, scroll);
@@ -1832,6 +2391,14 @@ pub(super) fn drawer(
                     Some(((at.1, at.2), rule))
                 })
                 .collect(),
+            claimed: app
+                .claimed
+                .iter()
+                .filter(|((table, ..), _)| table == sheet.name)
+                .map(|((_, pk, column), claimed)| {
+                    ((pk.clone(), column.clone()), claimed.words.clone())
+                })
+                .collect(),
         },
     );
     *state.places.borrow_mut() = places;
@@ -1847,25 +2414,29 @@ pub(super) fn drawer(
     let hide_w = native_button_label_width("Hide history") + 24.0;
     let head_room = (inner - hide_w - 36.0).max(0.0);
     // The scope's words give way last, its segments narrowing alike.
+    let segments = Scope::ALL.len() as f32;
     let scope_w = (Scope::ALL
         .into_iter()
         .map(|scope| native_button_label_width(scope.word()) + 24.0)
         .fold(0.0_f32, f32::max)
-        * 3.0
-        + 4.0)
+        * segments
+        + 2.0 * (segments - 1.0))
         .min(head_room);
     let (title, title_w) = title(head_room - scope_w);
     let count_w = (head_room - scope_w - title_w).max(0.0);
     // In a head too narrow for all its words, the counts stay and the note on them goes.
-    let count = if !selected(state.scope, selection) {
-        String::new()
+    let (said, short) = if registry {
+        let count = registry::count_words(&app.registry);
+        (format!("{count} \u{b7} {ORDER}"), count)
+    } else if selected(state.scope, selection) {
+        (tally.words(state.scope), tally.count(state.scope))
     } else {
-        let whole = tally.words(state.scope);
-        if text_width(&whole, SemanticRole::Text, StyleRef::Note) <= count_w {
-            whole
-        } else {
-            tally.count(state.scope)
-        }
+        (String::new(), String::new())
+    };
+    let count = if text_width(&said, SemanticRole::Text, StyleRef::Note) <= count_w {
+        said
+    } else {
+        short
     };
     let head = vec![
         title,
@@ -1919,9 +2490,119 @@ pub(super) fn drawer(
     let body = group("tables/history/body")
         .layout(Layout::row().gap(4.0).height(Length::Fixed(room)))
         .children(body);
+    let body = if registry {
+        group("tables/history/registry")
+            .layout(Layout::column())
+            .children(vec![filters(app, view, inner, filters_h), body])
+    } else {
+        body
+    };
     card(head, Some(body), height)
 }
 
+/// A filter's button at Registry scope, `width` wide: it lists the filter's choices in the
+/// list's place, and says whether they show.
+fn filter_button(which: Which, label: &str, spoken: &str, open: bool, width: f32) -> UiNode {
+    let key = format!("{FILTER}{}", which.slug());
+    UiNode::new(
+        key.clone(),
+        UiContent::Button(
+            Control::new(
+                ButtonSpec::new(spoken.to_owned()).visual_label(label),
+                ActionId::new(key),
+            )
+            .state(ControlState {
+                expanded: Some(open),
+                ..ControlState::default()
+            })
+            .style(StyleRef::Secondary),
+        ),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fixed(width))
+            .height(Length::Fill),
+    )
+}
+
+/// The Registry scope's filters, one line `height` tall over its list, `width` wide: table and
+/// machine (each a button that lists its choices in the list's place), kind, and Find.
+fn filters(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiNode {
+    let filter = &app.registry.filter;
+    let table = filter.table.as_ref().map_or_else(
+        || "All tables".to_owned(),
+        |name| {
+            app.title_of(name)
+                .map_or_else(|| name.clone(), str::to_owned)
+        },
+    );
+    let machine = filter.machine.as_ref().map_or_else(
+        || "All machines".to_owned(),
+        |key| {
+            app.registry_machines()
+                .into_iter()
+                .find(|(row, _)| row == key)
+                .map_or_else(|| key.clone(), |(_, words)| words)
+        },
+    );
+    let choosing = view.history.choosing;
+    let fit = |label: &str| (native_button_label_width(label) + 24.0).min(width * 0.22);
+    let (table_label, machine_label) = (format!("Table: {table}"), format!("Machine: {machine}"));
+    let (table_w, machine_w) = (fit(&table_label), fit(&machine_label));
+    let kinds_w = (registry::KINDS
+        .iter()
+        .map(|(_, word, _)| native_button_label_width(word) + 24.0)
+        .fold(0.0_f32, f32::max)
+        * registry::KINDS.len() as f32
+        + 2.0 * (registry::KINDS.len() as f32 - 1.0))
+        .min(width * 0.32);
+    let find_w = (width - table_w - machine_w - kinds_w - 3.0 * 8.0).max(1.0);
+    let kinds = segmented(
+        "tables/history/kind",
+        "Kind",
+        registry::KINDS
+            .iter()
+            .map(|(kind, word, slug)| {
+                (
+                    format!("{KIND}{slug}"),
+                    (*word).to_owned(),
+                    format!("Kind: {word}"),
+                    *kind == filter.kind,
+                )
+            })
+            .collect(),
+        kinds_w,
+    );
+    group("tables/history/filters")
+        .layout(
+            Layout::row()
+                .gap(8.0)
+                .height(Length::Fixed(height))
+                .padding(Insets::symmetric(0.0, 2.0)),
+        )
+        .children(vec![
+            filter_button(
+                Which::Table,
+                &table_label,
+                &format!("{table_label}, the table filter"),
+                choosing == Some(Which::Table),
+                table_w,
+            ),
+            filter_button(
+                Which::Machine,
+                &machine_label,
+                &format!("{machine_label}, the machine filter"),
+                choosing == Some(Which::Machine),
+                machine_w,
+            ),
+            kinds,
+            super::field(FIND_RECORDS, "Find in history", &view.history.find, view)
+                .layout(Layout::default().width(Length::Fixed(find_w))),
+        ])
+}
+
+// Named for its file, so a test's path says the file it is in
+// (`native_tables_history_tests::…`), as the tracker's exit tests name them.
 #[cfg(all(test, unix))]
 #[path = "native_tables_history_tests.rs"]
-mod tests;
+mod native_tables_history_tests;

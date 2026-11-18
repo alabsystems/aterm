@@ -9,10 +9,11 @@ repository.workspace = true
 authors.workspace = true
 description = "Embedded encrypted replicated application database over astream"
 [features]
-# The one `aterm_types::dev_seam!` read here: `ATERM_DEV_FLEET_FIXTURE`, which holds the fleet
-# tables to `fleet::fixture`'s lab (`fleet::fixture::under_seam`). A debug build compiles it
-# anyway; the release cutter never enables this (aterm's and aterm-gui's `dev-seams` forward
-# here), so a shipped binary reads no fixture.
+# The one seam read here: `ATERM_DEV_FLEET_FIXTURE`, which holds the fleet tables to
+# `fleet::fixture`'s lab (`fleet::fixture::under_seam`) and whose value chooses the Fleet band's
+# scene (`fleet::fixture::scene_under_seam`). A debug build compiles it anyway; the release
+# cutter never enables this (aterm's and aterm-gui's `dev-seams` forward here), so a shipped
+# binary reads no fixture.
 dev-seams = []
 [dependencies]
 # The grid round trip reads and writes a TSV with amacs's own table codec, so a lab table edited

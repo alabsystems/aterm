@@ -264,7 +264,7 @@ fn measured_sample(binary: &Binary, run: &Run) -> (aterm_json::Value, crate::tes
 }
 
 /// A BINARY'S HISTORY KEEPS ONLY A RUN THAT MEASURED IT OR ITS LATEST DECISIVE OUTCOME: one the
-/// run's ceiling left no time to start ([`not_started`]), one something outside it ended (an
+/// dispatcher left unstarted ([`never_run`]), one something outside it ended (an
 /// interrupt that came before it started, a stuck holder: `spawn_error`) and one that ended as an
 /// interrupt was ending the run keep no sample, each with its event as before. One verify stopped
 /// at its first red case keeps an outcome-only FAIL with zero wall and no usage, while one the
@@ -277,7 +277,7 @@ fn only_a_measured_run_or_a_decisive_outcome_keeps_a_sample() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let binary = binary();
-    let never = not_started(&binary, Duration::from_secs(30));
+    let never = never_run();
     let (event, sample) = event_and_sample(&binary, &never, false);
     assert_eq!(event["outcome"].as_str(), Some("FAIL"));
     assert!(sample.is_none(), "{sample:?}");

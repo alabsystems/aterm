@@ -50,12 +50,21 @@ fn screen_529() -> String {
 
 fn write_shim(path: &Path, screen: &Path) {
     use std::os::unix::fs::PermissionsExt;
+    let shell = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+    let cat = aterm_uds::deadline::stand_in(Path::new("/bin/cat"));
+    let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
     let body = format!(
-        "#!/bin/sh\nprintf '\\033[?1049h\\033[2J\\033[H'\ncat '{}'\nsleep 600\nexit 0\n",
-        screen.display()
+        "#!{}\n[ \"$1\" = --version ] && exit 0\nprintf '\\033[?1049h\\033[2J\\033[H'\n'{}' '{}'\n'{}' 600\nexit 0\n",
+        shell.display(),
+        cat.display(),
+        screen.display(),
+        sleep.display()
     );
     std::fs::write(path, body).expect("write the shim");
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    // Keep this a regular file at the managed path: resolving a shared stand-in symlink
+    // would change the program identity this fixture tests.
+    aterm_spec::wait::first_exec(path, &["--version"]);
 }
 
 fn shim_root(inst: &Instance) -> PathBuf {

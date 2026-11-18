@@ -1364,6 +1364,9 @@ const GATE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 /// processes with that inode open ([`gate_openers`]): the evidence left where a holder recorded
 /// nothing.
 ///
+/// The final boolean says whether the admission lock was released while waiting; an
+/// index-wide caller must then repeat its census before relying on its completeness.
+///
 /// # Errors
 /// `WouldBlock`, as above; the gate or the admission lock could not be locked or opened again.
 #[cfg(unix)]
@@ -1375,7 +1378,7 @@ fn producer_gate(
     root: &Path,
     within: std::time::Duration,
     work: &mut dyn FnMut(i32) -> Option<u64>,
-) -> std::io::Result<(crate::lock::Flock, gate::Held)> {
+) -> std::io::Result<(crate::lock::Flock, gate::Held, bool)> {
     let began = std::time::Instant::now();
     let mut watch = gate::Watch::new();
     let mut paused = false;
@@ -1385,7 +1388,7 @@ fn producer_gate(
         // A second descriptor on the gate's own inode, for the refusal's scan of who has it open.
         let probe = aterm_uds::kept_out(|| gate.try_clone());
         match gate::try_exclusive(gate) {
-            Ok(held) => return Ok((admission, held)),
+            Ok(held) => return Ok((admission, held, paused)),
             Err(std::fs::TryLockError::WouldBlock) => {}
             Err(std::fs::TryLockError::Error(error)) => {
                 return Err(std::io::Error::new(
@@ -1511,20 +1514,28 @@ fn describe_gate_openers(
 /// The registration gate was busy or an admitted cache's owner could not be published.
 #[cfg(unix)]
 pub fn create_checked(home: &Path, root: &Path, workspace: &Path) -> std::io::Result<bool> {
-    create_with_policy(home, root, workspace, None, true).map(|(recorded, _)| recorded)
+    create_with_policy(home, root, workspace, None, Admission::Adopt).map(|(recorded, _)| recorded)
 }
 
-/// Admit `workspace`'s producer to the cache `root`, creating it when it is absent, and
-/// recording a cargo-made existing one where it stands when `adopt` ([`create_checked`]'s
-/// producers; a package target is only ever created fresh).
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    Adopt,
+    Create,
+    Existing,
+}
+
+/// Admit a producer under the root's gate. `Existing` extends custody already recorded;
+/// `Create` also creates fresh roots, and `Adopt` may claim a proven cargo-made target.
 #[cfg(unix)]
 fn create_with_policy(
     home: &Path,
     root: &Path,
     workspace: &Path,
     policy: Option<package::Policy>,
-    adopt: bool,
+    mode: Admission,
 ) -> std::io::Result<(bool, bool)> {
+    let adopt = mode == Admission::Adopt;
     let mut must_record = false;
     let mut created = false;
     let mut refusal = None;
@@ -1563,7 +1574,7 @@ fn create_with_policy(
         must_record = true;
         // The record may be between fresh creation and publication, so a busy gate is never
         // permission to use the directory without recording this producer's owner.
-        let (_admission, _held) = match producer_gate(
+        let (_admission, _held, _) = match producer_gate(
             &index,
             admission,
             lock,
@@ -1590,6 +1601,9 @@ fn create_with_policy(
                 return None;
             }
             _ => {}
+        }
+        if mode == Admission::Existing && before.is_none() {
+            return None;
         }
         if before.as_ref().is_some_and(|before| before.root != root) {
             must_record = true;
@@ -1632,6 +1646,9 @@ fn create_with_policy(
                 return None;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if mode == Admission::Existing {
+                    return None;
+                }
                 must_record = true;
                 created = true;
                 creation::begin(home, &path, root, workspace, policy.clone())?
@@ -1712,6 +1729,28 @@ fn create_with_policy(
     } else {
         Ok((false, false))
     }
+}
+
+/// Add a known default-target producer without creating or adopting an ordinary target.
+#[cfg(unix)]
+fn observe_existing(home: &Path, target: &Path, owner: &Path) -> std::io::Result<bool> {
+    if let Some(linked) = through_link(home, target) {
+        let admitted = match linked {
+            Ok(linked) => admit_linked(home, &linked, owner)?,
+            Err(refusal) => Err(refusal),
+        };
+        return match admitted {
+            Ok(()) => Ok(true),
+            Err(LinkRefusal::Unowned | LinkRefusal::CargoMade | LinkRefusal::Dangling) => Ok(false),
+            Err(refusal) => Err(std::io::Error::other(refusal.why())),
+        };
+    }
+    create_with_policy(home, target, owner, None, Admission::Existing).map(|(recorded, _)| recorded)
+}
+
+#[cfg(not(unix))]
+fn observe_existing(_: &Path, _: &Path, _: &Path) -> std::io::Result<bool> {
+    Ok(false)
 }
 
 #[cfg(not(unix))]
@@ -1923,7 +1962,7 @@ fn admit_linked(
     let path = index.join(format!("{key}.json"));
     let gate_at = gate_path(&path).ok_or_else(stop)?;
     let gate = open_gate(&gate_at).ok_or_else(stop)?;
-    let (_admission, _held) = producer_gate(
+    let (_admission, _held, _) = producer_gate(
         &index,
         admission,
         gate,
@@ -2356,8 +2395,18 @@ fn suppress_unresolved(home: &Path, target: &Path) -> std::io::Result<bool> {
         let index = index(home).ok_or_else(stop)?;
         let key = key(&root).ok_or_else(stop)?;
         let path = index.join(format!("{key}.json"));
-        let lock = gate::open(&gate_path(&path).ok_or_else(stop)?)?;
-        let _held = gate::try_exclusive(lock).map_err(|_| stop())?;
+        let admission = crate::lock::Flock::lock(open_admission(&index).ok_or_else(stop)?)?;
+        let at = gate_path(&path).ok_or_else(stop)?;
+        let lock = gate::open(&at)?;
+        let (_admission, _held, _) = producer_gate(
+            &index,
+            admission,
+            lock,
+            &at,
+            &root,
+            GATE_QUIET,
+            &mut gate::work,
+        )?;
         if linked.as_ref().is_some_and(|linked| !linked.still()) {
             return Err(std::io::Error::other(LinkRefusal::Changed.why()));
         }
@@ -2392,24 +2441,57 @@ fn suppress_configured(home: &Path) -> std::io::Result<()> {
     let directory = index(home).ok_or_else(stop)?;
     let admission =
         crate::metadata_io::open_regular(&directory.join("locks.noindex/admission.lock"))?;
-    let _admission = crate::lock::Flock::lock(admission)?;
-    for entry in std::fs::read_dir(&directory)? {
-        let path = entry?.path();
-        if !path
-            .extension()
-            .is_some_and(|extension| extension == "json")
-        {
-            continue;
+    let mut admission = crate::lock::Flock::lock(admission)?;
+    loop {
+        // Snapshot under admission. If a gate wait releases it, the next pass includes
+        // registrations or replacements made during that wait.
+        let entries = std::fs::read_dir(&directory)?
+            .take(MAX_ROOTS + 1)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        if entries.len() > MAX_ROOTS {
+            return Err(stop());
         }
-        let lock = gate::open(&gate_path(&path).ok_or_else(stop)?)?;
-        let _held = gate::try_exclusive(lock).map_err(|_| stop())?;
-        let mut receipt = read(&path).ok_or_else(stop)?;
-        if !receipt.owners_unknown {
-            receipt.owners_unknown = true;
-            write(&path, &receipt).ok_or_else(stop)?;
+        let mut released = false;
+        for entry in entries {
+            let path = entry.path();
+            if !path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                continue;
+            }
+            let root = match read(&path) {
+                Some(receipt) => receipt.root,
+                None if std::fs::symlink_metadata(&path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    continue;
+                }
+                None => return Err(stop()),
+            };
+            let at = gate_path(&path).ok_or_else(stop)?;
+            let lock = gate::open(&at)?;
+            let (again, _held, waited) = producer_gate(
+                &directory,
+                admission,
+                lock,
+                &at,
+                &root,
+                GATE_QUIET,
+                &mut gate::work,
+            )?;
+            admission = again;
+            released |= waited;
+            let mut receipt = read(&path).ok_or_else(stop)?;
+            if !receipt.owners_unknown {
+                receipt.owners_unknown = true;
+                write(&path, &receipt).ok_or_else(stop)?;
+            }
+        }
+        if !released {
+            return Ok(());
         }
     }
-    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -3343,12 +3425,14 @@ fn observe_with_placement(
         };
         // A target is HOME's where the kernel reaches it there, whatever its spelling
         // ([`under_home`]: through HOME's other name or a link from outside it).
-        // With none named, Targo builds into its root's `target`; a root atpkg never manages
+        // With none named, a managed workspace joins its recorded default target's owners
+        // without claiming an ordinary target. A root atpkg never manages
         // (HOME's) records no owner there, so a root recorded at that folder for another
         // workspace is held in custody, as one this call named explicitly would be, never
         // retired once that workspace goes while this one still builds there.
         // A `miri` line builds inside the folder whose `miri` its target is (`base`): a root
         // recorded at that folder is held too, as the same call without `miri` would hold it.
+        let mut owned_default = false;
         let protected = match target_name(&named, tool, &moved) {
             Some(target) => {
                 let within = target
@@ -3363,18 +3447,17 @@ fn observe_with_placement(
                 protected
             }
             None => match workspace_target_chosen(args, tool, home, machine) {
-                Some(default)
-                    if default.manifests.iter().any(|manifest| {
-                        matches!(
-                            workspace_at(home, manifest, default.target.parent()),
-                            Ok(None)
-                        )
-                    }) =>
-                {
+                Some(default) => {
                     let target = under_home(&default.target, home).unwrap_or(default.target);
-                    suppress_unresolved(home, &target)?
+                    match workspace_choices(home, &default.manifests, args, tool, machine) {
+                        Ok(Some(owner)) => {
+                            owned_default = observe_existing(home, &target, &owner)?;
+                            owned_default
+                        }
+                        Ok(None) | Err(()) => suppress_unresolved(home, &target)?,
+                    }
                 }
-                _ => false,
+                None => false,
             },
         };
         let unresolved = match cwd
@@ -3397,7 +3480,9 @@ fn observe_with_placement(
         if line.is_none() || unresolved || unread {
             suppress_configured(home)?;
         }
-        return Ok(if protected {
+        return Ok(if owned_default {
+            Observation::Owned
+        } else if protected {
             Observation::Protected
         } else {
             Observation::Unmanaged
@@ -3602,7 +3687,7 @@ fn observe_configured_outputs(
             return Ok(Observation::Unmanaged);
         }
         for root in &roots {
-            if !create_with_policy(home, root, owner, None, false)?.0 {
+            if !create_with_policy(home, root, owner, None, Admission::Create)?.0 {
                 return Ok(Observation::Unmanaged);
             }
         }
@@ -3849,8 +3934,6 @@ fn command_observation(
 /// [`loses_config`](super::loses_config) (tippy, clippy); the words and the variable, which the
 /// call never had, are hidden here; `env`: it exported `CARGO_BUILD_BUILD_DIR` alone (the trust
 /// lane), which the call never had, hidden here; `-`: nothing), so the call is read as typed.
-/// A `-C` call whose trust.lock is not the launcher's is refused first
-/// ([`directory_lock_guard`]).
 ///
 /// With `build`, the answer is what an observed call that produces build output builds
 /// ([`ShimBuild`]), for the front's start line ([`crate::build_start`]), read by a second reader
@@ -3861,7 +3944,7 @@ fn command_observation(
 /// not resolve, and wherever calls are not observed (off macOS, or with no home).
 ///
 /// # Errors
-/// As [`observe_command`]'s, [`directory_lock_guard`]'s refusal, or `InvalidInput` for an
+/// As [`observe_command`]'s, or `InvalidInput` for an
 /// unknown or mismatched placement claim.
 pub fn observe_shim_call(
     args: &[String],
@@ -3870,7 +3953,6 @@ pub fn observe_shim_call(
     cwd: Option<&Path>,
     build: bool,
 ) -> std::io::Result<Option<ShimBuild>> {
-    directory_lock_guard(args, tool, placed, cwd)?;
     observation_with(
         args,
         tool,
@@ -3993,96 +4075,6 @@ fn shim_build(
         workspace,
         build_dir,
     })
-}
-
-/// THE `-C` TRUST.LOCK GUARD. The shim's hop (`build_admit`'s `run_hidden`) picks the Trust
-/// compiler by the `trust.lock` found above the launcher's directory `cwd`
-/// ([`crate::trust_lock::shim_target`]), while Targo works in the directory a `-C` before the
-/// verb names and builds the tree there. So a Targo call `args` (as the shim's block `placed`
-/// handed them, [`typed_call`]) with a `-C` is refused where the lock found above the directory
-/// Targo works in ([`super::changed_into`], as Targo's `getcwd` reads it back, a relative one
-/// against `cwd`) is another outcome than the launcher's, each found by
-/// [`crate::trust_lock::find`] as the hop would search from that directory: another lock file,
-/// a lock on one side only, or a lock that does not read on either side (the same file
-/// included). A `-C` this reader cannot resolve (a missing or second value, which Targo
-/// refuses, or a folder it cannot change into) and a launcher whose directory cannot be read
-/// are refused too. A `-C` whose outcome is the launcher's, a call with none, and the lint,
-/// whose words are its own, are not judged. The guard stands until the hop searches from the
-/// directory Targo works in, which makes it moot.
-///
-/// # Errors
-/// The refusal, naming the two outcomes and the remedy: run the call from the tree it builds.
-fn directory_lock_guard(
-    args: &[String],
-    tool: super::Tool,
-    placed: &str,
-    cwd: Option<&Path>,
-) -> std::io::Result<()> {
-    if tool != super::Tool::Targo {
-        return Ok(());
-    }
-    let typed = typed_call(args, placed).map_or(args, |(typed, _)| typed);
-    let Some(directory) = super::directory_arg(typed) else {
-        return Ok(());
-    };
-    let refuse = |why: String| {
-        Err(std::io::Error::other(format!(
-            "{why}; the compiler is picked by the trust.lock above the directory a call is \
-             launched from, so run the call from the tree it builds (cd there) rather than \
-             naming it with -C"
-        )))
-    };
-    let Some(cwd) = cwd else {
-        return refuse(
-            "this call names a -C directory, and the launcher's directory, whose trust.lock \
-             picks the compiler, cannot be read"
-                .to_owned(),
-        );
-    };
-    let worked = directory.filter(|dir| !dir.is_empty()).and_then(|dir| {
-        let dir = Path::new(dir);
-        super::changed_into(&if dir.is_absolute() {
-            dir.to_path_buf()
-        } else {
-            cwd.join(dir)
-        })
-    });
-    let Some(worked) = worked else {
-        return refuse(format!(
-            "this call's -C directory ({}) cannot be resolved, so the trust.lock it builds \
-             under cannot be compared with the launcher's",
-            directory.unwrap_or("no value")
-        ));
-    };
-    let launcher = crate::trust_lock::find(cwd);
-    let there = crate::trust_lock::find(&worked);
-    let same = match (&launcher, &there) {
-        (None, None) => true,
-        (Some(here), Some(there)) => {
-            here.path == there.path && here.lock.is_ok() && there.lock.is_ok()
-        }
-        _ => false,
-    };
-    if same {
-        return Ok(());
-    }
-    let outcome = |found: &Option<crate::trust_lock::Found>| match found {
-        None => "no trust.lock".to_owned(),
-        Some(found) => match &found.lock {
-            Ok(_) => format!("trust.lock {}", found.path.display()),
-            Err(why) => format!(
-                "trust.lock {}, which does not read ({why})",
-                found.path.display()
-            ),
-        },
-    };
-    refuse(format!(
-        "this call's -C directory {} builds under {}, but the launcher's {} finds {}",
-        worked.display(),
-        outcome(&there),
-        cwd.display(),
-        outcome(&launcher)
-    ))
 }
 
 /// The call as typed, from the words a shim's block `placed` handed its front

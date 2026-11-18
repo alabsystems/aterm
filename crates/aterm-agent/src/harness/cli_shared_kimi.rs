@@ -324,6 +324,7 @@ fn request<'a>(
         cli: Cli::Kimi,
         route,
         row,
+        word: None,
         staging,
         store: context.store,
         hosts,

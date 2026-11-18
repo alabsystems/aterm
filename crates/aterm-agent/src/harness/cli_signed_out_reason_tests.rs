@@ -142,19 +142,88 @@ fn run(form: AccountsCmd, env: &Env) -> String {
     String::from_utf8(out).expect("UTF-8")
 }
 
-/// The line of `text` that names `label` first.
-fn line_of<'a>(text: &'a str, label: &str) -> &'a str {
-    text.lines()
-        .find(|line| line.split_whitespace().any(|word| word == label))
-        .unwrap_or_else(|| panic!("no {label} in {text}"))
+/// The name the report gives the row `label` of the pool, whose row with an address holds
+/// `<label>@example.test`: that account's ([`crate::harness::account_names::shown_row`], with no
+/// lab).
+fn shown(label: &str) -> String {
+    format!("oai {label}@example.test")
 }
 
-/// `field` of the row `label` names in `rows`, as the report's words.
-fn field(rows: &Value, label: &str, key: &str) -> Value {
+/// The rows of the pool with an address (`base@example.test`); every other row has a login
+/// directory and no address.
+const ADDRESSED: [&str; 1] = ["base"];
+
+/// The name the report gives the row `label`: a row with an address its account's ([`shown`]), a
+/// row with no address its label marked so.
+fn report_shown(label: &str) -> String {
+    if ADDRESSED.contains(&label) {
+        shown(label)
+    } else {
+        format!("{label} (no address)")
+    }
+}
+
+/// The report's line of the row `label`: the one its name leads ([`report_shown`]), never a line
+/// that holds the label alone.
+fn report_line_of<'a>(text: &'a str, label: &str) -> &'a str {
+    let name = report_shown(label);
+    text.lines()
+        .find(|line| line.starts_with(&format!("{name} ")))
+        .unwrap_or_else(|| panic!("no line of {name} in {text}"))
+}
+
+/// `key` of the report JSON's row `label` in `rows`: a row with an address is found by its
+/// account's key and name and keeps no `label`; a row with no address by its label, with no key.
+fn report_field(rows: &Value, label: &str, key: &str) -> Value {
+    let addressed = ADDRESSED.contains(&label);
+    let ac = aterm_db::typed::keys::account_pk("codex", &format!("{label}@example.test"))
+        .expect("a key");
     rows.as_array()
         .expect("rows")
         .iter()
-        .find(|row| row["label"] == Value::from(label) || row["believed"] == Value::from(label))
+        .find(|row| {
+            if addressed {
+                row["ac"] == Value::from(ac.clone())
+                    && row["name"] == Value::from(shown(label))
+                    && row.get("label").is_none()
+            } else {
+                row["ac"].is_null() && row["label"] == Value::from(label)
+            }
+        })
+        .unwrap_or_else(|| panic!("no {label} in {rows}"))[key]
+        .clone()
+}
+
+/// The line of `text` (the table's, or the observed places') that names the row `label` as the
+/// report names it ([`report_shown`]): in the table's ACCOUNT column, or in the observed places'
+/// BELIEVED column, never by the label alone.
+fn line_of<'a>(text: &'a str, label: &str) -> &'a str {
+    let name = report_shown(label);
+    text.lines()
+        .find(|line| line.contains(&format!(" {name} ")))
+        .unwrap_or_else(|| panic!("no {name} in {text}"))
+}
+
+/// `key` of the JSON row (the table's, or the observed places') that names the row `label`: a row
+/// with an address by its account's key and name, with no `label` (the table's `ac` and `name`,
+/// the observed places' `believed`'s); a row with no address by its label, with no key or name.
+fn field(rows: &Value, label: &str, key: &str) -> Value {
+    let addressed = ADDRESSED.contains(&label);
+    let ac = aterm_db::typed::keys::account_pk("codex", &format!("{label}@example.test"))
+        .expect("a key");
+    let names = |names: &Value| {
+        if addressed {
+            names["ac"] == Value::from(ac.clone())
+                && names["name"] == Value::from(shown(label))
+                && names.get("label").is_none()
+        } else {
+            names["ac"].is_null() && names["label"] == Value::from(label)
+        }
+    };
+    rows.as_array()
+        .expect("rows")
+        .iter()
+        .find(|row| names(row) || names(&row["believed"]))
         .unwrap_or_else(|| panic!("no {label} in {rows}"))[key]
         .clone()
 }
@@ -170,6 +239,10 @@ const PLAIN: [&str; 2] = ["gone", "fresh"];
 /// THE LIST SAYS WHY: `accounts --cli codex` writes `signed-out (token expired)` for the row whose
 /// settled refusal is on record and `signed_out_reason` in its JSON; a row signed out with nothing
 /// settled on record stays plain `signed-out`, and the row not signed out keeps its own condition.
+/// Each row is found as the report names it: the row with an address by its account alone, in
+/// its words and its JSON, and each row with no address by its label marked so. NEGATIVE
+/// CONTROL: with the report's row line printing each row's bare label, `no line of lost (no
+/// address) in …` (2026-11-16, by hand on SF-07H S7a's review settle, then restored).
 #[test]
 fn the_codex_list_says_why_a_row_is_signed_out() {
     let (_tmp, env, _source) = pool("signed-out-reason-list", "base@example.test");
@@ -182,31 +255,49 @@ fn the_codex_list_says_why_a_row_is_signed_out() {
     assert_eq!(reads, [], "a local read asks no provider");
     for label in SAYS {
         assert!(
-            line_of(&text, label).contains(" signed-out (token expired)"),
+            report_line_of(&text, label).contains(" signed-out (token expired)"),
             "{label}: {text}"
         );
     }
     for label in PLAIN {
-        assert!(line_of(&text, label).contains(" signed-out "), "{text}");
-        assert!(!line_of(&text, label).contains(" signed-out ("), "{text}");
+        assert!(
+            report_line_of(&text, label).contains(" signed-out "),
+            "{text}"
+        );
+        assert!(
+            !report_line_of(&text, label).contains(" signed-out ("),
+            "{text}"
+        );
     }
-    assert!(!line_of(&text, "live").contains(" signed-out"), "{text}");
+    assert!(
+        !report_line_of(&text, "live").contains(" signed-out"),
+        "{text}"
+    );
     let doc: Value = aterm_json::from_str(&json).expect("JSON");
     let rows = &doc["accounts"];
     for label in SAYS {
-        assert_eq!(field(rows, label, "condition"), Value::from("signed-out"));
         assert_eq!(
-            field(rows, label, "signed_out_reason"),
+            report_field(rows, label, "condition"),
+            Value::from("signed-out")
+        );
+        assert_eq!(
+            report_field(rows, label, "signed_out_reason"),
             Value::from("refresh_token_expired"),
             "{label}"
         );
     }
     for label in PLAIN {
-        assert_eq!(field(rows, label, "condition"), Value::from("signed-out"));
-        assert_eq!(field(rows, label, "signed_out_reason"), Value::Null);
+        assert_eq!(
+            report_field(rows, label, "condition"),
+            Value::from("signed-out")
+        );
+        assert_eq!(report_field(rows, label, "signed_out_reason"), Value::Null);
     }
-    assert_ne!(field(rows, "live", "condition"), Value::from("signed-out"));
-    assert_eq!(field(rows, "live", "signed_out_reason"), Value::Null);
+    assert_ne!(
+        report_field(rows, "live", "condition"),
+        Value::from("signed-out")
+    );
+    assert_eq!(report_field(rows, "live", "signed_out_reason"), Value::Null);
 }
 
 /// THE TABLE SAYS WHY, as the list does: `signed-out (token expired)` in its readiness text,
@@ -269,7 +360,9 @@ fn the_observed_codex_places_say_why_a_row_is_signed_out() {
         assert!(!line_of(&text, label).contains(" signed-out ("), "{text}");
     }
     assert!(!line_of(&text, "live").contains(" signed-out"), "{text}");
-    let rows: Value = aterm_json::from_slice(&json).expect("JSON");
+    let doc: Value = aterm_json::from_slice(&json).expect("JSON");
+    assert_eq!(doc["kind"], Value::from("accounts-observed"), "{doc}");
+    let rows = doc["places"].clone();
     for label in SAYS {
         assert_eq!(field(&rows, label, "auth"), Value::from("signed-out"));
         assert_eq!(
@@ -298,22 +391,29 @@ fn a_row_says_no_reason_for_another_accounts_login_in_its_place() {
         ("base@example.test", Some("refresh_token_expired")),
     ] {
         let (_tmp, env, _source) = pool("signed-out-reason-displaced", default_names);
-        let says = |text: &str| {
-            let line = line_of(text, "base");
+        let says = |text: &str, line: &str| {
             assert!(line.contains(" signed-out"), "{default_names}: {text}");
             line.contains(" signed-out (token expired)")
         };
         let list = run(AccountsCmd::Report { json: false }, &env);
-        assert_eq!(says(&list), shown.is_some(), "{default_names}: {list}");
+        assert_eq!(
+            says(&list, report_line_of(&list, "base")),
+            shown.is_some(),
+            "{default_names}: {list}"
+        );
         let doc: Value =
             aterm_json::from_str(&run(AccountsCmd::Report { json: true }, &env)).expect("JSON");
         assert_eq!(
-            field(&doc["accounts"], "base", "signed_out_reason"),
+            report_field(&doc["accounts"], "base", "signed_out_reason"),
             Value::from(shown),
             "{default_names}"
         );
         let table = run(AccountsCmd::Table { json: false }, &env);
-        assert_eq!(says(&table), shown.is_some(), "{default_names}: {table}");
+        assert_eq!(
+            says(&table, line_of(&table, "base")),
+            shown.is_some(),
+            "{default_names}: {table}"
+        );
         let doc: Value =
             aterm_json::from_str(&run(AccountsCmd::Table { json: true }, &env)).expect("JSON");
         assert_eq!(
@@ -332,13 +432,13 @@ fn a_row_says_no_reason_for_another_accounts_login_in_its_place() {
         );
         let observed = String::from_utf8(text).expect("UTF-8");
         assert_eq!(
-            says(&observed),
+            says(&observed, line_of(&observed, "base")),
             shown.is_some(),
             "{default_names}: {observed}"
         );
-        let rows: Value = aterm_json::from_slice(&json).expect("JSON");
+        let doc: Value = aterm_json::from_slice(&json).expect("JSON");
         assert_eq!(
-            field(&rows, "base", "signed_out_reason"),
+            field(&doc["places"], "base", "signed_out_reason"),
             Value::from(shown),
             "{default_names}"
         );

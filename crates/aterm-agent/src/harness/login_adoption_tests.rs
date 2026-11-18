@@ -97,13 +97,11 @@ pub(in crate::harness) fn tap_path(state_dir: &Path) -> PathBuf {
 
 /// Sets when the fixture process's usage-tap file was last written, as a tap that stopped
 /// then leaves it.
-#[cfg(unix)]
 pub(in crate::harness) fn tap_written_at(state_dir: &Path, at: i64) {
     written_at(&tap_path(state_dir), at);
 }
 
 /// Sets when the file `path` was last written.
-#[cfg(unix)]
 fn written_at(path: &Path, at: i64) {
     let written =
         std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::try_from(at).unwrap());
@@ -936,7 +934,6 @@ fn login_adopted_a_login_row_is_the_commands_own_row_and_never_a_quotation() {
 /// written at `T + 30` lifts nothing. CONTROL: the same file written again after it does. A
 /// file not written for two minutes keeps no baseline at all: when it is written again its
 /// baseline is taken then, and only what comes after that counts.
-#[cfg(unix)]
 #[test]
 fn login_adopted_a_file_no_longer_written_shows_nothing() {
     let world = World::seen();
@@ -997,7 +994,6 @@ fn login_adopted_a_file_no_longer_written_shows_nothing() {
 /// file still names, and not above the file's API time. NEGATIVE CONTROLS: a baseline dated
 /// after now (a clock set back since), and one above the file's API time (a process that
 /// began again), each show nothing to the reading, exactly as the keeper takes each again.
-#[cfg(unix)]
 #[test]
 fn login_adopted_one_rule_says_which_baseline_stands() {
     let now = T + 120;
@@ -1051,7 +1047,6 @@ fn login_adopted_one_rule_says_which_baseline_stands() {
 /// next look is not evidence (that look takes the new floor, and only a request begun after
 /// it counts); API time that did not grow adopts nothing; and growth with no rate-limit
 /// figure adopts nothing.
-#[cfg(unix)]
 #[test]
 fn login_adopted_needs_growth_past_a_baseline_kept_on_disk() {
     // Kept: the second look is a new process's, which holds nothing in memory.
@@ -1084,7 +1079,7 @@ fn login_adopted_needs_growth_past_a_baseline_kept_on_disk() {
 
     // Lost: what happened before the next look is under the new floor.
     let world = World::seen();
-    fs::remove_file(world.store().dir.join(BASELINES_FILE)).unwrap();
+    fs::remove_file(baselines_dir(&world.store().dir).join(BASELINES_FILE)).unwrap();
     world.served(T + 95, T + 97, 9_000);
     assert_eq!(
         world.pass(T + 120).0,
@@ -1139,13 +1134,90 @@ fn login_adopted_a_login_row_counts_only_after_its_process_was_seen_with_the_con
     );
 }
 
+/// THE WITNESSES ARE READ PAST THE WINDOW'S ACCOUNTS KEEPER'S TRACE, SO EVERY ASK OF THEM POISONS
+/// THE SCOPE ARMED ON ITS THREAD: an adoption step over a row signed out on record asks them, and
+/// so does the ladder's ask of that row through the same pass's witnesses, read already; neither
+/// run is kept. A step and an ask over a row that is not signed out ask none and compare no
+/// clock, so a step handed the reading through `trace::Now` is kept.
+///
+/// Every such ask gives the witnesses' reason first ([`PAST_THE_TRACE`]), before its asker takes
+/// the reading raw.
+///
+/// NEGATIVE CONTROL (2026-11-16, at the merge of the keeper with FL-174): `Pass::witnesses`
+/// without its `trace::poison` failed "a step that asked the witnesses is never kept", the run's
+/// first reason then the raw reading's: left `Some(Poison("a raw read of now"))`, right the
+/// witnesses' reason. Restored, the file touched.
+#[test]
+fn login_adopted_every_ask_of_the_witnesses_poisons_the_trace_and_no_sign_out_asks_none() {
+    use aterm_uds::trace::{self, Now, Unkept};
+    let later = std::time::Duration::from_secs(60);
+    let traced = |world: &World, pass: &Pass| {
+        trace::read_as_if_later(later, || {
+            trace::scope(|| {
+                adopt_live_logins(
+                    &world.home,
+                    &world.state,
+                    &world.roster,
+                    Now::at(T + 120),
+                    pass,
+                    &|_| {},
+                )
+            })
+        })
+        .1
+    };
+    let asked = |world: &World, pass: &Pass| {
+        let store = world.store();
+        let records = store
+            .read_account_records(Some(&world.roster), T + 120)
+            .unwrap();
+        trace::read_as_if_later(later, || {
+            trace::scope(|| {
+                pass.live(
+                    (&world.home, &world.state),
+                    &store,
+                    (&records.roster, &records.state),
+                    LABEL,
+                    Now::at(T + 120),
+                )
+            })
+        })
+        .1
+    };
+    let past = Some(Unkept::Poison(PAST_THE_TRACE.into()));
+    let world = World::seen();
+    let pass = Pass::default();
+    assert_eq!(
+        traced(&world, &pass).unkept(),
+        past,
+        "a step that asked the witnesses is never kept"
+    );
+    assert_eq!(
+        asked(&world, &pass).unkept(),
+        past,
+        "an ask of witnesses the pass read already"
+    );
+
+    let world = World::new(Auth::Ok);
+    let pass = Pass::default();
+    assert_eq!(
+        traced(&world, &pass).unkept(),
+        None,
+        "a step with no row signed out asks no witness"
+    );
+    assert_eq!(
+        asked(&world, &pass).unkept(),
+        None,
+        "nor an ask of that row"
+    );
+}
+
 /// A PASS READS ITS WITNESSES ONCE, AND ONLY THE TRANSCRIPTS ITS READINGS NAME, FROM THEIR END.
 /// Every asker of one pass is handed the same reading: evidence written after the pass's first
 /// ask is the next pass's. A transcript no usage-tap file names is never opened (one that
 /// would lift the row sits beside the named one and lifts nothing), a transcript is read from
 /// its end alone (evidence before the last four megabytes is not seen, evidence in them is),
 /// and what one pass reads is taken off its budget.
-#[cfg(unix)]
 #[test]
 fn login_adopted_a_pass_reads_its_witnesses_once_and_within_bounds() {
     let live = |world: &World, pass: &Pass, now: i64| {
@@ -1264,7 +1336,6 @@ fn login_adopted_a_pass_reads_its_witnesses_once_and_within_bounds() {
 /// choice by the usage-tap file's time reads the other eight and lifts nothing), and the row
 /// is lifted. With every transcript written since, the eight most recently written are read
 /// and no more.
-#[cfg(unix)]
 #[test]
 fn login_adopted_the_tab_a_person_used_is_read_however_many_idle_tabs_share_its_login() {
     let world = World::new(Auth::SignedOut);
@@ -1354,7 +1425,6 @@ fn login_adopted_the_tab_a_person_used_is_read_however_many_idle_tabs_share_its_
 }
 
 /// The fixture row as the records hold it.
-#[cfg(unix)]
 fn struck_row(world: &World) -> Row {
     world
         .store()
@@ -1448,6 +1518,64 @@ fn login_adopted_writer_agrees_with_itself_and_notes_the_journal() {
         Err(accounts::NotAdopted::Future)
     );
     assert_eq!(state.account("w3").auth, Auth::SignedOut);
+}
+
+/// ON WINDOWS KEEPING THE BASELINES LEAVES THE STORE'S OTHER ENTRIES AS THEY WERE: the store's
+/// folder there keeps the list it inherits, and the baselines go into a private folder of their
+/// own made at its birth ([`baselines_dir`]), so a keep rewrites no access list of the store, of a
+/// login's folder or of a file in it, and moves no file's stamp, which every watcher of the
+/// store reads. The store's folder here carries one entry more than a private list holds (the
+/// user's read, passed on), so a list passed on to its entries would show. NEGATIVE CONTROL: a
+/// keep that makes the store's folder itself private (`baselines_dir` answering the store's own)
+/// rewrites the login's file: its access list and its stamp move.
+#[cfg(windows)]
+#[test]
+fn on_windows_keeping_the_baselines_leaves_the_stores_other_entries_as_they_were() {
+    use aterm_uds::acl::{Descriptor, Parts, Sid};
+    use aterm_uds::file_watch::FileStamp;
+    let scratch = aterm_tempfile::TempDir::new().unwrap();
+    let store = scratch.path().join("accounts");
+    fs::create_dir_all(&store).unwrap();
+    let user = Sid::token_user().unwrap();
+    Descriptor::from_sddl(&format!("D:(A;OICI;FR;;;{user})"))
+        .unwrap()
+        .apply_to_path(&store, Parts::DACL)
+        .unwrap();
+    let login = store.join("logins").join(LABEL);
+    fs::create_dir_all(&login).unwrap();
+    let transcript = login.join("transcript.jsonl");
+    fs::write(&transcript, b"{}\n").unwrap();
+    let list = |path: &Path| {
+        Descriptor::of_path(path, Parts::OWNER | Parts::DACL)
+            .and_then(|d| d.to_sddl(Parts::OWNER | Parts::DACL))
+            .unwrap()
+    };
+    let before: Vec<String> = [&store, &login, &transcript]
+        .iter()
+        .map(|path| list(path))
+        .collect();
+    let stamped = FileStamp::of(&transcript).expect("a stamp");
+
+    let baselines = Baselines(BTreeMap::from([(
+        format!("{SID}-{PID}"),
+        Baseline {
+            api_ms: 4_000,
+            taken_at: T + 10,
+            session: None,
+        },
+    )]));
+    baselines.keep(&store).expect("the baselines are kept");
+    assert_eq!(Baselines::kept(&store), baselines);
+
+    let after: Vec<String> = [&store, &login, &transcript]
+        .iter()
+        .map(|path| list(path))
+        .collect();
+    assert_eq!(
+        (after, FileStamp::of(&transcript)),
+        (before, Some(stamped)),
+        "no access list of the store's entries moved, and the login's file keeps its stamp"
+    );
 }
 
 /// FL-116: A SERVED TURN IS DATED BY THE REQUEST ITS REPLY ANSWERED ([`served_request`]), so a

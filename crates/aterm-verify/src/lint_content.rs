@@ -261,7 +261,7 @@ pub(crate) fn plan(
     ctx: &crate::Ctx,
     mut commands: impl FnMut(&str) -> Result<Vec<Cmd>, String>,
 ) -> Result<Plan, String> {
-    let members = crate::changed::read_members(&ctx.root, &ctx.tools, &ctx.path_env);
+    let members = crate::changed::read_members(&ctx.root, &ctx.tools, &ctx.path_env)?;
     if members.is_empty() {
         return Err("Cargo did not report any workspace member".into());
     }

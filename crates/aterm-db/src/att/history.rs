@@ -3,17 +3,24 @@
 
 //! A table's history in pages (docs/DESIGN-tables-app-2026-11-14.md §4.1–§4.3).
 //!
-//! A page is one store read. The causal clocks are folded over the whole authenticated index,
+//! A page is cut from the whole of one revision's history, ordered and resolved ([`Kept`]). That
+//! is read once a revision: the causal clocks are folded over the whole authenticated index,
 //! which the order needs, and the quota over every eligible record, which a record's inertness
-//! needs; both judge each record in place. The filters and the cursor are then applied, and only
-//! the records the page keeps are copied out as [`Entry`]s, their writers' machines resolved
-//! and each named by the Mac its facts bind ([`Mac`], design §4.5), from the table as the same
-//! read projects it.
-//! The cursor is the sort key, (causal clock, operation digest). A page carries the
+//! needs; every eligible record is then copied out as an [`Entry`], its writer's machine
+//! resolved and named by the Mac its facts bind ([`Mac`], design §4.5), from the table as the
+//! same read projects it. A page applies the filters and the cursor to that order.
+//! The cursor is the sort key, (causal clock, operation digest); a page read newest first runs
+//! back from history's end, its cursor naming the entry it goes on before. A page carries the
 //! [`Revision`] it was read at; a page asked at another revision says so ([`Page::moved`]) and
 //! starts from the top, since an operation arriving late with an earlier clock, or a change of
-//! membership, can land inside a range already served. No fold is kept between calls: a reader
-//! asks [`Handle::revision`], which opens no payload, to learn whether to read again.
+//! membership, can land inside a range already served.
+//!
+//! A reader that asks page after page keeps a [`Kept`] between them
+//! ([`Handle::history_page_kept`]): each page reads the store's revision, which opens no payload,
+//! and where the kept order is of that revision the page is cut from it, decoding, projecting
+//! and ordering nothing; at any other revision the store is read again and the order replaced.
+//! The revision is read in the same observation as the page, so a page is never cut from an
+//! order the table has moved past.
 
 use super::{Handle, View, decode};
 use crate::{
@@ -30,6 +37,7 @@ use crate::{
 };
 use astream_wire::sync::{Actor, Digest};
 use aterm_codec::hex;
+use aterm_secrets::client::Paths;
 use std::collections::BTreeMap;
 
 use crate::documents::log::Hlc;
@@ -424,6 +432,19 @@ impl Filter {
                 .as_deref()
                 .is_none_or(|column| CellKey::parse(&change.key).is_ok_and(|key| key.col == column))
     }
+
+    /// Whether a page keeps `entry`: its kind and writer match, and, where a place is named, one
+    /// of its changes is to that place.
+    fn keeps(&self, entry: &Entry) -> bool {
+        self.kind.is_none_or(|wanted| wanted == entry.kind)
+            && match self.writer {
+                None => true,
+                Some(Writer::Actor(wanted)) => wanted == entry.actor,
+                Some(Writer::Machine(wanted)) => entry.machine == Some(wanted),
+            }
+            && (self.collection.is_none() && self.row.is_none() && self.column.is_none()
+                || entry.changes.iter().any(|change| self.wants(change)))
+    }
 }
 
 /// One page asked for.
@@ -437,6 +458,11 @@ pub struct Ask {
     /// The revision the reader's earlier pages were read at; where the table is at another now,
     /// the page says so and starts from the top.
     pub revision: Option<Revision>,
+    /// Newest first: the page runs back through history from its end, and `after` names the
+    /// entry the entries before which it holds. A reader that lists the newest record at its top
+    /// (the Tables page's History) is served its first page in one call, where oldest first it
+    /// would ask page after page to reach the end.
+    pub newest_first: bool,
 }
 
 impl Ask {
@@ -447,6 +473,18 @@ impl Ask {
             after: None,
             limit,
             revision: None,
+            newest_first: false,
+        }
+    }
+
+    /// The newest `limit` entries `filter` keeps, newest first.
+    pub const fn newest(filter: Filter, limit: usize) -> Self {
+        Self {
+            filter,
+            after: None,
+            limit,
+            revision: None,
+            newest_first: true,
         }
     }
 
@@ -457,6 +495,7 @@ impl Ask {
             after: Some(page.next?),
             limit: self.limit,
             revision: Some(page.revision),
+            newest_first: self.newest_first,
         })
     }
 }
@@ -469,35 +508,163 @@ pub struct Page {
     /// It was asked at another revision, so it starts from the top and the reader's earlier
     /// pages are stale.
     pub moved: bool,
-    /// The entries, in history's order.
+    /// The entries, in history's order; newest first where they were asked so.
     pub entries: Vec<Entry>,
     /// Where the next page starts; `None` where no entry the filter keeps follows.
     pub next: Option<Cursor>,
 }
 
+/// The whole of one revision of one table's history, ordered and resolved: what every page at
+/// that revision is cut from ([`Handle::history_page_kept`]). It holds one revision of one
+/// table at a time; a page at any other revision, or of another table or home, replaces it.
+/// Empty until a page fills it, and its order goes when it is dropped.
+///
+/// That one revision is every eligible entry of the table's history, those below a final
+/// checkpoint's floor included (the store's quotas bound only the records above it), so its
+/// memory grows with the table's history: 50.8 MiB at 105,043 entries of one small change each,
+/// more where an entry's changes and its writer's Mac are wider. Its reader holds it for as
+/// long as it reads.
+#[derive(Default)]
+pub struct Kept {
+    order: Option<Order>,
+    reads: u64,
+}
+
+impl Kept {
+    /// The revision the kept order is of, where one is kept.
+    pub fn revision(&self) -> Option<Revision> {
+        self.order.as_ref().map(|order| order.revision)
+    }
+
+    /// How many times a page asked with this read its table and kept the order it read: once a
+    /// revision, while its pages are asked at the revision it holds. A reader counts these to
+    /// learn that a page cut from the kept order read nothing again.
+    pub const fn reads(&self) -> u64 {
+        self.reads
+    }
+}
+
+impl std::fmt::Debug for Kept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Kept")
+            .field("revision", &self.revision())
+            .field(
+                "entries",
+                &self.order.as_ref().map(|order| order.entries.len()),
+            )
+            .field("reads", &self.reads)
+            .finish()
+    }
+}
+
+/// [`Kept`]'s order: whose table it is, at which revision, and every entry.
+struct Order {
+    paths: Paths,
+    table: &'static super::Compiled,
+    revision: Revision,
+    /// Every eligible entry, in history's order (oldest first).
+    entries: Vec<Entry>,
+}
+
+impl Order {
+    /// Whether this is the order of `table` at `paths` at `revision`. The revision digests the
+    /// table's scope and this Mac's access with every record, so it alone names the order; the
+    /// home and the table are compared too, since a [`Kept`] may be handed any handle.
+    ///
+    /// The table is compared by what names its store (application, role and descriptor version)
+    /// and its generation, never by address: a compiled table is a `const` (`att::REGISTRY`),
+    /// and each `&REGISTRY` may be a copy of its own, so a handle made at one place and a
+    /// handle made at another are of the same table at different addresses.
+    fn of(&self, paths: &Paths, table: &super::Compiled, revision: Revision) -> bool {
+        let kept = self.table;
+        self.revision == revision
+            && kept.table.application == table.table.application
+            && kept.table.role == table.table.role
+            && kept.version == table.version
+            && kept.generation == table.generation
+            && self.paths == *paths
+    }
+}
+
 impl Handle {
     /// One page of this table's eligible history ([`Ask`]), in derived causal-clock order with
-    /// concurrent edits ordered by clock then digest, read in one store read.
+    /// concurrent edits ordered by clock then digest (newest first where [`Ask::newest_first`]),
+    /// read in one store read. A reader that asks more than one page keeps their order between
+    /// them ([`Self::history_page_kept`]).
     ///
     /// # Errors
     /// As [`Self::view`]; also refuses incomplete causal clocks, a logical counter overflow, or
     /// a page of no entries.
     pub fn history_page(&self, ask: &Ask) -> Result<Page> {
+        self.read_history_page(ask, None)
+    }
+
+    /// [`Self::history_page`] cut from `kept` where it holds this table's order at the revision
+    /// the store is at, which is read without opening a payload: such a page decodes, projects
+    /// and orders no record. Else the store is read in the same observation, and `kept` takes
+    /// the order of that revision once the observation stands, its earlier order let go first,
+    /// so it never holds two. A page is never cut from an order of any revision but the one its
+    /// own observation read.
+    ///
+    /// # Errors
+    /// As [`Self::history_page`]. On an error `kept` holds no order or the one it held, never a
+    /// part of one.
+    pub fn history_page_kept(&self, ask: &Ask, kept: &mut Kept) -> Result<Page> {
+        self.read_history_page(ask, Some(kept))
+    }
+
+    /// [`Self::history_page_kept`] where `kept` is given; with none, the page takes its entries
+    /// out of the order it read rather than copying them, so a read of the whole history
+    /// ([`Self::history`]) holds one copy of it, not two.
+    fn read_history_page(&self, ask: &Ask, mut kept: Option<&mut Kept>) -> Result<Page> {
         if ask.limit == 0 {
             return Err(Error::new("a history page holds at least one entry"));
         }
-        let table = self.compiled.table;
-        super::reopened(crate::admission::deadline(), || {
+        let compiled = self.compiled;
+        let table = compiled.table;
+        let read = super::reopened(crate::admission::deadline(), || {
             application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
                 let revision = Revision(store.revision(session)?);
+                if let Some(kept) = kept.as_deref_mut() {
+                    if let Some(order) = &kept.order
+                        && order.of(&self.paths, compiled, revision)
+                    {
+                        return Ok((
+                            Cut::of(&order.entries, revision, ask).copied(&order.entries),
+                            None,
+                        ));
+                    }
+                    // Another revision's order goes before this one is read: one is held at
+                    // most.
+                    kept.order = None;
+                }
                 let log = Log::read_with(session, store, scope, decode)?;
                 let resolve = owned::commons::historical(session);
-                // The names come from the same read, so a page and its writers' names are of one
-                // revision.
+                // The names come from the same read, so an entry and its writer's name are of
+                // one revision.
                 let macs = Macs::of(&View::read(table, session, &log)?);
-                page(table, &log, revision, ask, &resolve, &macs)
+                let entries = ordered(table, &log, &resolve, &macs)?;
+                let cut = Cut::of(&entries, revision, ask);
+                Ok(if kept.is_some() {
+                    (cut.copied(&entries), Some((revision, entries)))
+                } else {
+                    (cut.taken(entries), None)
+                })
             })
-        })
+        });
+        let (page, read) = read?;
+        // Kept only once the observation stands: one refused as busy may have read a table that
+        // moved under it.
+        if let (Some(kept), Some((revision, entries))) = (kept, read) {
+            kept.order = Some(Order {
+                paths: self.paths.clone(),
+                table: compiled,
+                revision,
+                entries,
+            });
+            kept.reads += 1;
+        }
+        Ok(page)
     }
 
     /// Every eligible edit, as one page of every entry ([`Self::history_page`]).
@@ -523,16 +690,14 @@ impl Handle {
     }
 }
 
-/// The page `ask` names of `log`, which was read at `revision`; `resolve` finds a record's
+/// Every eligible entry of `log`, in history's order (oldest first); `resolve` finds a record's
 /// writer machine through the roster it names, and `macs` that machine's Mac.
-fn page(
+fn ordered(
     table: &'static Table,
     log: &Log,
-    revision: Revision,
-    ask: &Ask,
     resolve: &dyn Fn(&Digest, &Actor) -> Option<[u8; 16]>,
     macs: &Macs,
-) -> Result<Page> {
+) -> Result<Vec<Entry>> {
     let order = log.causal_order()?;
     let (records, merges) = log.eligible_and_merges();
     let quota = owned::quota_of(
@@ -548,47 +713,16 @@ fn page(
         }),
         &merges,
     );
-    let moved = ask.revision.is_some_and(|asked| asked != revision);
-    let start = match ask.after.filter(|_| !moved) {
-        Some(after) => {
-            order.partition_point(|&(hlc, id)| (hlc, id) <= (after.hlc, after.operation))
-        }
-        None => 0,
-    };
-    let filter = &ask.filter;
-    let mut entries = Vec::new();
-    let mut next = None;
-    for &(hlc, id) in &order[start..] {
+    let mut entries = Vec::with_capacity(order.len());
+    for (hlc, id) in order {
         let Some((operation, command)) = log.eligible_record(&id) else {
             continue;
         };
         let Some(changes) = command.changes() else {
             continue;
         };
-        let revert = is_revert(command);
-        let kind = EntryKind::of(table, revert, changes);
-        if filter.kind.is_some_and(|wanted| wanted != kind) {
-            continue;
-        }
         let actor = operation.header.actor;
-        let mut machine = None;
-        let mut signer = || *machine.get_or_insert_with(|| resolve(&operation.roster, &actor));
-        let writes = match filter.writer {
-            None => true,
-            Some(Writer::Actor(wanted)) => wanted == actor,
-            Some(Writer::Machine(wanted)) => signer() == Some(wanted),
-        };
-        if !writes
-            || (filter.collection.is_some() || filter.row.is_some() || filter.column.is_some())
-                && !changes.iter().any(|change| filter.wants(change))
-        {
-            continue;
-        }
-        if entries.len() == ask.limit {
-            next = entries.last().map(Entry::cursor);
-            break;
-        }
-        let machine = signer();
+        let machine = resolve(&operation.roster, &actor);
         let inert = if quota.over.contains(&id) {
             Some(Inert::Quota)
         } else if changes.iter().all(|change| {
@@ -610,17 +744,105 @@ fn page(
             hlc,
             request: operation.request,
             reverts: operation.reverts,
-            kind,
+            kind: EntryKind::of(table, is_revert(command), changes),
             inert,
             changes: changes.to_vec(),
         });
     }
-    Ok(Page {
-        revision,
-        moved,
-        entries,
-        next,
-    })
+    Ok(entries)
+}
+
+/// Which entries the page an [`Ask`] names holds, as places in the order it was cut from.
+pub(super) struct Cut {
+    revision: Revision,
+    moved: bool,
+    newest_first: bool,
+    /// The page's entries' places, in the page's order: rising oldest first, falling newest
+    /// first.
+    at: Vec<usize>,
+    next: Option<Cursor>,
+}
+
+impl Cut {
+    /// The page `ask` names of `entries`, every eligible entry of the table at `revision` in
+    /// history's order.
+    pub(super) fn of(entries: &[Entry], revision: Revision, ask: &Ask) -> Self {
+        let moved = ask.revision.is_some_and(|asked| asked != revision);
+        let after = ask.after.filter(|_| !moved);
+        // Oldest first, the entries after the cursor; newest first, those before it, run
+        // backwards.
+        let served: Box<dyn Iterator<Item = usize>> = if ask.newest_first {
+            let end = after.map_or(entries.len(), |after| {
+                entries.partition_point(|entry| entry.cursor() < after)
+            });
+            Box::new((0..end).rev())
+        } else {
+            let start = after.map_or(0, |after| {
+                entries.partition_point(|entry| entry.cursor() <= after)
+            });
+            Box::new(start..entries.len())
+        };
+        let mut at: Vec<usize> = Vec::new();
+        let mut next = None;
+        for n in served.filter(|&n| ask.filter.keeps(&entries[n])) {
+            if at.len() == ask.limit {
+                next = at.last().map(|&last| entries[last].cursor());
+                break;
+            }
+            at.push(n);
+        }
+        Self {
+            revision,
+            moved,
+            newest_first: ask.newest_first,
+            at,
+            next,
+        }
+    }
+
+    /// The page, its entries copied from `entries`, the order it was cut from.
+    pub(super) fn copied(self, entries: &[Entry]) -> Page {
+        let page = self.at.iter().map(|&n| entries[n].clone()).collect();
+        self.page(page)
+    }
+
+    /// The page, its entries taken out of `entries`, the order it was cut from, which goes.
+    pub(super) fn taken(self, entries: Vec<Entry>) -> Page {
+        let mut page = Vec::with_capacity(self.at.len());
+        {
+            // The order is walked once, oldest first; a page asked newest first is turned back
+            // after.
+            let mut wanted: Box<dyn Iterator<Item = &usize>> = if self.newest_first {
+                Box::new(self.at.iter().rev())
+            } else {
+                Box::new(self.at.iter())
+            };
+            let mut want = wanted.next();
+            for (n, entry) in entries.into_iter().enumerate() {
+                let Some(&at) = want else {
+                    break;
+                };
+                if n == at {
+                    page.push(entry);
+                    want = wanted.next();
+                }
+            }
+        }
+        if self.newest_first {
+            page.reverse();
+        }
+        self.page(page)
+    }
+
+    /// The page of `entries`, its entries in its order.
+    fn page(self, entries: Vec<Entry>) -> Page {
+        Page {
+            revision: self.revision,
+            moved: self.moved,
+            entries,
+            next: self.next,
+        }
+    }
 }
 
 const fn is_revert(command: &Command) -> bool {

@@ -74,6 +74,24 @@ impl ProcessLifetime {
         self.identity.pid.unsigned_abs()
     }
 
+    /// Whether independently observed lifetime parts name this exact process generation.
+    /// This compares evidence without reading the kernel or proving that the process still
+    /// lives. `birth` must use [`Birth`]'s platform unit, rather than a sweep's clock or a
+    /// rounded wall-clock start; an unavailable part supplies no matching observation.
+    #[must_use]
+    pub fn matches_observation(
+        &self,
+        scope: &BootStamp,
+        namespace: Option<&str>,
+        pid: u32,
+        birth: Birth,
+    ) -> bool {
+        self.scope == *scope
+            && self.namespace.as_deref() == namespace
+            && i32::try_from(pid).ok() == Some(self.identity.pid)
+            && birth == self.identity.birth
+    }
+
     pub(crate) fn retained_if_current(self) -> Option<Self> {
         (Self::capture(self.pid()).as_ref() == Some(&self)).then_some(self)
     }

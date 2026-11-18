@@ -487,6 +487,20 @@ fn a_failed_store_read_withdraws_the_forecast_without_spending_a_replay() {
             .unwrap();
     };
     set_modified();
+    // Windows' file clock ticks once a millisecond at best, so the rejected version's change
+    // time is set an hour back there, as nothing but a writer of its times does: the repair,
+    // however soon after it, moves it.
+    #[cfg(windows)]
+    {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(store.state_file())
+            .unwrap();
+        let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        let since_1970 = hour_ago.duration_since(std::time::UNIX_EPOCH).unwrap();
+        let ticks = i64::try_from(since_1970.as_nanos() / 100).unwrap() + 116_444_736_000_000_000;
+        aterm_dirfd::seam::set_change_time(&file, ticks).unwrap();
+    }
     let rejected_stamp = crate::footer_inputs::stamp(&store.state_file());
     for wall in [NOW + 10, NOW + 20] {
         assert!(memo.at(wall, Some(&roster), false).is_none());
@@ -1558,6 +1572,7 @@ fn card_of_me(
     account_card::build(&account_card::Inputs {
         cli: accounts::Cli::Claude,
         roster,
+        lab: None,
         state,
         enrolled,
         signing_in: None,

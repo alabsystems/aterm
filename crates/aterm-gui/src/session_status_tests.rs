@@ -2183,15 +2183,17 @@ fn the_status_record_and_the_roster_carry_the_pause_after_task() {
     );
 }
 
-/// A proven contract v3 claim's versions ride `status` right after `supervisor_proven=`
-/// (`docs/DESIGN-harness-repos-2026-10-24.md` §11 D48); a proven claim that named none shows `-`
-/// for both, as an unclaimed tab does (the controls).
+/// A proven scoped claim's versions ride `status` right after `supervisor_proven=`
+/// (`docs/DESIGN-harness-repos-2026-10-24.md` §11 D48): the version aterm read from the build the
+/// claim's proof admitted, never the `version=` the claim states, and the vendor the claim
+/// states. A claim whose proof read no version and that named no vendor shows `-` for both, as
+/// an unclaimed tab does (the controls).
 #[test]
 fn the_status_record_carries_a_scoped_claims_versions() {
     let app = crate::App::headless_for_test();
     let ctx = app.pool.get(0).expect("live session").ctx.clone();
     let holder = "grok-alab@4242";
-    for (words, want) in [
+    for (words, admitted, want) in [
         (
             &[
                 "contract=3",
@@ -2199,11 +2201,24 @@ fn the_status_record_carries_a_scoped_claims_versions() {
                 "version=0.3.0",
                 "vendor=1.0.70",
             ][..],
-            " supervisor_proven=1 supervisor_version=0.3.0 supervisor_vendor=1.0.70 supervisor_act=- \
+            Some("0.9.0"),
+            " supervisor_proven=1 supervisor_version=0.9.0 supervisor_vendor=1.0.70 supervisor_act=- \
+             autopilot=",
+        ),
+        (
+            &[
+                "contract=3",
+                "scope=relaunch",
+                "version=0.3.0",
+                "vendor=1.0.70",
+            ][..],
+            None,
+            " supervisor_proven=1 supervisor_version=- supervisor_vendor=1.0.70 supervisor_act=- \
              autopilot=",
         ),
         (
             &["contract=3", "scope=relaunch"][..],
+            None,
             " supervisor_proven=1 supervisor_version=- supervisor_vendor=- supervisor_act=- autopilot=",
         ),
     ] {
@@ -2212,20 +2227,26 @@ fn the_status_record_carries_a_scoped_claims_versions() {
         else {
             panic!("grok-alab's claim reads as a scoped claim: {words:?}");
         };
-        ctx.meta.lock().unwrap().supervisor = Some(crate::session_timeline::SupervisorClaim {
-            holder: holder.to_string(),
-            conn: Some(1),
-            expires_us: None,
-            proven: None,
-            scoped: Some(crate::harness_claim::Scoped {
-                proven: crate::self_claim::Proven {
-                    pid: 4242,
-                    start: "stand-in".to_string(),
-                },
-                claim,
-                child: None,
-            }),
-        });
+        let proven = crate::self_claim::Proven {
+            pid: 4242,
+            start: "stand-in".to_string(),
+        };
+        {
+            let mut meta = ctx.meta.lock().unwrap();
+            meta.supervisor_verified =
+                admitted.map(|version| (proven.clone(), version.to_string()));
+            meta.supervisor = Some(crate::session_timeline::SupervisorClaim {
+                holder: holder.to_string(),
+                conn: Some(1),
+                expires_us: None,
+                proven: None,
+                scoped: Some(crate::harness_claim::Scoped {
+                    proven,
+                    claim,
+                    child: None,
+                }),
+            });
+        }
         let record = app.session_status_record(0).expect("live session");
         assert!(record.contains(want), "{want}: {record}");
         assert!(

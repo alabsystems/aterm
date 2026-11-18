@@ -148,6 +148,8 @@ pub(super) fn sync_reader_with_candidates_until(
                         left,
                         subscriber.as_deref(),
                         &read_only,
+                        None,
+                        None,
                     )
                 }
                 Err(_) => Vec::new(),

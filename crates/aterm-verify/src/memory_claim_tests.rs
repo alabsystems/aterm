@@ -1517,7 +1517,7 @@ fn a_passing_test_compile_keeps_each_observed_units_peak() {
         admit_quiet: units_admit,
         admit_memory: units_admit,
     };
-    let run_units = |at: &Path, pass: bool, pooled: bool| -> crate::memory::Records {
+    let run_units = |at: &Path, pass: bool, pooled: bool| -> crate::memory::ShapingHistory {
         std::fs::create_dir_all(at).expect("a folder");
         std::fs::create_dir(at.join("scratch")).expect("a scratch folder");
         UNITS_PASS.store(pass, std::sync::atomic::Ordering::SeqCst);
@@ -1572,9 +1572,17 @@ fn a_passing_test_compile_keeps_each_observed_units_peak() {
         let _log = rx
             .recv_timeout(MUST_HAPPEN)
             .expect("hang detector: the run never ended");
-        crate::memory::Records::load(&at.join("stage-memory.json"))
+        let path = at.join("stage-memory.json");
+        assert!(
+            crate::memory::Records::load(&path)
+                .rows()
+                .iter()
+                .all(|row| row.key.stage != crate::shape::UNIT_STAGE),
+            "weaker shaping units never occupy the aggregate stage file"
+        );
+        crate::memory::ShapingHistory::load(&path)
     };
-    let units = |r: &crate::memory::Records| -> Vec<(String, u64)> {
+    let units = |r: &dyn crate::memory::ShapingSource| -> Vec<(String, u64)> {
         r.rows()
             .iter()
             .filter(|row| row.key.stage == crate::shape::UNIT_STAGE)

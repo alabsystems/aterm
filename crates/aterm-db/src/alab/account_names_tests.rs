@@ -3,7 +3,7 @@
 
 //! Account names over hand-built rows; every address is synthetic (`example.invalid`).
 
-use super::{Found, Names, named, of_cells, one};
+use super::of_cells;
 use crate::{
     alab::registry::{ACCOUNT, ADDRESS},
     database::Change,
@@ -13,6 +13,7 @@ use crate::{
         keys,
     },
 };
+use aterm_file::{AccountNames, account::one};
 use aterm_json::json;
 use std::collections::BTreeMap;
 
@@ -55,7 +56,7 @@ fn label(pk: &str, value: &CellValue) -> Change {
     .expect("a label cell")
 }
 
-fn names(book: &Book) -> BTreeMap<String, Names> {
+fn names(book: &Book) -> BTreeMap<String, AccountNames> {
     of_cells(&book.cells())
 }
 
@@ -83,7 +84,8 @@ fn an_owners_label_names_an_account_and_may_hold_a_machines_word() {
     assert_eq!(names[&google].slug, "google-m2-work");
     assert_eq!(
         names[&claude],
-        Names {
+        AccountNames {
+            realm: "claude".to_owned(),
             slug: "claude-fb-alpha".to_owned(),
             name: Some(format!("claude {ADA}")),
             email: Some(ADA.to_owned()),
@@ -142,14 +144,15 @@ fn owners_labels_in_conflict_name_no_handle_and_an_identity_names_the_account() 
     assert_eq!(names[&claude].login.as_deref(), Some(ADA));
 }
 
-/// A word names an account by its slug, its key, its provider word and address in either
-/// spelling, or an address that signs in to one account; an address three accounts share names
-/// all three and lists them by slug, name and key; a prefix names none and lists none.
-/// NEGATIVE CONTROL: with `named` giving the resolver no address handle (`email` left out of
-/// `handles`), an address that names one account names none: `` left: Err("no account is named
-/// `bea.m2@beta.example.invalid`: …") right: Ok("ac-…") ``.
+/// One address signed in to three providers is three accounts in the cells, each slugged with
+/// its own provider word and named by that word and the address, and a second address is a
+/// fourth; the account layer resolves among exactly what the cells give. The resolver's own
+/// cases (several accounts, prefixes, retired accounts) are aterm-file's
+/// (`account::tests::one_takes_every_name_of_an_account_and_lists_the_several_an_address_names`).
+/// NEGATIVE CONTROL: with `of_cells` dropping the claims address (`email: None`), the name goes
+/// too and the address names nothing: `` left: ("claude", "claude-fb-alpha", None, None, …) ``.
 #[test]
-fn one_takes_every_name_of_an_account_and_lists_the_several_an_address_names() {
+fn the_cells_give_each_account_of_one_address_its_own_slug_name_and_address() {
     let mut book = Book::new();
     let (_, mut changes) = address(ADA);
     let (_, more) = address(BEA);
@@ -164,43 +167,59 @@ fn one_takes_every_name_of_an_account_and_lists_the_several_an_address_names() {
     changes.extend(born);
     book.write(1, &[], changes);
     let names = names(&book);
-    let oai = keys_of["codex"].as_str();
-    for word in [
-        "oai-fb-alpha".to_owned(),
-        oai.to_owned(),
-        format!("oai {ADA}"),
-        format!("oai:{ADA}"),
+    for (realm, slug, word) in [
+        ("claude", "claude-fb-alpha", "claude"),
+        ("codex", "oai-fb-alpha", "oai"),
+        ("google", "google-fb-alpha", "google"),
     ] {
-        assert_eq!(one(&names, &word), Ok(oai), "{word}");
-    }
-    assert_eq!(one(&names, BEA), Ok(bea.as_str()));
-    let mut all: Vec<&str> = keys_of.values().map(String::as_str).collect();
-    all.sort_unstable();
-    assert_eq!(named(&names, ADA), Found::Many(all));
-    let several = one(&names, ADA).expect_err("three accounts");
-    assert!(
-        several.starts_with(&format!("`{ADA}` names 3 accounts; name one by its slug:")),
-        "{several}"
-    );
-    for realm in ["claude", "codex", "google"] {
-        let names = &names[&keys_of[realm]];
-        let line = format!(
-            "  {}  {}  {}",
-            names.slug,
-            names.name.as_deref().unwrap_or_default(),
-            keys_of[realm]
+        let account = &names[&keys_of[realm]];
+        assert_eq!(
+            (
+                account.realm.as_str(),
+                account.slug.as_str(),
+                account.name.clone(),
+                account.email.as_deref(),
+                account.login.as_deref(),
+            ),
+            (
+                realm,
+                slug,
+                Some(format!("{word} {ADA}")),
+                Some(ADA),
+                Some(ADA)
+            ),
         );
-        assert!(several.contains(&line), "{several}");
     }
-    for word in [
-        "claude-fb",
-        "fb-alpha",
-        "m2-beta",
-        "claude",
-        "fb@alpha.example.invalid",
-    ] {
-        let none = one(&names, word).expect_err("names none");
-        assert_eq!(none, aterm_file::no_account(word));
-        assert!(!none.contains(ADA) && !none.contains(BEA), "{none}");
-    }
+    assert_eq!(names[&bea].slug, "claude-m2-beta");
+    // What the cells give is what a word names.
+    assert_eq!(
+        one(&names, &format!("oai:{ADA}")),
+        Ok(keys_of["codex"].as_str())
+    );
+    assert_eq!(one(&names, BEA), Ok(bea.as_str()));
+}
+
+/// An account's realm is canonical whatever spelling its cell holds (an older build's `openai`
+/// reads as `codex`), and an account whose realm cell is missing has no realm, never the claims
+/// ring's empty default: a reader then knows no pool for it.
+/// NEGATIVE CONTROL: with `realm` keeping the cell's text (`raw.unwrap_or_default().to_owned()`),
+/// the older spelling stays: `` left: "openai" right: "codex" ``.
+#[test]
+fn an_accounts_realm_is_canonical_and_a_missing_one_is_none() {
+    let mut book = Book::new();
+    let (login, mut changes) = address(ADA);
+    let older = keys::account_pk("codex", ADA).expect("an account key");
+    let unknown = keys::account_pk("claude", ADA).expect("an account key");
+    changes.extend([
+        put(&ACCOUNT, &older, "realm", json!("openai")),
+        put(&ACCOUNT, &older, "login", json!(login)),
+        put(&ACCOUNT, &older, "row", json!("live")),
+        put(&ACCOUNT, &unknown, "login", json!(login)),
+        put(&ACCOUNT, &unknown, "row", json!("live")),
+    ]);
+    book.write(1, &[], changes);
+    let names = names(&book);
+    assert_eq!(names[&older].realm, "codex");
+    assert_eq!(names[&older].name.as_deref(), Some(&*format!("oai {ADA}")));
+    assert_eq!(names[&unknown].realm, "");
 }

@@ -85,6 +85,7 @@ mod payload;
 mod reach;
 pub mod rekey;
 pub mod rooted;
+pub mod served;
 pub mod store;
 #[cfg(any(unix, windows))]
 pub(crate) mod untaken;
@@ -105,13 +106,14 @@ pub use genesis::Proof;
 pub use payload::Payload;
 pub use rekey::{RekeyDue, Turn, audience_tag, secure_twins};
 pub use rooted::{Rooting, Stub};
+pub use served::Served;
 #[cfg(any(unix, windows))]
 pub(crate) use store::decode_records_before_cut;
 #[cfg(test)]
 pub(crate) use store::encode_records;
 pub use store::{
     MAX_RECORDS_STREAM, MemberVerdict, Store, Written, decode_records, decode_records_bounded,
-    decode_records_in, on_written, read_records,
+    decode_records_in, decode_reply, on_written, read_records, read_reply,
 };
 
 #[cfg(any(test, debug_assertions))]
@@ -925,6 +927,17 @@ impl Record {
     /// does not read.
     #[cfg(any(unix, windows))]
     pub(crate) fn vouched(wire: &[u8], reading: Reading) -> Result<Self> {
+        Self::unsigned(wire, reading)
+    }
+
+    /// Read exact bytes as [`Record::decode_in`] does, but for their signature, which whoever
+    /// takes the record checks before it counts: [`Record::vouched`]'s reading, and a served
+    /// stub's frame's ([`Stub::decode`], verified where it is read, [`Stub::checked`]).
+    ///
+    /// # Errors
+    /// Anything in the bytes is malformed, out of bound or trailing, or of a layout `reading`
+    /// does not read.
+    fn unsigned(wire: &[u8], reading: Reading) -> Result<Self> {
         if wire.len() > MAX_RECORD {
             return Err(Error::new("membership record is too long"));
         }
@@ -1130,11 +1143,23 @@ impl Record {
     /// nothing in this build sheds (tracker FL-148f).
     #[cfg(test)]
     pub(crate) fn shed(&self) -> Option<Self> {
-        if self.version() != VERSION_TWO || !matches!(self.kind(), Kind::Put | Kind::Delete) {
+        if !matches!(self.kind(), Kind::Put | Kind::Delete) {
             return None;
         }
-        let bytes = self.wire_bytes().ok()?;
-        let (_, count, _) = Self::frame_prefix_reader(&bytes, Reading::Follow).ok()?;
+        let shed = Self::decode_in(&self.shed_frame()?, Reading::Follow).ok()?;
+        (shed.id == self.id).then_some(shed)
+    }
+    /// A version-2 record's shed form: every byte through its signature, its tail length zero,
+    /// whose SHA-256 is its id ([`VERSION_TWO`]); all of a `Checkpoint`. Read from the bytes it
+    /// keeps in memory (a shelved record keeps its frame), so it reads nothing back. `None` for a
+    /// version-1 record, whose id hashes its ciphertext too. What a version-2 record's stub keeps
+    /// ([`rooted::Stub::frame`]).
+    pub(crate) fn shed_frame(&self) -> Option<Vec<u8>> {
+        if self.version() != VERSION_TWO {
+            return None;
+        }
+        let bytes = self.wire.frame();
+        let (_, count, _) = Self::frame_prefix_reader(bytes, Reading::Follow).ok()?;
         let lens = header_len(count, VERSION_TWO) - 8;
         let clear = usize::try_from(u32::from_be_bytes(
             bytes.get(lens..lens + 4)?.try_into().ok()?,
@@ -1144,8 +1169,7 @@ impl Record {
         let mut shed = bytes.get(..lens + 4)?.to_vec();
         shed.extend_from_slice(&[0; 4]);
         shed.extend_from_slice(bytes.get(lens + 8..sealed)?);
-        let shed = Self::decode_in(&shed, Reading::Follow).ok()?;
-        (shed.id == self.id).then_some(shed)
+        Some(shed)
     }
     /// Whether `whole` is this record with its ciphertext, where this one is shed: the one
     /// record a shed frame gives its place to ([`Log::insert`]).

@@ -13,7 +13,17 @@ use crate::ai::connector::Completion;
 
 const KIMI_GLOBAL: &[&str] = &["auth.kimi.ai", "www.kimi.ai"];
 const CODE: &str = "QXR4-MZK7";
-const SIGN_IN_ONCE: &str = "aterm harness accounts browser kimi-one --cli kimi";
+/// The window step an approver names for its row: `accounts browser` of the row's account key.
+const SIGN_IN_ONCE: &str = "aterm harness accounts browser ac-0123456789abcdef --cli kimi";
+
+/// The roster row `label` with `email`, as a sign-in's approver is made for it.
+fn vendor_row(label: &str, email: &str) -> crate::harness::accounts::Row {
+    crate::harness::accounts::Row {
+        label: label.to_owned(),
+        email: Some(email.to_owned()),
+        ..crate::harness::accounts::Row::default()
+    }
+}
 
 fn device_gate() -> Gate<'static> {
     Gate {
@@ -1920,7 +1930,11 @@ fn a_page_wanting_a_persons_sign_in_ends_needs_sign_in_and_a_browser_that_never_
 
 /// `accounts browser` opens the very profile the headless approver signs in through: a vendor
 /// row's is its email's under the shared store, Claude Code's its own store's. CONTROL: two
-/// emails, or a plus-addressed one, are two profiles.
+/// emails, or a plus-addressed one, are two profiles. The approver's stop names the row by the
+/// word its caller hands it, else by its account's key.
+/// NEGATIVE CONTROL: with `VendorApprover::new` ignoring the word it is handed (the key always),
+/// the slug's stop names `ac-0845981402f06687` and this fails (2026-11-16, by hand, then
+/// restored).
 #[test]
 fn the_window_and_the_headless_approver_open_one_profile_per_row() {
     use super::super::accounts::Cli;
@@ -1930,16 +1944,67 @@ fn the_window_and_the_headless_approver_open_one_profile_per_row() {
     let home = tmp.path().join("home");
     let email = "kimi-one@example.com";
     let window = row_browser_profile(Cli::Kimi, &store, &shared, "kimi-one", Some(email));
-    let approver = VendorApprover::new(Cli::Kimi, "kimi-one", Some(email), &shared, Some(&home));
+    let approver = VendorApprover::new(
+        Cli::Kimi,
+        (&vendor_row("kimi-one", email), None),
+        &shared,
+        Some(&home),
+    );
     assert_eq!(window, approver.profile_dir(Some(email)));
     assert!(window.starts_with(shared.join(VENDOR_PROFILES_DIR)));
+    // With no word from its caller (one that holds no roster), the window's step names the row's
+    // account by its key, made from the row's region and address (never its label): a key names
+    // its account whatever another row is labelled. CONTROL: a mainland row's is its region's
+    // account.
+    let key = |realm| aterm_db::typed::keys::account_pk(realm, email).expect("a key");
     assert_eq!(
-        approver.sign_in_once.as_deref(),
-        Some("aterm harness accounts browser kimi-one --cli kimi")
+        approver.sign_in_once,
+        Some(format!(
+            "aterm harness accounts browser {} --cli kimi",
+            key("kimi:global")
+        ))
+    );
+    let mainland = crate::harness::accounts::Row {
+        vendor: crate::harness::accounts::Vendor {
+            region: Some(crate::ai::connector::Region::MainlandCn),
+            ..crate::harness::accounts::Vendor::default()
+        },
+        ..vendor_row("kimi-one", email)
+    };
+    assert_eq!(
+        VendorApprover::new(Cli::Kimi, (&mainland, None), &shared, Some(&home)).sign_in_once,
+        Some(format!(
+            "aterm harness accounts browser {} --cli kimi",
+            key("kimi:mainland-cn")
+        ))
+    );
+    // A caller that names the row by a word among its roster (the lab's slug of its account, as
+    // a renewal's own lines and its `NEEDS YOU:` type it): the stop types that word too, so one
+    // run names the account by one word.
+    let slug = crate::harness::account_names::Named {
+        pk: "kimi-one-x".to_owned(),
+        row: None,
+        names: aterm_file::AccountNames::default(),
+    }
+    .word();
+    assert_eq!(
+        VendorApprover::new(
+            Cli::Kimi,
+            (&vendor_row("kimi-one", email), Some(&slug)),
+            &shared,
+            Some(&home)
+        )
+        .sign_in_once,
+        Some("aterm harness accounts browser kimi-one-x --cli kimi".to_owned())
     );
     // A Grok row's profile signed in gets no renewal past accounts.x.ai's block page, so a stop
     // on its sign-in page names no window.
-    let grok = VendorApprover::new(Cli::Grok, "grok-one", Some(email), &shared, Some(&home));
+    let grok = VendorApprover::new(
+        Cli::Grok,
+        (&vendor_row("grok-one", email), None),
+        &shared,
+        Some(&home),
+    );
     assert_eq!(grok.sign_in_once, None);
     assert_eq!(
         row_browser_profile(
@@ -1994,7 +2059,12 @@ fn a_vendor_sign_in_makes_no_profile_claude_codes_renewal_would_pick() {
         m1,
         "CONTROL: the row's label profile"
     );
-    let kimi = VendorApprover::new(Cli::Kimi, "kimi-m1", Some("a@example.com"), &shared, None);
+    let kimi = VendorApprover::new(
+        Cli::Kimi,
+        (&vendor_row("kimi-m1", "a@example.com"), None),
+        &shared,
+        None,
+    );
     make(&kimi.profile_dir(Some("a@example.com")));
     let codex = row_browser_profile(
         Cli::Codex,
@@ -2026,8 +2096,7 @@ fn a_vendor_sign_in_makes_no_profile_claude_codes_renewal_would_pick() {
     assert!(!has_browser_profile(&shared, "m3", Some("b@example.com")));
     let grok = VendorApprover::new(
         Cli::Grok,
-        "grok-m3",
-        Some("b@example.com"),
+        (&vendor_row("grok-m3", "b@example.com"), None),
         &shared,
         Some(&home),
     );
@@ -2044,7 +2113,12 @@ fn a_vendor_sign_in_makes_no_profile_claude_codes_renewal_would_pick() {
 
     let claudes = browser_profile_dir(&shared, Some("c@example.com"));
     make(&claudes);
-    let shares = VendorApprover::new(Cli::Kimi, "kimi-c", Some("c@example.com"), &shared, None);
+    let shares = VendorApprover::new(
+        Cli::Kimi,
+        (&vendor_row("kimi-c", "c@example.com"), None),
+        &shared,
+        None,
+    );
     assert_eq!(
         shares.profile_dir(Some("c@example.com")),
         resolve_browser_profile_dir(&shared, Some("c"), Some("c@example.com")),
@@ -2207,8 +2281,13 @@ fn a_kimi_rows_email_is_never_typed_and_its_mail_is_never_read() {
     let tmp = aterm_tempfile::tempdir().expect("tmp");
     let home = tmp.path().join("home");
     let approver = |cli| {
-        VendorApprover::new(cli, "one", Some("one@example.com"), tmp.path(), Some(&home))
-            .types_email
+        VendorApprover::new(
+            cli,
+            (&vendor_row("one", "one@example.com"), None),
+            tmp.path(),
+            Some(&home),
+        )
+        .types_email
     };
     assert!(!approver(Cli::Kimi));
     assert!(approver(Cli::Grok) && approver(Cli::Codex), "CONTROL");
@@ -2592,8 +2671,12 @@ fn the_approver_opens_nothing_on_a_profile_another_launch_holds() {
     let shared = tmp.path().join("state/accounts");
     let home = tmp.path().join("home");
     let email = "kimi-one@example.com";
-    let mut approver =
-        VendorApprover::new(Cli::Kimi, "kimi-one", Some(email), &shared, Some(&home));
+    let mut approver = VendorApprover::new(
+        Cli::Kimi,
+        (&vendor_row("kimi-one", email), None),
+        &shared,
+        Some(&home),
+    );
     let profile = approver.profile_dir(Some(email));
     // Private, as aterm keeps its state: its readers refuse any other directory.
     std::fs::DirBuilder::new()
@@ -2640,8 +2723,7 @@ fn vendor_browser_preparation_obeys_the_login_lifetime() {
     for finished in [false, true] {
         let mut approver = VendorApprover::new(
             Cli::Codex,
-            "codex-one",
-            Some("codex-one@example.com"),
+            (&vendor_row("codex-one", "codex-one@example.com"), None),
             &shared,
             Some(&home),
         );
@@ -2688,8 +2770,7 @@ fn vendor_aterm_profile_contention_and_spawn_failure_report_not_run_while_extern
     let shared = tmp.path().join("accounts");
     let mut approver = VendorApprover::new(
         Cli::Codex,
-        "codex-one",
-        Some("codex-one@example.invalid"),
+        (&vendor_row("codex-one", "codex-one@example.invalid"), None),
         &shared,
         Some(&home),
     );

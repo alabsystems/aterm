@@ -3,6 +3,9 @@
 
 //! Composition of root-approved account data with the existing local login
 //! workflow. Shared configuration never becomes an unchecked local roster row.
+//!
+//! Traced by the accounts keeper: what this file reads of the file system itself, it reads
+//! through `aterm_uds::trace::fs` (census `traced-reads`).
 
 use aterm_agent::harness::{
     accounts,
@@ -24,7 +27,7 @@ mod recovery;
 #[path = "repository_catalog.rs"]
 mod repository_catalog;
 
-const USAGE: &str = "aterm harness accounts shared-renew <local-label> --account <digest> --decision <digest> --request <nonce> [--config <aterm.toml>]\nRenews one existing local Claude OAuth row using an exact current root grant.\n";
+const USAGE: &str = "aterm harness accounts shared-renew <account> --account <digest> --decision <digest> --request <nonce> [--config <aterm.toml>]\nRenews one existing local Claude OAuth row, named by its account (its slug, its key, or `claude <address>`), using an exact current root grant.\n";
 
 pub(super) fn install_automatic() {
     aterm_agent::harness::accounts_sync::shared_renewal::install_authority(automatic_authority);
@@ -187,7 +190,8 @@ impl Authority for Approved {
 }
 
 struct Command {
-    label: String,
+    /// The account word that names the row ([`aterm_agent::harness::account_names::row_named`]).
+    account_word: String,
     account: [u8; 32],
     decision: [u8; 32],
     request: [u8; 16],
@@ -203,13 +207,21 @@ fn digest<const N: usize>(text: &str) -> Result<[u8; N], String> {
 }
 
 fn parse(args: &[OsString]) -> Result<Command, String> {
-    let label = args
-        .first()
-        .and_then(|s| s.to_str())
-        .filter(|s| accounts::admissible_label(s))
-        .ok_or_else(|| "shared renewal requires one valid local label".to_owned())?;
+    // The operands before the first option name one account: its slug, its key, or its provider
+    // word and address in either form (`claude ada@x.example`, `claude:ada@x.example`).
+    let operands = args
+        .iter()
+        .take_while(|arg| !arg.to_str().is_some_and(|arg| arg.starts_with("--")))
+        .map(|arg| {
+            arg.to_str()
+                .ok_or_else(|| "shared renewal's account must be UTF-8".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let [account_word] = aterm_agent::harness::account_names::words(&operands)
+        .try_into()
+        .map_err(|_| "shared renewal names one account".to_owned())?;
     let mut options = BTreeMap::new();
-    let (pairs, remainder) = args[1..].as_chunks::<2>();
+    let (pairs, remainder) = args[operands.len()..].as_chunks::<2>();
     for pair in pairs {
         let key = pair[0]
             .to_str()
@@ -235,7 +247,7 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
     let request = digest(take("--request")?)?;
     let config = options.remove("--config").map(PathBuf::from);
     Ok(Command {
-        label: label.to_owned(),
+        account_word,
         account,
         decision,
         request,
@@ -277,7 +289,7 @@ pub(super) fn try_run(args: &[OsString]) -> Option<ExitCode> {
         Ok(cli::shared_renewal::run(
             &env,
             &cli::LiveAccounts::default(),
-            &command.label,
+            &command.account_word,
             command.request,
             &authority,
             &mut std::io::stdout(),

@@ -99,18 +99,24 @@ fn only_a_complete_store_build_or_the_dev_link_of_the_rows_program_proves() {
     let dir = aterm_tempfile::TempDir::new().expect("dir");
     let root = std::fs::canonicalize(dir.path()).expect("canonical");
     let (layout, exe) = store_with_build(&root, 412, true);
-    assert!(image_in(&layout, grok_alab(), &exe), "positive control");
+    assert!(
+        image_in(&layout, grok_alab(), &exe).is_some(),
+        "positive control"
+    );
     for contract in [SCOPED, UNIVERSAL] {
         assert!(
-            image_for(&layout, grok_alab(), contract, &exe),
+            image_for(&layout, grok_alab(), contract, &exe).is_some(),
             "contract {contract}"
         );
     }
 
     let (unready, unready_exe) = store_with_build(&root.join("b"), 413, false);
-    assert!(!image_in(&unready, grok_alab(), &unready_exe), "not ready");
     assert!(
-        !image_for(&unready, grok_alab(), SCOPED, &unready_exe),
+        image_in(&unready, grok_alab(), &unready_exe).is_none(),
+        "not ready"
+    );
+    assert!(
+        image_for(&unready, grok_alab(), SCOPED, &unready_exe).is_none(),
         "not ready, contract 3"
     );
 
@@ -120,18 +126,18 @@ fn only_a_complete_store_build_or_the_dev_link_of_the_rows_program_proves() {
     std::fs::write(&vendor, b"x").expect("vendor");
     atpkg::store::mark_build_ready(&other).expect("ready");
     assert!(
-        !image_in(&layout, grok_alab(), &vendor),
+        image_in(&layout, grok_alab(), &vendor).is_none(),
         "the vendor's store is not the harness's"
     );
 
     let stray = root.join("stray-grok-alab");
     std::fs::write(&stray, b"x").expect("stray");
     assert!(
-        !image_in(&layout, grok_alab(), &stray),
+        image_in(&layout, grok_alab(), &stray).is_none(),
         "a file named like the harness"
     );
     assert!(
-        !image_in(&layout, grok_alab(), &root.join("missing")),
+        image_in(&layout, grok_alab(), &root.join("missing")).is_none(),
         "nothing there"
     );
 
@@ -139,9 +145,12 @@ fn only_a_complete_store_build_or_the_dev_link_of_the_rows_program_proves() {
     let built = checkout.join("target").join("release").join("grok-alab");
     std::fs::create_dir_all(built.parent().expect("dir")).expect("dir");
     std::fs::write(&built, b"x").expect("built");
-    assert!(!image_in(&layout, grok_alab(), &built), "not linked yet");
     assert!(
-        !image_for(&layout, grok_alab(), SCOPED, &built),
+        image_in(&layout, grok_alab(), &built).is_none(),
+        "not linked yet"
+    );
+    assert!(
+        image_for(&layout, grok_alab(), SCOPED, &built).is_none(),
         "not linked yet, contract 3"
     );
     atpkg::link(
@@ -151,9 +160,12 @@ fn only_a_complete_store_build_or_the_dev_link_of_the_rows_program_proves() {
         &[std::path::PathBuf::from("target/release/grok-alab")],
     )
     .expect("dev link");
-    assert!(
+    assert_eq!(
         image_in(&layout, grok_alab(), &built),
-        "the dev link's checkout"
+        Some(Passed {
+            version: Some("link".to_string())
+        }),
+        "the dev link's checkout, admitted under no version of its own"
     );
     let linked = aterm_agent::harness::registry::for_layout(&layout);
     let row = linked.entry("grok-alab").expect("the seed row stands").row;
@@ -171,11 +183,11 @@ fn only_a_complete_store_build_or_the_dev_link_of_the_rows_program_proves() {
     );
     for contract in [SCOPED, UNIVERSAL] {
         assert!(
-            image_for(&layout, row, contract, &built),
+            image_for(&layout, row, contract, &built).is_some(),
             "the dev link's checkout proves contract {contract}"
         );
         assert!(
-            !image_for(&layout, row, contract, &stray),
+            image_for(&layout, row, contract, &stray).is_none(),
             "still nothing outside it, contract {contract}"
         );
     }
@@ -204,23 +216,29 @@ fn claude_code_alabs_image_is_its_packages_build_whatever_its_tool_is_named() {
         exe
     };
     let tool = build("claude-code-alab", 14275, "claude-alab", true);
-    assert!(image_in(&layout, row, &tool), "its package's build");
     assert!(
-        !image_in(&layout, grok_alab(), &tool),
+        image_in(&layout, row, &tool).is_some(),
+        "its package's build"
+    );
+    assert!(
+        image_in(&layout, grok_alab(), &tool).is_none(),
         "one row's build proves no other row"
     );
     let vendor = build("claude", 2_001_310, "claude", true);
     assert!(
-        !image_in(&layout, row, &vendor),
+        image_in(&layout, row, &vendor).is_none(),
         "Claude Code's own store is not the harness's"
     );
     let other = build("grok-alab", 412, "claude-alab", true);
     assert!(
-        !image_in(&layout, row, &other),
+        image_in(&layout, row, &other).is_none(),
         "a tool of its name in another harness's store"
     );
     let unready = build("claude-code-alab", 14276, "claude-alab", false);
-    assert!(!image_in(&layout, row, &unready), "a build not ready");
+    assert!(
+        image_in(&layout, row, &unready).is_none(),
+        "a build not ready"
+    );
 }
 
 /// A fake kernel for [`keep_child`]: each pid's parent, group and birth.
@@ -439,6 +457,125 @@ fn a_live_contract_4_claim_is_proven_again_when_the_registry_changes() {
     assert!(standing(&ctx).0);
 }
 
+/// An image refusal still applies after a request-only renewal made while the proof reads
+/// off-lock. A new grant, claimant birth or kept child is different authority and survives
+/// that earlier verdict.
+#[test]
+fn a_request_only_renewal_cannot_escape_an_off_lock_image_refusal() {
+    use aterm_agent::harness::contract::{Scope, Source};
+
+    static ROWS: [Row; 1] = [Row {
+        id: "grok-alab",
+        program: aterm_phase::Program::Grok,
+        package: "grok-alab",
+        vendor: "grok",
+        allows: &[Scope::Relaunch, Scope::Upgrade],
+        source: Source::Linked,
+    }];
+    let scoped = |request: &str| {
+        let scope = format!("scope={request}");
+        let contract::Words::Scoped(claim) = contract::read_in(
+            &ROWS,
+            "grok-alab@4242",
+            &["contract=4", &scope, "version=0.3.0"],
+        ) else {
+            panic!("the explicit linked row admits its contract 4 claim");
+        };
+        Scoped {
+            proven: Proven {
+                pid: 4242,
+                start: "fixture-birth".to_string(),
+            },
+            claim,
+            child: None,
+        }
+    };
+    for change in ["request", "grant", "proof", "child", "kept-child"] {
+        let ctx = crate::session_store::test_handle_on(7607, -1).ctx;
+        let mut original = scoped("relaunch,old-word");
+        if change == "kept-child" {
+            original.claim.child = Some(ChildWord {
+                pid: 4243,
+                start_us: 17,
+            });
+        }
+        crate::session_timeline::claim_supervisor_scoped(
+            &ctx,
+            "grok-alab@4242",
+            Some(71),
+            original,
+            crate::metrics::now_us(),
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("the original claim");
+        let (revision, placements) = {
+            let meta = ctx.meta.lock().unwrap();
+            (meta.supervisor_revision, meta.claim_placements)
+        };
+        let mut renewed = scoped(if change == "grant" {
+            "upgrade,relaunch,new-word,accounts"
+        } else {
+            "relaunch,new-word,accounts"
+        });
+        assert!(
+            !renewed.claim.scopes.contains(Scope::Accounts),
+            "the linked row withholds the requested accounts duty"
+        );
+        if change == "proof" {
+            renewed.proven.start = "another-fixture-birth".to_string();
+        }
+        if matches!(change, "child" | "kept-child") {
+            renewed.claim.child = Some(ChildWord {
+                pid: 4243,
+                start_us: 17,
+            });
+            renewed.child = Some(KeptChild {
+                pid: 4243,
+                claimed_us: 17,
+                birth: Birth(17),
+            });
+        }
+        let called = std::cell::Cell::new(false);
+        let refused = reprove(
+            &ctx,
+            &ROWS,
+            &|row, pid| {
+                assert!(!called.replace(true), "the original image is judged once");
+                assert_eq!((row.source, pid), (Source::Linked, 4242));
+                crate::session_timeline::claim_supervisor_scoped(
+                    &ctx,
+                    "grok-alab@4242",
+                    Some(71),
+                    renewed.clone(),
+                    crate::metrics::now_us(),
+                    aterm_slog::Actor::Ctl,
+                )
+                .expect("renew while the original proof reads off-lock");
+                let meta = ctx.meta.lock().unwrap();
+                assert_eq!(meta.claim_placements, placements + 1);
+                assert_eq!(meta.supervisor_revision == revision, change == "request");
+                assert_eq!(
+                    meta.live_scoped(crate::metrics::now_us()),
+                    Some(&renewed),
+                    "the latest requested set is stored even when authority stays"
+                );
+                false
+            },
+            crate::metrics::now_us(),
+        );
+        assert!(called.get(), "the image refusal was observed");
+        let meta = ctx.meta.lock().unwrap();
+        if change == "request" {
+            assert_eq!(refused, Some("its image no longer passes its row's rule"));
+            assert!(meta.live_scoped(crate::metrics::now_us()).is_none());
+            assert_ne!(meta.supervisor_revision, revision);
+        } else {
+            assert_eq!(refused, None, "a new {change} survives the stale refusal");
+            assert_eq!(meta.live_scoped(crate::metrics::now_us()), Some(&renewed));
+        }
+    }
+}
+
 /// WHAT A SCOPED CLAIM HEARS OF A RESTART (HX-05's review, finding 13): a model restart where it
 /// holds `relaunch`, or `accounts` under contract 4; an account move, which names the account's
 /// home, only where it was granted `accounts` under contract 4, as its reply says. NEGATIVE
@@ -496,8 +633,11 @@ fn a_re_proof_keeps_the_image_verdict_while_nothing_it_was_judged_on_moved() {
     let pass = |key: Option<ImageKey>, reuse: bool, verdict: bool| {
         kept.passes(key, reuse, || {
             judged.set(judged.get() + 1);
-            verdict
+            verdict.then(|| Passed {
+                version: Some(format!("1.{}.0", judged.get())),
+            })
         })
+        .is_some()
     };
     let base = who(&holder, row, UNIVERSAL, "s1");
     let at = |c: Claimant<'_>, exe: &Path, generation: u64| ImageKey::of(&c, exe, generation);
@@ -509,6 +649,13 @@ fn a_re_proof_keeps_the_image_verdict_while_nothing_it_was_judged_on_moved() {
         assert!(pass(at(base, &exe, 1), true, true));
     }
     assert_eq!(judged.get(), 1, "the re-proofs reuse its pass");
+    assert_eq!(
+        kept.passes(at(base, &exe, 1), true, || None),
+        Some(Passed {
+            version: Some("1.1.0".to_string())
+        }),
+        "a reused pass is what the claim's proof admitted, its version with it"
+    );
 
     // Each moved part of the key judges again, and its pass is kept in turn.
     let other = root.join("other-name");

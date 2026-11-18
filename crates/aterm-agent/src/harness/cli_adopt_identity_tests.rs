@@ -14,12 +14,20 @@
 use super::*;
 use std::cell::{Cell, RefCell};
 
+/// The account `adopt-default` names is the canonical identity Claude Code's status must report,
+/// beside the alias `--email` its login signs in with.
 #[test]
 fn claude_adoption_accepts_an_explicit_canonical_identity() {
     assert!(
-        parsed("accounts adopt-default local --email alias@example.test --identity-email owner@example.test").is_ok(),
-        "Claude adoption should check an explicit canonical identity"
+        parsed("accounts adopt-default claude owner@example.test --email alias@example.test")
+            .is_ok(),
+        "Claude adoption should check the account named as its canonical identity"
     );
+}
+
+/// The label `adopt-default` gives `cli`'s account at `email`: its reserved slug.
+fn adopted(cli: Cli, email: &str) -> String {
+    crate::harness::account_names::tests::added_label(cli, email)
 }
 
 struct AdoptHost<'a> {
@@ -126,17 +134,19 @@ fn run_case(case: i64) -> (i64, i64, i64) {
             *after_probe.borrow_mut() = Some(std::fs::read(&path).ok());
         }),
     };
-    let identity = match case {
-        12 => " --identity-email invalid",
+    // The account named is the identity the status must report: a word that names none is
+    // refused before any probe, and with none `--email` names the account, which is unchecked.
+    let account = match case {
+        12 => " invalid",
         16 => "",
-        _ => " --identity-email owner@example.test",
+        _ => " claude owner@example.test",
     };
     let email = if matches!(case, 20 | 21) {
         "owner@example.test"
     } else {
         "alias@example.test"
     };
-    let line = format!("accounts adopt-default local --email {email}{identity}");
+    let line = format!("accounts adopt-default{account} --email {email}");
     let cmd = parsed(&line).expect("adoption command");
     let Cmd::Accounts(form) = cmd else {
         panic!("Claude command")
@@ -148,7 +158,12 @@ fn run_case(case: i64) -> (i64, i64, i64) {
     let published = code == ExitCode::SUCCESS;
     if published {
         let roster = Roster::load(&path).unwrap();
-        let row = roster.row("local").unwrap();
+        let account = if case == 16 {
+            email
+        } else {
+            "owner@example.test"
+        };
+        let row = roster.row(&adopted(Cli::Claude, account)).unwrap();
         assert_eq!(row.email.as_deref(), Some(email));
         assert_eq!(
             row.identity_email.as_deref(),
@@ -298,12 +313,16 @@ fn native_default_adoption_requires_current_provider_proof_without_login_or_toke
                 case,
                 calls: Cell::new(0),
             };
-            let identity = if case == 4 {
-                ""
-            } else if case == 5 {
-                " --identity-email invalid"
-            } else {
-                " --identity-email owner@example.com"
+            // The account named is the identity the provider's own profile must prove: a word
+            // that names none is refused before any proof, and with none `--email` names the
+            // account, which no proof checks.
+            let account = match case {
+                4 => String::new(),
+                5 => " invalid".to_owned(),
+                _ => format!(
+                    " {} owner@example.com",
+                    crate::harness::account_names::provider_word_of(cli)
+                ),
             };
             let region = if cli == Cli::Kimi {
                 " --region global"
@@ -311,12 +330,9 @@ fn native_default_adoption_requires_current_provider_proof_without_login_or_toke
                 ""
             };
             let command = parsed(&format!(
-                "accounts adopt-default local --cli {} --email alias@example.com{identity}{region}",
+                "accounts adopt-default{account} --cli {} --email alias@example.com{region}",
                 cli.id()
             ));
-            if case == 5 && command.is_err() {
-                continue;
-            }
             let Cmd::AccountsOf(of) = command.unwrap() else {
                 panic!("native adoption command");
             };
@@ -345,7 +361,12 @@ fn native_default_adoption_requires_current_provider_proof_without_login_or_toke
             let roster = env.accounts_roster_for(cli).unwrap();
             if published {
                 let roster = Roster::load_for(cli, &roster).unwrap();
-                let row = roster.row("local").unwrap();
+                let account = if case == 4 {
+                    "alias@example.com"
+                } else {
+                    "owner@example.com"
+                };
+                let row = roster.row(&adopted(cli, account)).unwrap();
                 assert_eq!(row.email.as_deref(), Some("alias@example.com"));
                 assert_eq!(
                     row.identity_email.as_deref(),

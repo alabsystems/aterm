@@ -18,10 +18,12 @@
 use super::{AgentWord, MACS_MAX, TaskWord, dial_of, field, glance_of, short_name};
 use aterm_db::fleet::read::{
     AGENTS_MAX, Access, AccountWord, AgentSeen, Answer, Answered, Harness, Limits, Load, Look,
-    MachineSeen, OutSrc, Pressure, Read, Tally, TurnFacts, WaitTally, Work, WorkTally, word,
+    MachineSeen, OutSrc, Pressure, Read, Tally, TurnFacts, WaitTally, Work, WorkTally,
+    activity_word, need_of, word,
 };
 use aterm_json::{Map, Value};
 use aterm_types::look_words;
+use aterm_types::update_standing::UpdateFact;
 use std::collections::BTreeSet;
 
 /// A header's or a row's count: digits and nothing else.
@@ -166,6 +168,31 @@ fn access_of(instance: &Map) -> Option<(Option<Access>, bool)> {
     })
 }
 
+/// A header's updater standing: its `update=` and `update_*=` words and the `at_ms=` they were
+/// said at, read by [`UpdateFact::of_fields`]; `None` where it has no `update=` (an aterm before
+/// these words) or its word is none.
+fn update_of(instance: &Map) -> Option<UpdateFact> {
+    // A header's `at_ms=0` is its clock unread, never a time (`at_ms_of`).
+    let at = at_ms_of(instance).map(|at| at.to_string());
+    const KEYS: [&str; 7] = [
+        "update",
+        "update_at",
+        "update_to",
+        "update_until",
+        "update_why",
+        "update_tries",
+        "update_checks",
+    ];
+    let mut fields: Vec<(&str, &str)> = KEYS
+        .iter()
+        .filter_map(|key| field(instance, key).map(|value| (*key, value)))
+        .collect();
+    if let Some(at) = &at {
+        fields.push(("at_ms", at));
+    }
+    UpdateFact::of_fields(&fields)
+}
+
 /// What one machine's replies said: one reply for a peer, each of its windows' for this Mac.
 #[derive(Default)]
 struct Heard {
@@ -177,6 +204,8 @@ struct Heard {
     look: Option<Look>,
     /// The first reply's fleet access and drive grant that said them ([`access_of`]).
     access: Option<(Option<Access>, bool)>,
+    /// The first reply's updater standing that said one ([`update_of`]).
+    update: Option<UpdateFact>,
     label: Option<String>,
     sessions: u32,
     /// A window went unread, or a reply left rows out: the rows are a lower bound.
@@ -201,6 +230,10 @@ impl Heard {
         let sent: Vec<&Map> = sessions.iter().filter_map(Value::as_object).collect();
         if self.build.is_none() {
             self.build = field(instance, "version").and_then(|build| word(build, 48));
+            // The standing is the window's whose build this is, so the two are one window's.
+            if self.build.is_some() {
+                self.update = update_of(instance);
+            }
         }
         if self.home_free_mb.is_none() {
             self.home_free_mb = count(instance, "home_free_mb");
@@ -279,6 +312,8 @@ impl Heard {
                 tok_for_ms: count(row, "tok_for_ms"),
                 turns: count32(row, "turns"),
                 tools: count32(row, "tools"),
+                need: need_of(needs),
+                activity: field(row, "word").and_then(activity_word),
                 work,
                 // A row a node's merge sent under a header of another time says its own
                 // window's (`-`: that window's clock unread), never the header's.
@@ -305,6 +340,7 @@ impl Heard {
             look: self.look.unwrap_or(Look::UNREAD),
             access: self.access.and_then(|(access, _)| access),
             drive: self.access.map(|(_, drive)| drive),
+            update: self.update,
             sessions: (!self.partial).then_some(self.sessions),
             tally: tallied.then_some(self.tally),
             work: tallied.then_some(self.work),

@@ -70,6 +70,38 @@ const TOOLCHAIN_LEASE_FD_ENV: &str = "ATERM_RELEASE_TOOLCHAIN_LEASE_FD";
 #[cfg(unix)]
 const TOOLCHAIN_LEASE_LEAF_ENV: &str = "ATERM_RELEASE_TOOLCHAIN_LEASE_LEAF";
 #[cfg(unix)]
+const COMPILER_HANDOFF_ENV: &str = "ATERM_RELEASE_COMPILER";
+
+/// A bounded declaration offer. The receiver re-reads the lock at this exact source and
+/// independently resolves its managed slot before adopting the original held descriptor.
+#[cfg(unix)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompilerHandoff {
+    commit: String,
+    bin: PathBuf,
+    pin: crate::release::CompilerPin,
+    /// User intent survives candidate changes; the sender's implicit transport pin does not.
+    user_override: bool,
+}
+
+#[cfg(unix)]
+struct StartupHandoff {
+    resource_offer: bool,
+    lease_fd: Option<std::os::fd::OwnedFd>,
+    lease_leaf: Option<std::ffi::OsString>,
+    compiler: Option<CompilerHandoff>,
+    transported: Option<PathBuf>,
+    line_fd: Option<std::os::fd::OwnedFd>,
+    writer_fd: Option<std::os::fd::OwnedFd>,
+    line_leaf: Option<std::ffi::OsString>,
+}
+
+/// Raw startup capability locators, consumed once. This supplies no source, compiler or
+/// lease authority: adoption independently proves all three after cutter identity is judged.
+#[cfg(unix)]
+static STARTUP_HANDOFF: std::sync::Mutex<Option<StartupHandoff>> = std::sync::Mutex::new(None);
+#[cfg(unix)]
 const LINE_FD_ENV: &str = "ATERM_RELEASE_LINE_FD";
 #[cfg(unix)]
 const LINE_WRITER_FD_ENV: &str = "ATERM_RELEASE_LINE_WRITER_FD";
@@ -335,13 +367,28 @@ fn public_release_exists(slug: &str, tag: &str) -> Result<bool, String> {
 
 /// The real backend.
 pub struct Real {
+    /// Explicit candidate roles. They never replace a compiler pinned by the launcher image.
+    compiler: Option<crate::trust_lock::CompilerInputs>,
+    compiler_source: Option<String>,
+    compiler_store: crate::trust_lock::ManagedStoreContext,
+    /// An owned duplicate of the checked managed lease; the original remains in gates' held
+    /// set and this descriptor follows the candidate through the controlled exec handoff.
+    #[cfg(unix)]
+    compiler_hold: Option<crate::gates::ToolchainLeaseOffer>,
     prefreeze_claim: Option<aterm_capacity::Claim>,
     prefrozen_step1: Option<PrefrozenStep1>,
-    pub(crate) build_inputs: fn() -> Result<String, String>,
+    pub(crate) build_inputs: fn(
+        Option<&crate::trust_lock::CompilerInputs>,
+        &crate::build_inputs::AppleSdk,
+    ) -> Result<String, String>,
     /// Whether the seal this process holds is still the named one, by status alone and whatever
     /// interrupt was caught ([`crate::build_inputs::held`]): what an interrupted cut asks before
     /// it records the rows its verifier finished.
-    pub(crate) inputs_held: fn(&str) -> bool,
+    pub(crate) inputs_held: fn(
+        Option<&crate::trust_lock::CompilerInputs>,
+        &crate::build_inputs::AppleSdk,
+        &str,
+    ) -> bool,
     /// Keeps this process's build-inputs seal in the release state, its reports also in the
     /// named log ([`crate::build_inputs::arm`]).
     pub(crate) arm_inputs: fn(&Path, Option<&Path>),
@@ -351,7 +398,12 @@ pub struct Real {
     pub(crate) handed_inputs: fn() -> Option<PathBuf>,
     /// Locate the exact kept seal produced by a pre-freeze. The real cutter rechecks it before
     /// adoption; this boundary only authenticates the record and selects its handoff path.
-    prefrozen_inputs: fn(&Path, &str) -> Option<PathBuf>,
+    prefrozen_inputs: fn(
+        Option<&crate::trust_lock::CompilerInputs>,
+        &crate::build_inputs::AppleSdk,
+        &Path,
+        &str,
+    ) -> Option<PathBuf>,
     /// Injectable boundary for the tree-half run. Production and tests both enter it through
     /// [`RealBranches::verify`], so the handoff completion around that call is mutation-covered.
     verify_half_op: VerifyHalf,
@@ -363,6 +415,7 @@ pub struct Real {
     stage_fixtures_run_op: StageFixturesRun,
     repo: PathBuf,
     home: PathBuf,
+    sdk: crate::build_inputs::AppleSdk,
     /// The publication engine this release is named (`--engine`, else the source a release that
     /// execed this cutter handed it ([`ENGINE_SOURCE_ENV`]), else `$PUBLICATION_ENGINE`, else
     /// `~/publication`): it names the engine's origin and committer, and nothing here runs, syncs
@@ -435,16 +488,46 @@ pub struct Real {
     /// The qualify graph's one pool ([`Backend::qualify_begin`]), handed to every child it starts.
     pool: Option<Pool>,
     warming: Option<WarmingVerifier>,
-    warm_verifier: Option<PathBuf>,
+    warm_verifier: Option<WarmVerifier>,
     automatic_prefreeze: Option<aterm_uds::spawnfd::Child>,
 }
 
 struct WarmingVerifier {
     commit: String,
+    compiler: Option<crate::release::CompilerPin>,
+    inputs: Option<String>,
     child: aterm_uds::spawnfd::Child,
     _forwarded: Forwarded,
     stdout: PathBuf,
     stderr: PathBuf,
+}
+
+/// Successful owning wait preserves the compile's provenance until final publication.
+struct WarmVerifier {
+    path: PathBuf,
+    commit: String,
+    compiler: Option<crate::release::CompilerPin>,
+    inputs: Option<String>,
+}
+
+impl WarmVerifier {
+    fn path_for(
+        &self,
+        commit: &str,
+        compiler: Option<&crate::release::CompilerPin>,
+        inputs: Option<&str>,
+    ) -> Result<&Path, String> {
+        if self.commit != commit
+            || self.compiler.as_ref() != compiler
+            || self.inputs.as_deref() != inputs
+        {
+            return Err(
+                "the completed verifier was built under another source, compiler or SDK seal"
+                    .into(),
+            );
+        }
+        Ok(&self.path)
+    }
 }
 
 /// The packaging child started at bundle, owned across READY and joined by step 7's sign.
@@ -791,7 +874,8 @@ fn release_admission_barrier_to_build(
 
 impl Branches for RealBranches<'_> {
     fn keep_build_on_test_red(&self, c: &Candidate) -> bool {
-        (self.real.build_inputs)()
+        self.real
+            .inputs()
             .and_then(|seal| {
                 crate::check_record::keep_build_on_test_failure(&self.real.git(), &c.commit, &seal)
             })
@@ -1610,9 +1694,45 @@ impl Drop for Real {
 }
 
 impl Real {
+    fn require_compiler(&self, commit: &str, prover: &Prover) -> Result<(), String> {
+        if self.compiler_source.as_deref() != Some(commit)
+            || self.compiler.as_ref().is_none_or(|compiler| {
+                compiler.bin != prover.bin || Some(&compiler.pin) != prover.compiler.as_ref()
+            })
+        {
+            return Err("the operation has no matching selected-source compiler context".into());
+        }
+        #[cfg(unix)]
+        {
+            if self.compiler_hold.is_none() {
+                return Err("the operation has no retained managed compiler lease".into());
+            }
+            let pin = prover
+                .compiler
+                .as_ref()
+                .ok_or("the prover has no compiler pin")?;
+            drop(self.compiler_store.offer(&prover.bin, pin.build)?);
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        Err("candidate compiler custody requires Unix descriptors".into())
+    }
+
+    fn inputs(&self) -> Result<String, String> {
+        (self.build_inputs)(self.compiler.as_ref(), &self.sdk)
+    }
+
+    fn held_inputs(&self, identity: &str) -> bool {
+        (self.inputs_held)(self.compiler.as_ref(), &self.sdk, identity)
+    }
+
+    fn kept_inputs(&self, state: &Path, identity: &str) -> Option<PathBuf> {
+        (self.prefrozen_inputs)(self.compiler.as_ref(), &self.sdk, state, identity)
+    }
+
     /// The backend for the clone at `repo`.
     /// # Errors
-    /// No HOME, or a log directory that cannot be made.
+    /// No HOME, a log directory that cannot be made, or an unavailable system macOS SDK.
     pub fn new(
         repo: &Path,
         engine: Option<&Path>,
@@ -1671,21 +1791,38 @@ impl Real {
             crate::release_leftovers::at_run_start(&state, &release, &logs);
         }
         Ok(Self {
+            compiler: None,
+            compiler_source: None,
+            compiler_store: crate::trust_lock::ManagedStoreContext::configured()?,
+            #[cfg(unix)]
+            compiler_hold: None,
             prefreeze_claim: None,
             prefrozen_step1: None,
             automatic_prefreeze: None,
-            build_inputs: crate::build_inputs::current,
-            inputs_held: crate::build_inputs::held,
+            build_inputs: |compiler, sdk| match compiler {
+                Some(compiler) => crate::build_inputs::current_for_with_sdk(compiler, sdk),
+                None => crate::build_inputs::current_with_sdk(sdk),
+            },
+            inputs_held: |compiler, sdk, identity| match compiler {
+                Some(compiler) => crate::build_inputs::held_for(compiler, sdk, identity),
+                None => crate::build_inputs::held(sdk, identity),
+            },
             arm_inputs: crate::build_inputs::arm,
             arm_prefrozen_inputs: crate::build_inputs::arm_prefrozen,
             handed_inputs: crate::build_inputs::handed_path,
-            prefrozen_inputs: crate::build_inputs::prefrozen_seal,
+            prefrozen_inputs: |compiler, sdk, state, identity| match compiler {
+                Some(compiler) => {
+                    crate::build_inputs::prefrozen_for_with_sdk(compiler, sdk, state, identity)
+                }
+                None => crate::build_inputs::prefrozen_with_sdk(sdk, state, identity),
+            },
             verify_half_op: Real::verify_half,
             build_run_op: Real::build_run,
             await_fixture_index_op: Real::await_fixture_index,
             stage_fixtures_run_op: Real::stage_fixtures_run_with_stop,
             repo: repo.to_path_buf(),
             home,
+            sdk: crate::build_inputs::AppleSdk::capture()?,
             engine_source,
             engine,
             engine_repository,
@@ -2109,6 +2246,13 @@ impl Real {
     /// spawns. Content evidence calls this same finalizer on a one-use command mirror.
     fn finalize_spawn_environment(&self, cmd: &mut Command) -> Result<(), String> {
         self.apply_prerequisites(cmd)?;
+        self.sdk.apply(cmd);
+        if let Some(compiler) = &self.compiler
+            && let Ok(stock) = compiler.stock()
+        {
+            cmd.env("HOME", stock.home())
+                .env("RUSTUP_HOME", stock.rustup_home());
+        }
         crate::credential_wait::ask_no_one(cmd);
         Ok(())
     }
@@ -3308,11 +3452,13 @@ impl Real {
         plan: &aterm_verify::NativeBuildPlan,
     ) -> Result<Vec<u8>, String> {
         use aterm_verify::provision::Host as _;
+        self.sdk.verify()?;
         let targo = aterm_verify::provision::System::new(&self.repo).targo()?;
         let mut cmd = self.child(targo, None);
         cmd.args(args);
         plan.apply_to_command(&mut cmd).map_err(|e| e.to_string())?;
         let out = self.output_forwarded(&mut cmd).map_err(|e| e.to_string())?;
+        self.sdk.verify()?;
         if let Ok(mut log) = crate::durable::open_append(&self.step_log(self.step), true) {
             let _ = log.write_all(&out.stdout);
             let _ = log.write_all(&out.stderr);
@@ -3335,6 +3481,13 @@ impl Real {
         bin: &crate::checkout_bin::Bin,
         profile: &str,
     ) -> Result<(PathBuf, Vec<u8>), String> {
+        self.require_compiler(
+            self.compiler_source
+                .as_deref()
+                .ok_or("no compiler source for build")?,
+            prover,
+        )?;
+        self.sdk.verify()?;
         let _phase =
             crate::cut_timing::Timer::start(&self.step_log(self.step), "frozen-tool-build");
         let plan = verify_plan(&self.repo)
@@ -3357,6 +3510,7 @@ impl Real {
         let (output, accounting) = self
             .output_accounted(self.step, &mut command)
             .map_err(|e| format!("{} build: {e}", bin.what))?;
+        self.sdk.verify()?;
         if let Ok(mut log) = crate::durable::open_append(&self.step_log(self.step), true) {
             let _ = log.write_all(&output.stdout);
             let _ = log.write_all(&output.stderr);
@@ -3421,18 +3575,50 @@ impl Real {
         commit: &str,
         prover: &Prover,
     ) -> Result<crate::release_tools::ToolSet, String> {
-        if let Ok(recorded) = crate::release_tools::recorded(&self.release, commit) {
+        self.require_compiler(commit, prover)?;
+        if let Ok(recorded) = crate::release_tools::recorded(&self.release, commit)
+            && recorded.compiler == prover.compiler
+            && prover.compiler.is_some()
+            && (!cfg!(target_os = "macos")
+                || self
+                    .inputs()
+                    .is_ok_and(|now| recorded.inputs.as_ref() == Some(&now)))
+        {
             crate::release_tools::clean_at(&self.repo, commit)?;
             return Ok(recorded);
         }
         crate::release_tools::clean_at(&self.repo, commit)?;
+        let inputs = if cfg!(target_os = "macos") {
+            Some(self.inputs()?)
+        } else {
+            None
+        };
+        let warm = self
+            .warm_verifier
+            .as_ref()
+            .map(|warm| {
+                warm.path_for(commit, prover.compiler.as_ref(), inputs.as_deref())
+                    .map(Path::to_path_buf)
+            })
+            .transpose()?;
         let cutter = self.frozen_cutter(commit, prover)?.tool.path;
-        let verify = match &self.warm_verifier {
-            Some(path) => path.clone(),
+        let verify = match warm {
+            Some(path) => path,
             None => self.build_frozen_tool(prover, &FROZEN_VERIFY, "test")?.0,
         };
-        let tools = crate::release_tools::stage(&self.release, commit, &cutter, &verify)?;
+        let mut tools = crate::release_tools::stage(&self.release, commit, &cutter, &verify)?;
+        tools.compiler = prover.compiler.clone();
         crate::release_tools::clean_at(&self.repo, commit)?;
+        if inputs
+            .as_ref()
+            .is_some_and(|before| !self.inputs().is_ok_and(|after| after == *before))
+        {
+            return Err("compiler or SDK inputs changed while freezing the tool set".into());
+        }
+        tools.inputs = inputs;
+        if let Some(warm) = &self.warm_verifier {
+            warm.path_for(commit, prover.compiler.as_ref(), tools.inputs.as_deref())?;
+        }
         crate::release_tools::publish(&self.release, &tools)?;
         Ok(tools)
     }
@@ -3466,13 +3652,41 @@ impl Real {
         commit: &str,
         prover: &Prover,
     ) -> Result<(crate::release_tools::Cutter, Option<PathBuf>), String> {
+        self.select_frozen_cutter(commit, prover, crate::release_tools::Recovery::read(commit))
+    }
+
+    fn select_frozen_cutter(
+        &self,
+        commit: &str,
+        prover: &Prover,
+        recovery: crate::release_tools::Recovery,
+    ) -> Result<(crate::release_tools::Cutter, Option<PathBuf>), String> {
+        if recovery == crate::release_tools::Recovery::Refuse {
+            return Err("the candidate's frozen cutter repair already failed".into());
+        }
+        if self.compiler_source.as_deref() != Some(commit)
+            || self.compiler.as_ref().is_none_or(|compiler| {
+                compiler.bin != prover.bin || Some(&compiler.pin) != prover.compiler.as_ref()
+            })
+        {
+            return Err(
+                "the frozen cutter needs the selected source's explicit compiler context".into(),
+            );
+        }
         // A dry run leaves the caller's HEAD alone. The compiler checkout below is still
         // checked clean at the exact selected commit before and after the frozen build.
         if !self.scratch_logs {
             crate::release_tools::clean_at(&self.repo, commit)?;
         }
-        if crate::release_tools::Recovery::read(commit) != crate::release_tools::Recovery::Refreeze
+        if recovery != crate::release_tools::Recovery::Refreeze
             && let Ok(cutter) = crate::release_tools::recorded_cutter(&self.release, commit)
+            && cutter.compiler == prover.compiler
+            && prover.compiler.is_some()
+            && (!cfg!(target_os = "macos")
+                || cutter
+                    .seal
+                    .as_ref()
+                    .is_some_and(|seal| self.inputs().is_ok_and(|current| current == *seal)))
         {
             let inputs = self.prepared_step1_handoff(commit, &cutter).unwrap_or(None);
             return Ok((cutter, inputs));
@@ -3508,8 +3722,10 @@ impl Real {
             &mut started_of,
         )
         .map_err(|why| format!("cutter workspace unavailable: {why:?}"))?;
-        if crate::release_tools::Recovery::read(commit) != crate::release_tools::Recovery::Refreeze
+        if recovery != crate::release_tools::Recovery::Refreeze
             && let Ok(prepared) = crate::release_tools::recorded_cutter(&cache, commit)
+            && prepared.compiler == prover.compiler
+            && prover.compiler.is_some()
             && self.cached_input_record(&cache.join("state"), &prepared)
             && let Some(prefrozen_inputs) = self.prepared_step1_handoff(commit, &prepared)
         {
@@ -3525,9 +3741,11 @@ impl Real {
                 commit,
                 &prepared.tool.path,
                 &log,
+                prepared.seal.clone(),
                 prepared.inputs.clone(),
             )?;
             cutter.built_from.clone_from(&prepared.built_from);
+            cutter.compiler = prover.compiler.clone();
             if !self.scratch_logs {
                 crate::release_tools::clean_at(&self.repo, commit)?;
             }
@@ -3547,16 +3765,33 @@ impl Real {
             println!("release-event: {event}");
             return Ok((cutter, prefrozen_inputs));
         }
-        let compiler = self.cutter_workspace_at(&cache, commit)?;
+        let mut compiler = self.cutter_workspace_at(&cache, commit)?;
+        compiler.compiler = self.compiler.clone();
+        compiler.compiler_source = Some(commit.to_owned());
+        #[cfg(unix)]
+        {
+            compiler.compiler_hold = Some(
+                self.compiler_store.offer(
+                    &prover.bin,
+                    prover
+                        .compiler
+                        .as_ref()
+                        .ok_or("the frozen prover has no source compiler pin")?
+                        .build,
+                )?,
+            );
+        }
         let built = compiler.frozen_cutter_here(commit, prover)?;
         let mut cutter = crate::release_tools::stage_cutter(
             &self.release,
             commit,
             &built.tool.path,
             &self.step_log(self.step),
+            built.seal,
             built.inputs,
         )?;
         cutter.built_from = built.built_from;
+        cutter.compiler = prover.compiler.clone();
         if !self.scratch_logs {
             crate::release_tools::clean_at(&self.repo, commit)?;
         }
@@ -3565,13 +3800,20 @@ impl Real {
     }
 
     fn cached_input_record(&self, state: &Path, cutter: &crate::release_tools::Cutter) -> bool {
+        if self
+            .compiler
+            .as_ref()
+            .is_none_or(|compiler| cutter.compiler.as_ref() != Some(&compiler.pin))
+        {
+            return false;
+        }
         if cfg!(target_os = "macos") {
             cutter
-                .inputs
+                .seal
                 .as_ref()
-                .is_some_and(|inputs| (self.prefrozen_inputs)(state, &inputs.seal).is_some())
+                .is_some_and(|seal| self.kept_inputs(state, seal).is_some())
         } else {
-            cutter.inputs.is_none()
+            cutter.seal.is_none() && cutter.inputs.is_none()
         }
     }
 
@@ -3584,14 +3826,14 @@ impl Real {
         cutter: &crate::release_tools::Cutter,
     ) -> Option<Option<PathBuf>> {
         if cfg!(target_os = "macos") {
-            let inputs = cutter.inputs.as_ref()?;
+            let seal = cutter.seal.as_ref()?;
             let adopted = self.prefrozen_step1.as_ref()?;
-            if adopted.commit != commit || adopted.seal != inputs.seal {
+            if adopted.commit != commit || adopted.seal != *seal {
                 return None;
             }
             (self.handed_inputs)().map(Some)
         } else {
-            cutter.inputs.is_none().then_some(None)
+            (cutter.seal.is_none() && cutter.inputs.is_none()).then_some(None)
         }
     }
 
@@ -3672,6 +3914,8 @@ impl Real {
         let _ = std::fs::remove_dir_all(&compiler.logs);
         compiler.release = cache.to_owned();
         compiler.state = cache.join("state");
+        compiler.sdk = self.sdk.clone();
+        compiler.compiler_store = self.compiler_store.clone();
         compiler.build_inputs = self.build_inputs;
         compiler.arm_inputs = self.arm_inputs;
         compiler.arm_prefrozen_inputs = self.arm_prefrozen_inputs;
@@ -3697,11 +3941,17 @@ impl Real {
         let seal = if cfg!(target_os = "macos") {
             let _timing = crate::cut_timing::Timer::start(&log, "cutter-inputs-seal");
             (self.arm_inputs)(&self.state, Some(&self.transcript()));
-            Some((self.build_inputs)()?)
+            Some(self.inputs()?)
         } else {
             None
         };
         let (source, output) = self.build_frozen_tool(prover, &FROZEN_CUTTER, "gate")?;
+        if seal
+            .as_ref()
+            .is_some_and(|before| !self.inputs().is_ok_and(|after| after == *before))
+        {
+            return Err("compiler or SDK inputs changed while building the frozen cutter".into());
+        }
         let observation = seal.as_deref().and_then(|seal| {
             let _timing = crate::cut_timing::Timer::start(&log, "cutter-input-graph");
             match crate::cutter_inputs::capture(&self.repo, &output, seal) {
@@ -3721,7 +3971,7 @@ impl Real {
             })
             .transpose()?
             .flatten();
-        let cutter = if let Some(cutter) = adopted {
+        let mut cutter = if let Some(cutter) = adopted {
             let event = aterm_json::json!({
                 "schema": 1, "event": "cutter-adopted", "commit": commit,
                 "built_from": &cutter.built_from, "inputs": &cutter.inputs,
@@ -3737,30 +3987,44 @@ impl Real {
                 commit,
                 &source,
                 &log,
+                seal.clone(),
                 observation.map(|observation| observation.inputs),
             )?
         };
+        cutter.compiler = prover.compiler.clone();
         {
             let _phase = crate::cut_timing::Timer::start(&log, "cutter-source-recheck");
             crate::release_tools::clean_at(&self.repo, commit)?;
         }
         {
             let _phase = crate::cut_timing::Timer::start(&log, "cutter-record-publish");
+            if seal
+                .as_ref()
+                .is_some_and(|before| !self.inputs().is_ok_and(|after| after == *before))
+            {
+                return Err(
+                    "compiler or SDK inputs changed before publishing the frozen cutter".into(),
+                );
+            }
             crate::release_tools::publish_cutter(&self.release, &cutter)?;
         }
         Ok(cutter)
     }
 
-    fn finish_tools(&mut self) -> Result<(), String> {
-        let commit = self
-            .warming
-            .as_ref()
-            .map(|warming| warming.commit.clone())
-            .unwrap_or_else(|| self.head());
+    fn finish_warming(&mut self) -> Result<Option<String>, String> {
         if let Some(mut warming) = self.warming.take() {
             crate::release_tools::clean_at(&self.repo, &warming.commit)?;
             let status = warming.child.wait().map_err(|e| e.to_string())?;
+            self.sdk.verify()?;
             crate::release_tools::clean_at(&self.repo, &warming.commit)?;
+            if warming.compiler.as_ref() != self.compiler.as_ref().map(|compiler| &compiler.pin)
+                || warming
+                    .inputs
+                    .as_ref()
+                    .is_some_and(|before| !self.inputs().is_ok_and(|after| after == *before))
+            {
+                return Err("compiler or SDK inputs changed while warming the verifier".into());
+            }
             let stdout = std::fs::read(&warming.stdout).map_err(|e| e.to_string())?;
             let stderr = std::fs::read(&warming.stderr).map_err(|e| e.to_string())?;
             if !status.success() {
@@ -3769,13 +4033,20 @@ impl Real {
                     String::from_utf8_lossy(&stderr)
                 ));
             }
-            self.warm_verifier = Some(crate::checkout_bin::built(
-                &self.repo,
-                &FROZEN_VERIFY,
-                &stdout,
-            )?);
+            self.warm_verifier = Some(WarmVerifier {
+                path: crate::checkout_bin::built(&self.repo, &FROZEN_VERIFY, &stdout)?,
+                commit: warming.commit.clone(),
+                compiler: warming.compiler.clone(),
+                inputs: warming.inputs.clone(),
+            });
+            return Ok(Some(warming.commit.clone()));
         }
-        let prover = self.prover(None)?;
+        Ok(None)
+    }
+
+    fn finish_tools(&mut self) -> Result<(), String> {
+        let commit = self.finish_warming()?.unwrap_or_else(|| self.head());
+        let prover = self.candidate_prover(&commit, None)?;
         self.frozen_tools(&commit, &prover)?;
         Ok(())
     }
@@ -3785,15 +4056,41 @@ impl Real {
         use std::os::fd::AsRawFd as _;
 
         let mut guards = Vec::new();
-        if let Some(lease) = crate::gates::offer_toolchain_lease(&prover.bin)? {
-            command
-                .env(
-                    TOOLCHAIN_LEASE_FD_ENV,
-                    lease.descriptor.as_raw_fd().to_string(),
-                )
-                .env(TOOLCHAIN_LEASE_LEAF_ENV, &lease.leaf);
-            guards.push(lease.descriptor);
+        let compiler = self
+            .compiler
+            .as_ref()
+            .ok_or("no candidate compiler at exec")?;
+        if compiler.bin != prover.bin
+            || Some(&compiler.pin) != prover.compiler.as_ref()
+            || self.compiler_hold.is_none()
+        {
+            return Err("the exec prover differs from the held candidate compiler".into());
         }
+        let commit = self
+            .compiler_source
+            .as_ref()
+            .ok_or("no compiler source at exec")?;
+        let offer = CompilerHandoff {
+            commit: commit.clone(),
+            bin: compiler.bin.clone(),
+            pin: compiler.pin.clone(),
+            user_override: std::env::var_os("TRUST_STAGE2_BIN")
+                .is_some_and(|value| !value.is_empty()),
+        };
+        let offer = aterm_json::to_string(&offer).map_err(|error| error.to_string())?;
+        if offer.len() > 4096 {
+            return Err("the compiler handoff exceeds its bounded declaration".into());
+        }
+        let lease = self.compiler_store.offer(&prover.bin, compiler.pin.build)?;
+        command
+            .env(COMPILER_HANDOFF_ENV, offer)
+            .env("TRUST_STAGE2_BIN", &prover.bin)
+            .env(
+                TOOLCHAIN_LEASE_FD_ENV,
+                lease.descriptor.as_raw_fd().to_string(),
+            )
+            .env(TOOLCHAIN_LEASE_LEAF_ENV, &lease.leaf);
+        guards.push(lease.descriptor);
         let claim = self
             .line_priority
             .as_ref()
@@ -4553,6 +4850,7 @@ impl Real {
         stop: Option<&BranchStop>,
         jobs: Option<&aterm_capacity::BranchShares>,
     ) -> std::io::Result<std::process::Output> {
+        self.sdk.verify().map_err(std::io::Error::other)?;
         scrub_fixture_command(cmd);
         if step == Step::Qualify
             && let Some(jobs) = jobs
@@ -4561,6 +4859,7 @@ impl Real {
         }
         cmd.env("TRUST_STAGE2_BIN", &prover.bin);
         let (out, record) = self.output_accounted_with_stop(step, cmd, stop)?;
+        self.sdk.verify().map_err(std::io::Error::other)?;
         append_output(log, &out);
         if let Ok(mut file) = crate::durable::open_append(log, true) {
             let _ = writeln!(file, "{record}");
@@ -4691,7 +4990,7 @@ impl Real {
             )
             .could_not_run()
         };
-        let seal = (self.build_inputs)().map_err(unsealed)?;
+        let seal = self.inputs().map_err(unsealed)?;
         let tree = self
             .git_out(&["rev-parse", &format!("{}^{{tree}}", c.commit)])
             .ok_or_else(|| {
@@ -4900,7 +5199,7 @@ impl Real {
                 .could_not_run(),
             ));
         }
-        match (self.build_inputs)() {
+        match self.inputs() {
             Ok(now) if now == seal => {}
             Ok(_) => {
                 return Err(abandoned(unsealed(
@@ -4911,7 +5210,7 @@ impl Real {
             // still judged R's tree under this seal where the held seal stands by status, so
             // what its verifier finished is recorded: each FAIL it showed, and each test binary
             // and lint package that passed, which the next hop may be offered.
-            Err(_) if (self.inputs_held)(&seal) => {}
+            Err(_) if self.held_inputs(&seal) => {}
             Err(e) => return Err(abandoned(unsealed(e))),
         }
         let log_sha256 = crate::artifact::file_sha256(&log).unwrap_or_else(|e| {
@@ -5068,7 +5367,7 @@ impl Real {
             build: reserved.build,
             commit: reserved.commit.clone(),
         };
-        let found = crate::artifact::compilers()
+        let found = crate::artifact::compilers(&self.repo, &identity.commit)
             .map(|compilers| crate::artifact::key(&identity, &compilers))
             .and_then(|key| {
                 let store = crate::artifact::store(&self.repo)?;
@@ -5335,7 +5634,12 @@ fn distribute_after_shape(
     Ok((site?, tap?))
 }
 
-fn built_answer(repo: &Path, artifact: Option<&Artifact>, prover: &Prover) -> Answer {
+fn built_answer(
+    repo: &Path,
+    artifact: Option<&Artifact>,
+    prover: &Prover,
+    inputs: impl FnOnce() -> Result<String, String>,
+) -> Answer {
     let Some(a) = artifact else {
         return Answer::no("no bundle is built for it yet");
     };
@@ -5352,7 +5656,7 @@ fn built_answer(repo: &Path, artifact: Option<&Artifact>, prover: &Prover) -> An
             short(&complete.trustc),
             short(&prover.commit)
         )),
-        Ok(Some(complete)) => match crate::build_inputs::current() {
+        Ok(Some(complete)) => match inputs() {
             Ok(inputs) if inputs == complete.inputs => Answer::yes(format!(
                 "built once: {} (executable sha256 {})",
                 a.app.display(),
@@ -6193,7 +6497,7 @@ pub(crate) fn measure_local_appkit(
     real.logs = root.to_owned();
     real.scratch_logs = false;
     real.step = Step::Qualify;
-    let prover = real.prover(None)?;
+    let prover = real.candidate_prover(commit, None)?;
     let candidate = Candidate {
         commit: commit.to_owned(),
         version: real
@@ -6295,7 +6599,7 @@ pub(crate) fn measure_local_fixtures(
     real.logs = root.to_owned();
     real.scratch_logs = false;
     real.step = Step::Qualify;
-    let prover = real.prover(None)?;
+    let prover = real.candidate_prover(commit, None)?;
     let targo = prover.bin.join("targo");
     let layout = diagnostic_verify_layout(repo).map_err(|error| error.to_string())?;
     let index = crate::fixtures::GeneratorIndex::from_plan(&targo, repo, layout.clone())
@@ -8605,8 +8909,11 @@ impl Real {
             .as_ref()
             .map_or(self.repo.as_path(), |(root, _)| root.as_path());
         let _ = check_commit_gate("locked metadata", &mut blocks, &mut report, || {
-            crate::cut_timing::measure("commit-gate locked metadata", || {
-                crate::gates::locked_metadata_gate(metadata_root)
+            crate::cut_timing::measure("commit-gate locked metadata", || match &self.compiler {
+                Some(compiler) => {
+                    crate::gates::locked_metadata_for(metadata_root, &compiler.bin.join("targo"))
+                }
+                None => crate::gates::locked_metadata_gate(metadata_root),
             })
             .map_err(|error| {
                 let refusal = cut_refusal("locked metadata", &error.to_string());
@@ -8639,7 +8946,7 @@ impl Real {
                             .into(),
                     );
                 }
-                let inputs = crate::build_inputs::current()?;
+                let inputs = self.inputs()?;
                 crate::gates::CommitGateRecord::new(&c.commit, &c.version, inputs, tags)
                     .judged_by(&run)
                     .save(&git)
@@ -8684,7 +8991,7 @@ impl Real {
                     .map_err(ToString::to_string)?
                     .tag_fingerprint()
             })?;
-            let inputs = crate::build_inputs::current()?;
+            let inputs = self.inputs()?;
             crate::gates::CommitGateRecord::new(&c.commit, &c.version, inputs, tags)
                 .recorded(&git)
                 .map_err(|e| e.to_string())?
@@ -8898,8 +9205,11 @@ fn cached_prefrozen_seal(real: &Real, commit: &str) -> Option<(String, PathBuf)>
     }
     let cache = cutter_cache_dir(&real.release);
     let cutter = crate::release_tools::recorded_cutter(&cache, commit).ok()?;
-    let seal = cutter.inputs?.seal;
-    let path = (real.prefrozen_inputs)(&cache.join("state"), &seal)?;
+    if !real.cached_input_record(&cache.join("state"), &cutter) {
+        return None;
+    }
+    let seal = cutter.seal?;
+    let path = real.kept_inputs(&cache.join("state"), &seal)?;
     Some((seal, path))
 }
 
@@ -9468,61 +9778,120 @@ impl Backend for Real {
         }
     }
 
-    fn prover(&mut self, journaled: Option<&str>) -> Result<Prover, String> {
+    fn prover(&mut self, _journaled: Option<&str>) -> Result<Prover, String> {
+        let commit = self.head();
+        self.candidate_prover(&commit, None)
+    }
+
+    fn compiler_pin(
+        &mut self,
+        commit: &str,
+    ) -> Result<Option<crate::release::CompilerPin>, String> {
+        crate::trust_lock::CompilerPin::at(&self.git(), commit).map(Some)
+    }
+
+    fn candidate_prover(
+        &mut self,
+        commit: &str,
+        journal: Option<&crate::release::Journal>,
+    ) -> Result<Prover, String> {
         let _phase =
             crate::cut_timing::Timer::start(&self.step_log(self.step), "prover-resolution");
-        let explicit = std::env::var_os("TRUST_STAGE2_BIN").filter(|v| !v.is_empty());
-        let (cand, source) = if let Some(dir) = explicit {
-            (PathBuf::from(dir), "TRUST_STAGE2_BIN".to_string())
-        } else if let Some(j) = journaled
-            && Path::new(j).join("trustc").is_file()
-            && Path::new(j).join("targo").is_file()
+        let pin = crate::trust_lock::CompilerPin::at(&self.git(), commit)?;
+        if let Some(journal) = journal
+            && journal.commit == commit
+            && journal
+                .compiler
+                .as_ref()
+                .is_some_and(|previous| previous != &pin)
         {
-            (
-                PathBuf::from(j),
-                "the prover this release started with".to_string(),
-            )
-        } else {
-            let found = crate::gates::trust_stage2_bin().map_err(|e| e.to_string())?;
-            let mut source = "the cut's own toolchain resolution".to_string();
-            if let Some(j) = journaled {
-                source.push_str(&format!(
-                    " — the prover this release started with ({j}) is gone; resolving a replacement"
-                ));
+            return Err("the candidate's original compiler lock differs from its journal".into());
+        }
+        let explicit = std::env::var_os("TRUST_STAGE2_BIN")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        #[cfg(unix)]
+        if let Some(compiler) = &self.compiler
+            && compiler.pin == pin
+            && self.compiler_hold.is_some()
+            && explicit
+                .as_ref()
+                .is_none_or(|asked| asked.canonicalize().ok().as_ref() == Some(&compiler.bin))
+        {
+            // This exact tree was fully checked under continuous managed custody above.
+            // Recheck the original named lease rather than folding gigabytes again for
+            // each step of the same run. A new declaration still takes the full path.
+            let hold = self.compiler_store.offer(&compiler.bin, pin.build)?;
+            self.compiler_hold = Some(hold);
+            self.compiler_source = Some(commit.to_owned());
+            return Ok(Prover {
+                bin: compiler.bin.clone(),
+                commit: pin.compiler_commit.clone(),
+                source: format!(
+                    "the candidate's continuously held locked build {}",
+                    pin.build
+                ),
+                compiler: Some(pin),
+            });
+        }
+        #[cfg(unix)]
+        let mut hold = None;
+        let mut before_probe = |bin: &Path| {
+            #[cfg(unix)]
+            {
+                hold = Some(self.compiler_store.offer(bin, pin.build)?);
+                Ok(())
             }
-            (found, source)
+            #[cfg(not(unix))]
+            Err("candidate compiler custody requires Unix descriptors".into())
         };
-        let bin = cand
-            .canonicalize()
-            .map_err(|e| format!("{source} ({}) is not a directory: {e}", cand.display()))?;
-        if !bin.join("trustc").is_file() || !bin.join("targo").is_file() {
-            return Err(format!(
-                "{source} ({}) holds no trustc and targo",
-                bin.display()
-            ));
+        // Dry release judgments obey the same Cut authority as writes. Installing the exact
+        // missing build can warm the managed store, but never changes candidate authority.
+        let selected = crate::trust_lock::locked_prover(
+            self.compiler_store.prefix(),
+            &pin.lock(),
+            explicit.as_deref(),
+            crate::trust_lock::Run::Cut,
+            &mut crate::trust_lock::install_locked,
+            &mut before_probe,
+        )?;
+        self.compiler = Some(crate::trust_lock::CompilerInputs {
+            bin: selected.bin.clone(),
+            stock: crate::buildplan::Stock::under(self.home.as_os_str(), &pin.stock_toolchain),
+            pin: pin.clone(),
+        });
+        self.compiler_source = Some(commit.to_owned());
+        #[cfg(unix)]
+        {
+            self.compiler_hold = hold;
         }
-        // Hold the resolved store entry before executing any of its tools.
-        if !self.scratch_logs {
-            crate::gates::lease_toolchain_checked(&bin)?;
-        }
-        let identity = crate::gates::toolchain_at(&bin).map_err(|e| e.to_string())?;
-        let commit = identity.rsplit(' ').next().unwrap_or("unknown").to_string();
-        if commit == "unknown" || commit.is_empty() {
-            return Err(format!(
-                "{}/trustc names no commit-hash in `trustc -vV`, so no receipt can tell it from \
-                 another prover",
-                bin.display()
-            ));
-        }
-        crate::gates::pin_trust_stage2_bin(&bin).map_err(|e| e.to_string())?;
         Ok(Prover {
-            bin,
-            commit,
-            source,
+            bin: selected.bin,
+            commit: pin.compiler_commit.clone(),
+            source: selected.source,
+            compiler: Some(pin),
         })
     }
 
     fn lease(&mut self, prover: &Prover) -> Result<(), String> {
+        if let Some(pin) = &prover.compiler {
+            if self
+                .compiler
+                .as_ref()
+                .is_none_or(|held| held.bin != prover.bin || &held.pin != pin)
+            {
+                return Err("the candidate compiler context does not own this prover".into());
+            }
+            #[cfg(unix)]
+            if self.compiler_hold.is_none() {
+                return Err("the candidate compiler's managed lease is absent".into());
+            }
+            #[cfg(unix)]
+            {
+                drop(self.compiler_store.offer(&prover.bin, pin.build)?);
+                return Ok(());
+            }
+        }
         crate::gates::lease_toolchain_checked(&prover.bin)
     }
 
@@ -9543,7 +9912,7 @@ impl Backend for Real {
             } else {
                 (self.arm_inputs)(&self.state, Some(&self.transcript()));
             }
-            let current = (self.build_inputs)()?;
+            let current = self.inputs()?;
             if let Some((seal, _)) = prepared {
                 let adopted = current == seal;
                 if adopted {
@@ -9721,7 +10090,7 @@ impl Backend for Real {
         let unavailable = |why: String| {
             InputFinding::Unanswered(format!("released-shim could not be asked of R: {why}"))
         };
-        let records = crate::check_record::checks(&self.git(), &c.commit, None, self.build_inputs);
+        let records = crate::check_record::checks(&self.git(), &c.commit, None, || self.inputs());
         if !shim_owed(&records) {
             return Ok(format!(
                 "released-shim not asked again: the `test` record of {}'s tree stands under \
@@ -10290,10 +10659,40 @@ impl Backend for Real {
     }
 
     fn own_cutter(&mut self, commit: &str) -> Result<String, crate::cutter::NotOwn> {
-        crate::gates::own_frozen_cutter(commit).map_err(|mut not| {
-            not.fix = self.cutter_retry();
-            not
-        })
+        crate::gates::own_frozen_cutter(commit)
+            .and_then(|note| {
+                let check = (|| {
+                    let compiler = self.compiler.as_ref().ok_or("no held candidate compiler")?;
+                    if self.compiler_source.as_deref() != Some(commit) {
+                        return Err("the compiler belongs to another selected source".to_owned());
+                    }
+                    let recorded = crate::release_tools::recorded_cutter(&self.release, commit)?;
+                    if recorded.compiler.as_ref() != Some(&compiler.pin) {
+                        return Err("the frozen cutter has no matching compiler declaration".into());
+                    }
+                    crate::gates::pin_trust_stage2_bin(&compiler.bin)
+                        .map_err(|error| error.to_string())?;
+                    if cfg!(target_os = "macos")
+                        && recorded
+                            .seal
+                            .as_ref()
+                            .is_none_or(|seal| !self.inputs().is_ok_and(|current| current == *seal))
+                    {
+                        return Err(
+                            "the frozen cutter's compiler and SDK seal no longer stands".into()
+                        );
+                    }
+                    Ok(())
+                })();
+                check.map(|()| note).map_err(|why| crate::cutter::NotOwn {
+                    why,
+                    fix: self.cutter_retry(),
+                })
+            })
+            .map_err(|mut not| {
+                not.fix = self.cutter_retry();
+                not
+            })
     }
 
     fn frozen_commit(&mut self) -> Option<String> {
@@ -10304,7 +10703,7 @@ impl Backend for Real {
     }
 
     fn cutter_recovery(&mut self, commit: &str) -> crate::release_tools::Recovery {
-        crate::release_tools::Recovery::read(commit)
+        crate::release_tools::Recovery::after_failed_check(commit)
     }
 
     fn exec_cutter(&mut self, commit: &str, prover: &Prover) -> Result<(), Refusal> {
@@ -10318,15 +10717,16 @@ impl Backend for Real {
         if interrupt::caught().is_some() {
             return Err(cannot("not started: the release was interrupted".into()));
         }
+        let recovery = crate::release_tools::Recovery::after_failed_check(commit);
         let (cutter, prefrozen_inputs) = self
-            .frozen_cutter_with_inputs(commit, prover)
+            .select_frozen_cutter(commit, prover, recovery)
             .map_err(cannot)?;
         let mut command = self.cutter_command_with_inputs(&cutter.tool.path, prefrozen_inputs);
         // The writer's identity is independent of the target it just built. A failed legacy
         // proof cannot supply it; the explicit re-freeze marker still bounds that repair.
         let freezer =
             crate::cutter::running_stamp().map_or("unproved", crate::cutter::Stamp::commit);
-        crate::release_tools::Recovery::read(commit).hand(
+        recovery.hand(
             &mut command,
             commit,
             freezer,
@@ -10359,12 +10759,28 @@ impl Backend for Real {
     }
 
     fn warm_tools(&mut self, commit: &str, prover: &Prover) -> Result<(), Refusal> {
-        if crate::release_tools::recorded(&self.release, commit).is_ok() {
+        self.require_compiler(commit, prover)
+            .map_err(|why| Refusal::new(why, "restore the candidate compiler and retry"))?;
+        if crate::release_tools::recorded(&self.release, commit).is_ok_and(|tools| {
+            tools.compiler == prover.compiler
+                && prover.compiler.is_some()
+                && (!cfg!(target_os = "macos")
+                    || tools
+                        .inputs
+                        .as_ref()
+                        .is_some_and(|seal| self.inputs().is_ok_and(|now| now == *seal)))
+        }) {
             return Ok(());
         }
         let stdout = self.logs.join("verifier-build.jsonl");
         let stderr = self.logs.join("verifier-build.log");
         let start = || -> Result<WarmingVerifier, String> {
+            self.sdk.verify()?;
+            let inputs = if cfg!(target_os = "macos") {
+                Some(self.inputs()?)
+            } else {
+                None
+            };
             let mut command = self.child(prover.bin.join("targo"), Some(prover));
             let plan = verify_plan(&self.repo)
                 .map_err(|e| format!("select verifier build directory: {e}"))?;
@@ -10390,6 +10806,8 @@ impl Backend for Real {
                 .map_err(|e| e.to_string())?;
             Ok(WarmingVerifier {
                 commit: commit.to_owned(),
+                compiler: prover.compiler.clone(),
+                inputs,
                 child,
                 _forwarded: forwarded,
                 stdout,
@@ -10407,7 +10825,7 @@ impl Backend for Real {
 
     fn facts(&mut self, c: &Candidate, prover: &Prover, artifact: Option<&Artifact>) -> Facts {
         let git = self.git();
-        let built = built_answer(&self.repo, artifact, prover);
+        let built = built_answer(&self.repo, artifact, prover, || self.inputs());
         // The tree's records need no bundle; the bundle's need its executable. The seal is the
         // run's, rechecked by stat, and read only once a record of this tree is there.
         let executable = artifact
@@ -10418,7 +10836,7 @@ impl Backend for Real {
             let reused = (|| -> Result<bool, String> {
                 let root = crate::check_record::root(&git)?;
                 let tree = crate::check_record::tree_of(&git, &c.commit)?;
-                let seal = (self.build_inputs)()?;
+                let seal = self.inputs()?;
                 let content = crate::artifact::content_digest(&artifact.app)?;
                 let Some(product) =
                     crate::check_record::product_key(&root, &tree, &seal, &content)?
@@ -10446,7 +10864,7 @@ impl Backend for Real {
         let content_error = if self.previous_line_head(&c.commit).is_none() {
             None
         } else {
-            match (self.build_inputs)().and_then(|seal| {
+            match self.inputs().and_then(|seal| {
                 let plan = self.check_content_plan(&c.commit, &seal, prover)?;
                 self.carry_hop_checks(&c.commit, &seal, &plan)
             }) {
@@ -10462,7 +10880,7 @@ impl Backend for Real {
         if let Some(why) = content_error {
             println!("    content record: no cross-hop carry ({why})");
         }
-        let checks = crate::check_record::checks(&git, &c.commit, executable, self.build_inputs)
+        let checks = crate::check_record::checks(&git, &c.commit, executable, || self.inputs())
             .unwrap_or_else(|e| {
                 crate::check_record::Checks::unanswered(format!(
                     "the check records' judge did not answer: {e}"
@@ -10612,7 +11030,23 @@ impl Backend for Real {
         self.land_fixtures_shared(c, reserved, prover)
     }
     fn audit(&mut self, machine_id: &str, profile: Option<&Path>, dry: bool) -> Vec<Finding> {
-        crate::provision::audit(&self.repo, machine_id, profile, dry)
+        let commit = self.compiler_source.clone().unwrap_or_else(|| self.head());
+        self.audit_candidate(&commit, machine_id, profile, dry)
+    }
+
+    fn audit_candidate(
+        &mut self,
+        commit: &str,
+        machine_id: &str,
+        profile: Option<&Path>,
+        dry: bool,
+    ) -> Vec<Finding> {
+        let compiler = self
+            .compiler
+            .as_ref()
+            .filter(|_| self.compiler_source.as_deref() == Some(commit))
+            .ok_or_else(|| "the machine audit has no selected-source compiler context".to_owned());
+        crate::provision::audit(&self.repo, commit, machine_id, profile, dry, compiler)
     }
 
     fn distribution(&mut self, dry: bool) -> Vec<Finding> {
@@ -11474,59 +11908,246 @@ fn inherited_fd(name: &str, raw: std::os::fd::RawFd) -> Result<std::os::fd::Owne
         return Err(format!("{name} is not a live inherited descriptor offer"));
     }
     // SAFETY: this process image received exclusive ownership of the explicitly inherited slot.
-    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+    // SAFETY: first-main owns this live slot before any other thread or child can observe it.
+    if unsafe { fcntl(raw, libc::F_SETFD, flags | FD_CLOEXEC) } < 0 {
+        return Err(format!(
+            "protect startup {name}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    aterm_uds::keep_out_of_children(&owned)
+        .map_err(|error| format!("protect startup {name}: {error}"))?;
+    Ok(owned)
+}
+
+/// The original startup description stays owned and protected until the handover guard drops.
+/// Native intake receives a duplicate of that same held description, never a fresh file open.
+#[cfg(unix)]
+unsafe fn adopt_captured_toolchain(
+    original: std::os::fd::OwnedFd,
+    bin: &Path,
+    leaf: &str,
+) -> Result<(), String> {
+    // SAFETY: the caller supplies continuous original custody and independently selected
+    // store paths; the adapter preserves that same description through native intake.
+    captured_intake(original, |intake| unsafe {
+        crate::gates::adopt_toolchain_lease(intake, bin, leaf)
+    })
 }
 
 #[cfg(unix)]
-fn take_handover_env(name: &str) -> Option<std::ffi::OsString> {
-    let value = std::env::var_os(name);
-    // SAFETY: release startup is single-threaded, and these private variables are consumed once.
-    unsafe { std::env::remove_var(name) };
-    value
+fn captured_intake<T>(
+    original: std::os::fd::OwnedFd,
+    adopt: impl FnOnce(std::os::fd::OwnedFd) -> Result<T, String>,
+) -> Result<T, String> {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+    let handing = aterm_uds::spawn_lock::handing(&[original.as_raw_fd()]);
+    let intake = original
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(|error| error.to_string())?;
+    let raw = intake.as_raw_fd();
+    // SAFETY: this exact duplicate is exclusively owned here. The protected original remains
+    // live until after handing drops; native intake performs no subprocess spawn and consumes
+    // intake on every answer. Its original-description/leaf checks remain authoritative.
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+        return Err(format!(
+            "prepare captured lease intake: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let result = adopt(intake);
+    drop(handing);
+    drop(original);
+    result
 }
 
-/// Adopt the two original resource descriptions handed through the native in-place exec.
-/// Paths are derived from the receiver's selected store and account ledger; only bounded leaf
-/// names and exact descriptor numbers cross the image boundary.
+/// Capture the complete raw offer at the first operation of main. Cutter proof, Git and
+/// compiler probes may leave persistent workers, so later adoption never mutates environment.
+///
+/// # Safety
+/// Call once as the first operation in the fresh process, before any worker can start.
 #[cfg(unix)]
-fn adopt_exec_handoffs() -> Result<Option<aterm_capacity::Claim>, String> {
+pub(crate) unsafe fn capture_exec_handoff_environment() -> Result<(), String> {
+    let mut saved = STARTUP_HANDOFF
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if saved.is_some() {
+        return Err("the startup handover environment was already captured".into());
+    }
     let resource_offer = [
         TOOLCHAIN_LEASE_FD_ENV,
         TOOLCHAIN_LEASE_LEAF_ENV,
+        COMPILER_HANDOFF_ENV,
         LINE_FD_ENV,
         LINE_WRITER_FD_ENV,
         LINE_LEAF_ENV,
     ]
     .into_iter()
     .any(|name| std::env::var_os(name).is_some());
+    if !resource_offer {
+        return Ok(());
+    }
+    let lease_fd = std::env::var_os(TOOLCHAIN_LEASE_FD_ENV);
+    let lease_leaf = std::env::var_os(TOOLCHAIN_LEASE_LEAF_ENV);
+    let compiler = std::env::var_os(COMPILER_HANDOFF_ENV)
+        .map(|value| {
+            let text = value
+                .to_str()
+                .filter(|text| text.len() <= 4096)
+                .ok_or("the inherited compiler declaration is not bounded UTF-8")?;
+            aterm_json::from_str::<CompilerHandoff>(text).map_err(|error| error.to_string())
+        })
+        .transpose()?;
+    let line_fd = std::env::var_os(LINE_FD_ENV);
+    let writer_fd = std::env::var_os(LINE_WRITER_FD_ENV);
+    let line_leaf = std::env::var_os(LINE_LEAF_ENV);
+    let transported = compiler
+        .as_ref()
+        .map(|compiler| {
+            let value = std::env::var_os("TRUST_STAGE2_BIN")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .ok_or("the compiler transport path is missing")?;
+            if value != compiler.bin {
+                return Err("the compiler transport path differs from its declaration".to_owned());
+            }
+            Ok(value)
+        })
+        .transpose()?;
+    // Validate ALL aliases/nonstdio numbers before any raw slot receives a Rust owner.
+    let [lease, line, writer] = inherited_fd_offers(
+        lease_fd.as_deref(),
+        line_fd.as_deref(),
+        writer_fd.as_deref(),
+    )?;
+    let lease_fd = lease
+        .map(|raw| inherited_fd(TOOLCHAIN_LEASE_FD_ENV, raw))
+        .transpose()?;
+    let line_fd = line.map(|raw| inherited_fd(LINE_FD_ENV, raw)).transpose()?;
+    let writer_fd = writer
+        .map(|raw| inherited_fd(LINE_WRITER_FD_ENV, raw))
+        .transpose()?;
+    // SAFETY: the caller owns the first-main boundary before any helper/proof/reader call.
+    unsafe {
+        for name in [
+            TOOLCHAIN_LEASE_FD_ENV,
+            TOOLCHAIN_LEASE_LEAF_ENV,
+            COMPILER_HANDOFF_ENV,
+            LINE_FD_ENV,
+            LINE_WRITER_FD_ENV,
+            LINE_LEAF_ENV,
+        ] {
+            std::env::remove_var(name);
+        }
+        if compiler
+            .as_ref()
+            .is_some_and(|compiler| !compiler.user_override)
+        {
+            std::env::remove_var("TRUST_STAGE2_BIN");
+        }
+    }
+    *saved = Some(StartupHandoff {
+        resource_offer,
+        lease_fd,
+        lease_leaf,
+        compiler,
+        transported,
+        line_fd,
+        writer_fd,
+        line_leaf,
+    });
+    Ok(())
+}
+
+/// Adopt the original resource descriptions from the owned first-main packet. This performs
+/// no environment mutation, including after Git or compiler readers have started.
+#[cfg(unix)]
+fn adopt_exec_handoffs(repo: &Path) -> Result<Option<aterm_capacity::Claim>, String> {
+    let Some(StartupHandoff {
+        resource_offer,
+        lease_fd,
+        lease_leaf,
+        compiler,
+        transported,
+        line_fd,
+        writer_fd,
+        line_leaf,
+    }) = STARTUP_HANDOFF
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    else {
+        if [
+            TOOLCHAIN_LEASE_FD_ENV,
+            TOOLCHAIN_LEASE_LEAF_ENV,
+            COMPILER_HANDOFF_ENV,
+            LINE_FD_ENV,
+            LINE_WRITER_FD_ENV,
+            LINE_LEAF_ENV,
+        ]
+        .into_iter()
+        .any(|name| std::env::var_os(name).is_some())
+        {
+            return Err("resource offers were not captured at process startup".into());
+        }
+        return Ok(None);
+    };
     if resource_offer && !interrupt::exec_handoff_installed() {
         return Err(
             "inherited resource offers arrived without a proved signal-mask handoff".into(),
         );
     }
-    let lease_fd = take_handover_env(TOOLCHAIN_LEASE_FD_ENV);
-    let lease_leaf = take_handover_env(TOOLCHAIN_LEASE_LEAF_ENV);
-    let line_fd = take_handover_env(LINE_FD_ENV);
-    let writer_fd = take_handover_env(LINE_WRITER_FD_ENV);
-    let line_leaf = take_handover_env(LINE_LEAF_ENV);
-    let [lease_fd, line_fd, writer_fd] = inherited_fd_offers(
-        lease_fd.as_deref(),
-        line_fd.as_deref(),
-        writer_fd.as_deref(),
-    )?;
-    match (lease_fd, lease_leaf) {
-        (None, None) => {}
-        (Some(fd), Some(leaf)) => {
-            let fd = inherited_fd(TOOLCHAIN_LEASE_FD_ENV, fd)?;
+    match (lease_fd, lease_leaf, compiler) {
+        (None, None, None) => {}
+        (Some(fd), Some(leaf), Some(compiler)) => {
+            let mut fd = Some(fd);
             let leaf = leaf
                 .to_str()
                 .filter(|leaf| !leaf.is_empty() && !leaf.contains('/'))
                 .ok_or("the inherited toolchain lease leaf is invalid")?;
-            let toolchain = crate::gates::trust_stage2_bin().map_err(|e| e.to_string())?;
-            // SAFETY: inherited_fd established exclusive startup ownership; the receiver chose
-            // the pinned toolchain independently, and adoption consumes the OwnedFd on every
-            // answer, including a check after the lock boundary.
-            unsafe { crate::gates::adopt_toolchain_lease(fd, &toolchain, leaf) }?;
+            crate::gates::own_frozen_cutter(&compiler.commit).map_err(|why| why.why)?;
+            let git = crate::ledger::GitCli::new(repo);
+            let pin = crate::trust_lock::CompilerPin::at(&git, &compiler.commit)?;
+            if pin != compiler.pin {
+                return Err("the inherited compiler differs from the exact candidate lock".into());
+            }
+            let recorded = crate::release_tools::recorded_cutter(
+                &aterm_verify::engine::release_dir(repo),
+                &compiler.commit,
+            )?;
+            if recorded.compiler.as_ref() != Some(&pin) {
+                return Err(
+                    "the frozen cutter has no matching candidate compiler declaration".into(),
+                );
+            }
+            let home = aterm_types::dirs::home_dir();
+            let configured = atpkg::config::load().prefix_path(home.as_deref());
+            let layout = atpkg::store::resolve(configured.as_deref())
+                .ok_or("no managed store exists for the inherited compiler")?;
+            let explicit = transported;
+            let selected = crate::trust_lock::locked_prover(
+                &layout.prefix,
+                &pin.lock(),
+                explicit.as_deref(),
+                crate::trust_lock::Run::Cut,
+                &mut |_, _| {
+                    Err("the inherited locked compiler is missing; no replacement may take its lease".into())
+                },
+                &mut |bin| {
+                    if bin != compiler.bin {
+                        return Err("the inherited lease names another physical compiler".into());
+                    }
+                    let fd = fd.take().ok_or("the compiler lease was already consumed")?;
+                    // SAFETY: startup owns the original offered descriptor continuously. The
+                    // receiver selected this slot from R's original lock before adoption;
+                    // locked_prover rechecks its full tree under this hold before any probe.
+                    unsafe { adopt_captured_toolchain(fd, bin, leaf) }
+                },
+            )?;
+            crate::gates::pin_trust_stage2_bin(&selected.bin).map_err(|error| error.to_string())?;
         }
         _ => return Err("the inherited toolchain lease handover is incomplete".into()),
     }
@@ -11536,10 +12157,7 @@ fn adopt_exec_handoffs() -> Result<Option<aterm_capacity::Claim>, String> {
         (None, None) if writer_fd.is_none() => return Ok(None),
         _ => return Err("the inherited release-line handover is incomplete".into()),
     };
-    let fd = inherited_fd(LINE_FD_ENV, fd)?;
-    let writer = writer_fd
-        .map(|value| inherited_fd(LINE_WRITER_FD_ENV, value))
-        .transpose()?;
+    let writer = writer_fd;
     let leaf = leaf
         .to_str()
         .filter(|leaf| {
@@ -11722,8 +12340,9 @@ fn prepare_cached_cutter(
         tip.to_owned()
     };
     let cache = cutter_cache_dir(&real.release);
-    // The atomically published record binds an immutable, content-addressed executable.
-    // Rechecking that binding and kept input seal needs no compiler checkout or lease.
+    // Even an immutable executable's cached provenance must name this exact source lock.
+    // Resolve and hold it before rechecking the kept input seal or probing any compiler.
+    real.candidate_prover(&tip, None)?;
     if let Some(cutter) = crate::release_tools::recorded_cutter(&cache, &tip)
         .ok()
         .filter(|cutter| real.cached_input_record(&cache.join("state"), cutter))
@@ -11753,7 +12372,7 @@ fn prepare_cached_cutter(
     // source's lock, independently of the ongoing cut's working directory and seal.
     std::env::set_current_dir(&compiler.repo).map_err(|e| e.to_string())?;
     crate::gates::arm_toolchain_lease();
-    let prover = compiler.prover(None)?;
+    let prover = compiler.candidate_prover(&tip, None)?;
     let cutter = compiler.frozen_cutter_here(&tip, &prover)?;
     if !compiler.cached_input_record(&compiler.state, &cutter) {
         return Err("the pre-freeze produced no adoptable step-1 input seal".into());
@@ -12274,13 +12893,21 @@ impl PrefreezeSupervisorRuntime for LivePrefreezeSupervisor<'_> {
         let Ok(cutter) = crate::release_tools::recorded_cutter(self.cache, target) else {
             return false;
         };
+        let Ok(compiler) =
+            crate::trust_lock::inputs_at(&crate::ledger::GitCli::new(self.repo), target)
+        else {
+            return false;
+        };
+        if cutter.compiler.as_ref() != Some(&compiler.pin) {
+            return false;
+        }
         if cfg!(target_os = "macos") {
-            cutter.inputs.as_ref().is_some_and(|inputs| {
-                crate::build_inputs::prefrozen_seal(&self.cache.join("state"), &inputs.seal)
+            cutter.seal.as_ref().is_some_and(|seal| {
+                crate::build_inputs::prefrozen_for(&compiler, &self.cache.join("state"), seal)
                     .is_some()
             })
         } else {
-            cutter.inputs.is_none()
+            cutter.seal.is_none() && cutter.inputs.is_none()
         }
     }
 
@@ -12504,7 +13131,7 @@ pub fn run(repo: &Path, opts: &crate::release::ReleaseOptions) -> i32 {
         };
     }
     #[cfg(unix)]
-    let inherited_line = match adopt_exec_handoffs() {
+    let inherited_line = match adopt_exec_handoffs(repo) {
         Ok(line) => line,
         Err(why) => {
             eprintln!("release handover: {why}");
@@ -12610,7 +13237,7 @@ pub fn input_check(repo: &Path, base: &str) -> Result<(), String> {
         return Err("input-check requires a clean committed checkout".into());
     }
     let tip = real.head();
-    let prover = real.prover(None)?;
+    let prover = real.candidate_prover(&tip, None)?;
     real.fetch_engine_origin().map_err(|refusal| refusal.why)?;
     let start = std::time::Instant::now();
     let result = real.input_checks(base, &tip, &prover);
@@ -12693,16 +13320,28 @@ fn checked_with(
     };
     if opts.compat {
         std::fs::create_dir_all(repo.join("dist")).map_err(|e| e.to_string())?;
-        let outcome = match crate::buildplan::compat_available().map(|()| {
-            crate::buildplan::compat_check(repo, &found.commit, &repo.join("dist/watch-compat.log"))
-        }) {
-            Ok(Ok(why)) => Outcome::Pass(why),
-            Ok(Err(why)) => Outcome::Refuse(Refusal::new(why, "fix the stable compat slice")),
-            Err(why) => {
-                Outcome::CouldNotRun(Refusal::new(why, "provide the compat compiler and std"))
-            }
+        // The commit's own lock names the release its compat slice builds on: one that names
+        // none is the commit's defect, a release missing here is this machine's.
+        let outcome = match crate::trust_lock::stock_toolchain_at(&git, &found.commit) {
+            Err(why) => Outcome::Refuse(Refusal::new(
+                why,
+                "commit the trust.lock `atpkg-publish adopt` writes",
+            )),
+            Ok(stock) => match crate::buildplan::compat_available(&stock).map(|()| {
+                crate::buildplan::compat_check(
+                    repo,
+                    &found.commit,
+                    &repo.join("dist/watch-compat.log"),
+                )
+            }) {
+                Ok(Ok(why)) => Outcome::Pass(why),
+                Ok(Err(why)) => Outcome::Refuse(Refusal::new(why, "fix the stock compat slice")),
+                Err(why) => {
+                    Outcome::CouldNotRun(Refusal::new(why, "provide the compat compiler and std"))
+                }
+            },
         };
-        add(&mut found, "stable-x86_64", outcome);
+        add(&mut found, "stock-x86_64", outcome);
     }
     if !(export || wasm32) {
         return Ok(found);
@@ -12865,6 +13504,10 @@ pub(crate) mod dry_tools_tests;
 #[path = "release_steps_tests.rs"]
 mod tests;
 
+#[cfg(all(test, unix))]
+#[path = "release_compiler_handoff_tests.rs"]
+mod compiler_handoff_tests;
+
 impl Real {
     /// Read-only instrument entry. The supplied policy is data, not publication authority;
     /// normal release orchestration always selects its captured repository through Backend.
@@ -12921,6 +13564,7 @@ impl Real {
             }
             let engine_input = select(self).map_err(unavailable)?;
             let environment = verify_environment();
+            self.sdk.verify().map_err(unavailable)?;
             let bootstrap_phase = progress("release-input verifier bootstrap");
             let plan = aterm_verify::NativeBuildPlan::capture(&environment, root)
                 .map_err(|e| unavailable(format!("select release-input build directory: {e}")))?;
@@ -12941,6 +13585,7 @@ impl Real {
             let (built, accounting) = self
                 .output_accounted(Step::Checks, &mut bootstrap)
                 .map_err(|e| unavailable(e.to_string()))?;
+            self.sdk.verify().map_err(unavailable)?;
             if let Ok(mut log) = crate::durable::open_append(&self.step_log(Step::Checks), true) {
                 let _ = log.write_all(&built.stdout);
                 let _ = log.write_all(&built.stderr);
@@ -12972,7 +13617,7 @@ impl Real {
                 Ok(command)
             };
             let mut child = runtime()?;
-            let seal = (self.build_inputs)().map_err(unavailable)?;
+            let seal = self.inputs().map_err(unavailable)?;
             let scanner = atpkg::prerequisite::configured(
                 &[atpkg::prerequisite::Prerequisite::Gitleaks],
                 "release input records",
@@ -13122,7 +13767,7 @@ impl Real {
                         now.tree_root() == scanner.tree_root() && now.validate().is_ok()
                     })
             });
-            if !(self.build_inputs)().is_ok_and(|now| now == seal)
+            if !self.inputs().is_ok_and(|now| now == seal)
                 || !identity().is_ok_and(|now| now == (tree.clone(), input_seal.clone()))
                 || !same_scanner
             {

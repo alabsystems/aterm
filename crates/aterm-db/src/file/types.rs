@@ -24,8 +24,10 @@
 //! a key that does not name its signer's machine is inert.
 //!
 //! A file is bound to one of three stores ([`Store`]): a collection of a table family the
-//! catalog declares (the registry's), a collection of the lab journal's week ring (each Mac's
-//! own rows and events), or a fold of other files' projections, stored nowhere (a view).
+//! catalog declares (the registry's cells, `lab/tracker`'s logs), a collection of the lab
+//! journal's week ring (each Mac's own rows and events), or a fold of other files' projections,
+//! stored nowhere (a view). A log is appended by each Mac's own program, never through an
+//! outbox ([`Type::edited`]).
 
 use crate::{
     alab::{
@@ -33,6 +35,7 @@ use crate::{
         registry::{ACCOUNT, MACHINE, PREFERENCE},
     },
     att::{self, Compiled},
+    lab::tracker::{MEASURE, NOTE},
     typed::{Collection, Kind, Ty, Writers},
 };
 use aterm_file::{Intent, Name};
@@ -177,7 +180,7 @@ pub const LOG: &str = "log";
 /// The kind word of a view: a fold of other files, stored nowhere.
 pub const VIEW: &str = "view";
 /// The extension of every face this build writes.
-pub const TSV: &str = "tsv";
+pub const TSV: &str = aterm_file::snapshot::TABLE_EXT;
 
 /// Whether a value of `ty` can hold a secret: a `Secret`, or a `Sealed` record, at any depth.
 const fn holds_secret(ty: &Ty) -> bool {
@@ -268,6 +271,20 @@ impl Type {
         match self.store {
             Store::Table { family, collection } => Some((family, collection)),
             Store::Journal(_) | Store::View(_) => None,
+        }
+    }
+
+    /// The table family and collection an outbox intent to this file is signed into: a catalog
+    /// table's cells or owned rows. `None` for a log, which each Mac's own program appends to
+    /// (`att::Handle::append_log`) and nobody edits, for a file of the journal ring and for a
+    /// view.
+    #[must_use]
+    pub const fn edited(&self) -> Option<(&'static Compiled, &'static Collection)> {
+        match self.store {
+            Store::Table { family, collection } if !matches!(collection.kind, Kind::Log) => {
+                Some((family, collection))
+            }
+            Store::Table { .. } | Store::Journal(_) | Store::View(_) => None,
         }
     }
 
@@ -522,7 +539,37 @@ pub const LIMITS: Type = Type {
     handles: &["account_slug"],
 };
 
-const COMPILED: [Type; 7] = checked([ACCOUNTS, LINKS, MACHINES, LOGINS, USAGE, EVENTS, LIMITS]);
+/// `lab/measures`: every sample of the lab's metrics, as each Mac measured it (`lab/tracker`'s
+/// `measure` log, docs/DESIGN-lab-tracker-2026-11-14.md §3): one row an entry, `<uuid32>.<n>`.
+pub const MEASURES: Type = Type {
+    name: "lab/measures",
+    about: "each machine's samples of the lab's metrics: metric, value, when, command and commit",
+    class: Class::Mac,
+    store: Store::Table {
+        family: &att::TRACKER,
+        collection: &MEASURE,
+    },
+    computed: Computed::None,
+    handles: &[],
+};
+
+/// `lab/notes`: every note about a row of the tracker, with its evidence (`lab/tracker`'s `note`
+/// log): one row an entry, `<uuid32>.<n>`.
+pub const NOTES: Type = Type {
+    name: "lab/notes",
+    about: "each machine's notes on the tracker's rows, with the evidence each cites",
+    class: Class::Mac,
+    store: Store::Table {
+        family: &att::TRACKER,
+        collection: &NOTE,
+    },
+    computed: Computed::None,
+    handles: &[],
+};
+
+const COMPILED: [Type; 9] = checked([
+    ACCOUNTS, LINKS, MACHINES, LOGINS, USAGE, EVENTS, LIMITS, MEASURES, NOTES,
+]);
 
 /// Every shared file this build compiles; a view after the files it folds. `lab/emails`,
 /// `lab/mailboxes` and `lab/phones` wait for LT-04: their collections hold a `Secret` column,

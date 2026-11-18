@@ -97,3 +97,144 @@ fn only_live_connection_bound_claims_spare_their_connection() {
         "a detached renewal outlives either connection"
     );
 }
+
+/// EVERY PROVEN CONTRACT 4 CLAIM KEEPS THE RE-EXEC GRACE, a stream or none (D28): its connection
+/// closes and the claim stands for 45 s more with the grace's end as its expiry, placed by no
+/// claim (the placement count and the revision stand). A second close of the same serial does
+/// not extend it; the same holder claiming on a new connection renews it with no expiry, and
+/// the old connection's close then releases nothing; `meta unset supervisor` releases it at
+/// once, inside the grace; left alone it lapses at the grace's end and not before.
+/// NEGATIVE HALF: a contract 3 claim, a proven codex-alab self-claim and an unproven claim
+/// each end with their connection, as they always did.
+#[cfg(unix)]
+#[test]
+fn a_contract_4_claim_without_a_stream_keeps_the_grace_too() {
+    use aterm_agent::harness::contract::{SCOPED, Scope as Duty, UNIVERSAL};
+    let grace_us = alab_wire::record::REEXEC_GRACE_MS * 1000;
+    assert_eq!(
+        reexec_grace_us(),
+        Some(45_000_000),
+        "the wire contract's 45 s"
+    );
+    let store = crate::session_store::new_store();
+    let h = crate::session_store::test_handle(1);
+    store.write().unwrap().register(h.clone());
+    let holder = "grok-alab@4242";
+    let claim = |conn: u64, contract: u32| {
+        let mut scoped = crate::session_timeline::scoped_input_tests::scoped(&[Duty::Relaunch]);
+        scoped.claim.contract = contract;
+        crate::session_timeline::claim_supervisor_scoped(
+            &h.ctx,
+            holder,
+            Some(conn),
+            scoped,
+            crate::metrics::now_us(),
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("the claim");
+    };
+    // (live at `now`, the connection, the expiry, the placements, the revision)
+    let read = |now: u64| {
+        let meta = h.ctx.meta.lock().unwrap();
+        (
+            meta.live_claim(now).is_some(),
+            meta.supervisor.as_ref().and_then(|claim| claim.conn),
+            meta.supervisor_expiry(),
+            meta.claim_placements,
+            meta.supervisor_revision,
+        )
+    };
+
+    claim(10, UNIVERSAL);
+    let (_, _, _, placements, revision) = read(crate::metrics::now_us());
+    let closing = crate::metrics::now_us();
+    release_connection_claims(&store, None, 10);
+    let closed = crate::metrics::now_us();
+    let (live, conn, expiry, placed, at) = read(closed);
+    let expiry = expiry.expect("the grace's end is the claim's expiry");
+    assert!(live, "the claim outlives its connection");
+    assert!(
+        (closing + grace_us..=closed + grace_us).contains(&expiry),
+        "{expiry} is the close plus 45 s"
+    );
+    assert_eq!(
+        (conn, placed, at),
+        (Some(10), placements, revision),
+        "a close is no claim: nothing was placed and the authority stands"
+    );
+    assert!(read(expiry - 1).0 && !read(expiry).0, "live to its end");
+    assert!(
+        !connection_has_live_claim(&store, 11, closed),
+        "the kept claim spares no other connection"
+    );
+
+    // A second close of the same serial does not extend the grace.
+    release_connection_claims(&store, None, 10);
+    assert_eq!(read(closed).2, Some(expiry));
+
+    // The same holder claims on a new connection inside the grace: renewed, no expiry; the old
+    // connection's close then finds nothing of its own.
+    claim(11, UNIVERSAL);
+    assert_eq!(read(crate::metrics::now_us()).1, Some(11));
+    assert_eq!(read(crate::metrics::now_us()).2, None, "bound again");
+    release_connection_claims(&store, None, 10);
+    let (live, conn, expiry, ..) = read(crate::metrics::now_us());
+    assert_eq!((live, conn, expiry), (true, Some(11), None));
+
+    // `meta unset supervisor` releases at once, inside the grace.
+    release_connection_claims(&store, None, 11);
+    assert!(read(crate::metrics::now_us()).2.is_some(), "in its grace");
+    assert_eq!(
+        meta_line_for_test(&store, &h.term, h.local_id, &h.ctx, "unset supervisor"),
+        "OK\n"
+    );
+    assert!(
+        h.ctx.meta.lock().unwrap().supervisor.is_none(),
+        "released with no grace"
+    );
+
+    // Left alone, the grace's end is the claim's end, and not a microsecond before.
+    claim(12, UNIVERSAL);
+    release_connection_claims(&store, None, 12);
+    let expiry = read(crate::metrics::now_us()).2.expect("in its grace");
+    assert!(!crate::session_timeline::lapse_supervisor(
+        &h.ctx,
+        expiry - 1
+    ));
+    assert!(h.ctx.meta.lock().unwrap().supervisor.is_some());
+    assert!(crate::session_timeline::lapse_supervisor(&h.ctx, expiry));
+    assert!(h.ctx.meta.lock().unwrap().supervisor.is_none());
+
+    // NEGATIVE HALF: no other claim has a grace.
+    claim(13, SCOPED);
+    release_connection_claims(&store, None, 13);
+    assert!(
+        h.ctx.meta.lock().unwrap().supervisor.is_none(),
+        "a contract 3 claim ends with its connection"
+    );
+    let now = crate::metrics::now_us();
+    crate::session_timeline::claim_supervisor_as(
+        &h.ctx,
+        "codex-alab@4242",
+        Some(14),
+        None,
+        Some(crate::self_claim::stand_in::running()),
+        now,
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("a proven self-claim");
+    release_connection_claims(&store, None, 14);
+    assert!(
+        h.ctx.meta.lock().unwrap().supervisor.is_none(),
+        "a contract 2 self-claim ends with its connection"
+    );
+    assert_eq!(
+        crate::session_timeline::claim_supervisor(&h.ctx, "watcher", Some(15), None, now),
+        Ok(true)
+    );
+    release_connection_claims(&store, None, 15);
+    assert!(
+        h.ctx.meta.lock().unwrap().supervisor.is_none(),
+        "an unproven claim ends with its connection"
+    );
+}

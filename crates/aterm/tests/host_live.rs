@@ -211,53 +211,97 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
     })
 }
 
-/// Polls `probe` until `pred` holds of what it read, and returns that read. A hang detector, not
-/// a latency budget: it waits for as long as what this test process started (the instance, its
-/// stand-ins) keeps working, and fails, naming what it last read, once they made no CPU or I/O
+/// How often [`until_read`] reads the process tree: a sweep of the process table, so not once a
+/// poll (as `aterm_spec::wait`'s own tick).
+const TREE_TICK: Duration = Duration::from_millis(500);
+
+/// Polls `probe` every `gap` until `answer` finds what the wait is for in what it read, and
+/// returns that. A hang detector, not a latency budget: it waits for as long as what this test
+/// process started (the instance, its stand-ins) keeps working, and fails, naming `what` and what
+/// `last` renders of the last read, once a reading of their tree just taken shows no CPU or I/O
 /// progress for one whole `within` ([`aterm_uds::deadline::ProcessProgressProbe::read_descendants`],
-/// the poll's own work left out), or once [`aterm_spec::wait::WORKING_GUARD`] passed in all. A
-/// loaded Mac stretches the wall clock without bound, so a wall-clock `within` failed a test whose
-/// instance was only slow (`a_wall_the_host_resumes_is_no_stop_and_one_nobody_answers_is` at
-/// 60 s, with every core of the Mac busy). A reading that fails or cannot be compared is no
-/// evidence of a stall: the window opens again at the next one, as in `aterm_spec::wait`.
+/// with this process's own work left out, the children its polls ran and reaped included), or
+/// once [`aterm_spec::wait::WORKING_GUARD`] passed in all. A loaded Mac stretches the wall clock
+/// without bound, so a wall-clock `within` failed tests whose instance was only slow
+/// (`a_wall_the_host_resumes_is_no_stop_and_one_nobody_answers_is` at 60 s with every core of
+/// the Mac busy; `an_agent_that_exits_unasked_is_relaunched_on_its_conversation` at load 35,
+/// its relaunch under way). A reading that fails or cannot be compared is no evidence of a
+/// stall: the window opens again at the next one, as in `aterm_spec::wait`. Everything else the
+/// tree does is progress too, and holds the window open until the guard ends the wait: what the
+/// instance does to serve a probe that asks it (an `aterm ctl` request, every poll), another
+/// test's instance beside this one in the binary, and a stand-in's poll loop (each `sleep` it
+/// starts changes the tree's members). `probe` runs once a poll, so a check that must hold at
+/// every read (a file that must not appear, a key that must not be read) goes in it; `gap` is
+/// the caller's, so a probe that starts a process or asks the instance keeps its own pace.
+#[track_caller]
+fn until_read<T, U>(
+    within: Duration,
+    gap: Duration,
+    what: &str,
+    mut probe: impl FnMut() -> T,
+    answer: impl Fn(&T) -> Option<U>,
+    last: impl Fn(&T) -> String,
+) -> U {
+    let own = std::process::id();
+    let mut tree = aterm_uds::deadline::ProcessProgressProbe::default();
+    let began = Instant::now();
+    let tick = TREE_TICK.min(within / 4);
+    let mut seen = None;
+    let mut read_at: Option<Instant> = None;
+    let mut worked_at = began;
+    loop {
+        let got = probe();
+        if let Some(found) = answer(&got) {
+            return found;
+        }
+        let at = Instant::now();
+        if read_at.is_none_or(|read| at.saturating_duration_since(read) >= tick) {
+            read_at = Some(at);
+            match tree.read_descendants(own) {
+                Some(generation) if seen == Some(generation) => {}
+                reading => {
+                    seen = reading;
+                    worked_at = at;
+                }
+            }
+            // Judged on the reading just taken, as `aterm_spec::wait` judges: between readings
+            // the silence since `worked_at` is not all observed.
+            if at.saturating_duration_since(worked_at) >= within {
+                panic!(
+                    "{what}: what this test started made no CPU or I/O progress for {within:?}; \
+                     last: {}",
+                    last(&got)
+                );
+            }
+        }
+        if at.saturating_duration_since(began) >= aterm_spec::wait::WORKING_GUARD {
+            panic!(
+                "{what}: what this test started kept working for {:?} without it; last: {}",
+                aterm_spec::wait::WORKING_GUARD,
+                last(&got)
+            );
+        }
+        std::thread::sleep(gap);
+    }
+}
+
+/// [`until_read`] of a text: polls `probe` until `pred` holds of what it read, and returns that
+/// read, which the failure names.
+#[track_caller]
 fn until(
     within: Duration,
     what: &str,
     probe: impl Fn() -> String,
     pred: impl Fn(&str) -> bool,
 ) -> String {
-    let own = std::process::id();
-    let mut tree = aterm_uds::deadline::ProcessProgressProbe::default();
-    let began = Instant::now();
-    let mut seen = tree.read_descendants(own);
-    let mut worked_at = began;
-    loop {
-        let last = probe();
-        if pred(&last) {
-            return last;
-        }
-        let at = Instant::now();
-        match tree.read_descendants(own) {
-            Some(generation) if seen == Some(generation) => {}
-            reading => {
-                seen = reading;
-                worked_at = at;
-            }
-        }
-        if at.saturating_duration_since(worked_at) >= within {
-            panic!(
-                "{what}: what this test started made no CPU or I/O progress for {within:?}; \
-                 last: {last}"
-            );
-        }
-        if at.saturating_duration_since(began) >= aterm_spec::wait::WORKING_GUARD {
-            panic!(
-                "{what}: what this test started kept working for {:?} without it; last: {last}",
-                aterm_spec::wait::WORKING_GUARD
-            );
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    until_read(
+        within,
+        Duration::from_millis(20),
+        what,
+        probe,
+        |read| pred(read).then(|| read.clone()),
+        String::clone,
+    )
 }
 
 fn timeline_since(inst: &Instance, after: u64) -> Vec<(u64, String, String)> {
@@ -730,22 +774,26 @@ fn write_world(tmp: &Path) {
 /// Waits for the host to attach to `keys`' fake: a `supervisor=aterm-harness` meta change on
 /// the timeline after `mark`.
 fn until_attached(inst: &Instance, keys: &str, mark: u64) {
-    let deadline = Instant::now() + HANG;
-    loop {
-        let events = timeline_since(inst, mark);
-        if events.iter().any(|e| {
-            e.1 == "meta-change" && e.2.starts_with("field=supervisor value=aterm-harness")
-        }) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the host attached to {keys}: not within {HANG:?} (a hang); timeline: {events:?}\n\
-             harness log:\n{}",
-            harness_lines(inst)
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    until_read(
+        HANG,
+        Duration::from_millis(20),
+        &format!("the host attached to {keys}"),
+        || timeline_since(inst, mark),
+        |events| {
+            events
+                .iter()
+                .any(|e| {
+                    e.1 == "meta-change" && e.2.starts_with("field=supervisor value=aterm-harness")
+                })
+                .then_some(())
+        },
+        |events| {
+            format!(
+                "timeline: {events:?}\nharness log:\n{}",
+                harness_lines(inst)
+            )
+        },
+    );
 }
 
 fn no_earlier_claim(inst: &Instance) {
@@ -786,26 +834,27 @@ fn run_fake_looked(inst: &Instance, keys: &str, screens: &[&str]) -> usize {
 }
 
 fn let_go_once_looked(inst: &Instance, keys: &str, mark: usize) -> usize {
-    let deadline = Instant::now() + HANG;
-    loop {
-        let records = journal_records(inst);
-        if let Some(at) = records
-            .iter()
-            .skip(mark)
-            .position(|r| r.kind == "event" && r.summary != "-")
-        {
-            std::fs::write(inst.tmp.join(format!("{keys}.next")), b"").expect("let the fake go on");
-            return mark + at + 1;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the host's look at {keys}'s drawn scene: not within {HANG:?} (a hang); journal:\n{}\n\
-             harness log:\n{}",
-            journal(inst),
-            harness_lines(inst)
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let at = until_read(
+        HANG,
+        Duration::from_millis(20),
+        &format!("the host's look at {keys}'s drawn scene"),
+        || journal_records(inst),
+        |records| {
+            records
+                .iter()
+                .skip(mark)
+                .position(|r| r.kind == "event" && r.summary != "-")
+        },
+        |_| {
+            format!(
+                "journal:\n{}\nharness log:\n{}",
+                journal(inst),
+                harness_lines(inst)
+            )
+        },
+    );
+    std::fs::write(inst.tmp.join(format!("{keys}.next")), b"").expect("let the fake go on");
+    mark + at + 1
 }
 
 fn run_fake(inst: &Instance, keys: &str, screens: &[&str]) {
@@ -874,20 +923,26 @@ fn ledger(inst: &Instance) -> String {
 }
 
 fn chose(inst: &Instance, within: Duration) -> String {
-    let deadline = Instant::now() + within;
-    while Instant::now() < deadline {
-        if let Some(line) = journal(inst).lines().find(|l| l.contains("CHOSE seq=")) {
-            return line.to_string();
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!(
-        "no CHOSE within {within:?}; journal:\n{}\nharness log:\n{}\n\
-         processes under the instance (pid ppid stat command):\n{}",
-        journal(inst),
-        harness_lines(inst),
-        headless_boot::process_tree(inst)
-    );
+    until_read(
+        within,
+        Duration::from_millis(50),
+        "a CHOSE",
+        || journal(inst),
+        |journal| {
+            journal
+                .lines()
+                .find(|l| l.contains("CHOSE seq="))
+                .map(str::to_string)
+        },
+        |journal| {
+            format!(
+                "journal:\n{journal}\nharness log:\n{}\n\
+                 processes under the instance (pid ppid stat command):\n{}",
+                harness_lines(inst),
+                headless_boot::process_tree(inst)
+            )
+        },
+    )
 }
 
 fn ledger_rows(inst: &Instance, rule: &str, decision: &str) -> Vec<String> {
@@ -905,34 +960,35 @@ fn no_reads(inst: &Instance, log: &str) -> String {
     std::fs::read_to_string(inst.tmp.join(format!("{log}.noread"))).unwrap_or_default()
 }
 
+/// Waits for the fake to have read exactly `want`, failing at once on a read that is not a start
+/// of it. A key the fake reads is its own progress, so the wait's window (held to what this test
+/// started, [`until_read`]) restarts with each.
 fn keys_until(inst: &Instance, log: &str, want: &[&str], within: Duration) {
-    let mut deadline = Instant::now() + within;
-    let mut last: Vec<String> = Vec::new();
-    while Instant::now() < deadline {
-        let read = keys(inst, log);
-        if read == want {
-            return;
-        }
-        if read.len() > want.len() || read.iter().zip(want).any(|(got, want)| got != want) {
-            panic!(
-                "the fake read {read:?}, which is not a start of {want:?}\nreads with no byte:\n{}\n\
-                 harness log:\n{}",
+    until_read(
+        within,
+        Duration::from_millis(20),
+        &format!("the fake read {want:?}"),
+        || {
+            let read = keys(inst, log);
+            if read.len() > want.len() || read.iter().zip(want).any(|(got, want)| got != want) {
+                panic!(
+                    "the fake read {read:?}, which is not a start of {want:?}\nreads with no \
+                     byte:\n{}\nharness log:\n{}",
+                    no_reads(inst, log),
+                    harness_lines(inst)
+                );
+            }
+            read
+        },
+        |read| (*read == want).then_some(()),
+        |read| {
+            format!(
+                "{read:?} attention={:?}\nreads with no byte:\n{}\nharness log:\n{}",
+                attention(inst),
                 no_reads(inst, log),
                 harness_lines(inst)
-            );
-        }
-        if read.len() > last.len() {
-            deadline = Instant::now() + within;
-        }
-        last = read;
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let last = format!("{last:?} attention={:?}", attention(inst));
-    panic!(
-        "the fake read {want:?}: no key within {within:?} of the last; last: {last}\n\
-         reads with no byte:\n{}\nharness log:\n{}",
-        no_reads(inst, log),
-        harness_lines(inst)
+            )
+        },
     );
 }
 
@@ -962,32 +1018,33 @@ fn escalated_after(
 ) -> String {
     let escalations = |j: &str| j.matches("ESCALATED seq=").count();
     let before = escalations(&journal(inst));
-    let deadline = Instant::now() + within;
-    let text = loop {
-        let got = keys(inst, log);
-        let within_typed = got.len() <= typed.len()
-            && got
-                .iter()
-                .map(String::as_str)
-                .eq(typed[..got.len()].iter().copied());
-        assert!(
-            within_typed,
-            "the fake read {got:?}, past {typed:?}, before an attention naming {needle:?}\n\
-             harness log:\n{}",
-            harness_lines(inst)
-        );
-        let now = attention(inst).unwrap_or_default();
-        if now.contains(needle) {
-            break now;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "an attention naming {needle:?}: not within {within:?}; last: {now:?}; the fake read \
-             {got:?}\nharness log:\n{}",
-            harness_lines(inst)
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let text = until_read(
+        within,
+        Duration::from_millis(20),
+        &format!("an attention naming {needle:?}"),
+        || {
+            let got = keys(inst, log);
+            let within_typed = got.len() <= typed.len()
+                && got
+                    .iter()
+                    .map(String::as_str)
+                    .eq(typed[..got.len()].iter().copied());
+            assert!(
+                within_typed,
+                "the fake read {got:?}, past {typed:?}, before an attention naming {needle:?}\n\
+                 harness log:\n{}",
+                harness_lines(inst)
+            );
+            (got, attention(inst).unwrap_or_default())
+        },
+        |(_, now)| now.contains(needle).then(|| now.clone()),
+        |(got, now)| {
+            format!(
+                "{now:?}; the fake read {got:?}\nharness log:\n{}",
+                harness_lines(inst)
+            )
+        },
+    );
     until(
         HANG,
         "the hand-over journaled (ESCALATED)",
@@ -1465,15 +1522,14 @@ fn a_box_a_person_answered_loses_its_badge_while_the_worker_works() {
             .iter()
             .position(|e| e.1 == "agent-change" && e.2.starts_with("busy "))
     };
-    let deadline = Instant::now() + HANG;
-    while busy_at(&timeline_since(&inst, mark)).is_none() {
-        assert!(
-            Instant::now() < deadline,
-            "the answer never set the worker working: not within {HANG:?} (a hang): {:?}",
-            timeline_since(&inst, mark)
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    until_read(
+        HANG,
+        Duration::from_millis(20),
+        "the answer set the worker working",
+        || timeline_since(&inst, mark),
+        |events| busy_at(events),
+        |events| format!("{events:?}"),
+    );
     release_fake(&inst, "k1");
     let rested_after = |events: &[(u64, String, String)]| {
         events[busy_at(events)?..]
@@ -1481,19 +1537,14 @@ fn a_box_a_person_answered_loses_its_badge_while_the_worker_works() {
             .find(|e| e.1 == "agent-change" && !e.2.starts_with("busy "))
             .cloned()
     };
-    let deadline = Instant::now() + HANG;
-    let (events, rested) = loop {
-        let events = timeline_since(&inst, mark);
-        if let Some(rested) = rested_after(&events) {
-            break (events, rested);
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the worker never rested after its release: not within {HANG:?} (a hang): \
-             {events:?}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let (events, rested) = until_read(
+        HANG,
+        Duration::from_millis(20),
+        "the worker rested after its release",
+        || timeline_since(&inst, mark),
+        |events| rested_after(events).map(|rested| (events.clone(), rested)),
+        |events| format!("{events:?}"),
+    );
     let cleared = events
         .iter()
         .find(|e| e.1 == "meta-change" && e.2 == "field=attention value=-")
@@ -1740,14 +1791,14 @@ fn exec_log(tmp: &Path, name: &str) -> Vec<(u32, String)> {
 }
 
 fn first_launch(inst: &Instance) -> Vec<(u32, String)> {
-    let deadline = Instant::now() + HANG;
-    loop {
-        let got = launches(inst);
-        if !got.is_empty() || Instant::now() >= deadline {
-            return got;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    until_read(
+        HANG,
+        Duration::from_millis(50),
+        "the agent's first launch",
+        || launches(inst),
+        |got| (!got.is_empty()).then(|| got.clone()),
+        |got| format!("launches: {got:?}\nharness log:\n{}", harness_lines(inst)),
+    )
 }
 
 #[test]
@@ -1856,14 +1907,14 @@ fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
         |bound| bound == "true",
     );
     std::fs::write(inst.tmp.join("die"), "").expect("crash");
-    let deadline = Instant::now() + HANG;
-    let got = loop {
-        let got = launches(&inst);
-        if got.len() >= 2 || Instant::now() >= deadline {
-            break got;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    let got = until_read(
+        HANG,
+        Duration::from_millis(100),
+        "the relaunch after the crash",
+        || launches(&inst),
+        |got| (got.len() >= 2).then(|| got.clone()),
+        |got| format!("launches: {got:?}\nharness log:\n{}", harness_lines(&inst)),
+    );
     assert_eq!(
         got.len(),
         2,
@@ -2641,16 +2692,11 @@ fn land(inst: &Instance, staged: &Path) {
     .expect("the activation notice");
 }
 
+/// The window of a wait on an upgrade step ([`until_read`]): longer than [`HANG`], because the
+/// host takes a look that could not read the build's version again by its own clock, a pause an
+/// instance with nothing else to do may spend without progress.
 #[cfg(target_os = "macos")]
 const UPGRADE_WITHIN: Duration = Duration::from_secs(150);
-
-#[cfg(target_os = "macos")]
-const UPGRADE_CEILING: Duration = Duration::from_secs(10 * 60);
-
-#[cfg(target_os = "macos")]
-fn version_waits(inst: &Instance) -> usize {
-    journal(inst).matches("step=wait:no-version").count()
-}
 
 fn now_ms() -> u128 {
     std::time::SystemTime::now()
@@ -2660,18 +2706,22 @@ fn now_ms() -> u128 {
 
 #[track_caller]
 fn journaled_at(inst: &Instance, needle: &str) -> u128 {
-    let mut last = String::new();
-    let at = aterm_spec::wait::within(HANG, Duration::from_millis(20), || {
-        last = journal(inst);
-        last.lines().find(|l| l.contains(needle)).and_then(|l| {
-            l.strip_prefix("{\"t\":")?
-                .split(',')
-                .next()?
-                .parse::<u128>()
-                .ok()
-        })
-    });
-    at.unwrap_or_else(|| panic!("no journal record holds {needle:?} within {HANG:?}:\n{last}"))
+    until_read(
+        HANG,
+        Duration::from_millis(20),
+        &format!("a journal record holding {needle:?}"),
+        || journal(inst),
+        |journal| {
+            journal.lines().find(|l| l.contains(needle)).and_then(|l| {
+                l.strip_prefix("{\"t\":")?
+                    .split(',')
+                    .next()?
+                    .parse::<u128>()
+                    .ok()
+            })
+        },
+        |journal| format!("journal:\n{journal}"),
+    )
 }
 
 fn journal(inst: &Instance) -> String {
@@ -2682,32 +2732,23 @@ fn journal(inst: &Instance) -> String {
         .unwrap_or_default()
 }
 
+/// The session's launches once the upgrade's relaunch, a second, is among them.
 #[cfg(target_os = "macos")]
-fn upgrade_until<T>(
-    inst: &Instance,
-    from: Instant,
-    probe: impl Fn() -> T,
-    done: impl Fn(&T) -> bool,
-) -> T {
-    let mut waits = version_waits(inst);
-    let mut deadline = from + UPGRADE_WITHIN;
-    loop {
-        let got = probe();
-        if done(&got) {
-            return got;
-        }
-        let now = version_waits(inst);
-        if now > waits {
-            waits = now;
-            deadline = deadline
-                .max(Instant::now() + UPGRADE_WITHIN)
-                .min(from + UPGRADE_CEILING);
-        }
-        if Instant::now() >= deadline {
-            return got;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
+fn upgrade_launches(inst: &Instance) -> Vec<(u32, String)> {
+    until_read(
+        UPGRADE_WITHIN,
+        Duration::from_millis(200),
+        "the upgrade's relaunch",
+        || launches(inst),
+        |got| (got.len() >= 2).then(|| got.clone()),
+        |got| {
+            format!(
+                "launches: {got:?}\nharness log:\n{}\njournal:\n{}",
+                harness_lines(inst),
+                journal(inst)
+            )
+        },
+    )
 }
 
 /// A session the host supervises under `upgrade_ask`: the fake 2.1.281 under bash, its first
@@ -2773,12 +2814,7 @@ fn at_the_notice(tag: &str) -> (Instance, PathBuf) {
 fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
     let (inst, newer) = at_the_notice("v");
     land(&inst, &newer);
-    let got = upgrade_until(
-        &inst,
-        Instant::now(),
-        || launches(&inst),
-        |got| got.len() >= 2,
-    );
+    let got = upgrade_launches(&inst);
     assert_eq!(
         got.len(),
         2,
@@ -2833,27 +2869,25 @@ fn a_notice_typed_into_a_starved_agent_lands_whole_and_upgrades_it() {
     let (inst, newer) = at_the_notice("vs");
     std::fs::write(inst.tmp.join("starved-2.1.281"), "").expect("starve the running build");
     land(&inst, &newer);
-    let got = aterm_spec::wait::within(
+    let got = until_read(
         HANG,
         Duration::from_millis(20),
-        || {
-            let got = launches(&inst);
-            (got.len() >= 2).then_some(got)
-        },
-    )
-    .unwrap_or_else(|| {
-        panic!(
-            "the new build did not launch after the clock barriers within {HANG:?}: {:?}\nharness log:\n{}\njournal:\n{}\nworker stack:\n{}",
-            launches(&inst),
-            harness_lines(&inst),
-            journal(&inst),
-            headless_boot::thread_stack(
-                inst.child.id(),
-                &inst.log,
-                Some(&format!("aterm-harness-{}", inst.sid))
+        "the new build's launch after the clock barriers",
+        || launches(&inst),
+        |got| (got.len() >= 2).then(|| got.clone()),
+        |got| {
+            format!(
+                "{got:?}\nharness log:\n{}\njournal:\n{}\nworker stack:\n{}",
+                harness_lines(&inst),
+                journal(&inst),
+                headless_boot::thread_stack(
+                    inst.child.id(),
+                    &inst.log,
+                    Some(&format!("aterm-harness-{}", inst.sid))
+                )
             )
-        )
-    });
+        },
+    );
     assert_eq!(
         got.len(),
         2,
@@ -2924,12 +2958,7 @@ fn a_session_nobody_asked_anything_is_restarted_afresh_with_nothing_typed() {
         "{first:?}"
     );
     land(&inst, &newer);
-    let got = upgrade_until(
-        &inst,
-        Instant::now(),
-        || launches(&inst),
-        |got| got.len() >= 2,
-    );
+    let got = upgrade_launches(&inst);
     assert_eq!(
         got.len(),
         2,
@@ -2974,12 +3003,7 @@ fn a_restart_with_nothing_on_its_line_stays_out_of_the_twins_yolo() {
     install(&inst, &current);
     run_on_the_twin(&inst, "2.1.281", "", "");
     land(&inst, &newer);
-    let got = upgrade_until(
-        &inst,
-        Instant::now(),
-        || launches(&inst),
-        |got| got.len() >= 2,
-    );
+    let got = upgrade_launches(&inst);
     assert_eq!(
         got.get(1).map(|(_, args)| args.as_str()),
         Some("2.1.282 "),
@@ -3037,22 +3061,20 @@ fn worker_line_of(inst: &Instance, from: Option<&str>) -> String {
         "spawn: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let deadline = Instant::now() + HANG;
-    let got = loop {
-        let got = launches(inst);
-        if got.len() > before || Instant::now() >= deadline {
-            break got;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    match got.get(before) {
-        Some((_, args)) => args.clone(),
-        None => panic!(
-            "no worker launched: {got:?}\nharness log:\n{}\ninstance log:\n{}",
-            harness_lines(inst),
-            std::fs::read_to_string(inst.tmp.join("state/logs/aterm.log")).unwrap_or_default()
-        ),
-    }
+    until_read(
+        HANG,
+        Duration::from_millis(100),
+        "the worker's launch",
+        || launches(inst),
+        |got| got.get(before).map(|(_, args)| args.clone()),
+        |got| {
+            format!(
+                "launches: {got:?}\nharness log:\n{}\ninstance log:\n{}",
+                harness_lines(inst),
+                std::fs::read_to_string(inst.tmp.join("state/logs/aterm.log")).unwrap_or_default()
+            )
+        },
+    )
 }
 
 /// Checks the lines of two workers of a tab running `line` under bash (the twin's quoted path in
@@ -3205,17 +3227,17 @@ fn a_worker_spawned_from_inside_a_plain_tab_takes_the_launch_default() {
     );
     ctl_ok(&inst, &[&sel, "send", &line]);
     ctl_ok(&inst, &[&sel, "key", "enter"]);
-    let deadline = Instant::now() + HANG;
-    let got = loop {
-        let got = launches(&inst);
-        if !got.is_empty() || Instant::now() >= deadline {
-            break got;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    let first = until_read(
+        HANG,
+        Duration::from_millis(100),
+        "the worker's launch",
+        || launches(&inst),
+        |got| got.first().map(|(_, args)| args.clone()),
+        |got| format!("launches: {got:?}\nharness log:\n{}", harness_lines(&inst)),
+    );
     assert_eq!(
-        got.first().map(|(_, args)| args.as_str()),
-        Some("2.1.281 --dangerously-skip-permissions -- the task"),
+        first,
+        "2.1.281 --dangerously-skip-permissions -- the task",
         "harness log:\n{}",
         harness_lines(&inst)
     );
@@ -3400,16 +3422,13 @@ fn prompt_meets_the_hand(tag: &str, shell: &str, turn: bool) {
     let pwned = inst.tmp.join("work/pwned");
     let prompt = format!("Fix the parser; touch {}", pwned.display());
     let gate = inst.tmp.join("hold-registration-2.1.282");
-    let (st, ready_launches) = upgrade_until(
-        &inst,
-        Instant::now(),
+    let ready_launches = until_read(
+        UPGRADE_WITHIN,
+        Duration::from_millis(200),
+        &format!("{shell}: the replacement launched under the restart's hand"),
         || (status(&inst), launches(&inst)),
-        |(status, launches)| fresh_launch_is_held(status, launches),
-    );
-    assert!(
-        fresh_launch_is_held(&st, &ready_launches),
-        "{shell}: the replacement launched under the restart's hand: {st}\n{}",
-        hand_evidence(&inst)
+        |(status, launches)| fresh_launch_is_held(status, launches).then(|| launches.clone()),
+        |(status, _)| format!("{status}\n{}", hand_evidence(&inst)),
     );
     assert!(
         gate.is_file(),
@@ -3417,29 +3436,28 @@ fn prompt_meets_the_hand(tag: &str, shell: &str, turn: bool) {
     );
     let replacement_pid = ready_launches[1].0;
 
-    let deadline = Instant::now() + HANG;
     let mut held = 0;
-    let mut until_taken = |args: &[&str]| loop {
-        let out = ctl(&inst, args);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if !stderr.contains("ERR busy") {
-            assert!(
-                out.status.success(),
-                "{shell}: {args:?}: {out:?}\n{}",
-                hand_evidence(&inst)
-            );
-            break;
-        }
-        if stderr.contains("ERR busy lease=aterm-harness@") {
-            held += 1;
-            let _ = std::fs::remove_file(&gate);
-        }
+    let mut until_taken = |args: &[&str]| {
+        let out = until_read(
+            HANG,
+            Duration::from_millis(100),
+            &format!("{shell}: {args:?} let in"),
+            || {
+                let out = ctl(&inst, args);
+                if String::from_utf8_lossy(&out.stderr).contains("ERR busy lease=aterm-harness@") {
+                    held += 1;
+                    let _ = std::fs::remove_file(&gate);
+                }
+                out
+            },
+            |out| (!String::from_utf8_lossy(&out.stderr).contains("ERR busy")).then(|| out.clone()),
+            |out| format!("{out:?}\n{}", hand_evidence(&inst)),
+        );
         assert!(
-            Instant::now() < deadline,
-            "{shell}: never let in\n{}",
+            out.status.success(),
+            "{shell}: {args:?}: {out:?}\n{}",
             hand_evidence(&inst)
         );
-        std::thread::sleep(Duration::from_millis(100));
     };
     if turn {
         let hang_ms = format!("timeout={}", HANG.as_millis());
@@ -3463,24 +3481,26 @@ fn prompt_meets_the_hand(tag: &str, shell: &str, turn: bool) {
     );
     // A prompt the shell ran never reaches the agent afterwards: that miss is said at once, with
     // what held the tab (each process's state among it), not after the hang window with nothing.
-    let deadline = Instant::now() + HANG;
-    while !typed_by(&inst)
-        .iter()
-        .any(|(pid, line)| *pid == replacement_pid && *line == prompt)
-    {
-        assert!(
-            !pwned.exists(),
-            "{shell}: the shell ran the prompt\n{}",
-            hand_evidence(&inst)
-        );
-        assert!(
-            Instant::now() < deadline,
-            "{shell}: the prompt in the relaunched agent: not within {HANG:?}; typed: {:?}\n{}",
-            typed_by(&inst),
-            hand_evidence(&inst)
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    until_read(
+        HANG,
+        Duration::from_millis(20),
+        &format!("{shell}: the prompt in the relaunched agent"),
+        || {
+            assert!(
+                !pwned.exists(),
+                "{shell}: the shell ran the prompt\n{}",
+                hand_evidence(&inst)
+            );
+            typed_by(&inst)
+        },
+        |typed| {
+            typed
+                .iter()
+                .any(|(pid, line)| *pid == replacement_pid && *line == prompt)
+                .then_some(())
+        },
+        |typed| format!("typed: {typed:?}\n{}", hand_evidence(&inst)),
+    );
     assert!(
         !pwned.exists(),
         "{shell}: the shell ran the prompt\n{}",
@@ -3643,21 +3663,17 @@ fn a_hosted_run_is_taped_and_replays_offline_in_a_changed_world() {
         || status(&inst),
         |s| field(s, "supervisor") == Some("-"),
     );
-    let deadline = Instant::now() + HANG;
-    let tape = loop {
-        let tapes = listed_tapes(&inst);
-        if let [tape] = tapes.as_slice()
-            && tape_ended(tape)
-        {
-            break tape.clone();
-        }
-        assert!(
-            Instant::now() < deadline,
-            "one ended tape of the run: not within {HANG:?}; listed {tapes:?}\nharness log:\n{}",
-            harness_lines(&inst)
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let tape = until_read(
+        HANG,
+        Duration::from_millis(50),
+        "one ended tape of the run",
+        || listed_tapes(&inst),
+        |tapes| match tapes.as_slice() {
+            [tape] if tape_ended(tape) => Some(tape.clone()),
+            _ => None,
+        },
+        |tapes| format!("listed {tapes:?}\nharness log:\n{}", harness_lines(&inst)),
+    );
     let session_dir = tape.parent().expect("the session's directory");
     assert_eq!(
         session_dir.file_name().and_then(|n| n.to_str()),

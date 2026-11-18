@@ -491,12 +491,14 @@ fn a_renewal_hand_back_on_a_real_pty_runs_the_source_line_once_on_its_login() {
     };
     let witnesses = Witnesses::under(&opts.state);
     // `HostClosed::hand_back`'s step, which the renewal worker repeats while it waits or is
-    // deferred and stops once the source is handled or the step ended.
+    // deferred and stops once the source is handled or the step ended. A snapshot read that can
+    // fail for now (the whole-table read behind `terminal` on a loaded Mac) waits here as it
+    // waits there: both take `self_claimed::unsnapped_step`.
     let step = || match crate::harness::relaunch::self_claimed_snapshot(&opts, &copy, &resume) {
         Ok(snapshot) => {
             crate::harness::upgrade_drive::renewal_hand_back(&opts, &snapshot, &resume).step
         }
-        Err(why) => format!("snapshot:{why}"),
+        Err(why) => crate::harness::self_claimed::unsnapped_step(why),
     };
     let mut steps = Vec::new();
     let handed = zsh.try_until(|| {

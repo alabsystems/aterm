@@ -198,7 +198,10 @@ impl Judged {
         let parent_path = entry
             .parent()
             .ok_or_else(|| refused("no parent directory"))?;
-        let parent = fsx::lstat_in(glance, parent_path)?
+        // The parent is judged by its identity, owner and mode (on Windows its identity,
+        // attributes, owner and access list), never its times ([`fsx::folder_in`]): the vault
+        // folder, where every write of the state moves them.
+        let parent = fsx::folder_in(glance, parent_path)?
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
         Ok(Self {
             entry: entry.to_path_buf(),

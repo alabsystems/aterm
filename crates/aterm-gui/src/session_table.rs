@@ -1583,18 +1583,25 @@ impl SessionTable {
     /// The launch's sessions are registered: the restore and a seamless update's adoption have
     /// placed every one (`App::finish_restore_placement`). The budget judges the table from now
     /// on; until then it holds every row, since a row is protected by live sessions ([`Live`])
-    /// that may not be in the store yet.
-    pub(crate) fn sessions_settled(&self) {
+    /// that may not be in the store yet. Returns whether this call settled it.
+    pub(crate) fn sessions_settled(&self) -> bool {
         {
             let mut state = self.shared.lock();
             if state.settled {
-                return;
+                return false;
             }
             state.settled = true;
         }
         if !self.send(Job::Retain) {
             self.shared.retain();
         }
+        true
+    }
+
+    /// Whether the launch's sessions are registered ([`Self::sessions_settled`]): until then a
+    /// judge of what lives (this budget, the accounts' session reconcile) may not see them all.
+    pub(crate) fn settled(&self) -> bool {
+        self.shared.lock().settled
     }
 
     /// Run `then` on the disk table's worker once its load has ended (inline for a memory table).

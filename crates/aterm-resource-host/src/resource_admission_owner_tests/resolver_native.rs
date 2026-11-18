@@ -74,19 +74,26 @@ fn run(case: &str) {
         .env(CASE, case)
         .env(PROGRESS, &progress)
         .env(STORE, &store_path);
-    let output = match deadline::output_while_progressing(&mut command, HANG, &mut || {
-        fs::metadata(&progress).map_or(0, |metadata| metadata.len())
-    }) {
+    let phases =
+        || fs::read_to_string(&progress).unwrap_or_else(|error| format!("unread: {error}"));
+    let output = match deadline::output_while_process_progressing_complete_with_limit(
+        &mut command,
+        HANG,
+        "the native resolver custody fixture",
+        64 << 10,
+    ) {
         Ok(output) => output,
         Err(error) => panic!(
-            "native resolver host did not complete; preserved {}: {error:?}",
-            scratch.keep().display()
+            "native resolver host did not complete; preserved {}: {error:?}\ncompleted phases:\n{}",
+            scratch.keep().display(),
+            phases()
         ),
     };
     if !output.status.success() {
         panic!(
-            "native resolver host failed; preserved {}: {output:?}",
-            scratch.keep().display()
+            "native resolver host failed; preserved {}: {output:?}\ncompleted phases:\n{}",
+            scratch.keep().display(),
+            phases()
         );
     }
     assert!(String::from_utf8_lossy(&output.stdout).contains("actual-resolver-owner-retired"));
@@ -95,7 +102,7 @@ fn run(case: &str) {
     }
 }
 
-/// Advance only at real fixture phases and completed protocol exchanges, never on a poll.
+/// Record completed fixture phases and protocol exchanges for failure diagnostics, never polls.
 fn progressed(phase: &str) {
     let path = PathBuf::from(std::env::var_os(PROGRESS).unwrap());
     let mut log = fs::OpenOptions::new()

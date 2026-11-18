@@ -2995,6 +2995,7 @@ impl control_lanes::LaneService for ControlWorkerContext {
             stream,
             buffered,
             &control_stream::awake_now,
+            &|handle, rest| serve_stream_claim(handle, rest, &self.store, &self.proxy),
         );
         #[cfg(not(unix))]
         let _ = (request, stream, buffered);
@@ -3924,17 +3925,7 @@ pub(crate) fn spawn(
                 crate::board_keeper::start(state);
             }
             let admit = move |stream: CtlStream| {
-                // Peer credential gate: refuse other uids before spending a lane (Unix:
-                // unverifiable also refuses; Windows: the peer pid's token user where
-                // readable, the token remaining the mandatory gate).
-                if let Err(why) = control_auth::peer_check(&stream) {
-                    log_denial(
-                        AUDIT_SUBSYSTEM,
-                        &why,
-                        aterm_containment::mode_or_containment(),
-                        "peer uid mismatch",
-                    );
-                    aterm_uds::hangup::hang_up(&stream);
+                if !peer_admitted(&stream) {
                     return;
                 }
                 if let Err(mut stream) = lanes.admit(stream) {
@@ -3966,8 +3957,11 @@ pub(crate) fn spawn(
                     }
                     Some(fresh)
                 };
-                crate::control_listener::Supervisor::new(listener, rebind, endpoint)
-                    .run(admit, &aterm_uds::stop::Stop::new());
+                crate::control_listener::Supervisor::new(listener, rebind, endpoint).run(
+                    admit,
+                    turn_away_at_limit,
+                    &aterm_uds::stop::Stop::new(),
+                );
             }
             #[cfg(windows)]
             {
@@ -4003,6 +3997,40 @@ pub(crate) fn spawn(
         },
     );
     preparation
+}
+
+/// The control server's peer credential gate, before a connection spends a lane or is told
+/// anything: one of another uid is refused (Unix: one whose uid cannot be read too; Windows: the
+/// peer pid's token user where readable, the token remaining the mandatory gate), its denial
+/// logged and the connection hung up.
+fn peer_admitted(stream: &CtlStream) -> bool {
+    let Err(why) = control_auth::peer_check(stream) else {
+        return true;
+    };
+    log_denial(
+        AUDIT_SUBSYSTEM,
+        &why,
+        aterm_containment::mode_or_containment(),
+        "peer uid mismatch",
+    );
+    aterm_uds::hangup::hang_up(stream);
+    false
+}
+
+/// What the control listener says to a connection it accepted with no descriptor left
+/// (`EMFILE` or `ENFILE`) to take its reserve again (`control_listener::Reserve`), before it
+/// closes it: past the peer gate ([`peer_admitted`]), the busy line, in non-blocking writes that
+/// end at the first that would wait, counted as a busy reply.
+#[cfg(unix)]
+pub(crate) fn turn_away_at_limit(stream: &CtlStream) {
+    if !peer_admitted(stream) {
+        return;
+    }
+    crate::control_listener::note_busy_reply();
+    if stream.set_nonblocking(true).is_ok() {
+        let mut out = stream;
+        let _ = out.write_all(aterm_types::control_verbs::CONTROL_BUSY_LINE.as_bytes());
+    }
 }
 
 /// Accept-loop backoff after `err`, given the previous wait in this streak.
@@ -4768,6 +4796,36 @@ fn serve_meta_wired(
         scope,
         |entry_moved| {
             post_meta_change(session, ctx, rest, entry_moved, post);
+        },
+    )
+}
+
+/// SERVE A `claim` RECORD'S LINE for a record stream's session ([`control_stream::ServeClaim`]):
+/// `rest` (`set supervisor <holder> contract=4 …`) through [`serve_meta`] exactly as the request
+/// loop serves that connection's own `meta set supervisor`, with the production proofs. The
+/// stream lane entered the connection's serial, principal, caller and direct peer for its life,
+/// so the claim is proven against, and bound to, the stream's own connection. The scope is the
+/// owner's: `stream` opens for no other ([`control_stream::open`]).
+#[cfg(unix)]
+fn serve_stream_claim(
+    handle: &crate::session_store::SessionHandle,
+    rest: &str,
+    store: &Store,
+    proxy: &EventLoopProxy<Wake>,
+) -> String {
+    let (ctx, master) = (handle.ctx.as_ref(), handle.master);
+    serve_meta_wired(
+        rest,
+        &handle.term,
+        &|holder: &str| prove_self_claim_for(ctx, holder, master),
+        &|holder: &str, contract| prove_claim_for(ctx, holder, contract, master),
+        &|claimant: &crate::self_claim::Proven, word| keep_child_for(claimant, word, master),
+        handle.local_id,
+        ctx,
+        store,
+        Scope::Owner,
+        &mut |wake| {
+            let _ = proxy.send_event(wake);
         },
     )
 }
@@ -6816,19 +6874,20 @@ pub(crate) fn prove_self_claim_for(
     let contract = aterm_agent::harness::contract::holder_in(read.rows, holder)
         .filter(|(row, _)| aterm_agent::harness::registry::is_seed(row.id))
         .and_then(|_| held_contract(ctx, holder));
-    prove_claim_under(policy, &read, holder, contract, master, true)
+    prove_claim_under(policy, &read, holder, contract, master, true).map(|proof| proof.proven)
 }
 
 /// The PROOF OF A CLAIM BEING MADE: `holder`'s process under the image rule of the contract the
 /// claim names (`contract`, `None` for a claim without `contract=`), against the registry as it
 /// stands now and with its image judged in full; a pass serves the standing claim's re-proofs
-/// ([`prove_self_claim_for`]).
+/// ([`prove_self_claim_for`]). The proof carries the version of the build that image rule
+/// admitted, which is where `status` and `sessions` read `supervisor_version=` from.
 pub(crate) fn prove_claim_for(
     ctx: &SessionCtx,
     holder: &str,
     contract: Option<u32>,
     master: i32,
-) -> Option<crate::self_claim::Proven> {
+) -> Option<crate::harness_claim::ClaimProof> {
     prove_claim_with_policy(&ctx.native_policy, holder, contract, master)
 }
 
@@ -6850,7 +6909,7 @@ fn prove_claim_with_policy(
     holder: &str,
     contract: Option<u32>,
     master: i32,
-) -> Option<crate::self_claim::Proven> {
+) -> Option<crate::harness_claim::ClaimProof> {
     prove_claim_under(policy, &policy.read_now(), holder, contract, master, false)
 }
 
@@ -6867,34 +6926,69 @@ fn prove_claim_under(
     contract: Option<u32>,
     master: i32,
     reuse: bool,
-) -> Option<crate::self_claim::Proven> {
-    if let Some((row, pid)) = aterm_agent::harness::contract::holder_in(read.rows, holder) {
-        let peer = serving_peer_pid();
-        let foreground = crate::quit_safety::foreground_pgrp(master);
-        let named = peer == Some(pid) && i64::from(foreground) == i64::from(pid);
-        if !named {
-            return None;
-        }
-        let before = aterm_agent::harness::restart_stamp::kernel_start(pid)?;
-        let claimant = crate::harness_claim::Claimant {
-            holder,
-            row,
-            contract: contract.unwrap_or(aterm_agent::harness::contract::UNIVERSAL),
-            pid,
-            start: &before,
+) -> Option<crate::harness_claim::ClaimProof> {
+    if aterm_agent::harness::contract::holder_in(read.rows, holder).is_some() {
+        let kernel = ClaimKernel {
+            peer: serving_peer_pid(),
+            foreground: crate::quit_safety::foreground_pgrp(master),
         };
-        let proven = crate::harness_claim::prove_in(
-            read.rows,
-            holder,
-            crate::self_claim::Facts {
-                peer,
-                foreground,
-                alab_image: policy.claimant_image(read, claimant, reuse),
-            },
-        )?;
-        return (proven.start == before).then_some(proven);
+        let reads = &crate::native_session_policy::ImageReads::LIVE;
+        return prove_rostered_claim(policy, read, holder, contract, kernel, reuse, reads);
     }
-    prove_self_claim_by(holder, master, &crate::self_claim::runs_alab_build)
+    prove_self_claim_by(holder, master, &crate::self_claim::runs_alab_build).map(Into::into)
+}
+
+/// What the kernel says of a claim's connection and session when it is proven: the pid at the
+/// other end of the connection, and the process group in the session's foreground.
+#[derive(Clone, Copy)]
+struct ClaimKernel {
+    peer: Option<u32>,
+    foreground: i32,
+}
+
+/// [`prove_claim_under`] for a `holder` a row of `read` names, on the `kernel`'s facts as its
+/// caller read them and with the claimant's image read through `reads`: the peer is the pid the
+/// holder names and leads the foreground group, its image passes
+/// ([`crate::native_session_policy::SessionPolicy::claimant_image`]), and its kernel start
+/// holds across the proof. The proof carries the version that image step read from the build
+/// it admitted, a reused pass's included.
+fn prove_rostered_claim(
+    policy: &crate::native_session_policy::SessionPolicy,
+    read: &crate::native_session_policy::ProofRead,
+    holder: &str,
+    contract: Option<u32>,
+    kernel: ClaimKernel,
+    reuse: bool,
+    reads: &crate::native_session_policy::ImageReads<'_>,
+) -> Option<crate::harness_claim::ClaimProof> {
+    let (row, pid) = aterm_agent::harness::contract::holder_in(read.rows, holder)?;
+    let ClaimKernel { peer, foreground } = kernel;
+    let named = peer == Some(pid) && i64::from(foreground) == i64::from(pid);
+    if !named {
+        return None;
+    }
+    let before = aterm_agent::harness::restart_stamp::kernel_start(pid)?;
+    let claimant = crate::harness_claim::Claimant {
+        holder,
+        row,
+        contract: contract.unwrap_or(aterm_agent::harness::contract::UNIVERSAL),
+        pid,
+        start: &before,
+    };
+    let passed = policy.claimant_image(read, claimant, reuse, reads);
+    let proven = crate::harness_claim::prove_in(
+        read.rows,
+        holder,
+        crate::self_claim::Facts {
+            peer,
+            foreground,
+            alab_image: passed.is_some(),
+        },
+    )?;
+    (proven.start == before).then(|| crate::harness_claim::ClaimProof {
+        proven,
+        version: passed.and_then(|passed| passed.version),
+    })
 }
 
 /// A contract 4 claim's CHILD, kept on the kernel's reads for its just-proven `claimant`: the
@@ -7159,6 +7253,10 @@ fn connection_has_live_claim(store: &Store, conn: u64, now: u64) -> bool {
 #[path = "control_connection_claim_tests.rs"]
 mod connection_claim_tests;
 
+#[cfg(all(test, unix))]
+#[path = "control_claim_proof_tests.rs"]
+mod claim_proof_tests;
+
 fn release_source_connection_claims(
     store: &Store,
     proxy: Option<&EventLoopProxy<Wake>>,
@@ -7170,6 +7268,26 @@ fn release_source_connection_claims(
     release_connection_claims(store, proxy, conn);
 }
 
+/// THE RE-EXEC GRACE in microseconds, the wire contract's ([`alab_wire::record::REEXEC_GRACE_MS`]):
+/// how long a proven contract 4 claim is kept after its connection closes. `None` off Unix,
+/// where no scoped claim is proven and the wire library is not built.
+pub(crate) const fn reexec_grace_us() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        Some(alab_wire::record::REEXEC_GRACE_MS * 1000)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Connection `conn` closed: every session hands back what it held on it. A claim a native
+/// operation keeps stays with that operation ([`crate::native_act::retain_exec_claim`]); a
+/// proven contract 4 claim is kept through the re-exec grace with the grace's end as its expiry
+/// and released by the window's lapse timer; any other claim bound to the connection is
+/// released here ([`crate::session_timeline::release_closed_connection`]). The window is woken
+/// for each session where something moved, an armed grace included.
 fn release_connection_claims(store: &Store, proxy: Option<&EventLoopProxy<Wake>>, conn: u64) {
     let handles = store.read().unwrap_or_else(|p| p.into_inner()).snapshot();
     let now = crate::metrics::now_us();
@@ -7177,7 +7295,12 @@ fn release_connection_claims(store: &Store, proxy: Option<&EventLoopProxy<Wake>>
         control_session::release_connection_lease(&handle.ctx, conn);
         crate::native_act::connection_closed(&handle.ctx, conn);
         if crate::native_act::retain_exec_claim(&handle.ctx, handle.local_id, conn)
-            || !crate::session_timeline::release_closed_connection(&handle.ctx, conn, now)
+            || !crate::session_timeline::release_closed_connection(
+                &handle.ctx,
+                conn,
+                now,
+                reexec_grace_us(),
+            )
         {
             continue;
         }
@@ -12538,7 +12661,39 @@ pub(crate) fn meta_wakes_keeping_for_test(
             rest,
             term,
             prove,
-            prove_claim: &|holder, _| prove(holder),
+            prove_claim: &|holder, _| prove(holder).map(Into::into),
+            keep_child,
+            session,
+            ctx,
+            store,
+            scope: Scope::Owner,
+        },
+        conn,
+        crate::act_barrier::before_act,
+    )
+}
+
+/// [`meta_wakes_keeping_for_test`] with the claim's own proof answered by `prove_claim`, a
+/// test's stand-in for the image proof and the version of the build it admitted
+/// ([`crate::harness_claim::ClaimProof`]).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn meta_wakes_admitting_for_test(
+    store: &Store,
+    term: &Arc<Mutex<Terminal>>,
+    session: u64,
+    ctx: &SessionCtx,
+    rest: &str,
+    conn: Option<u64>,
+    prove_claim: &control_session::ProveClaim<'_>,
+    keep_child: &control_session::KeepChild<'_>,
+) -> (String, Vec<Wake>) {
+    meta_wakes_with_barrier_for_test(
+        MetaRequest {
+            rest,
+            term,
+            prove: &|holder| prove_claim(holder, None).map(|proof| proof.proven),
+            prove_claim,
             keep_child,
             session,
             ctx,

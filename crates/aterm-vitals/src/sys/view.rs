@@ -32,6 +32,81 @@ pub struct Line {
     pub value: bool,
 }
 
+/// A stable session identity joined by its local key, never by its place in a window.
+/// The host allocates these keys monotonically within this Vitals lifetime; moving a tab
+/// or restarting its program does not change its session identity. A launch nonce proves
+/// process ownership, not this name. Ambiguous roster keys or identities provide no binding.
+pub(super) fn session_sid<'a>(ctx: &Ctx<'a>, key: u64) -> Option<&'a str> {
+    let mut found = ctx.tabs.iter().filter(|fact| fact.key == key);
+    let fact = found.next()?;
+    let sid = fact.sid.as_str();
+    if found.next().is_some()
+        || sid.is_empty()
+        || sid.chars().any(char::is_control)
+        || ctx.tabs.iter().filter(|other| other.sid == sid).count() != 1
+    {
+        return None;
+    }
+    Some(sid)
+}
+
+pub(super) fn session_words(ctx: &Ctx<'_>, key: u64) -> String {
+    format!(
+        "sid={}",
+        session_sid(ctx, key).map_or_else(|| unavailable("not_sampled"), pct)
+    )
+}
+
+pub(super) fn session_json(ctx: &Ctx<'_>, key: u64) -> Jv {
+    session_sid(ctx, key).map_or_else(|| Jv::why("not_sampled"), Jv::s)
+}
+
+pub(super) fn sessions_words(ctx: &Ctx<'_>, keys: &[u64]) -> String {
+    let sid = match keys {
+        [key] => session_words(ctx, *key),
+        _ => format!("sid={}", unavailable("not_sampled")),
+    };
+    if keys.len() <= 1 {
+        return sid;
+    }
+    format!(
+        "{sid} sids={}",
+        keys.iter()
+            .map(|key| {
+                session_sid(ctx, *key).map_or_else(
+                    || unavailable("not_sampled"),
+                    |sid| pct(sid).replace(',', "%2C"),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+pub(super) fn set_sessions_json(ctx: &Ctx<'_>, keys: &[u64], object: &mut Jv) {
+    object.set(
+        "sid",
+        match keys {
+            [key] => session_json(ctx, *key),
+            _ => Jv::why("not_sampled"),
+        },
+    );
+    if keys.len() > 1 {
+        object.set(
+            "sids",
+            Jv::Arr(keys.iter().map(|key| session_json(ctx, *key)).collect()),
+        );
+    }
+}
+
+fn tab_scope_words(ctx: &Ctx<'_>, key: u64) -> String {
+    let place = ctx.tab_number(key).map_or_else(
+        || format!("scope=tab local={key}"),
+        |n| format!("scope=tab tab={n}"),
+    );
+    format!("{place} {}", session_words(ctx, key))
+}
+
 /// A reply before its header.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reply {
@@ -86,6 +161,9 @@ pub(super) fn header_line(
     }
     if let Some(s) = scope {
         h.push_str(&format!(" scope={}", s.word()));
+        if matches!(s, ScopeArg::Pane | ScopeArg::Tab) {
+            h.push_str(&format!(" {}", session_words(ctx, ctx.target.key)));
+        }
     }
     if let Some(s) = subject {
         h.push_str(&format!(" subject={s}"));
@@ -604,16 +682,17 @@ fn tab_clauses(f: &Fig, _cpu_incomplete: bool) -> Vec<String> {
 }
 
 fn tab_label(ctx: &Ctx<'_>) -> String {
-    match ctx.target.tab {
+    let place = match ctx.target.tab {
         Some(n) => format!("tab {n}"),
         None => "tab -".into(),
-    }
+    };
+    format!("{place} {}", session_words(ctx, ctx.target.key))
 }
 
 fn sentence(key: &str, label: &str, clauses: &[String]) -> Line {
     Line {
         key: key.into(),
-        text: format!("{label:<8}{}", clauses.join("; ")),
+        text: format!("{label:<7} {}", clauses.join("; ")),
         value: true,
     }
 }
@@ -724,10 +803,7 @@ fn event_line(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Line {
             let sc = match scope {
                 LoadScope::Global => "scope=global".to_owned(),
                 LoadScope::Aterm => "scope=aterm".to_owned(),
-                LoadScope::Tab(k) => match ctx.tab_number(*k) {
-                    Some(n) => format!("scope=tab tab={n}"),
-                    None => format!("scope=tab local={k}"),
-                },
+                LoadScope::Tab(k) => tab_scope_words(ctx, *k),
             };
             t.push_str(&format!(" {sc} from_mc={from_mc} to_mc={to_mc}"));
             if let Some(top) = top.as_deref().filter(|_| load_top_shown(ctx, scope)) {
@@ -742,6 +818,7 @@ fn event_line(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Line {
             if let Some(n) = ctx.tab_number(*key) {
                 t.push_str(&format!(" tab={n}"));
             }
+            t.push_str(&format!(" {}", session_words(ctx, *key)));
         }
         EventKind::Lane { lane, available } => {
             t.push_str(&format!(
@@ -756,7 +833,10 @@ fn event_line(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Line {
         EventKind::Orphan {
             key, procs, top, ..
         } => {
-            t.push_str(&format!(" local={key} procs={procs}"));
+            t.push_str(&format!(
+                " local={key} {} procs={procs}",
+                session_words(ctx, *key)
+            ));
             if let Some(top) = top {
                 t.push_str(&format!(" top={}", exe_word(top)));
             }
@@ -774,6 +854,7 @@ fn event_line(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Line {
                 Some(n) => t.push_str(&format!(" tab={n}")),
                 None => t.push_str(&format!(" local={tab}")),
             }
+            t.push_str(&format!(" {}", session_words(ctx, *tab)));
             t.push_str(&format!(
                 " job={} from={} to={} class={}",
                 pct(id),
@@ -834,6 +915,7 @@ fn event_json(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Jv {
                 LoadScope::Tab(k) => {
                     o.set("scope", Jv::s("tab"));
                     o.set("local", Jv::u(*k));
+                    o.set("sid", session_json(ctx, *k));
                     if let Some(n) = ctx.tab_number(*k) {
                         o.set("tab", Jv::u(n as u64));
                     }
@@ -847,6 +929,7 @@ fn event_json(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Jv {
         }
         EventKind::Tab { key, opened, .. } => {
             o.set("local", Jv::u(*key));
+            o.set("sid", session_json(ctx, *key));
             o.set("to", Jv::s(if *opened { "opened" } else { "closed" }));
             if let Some(n) = ctx.tab_number(*key) {
                 o.set("tab", Jv::u(n as u64));
@@ -867,6 +950,7 @@ fn event_json(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Jv {
             key, procs, top, ..
         } => {
             o.set("local", Jv::u(*key));
+            o.set("sid", session_json(ctx, *key));
             o.set("procs", Jv::u(u64::from(*procs)));
             if let Some(top) = top {
                 o.set("top", Jv::s(exe_word(top)));
@@ -882,6 +966,7 @@ fn event_json(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Jv {
             exit,
         } => {
             o.set("local", Jv::u(*tab));
+            o.set("sid", session_json(ctx, *tab));
             if let Some(n) = ctx.tab_number(*tab) {
                 o.set("tab", Jv::u(n as u64));
             }
@@ -1113,6 +1198,9 @@ fn overview_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     if let Some(r) = rest_line(ctx, s, &tab) {
         lines.push(r);
     }
+    if let Some(t) = spotlight_words(s) {
+        lines.push(line("spotlight", format!("spotlight {t}")));
+    }
     let views: Vec<&str> = View::ALL
         .iter()
         .filter(|v| **v != View::Overview)
@@ -1134,7 +1222,7 @@ fn exact_words() -> &'static str {
 fn tab_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     let keys = scope_keys(ctx, ScopeArg::Tab);
     let f = tabs_fig(s, &keys, ctx.target.key);
-    let mut head = format!("{} {}", tab_label(ctx), pct(&ctx.target.sid));
+    let mut head = tab_label(ctx);
     if let Some(w) = ctx.target.window {
         head.push_str(&format!(" · window {w}"));
     }
@@ -1313,8 +1401,9 @@ fn aterm_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         lines.push(line(
             format!("part tab {}", t.key),
             format!(
-                "reported name=tab tab={number} local={} program={} cpu_mc={} fp_bytes={} procs={}",
+                "reported name=tab tab={number} local={} {} program={} cpu_mc={} fp_bytes={} procs={}",
                 t.key,
+                session_words(ctx, t.key),
                 exe_word(&t.program),
                 (reported * 1000.0).round() as i64,
                 memory_record(t.scope.footprint, t.scope.footprint_unread),
@@ -1548,6 +1637,9 @@ fn global_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>)
             format!("disk     {} {}", pct(&v.mount), words::disk_space_line(v)),
         ));
     }
+    if let Some(t) = spotlight_words(s) {
+        lines.push(line("spotlight", format!("spotlight {t}")));
+    }
     if let Some(net) = s.net.as_ref() {
         lines.push(line(
             "net",
@@ -1565,6 +1657,114 @@ fn global_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>)
     if ctx.owner_class && stalled_lane(s, "top").is_some() {
         lines.push(line("top", format!("top      {}", unavailable("stalled"))));
     }
+}
+
+/// Why the Spotlight family is unread: `unread` before its first split by coalition, else the
+/// lane's word.
+fn spotlight_unread(s: &Snapshot) -> &'static str {
+    s.coal_lane.word().unwrap_or("unread")
+}
+
+/// The `spotlight` line after its key: the state, the family's CPU, reads and footprint over the
+/// last split, and each volume's indexing. `None` where no coalition lane exists (an OS with no
+/// Spotlight).
+fn spotlight_words(s: &Snapshot) -> Option<String> {
+    if s.coal_lane == crate::explain::CoalLane::Unsupported {
+        return None;
+    }
+    let Some(r) = s.spotlight.as_ref() else {
+        return Some(unavailable(spotlight_unread(s)));
+    };
+    let volumes = r.volumes.as_ref().map_or_else(
+        || format!("volumes {}", unavailable("unread")),
+        |v| {
+            v.iter()
+                .map(|v| format!("{} {}", v.path, v.indexing.word()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+    );
+    Some(format!(
+        "{} · {} reported · {} reads · {} · {volumes}",
+        r.state.word(),
+        c2(r.cpu_mc as f32 / 1000.0),
+        words::rate_mb_lone(r.read_bps as f64),
+        spotlight_footprint_words(r),
+    ))
+}
+
+/// The family's footprint: exact where every share's was read, `≥` where some were not, and
+/// unavailable(not_read) where none was.
+fn spotlight_footprint_words(r: &crate::spotlight::Reading) -> String {
+    match r.footprint_bytes() {
+        Some(bytes) => words::mem(bytes),
+        None if r.footprint_unread() => unavailable("not_read"),
+        None => format!("≥{}", words::mem(r.footprint.bytes)),
+    }
+}
+
+/// `sys --json`'s `spotlight` block: the state, the family's figures, each lead's share and each
+/// volume, or `{"why": <word>}` where unread.
+fn spotlight_json(s: &Snapshot) -> Jv {
+    let Some(r) = s.spotlight.as_ref() else {
+        return Jv::why(match s.coal_lane {
+            crate::explain::CoalLane::Unsupported => "unsupported",
+            _ => spotlight_unread(s),
+        });
+    };
+    let mut o = Jv::obj([("state", Jv::s(r.state.word()))]);
+    o.set("cpu_mc", Jv::Int(r.cpu_mc));
+    o.set("cpu_basis", Jv::s("published_counters"));
+    o.set(
+        "cpu_execution_window",
+        Jv::why("unavailable:execution_window_unknown"),
+    );
+    o.set("read_bps", Jv::u(r.read_bps));
+    o.set(
+        "footprint_bytes",
+        match r.footprint_bytes() {
+            Some(bytes) => Jv::u(bytes),
+            None if r.footprint_unread() => Jv::why("not_read"),
+            None => Jv::at_least(r.footprint.bytes, "not_read"),
+        },
+    );
+    o.set(
+        "members",
+        Jv::Arr(
+            r.shares
+                .iter()
+                .map(|m| {
+                    Jv::obj([
+                        ("signing_id", Jv::s(m.signing_id)),
+                        ("lead_pid", Jv::u(u64::from(m.lead_pid))),
+                        ("cpu_mc", Jv::Int(m.cpu_mc)),
+                        ("read_bps", Jv::u(m.read_bps)),
+                        ("footprint_bytes", Jv::known_or(m.footprint, "not_read")),
+                    ])
+                })
+                .collect(),
+        ),
+    );
+    match (r.volumes.as_ref(), r.volumes_age_ms) {
+        (Some(v), Some(age)) => {
+            o.set(
+                "volumes",
+                Jv::Arr(
+                    v.iter()
+                        .map(|v| {
+                            Jv::obj([
+                                ("path", Jv::s(v.path.clone())),
+                                ("indexing", Jv::s(v.indexing.json_word())),
+                            ])
+                        })
+                        .collect(),
+                ),
+            );
+            o.set("volumes_read_ms_ago", Jv::u(age));
+        }
+        _ => o.set("volumes", Jv::why("unread")),
+    }
+    o
 }
 
 fn top_rows(
@@ -1999,6 +2199,7 @@ fn jobs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         wide,
         q.top,
         &|k| ctx.tab_number(k),
+        &|k| session_sid(ctx, k).map(str::to_owned),
     ));
     let (at, wait_on) = rows
         .iter()
@@ -2212,10 +2413,7 @@ fn gpu_clients<'a>(ctx: &Ctx<'_>, s: &'a Snapshot) -> (Vec<&'a ProcView>, usize)
 /// A row's `scope=` words, with its tab's number where it has one.
 fn row_scope_words(ctx: &Ctx<'_>, r: &ProcView) -> String {
     match r.scope {
-        RowScope::Tab(k) => ctx.tab_number(k).map_or_else(
-            || format!("scope=tab local={k}"),
-            |n| format!("scope=tab tab={n}"),
-        ),
+        RowScope::Tab(k) => tab_scope_words(ctx, k),
         other => format!("scope={}", other.word()),
     }
 }
@@ -2326,10 +2524,7 @@ fn mem_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         }
         shown += 1;
         let scope = match r.scope {
-            RowScope::Tab(k) => ctx.tab_number(k).map_or_else(
-                || format!("scope=tab local={k}"),
-                |n| format!("scope=tab tab={n}"),
-            ),
+            RowScope::Tab(k) => tab_scope_words(ctx, k),
             other => format!("scope={}", other.word()),
         };
         lines.push(line(
@@ -2475,7 +2670,7 @@ fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     let keys = scope_keys(ctx, scope);
     let f = tabs_fig(s, &keys, ctx.target.key);
     let who = match scope {
-        ScopeArg::Pane | ScopeArg::Tab => format!("{} {}", tab_label(ctx), pct(&ctx.target.sid)),
+        ScopeArg::Pane | ScopeArg::Tab => tab_label(ctx),
         ScopeArg::Window => format!(
             "window {}",
             ctx.target
@@ -2507,15 +2702,25 @@ fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
                 disk::ScopeLine::Global { .. } => "scope global".to_owned(),
                 disk::ScopeLine::Bytes(b) => format!("scope {}", b.name),
             };
-            lines.push(line(key, sc.text(&|t| pct(t), &unavailable)));
+            let mut text = sc.text(&|t| pct(t), &unavailable);
+            if let disk::ScopeLine::Bytes(b) = sc
+                && b.name == "tab"
+            {
+                text.push_str(&format!(" {}", sessions_words(ctx, &b.keys)));
+            }
+            lines.push(line(key, text));
         }
         let (panes, withheld) = disk_panes(ctx, t);
         for p in panes {
             lines.push(line(
                 format!("pane {}", p.key),
-                p.text(ctx.path_ok(&[p.key]), ctx.home, &|t| pct(t), &|e| {
-                    exe_word(e).to_owned()
-                }),
+                format!(
+                    "{} {}",
+                    p.text(ctx.path_ok(&[p.key]), ctx.home, &|t| pct(t), &|e| {
+                        exe_word(e).to_owned()
+                    }),
+                    session_words(ctx, p.key)
+                ),
             ));
         }
         if withheld > 0 {
@@ -2551,6 +2756,7 @@ fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         let mut rec = format!("root n={n} kinds={}", r.kinds.join(","));
         if let Some(t) = r.tab {
             rec.push_str(&format!(" tab={t}"));
+            rec.push_str(&format!(" {}", sessions_words(ctx, &r.keys)));
         }
         rec.push(' ');
         rec.push_str(&place);
@@ -2587,9 +2793,11 @@ fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         if !r.shared_with.is_empty() {
             let tabs: Vec<String> = r.shared_with.iter().map(ToString::to_string).collect();
             rec.push_str(&format!(" shared_with={}", tabs.join(",")));
+            rec.push_str(&format!(" shared_with_sids={}", unavailable("not_sampled")));
         }
         if let Some(t) = r.counted_in {
             rec.push_str(&format!(" counted_in=tab{t}"));
+            rec.push_str(&format!(" counted_in_sid={}", unavailable("not_sampled")));
         }
         if !r.scopes.is_empty() {
             rec.push_str(&format!(" scopes={}", r.scopes.join(",")));
@@ -2647,10 +2855,7 @@ fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     let (programs, withheld) = disk_programs(ctx, s, scope);
     for (rank, p) in programs.iter().take(q.top).enumerate() {
         let scope = match p.scope {
-            ProcScope::Tab(k) => ctx.tab_number(k).map_or_else(
-                || format!("scope=tab local={k}"),
-                |n| format!("scope=tab tab={n}"),
-            ),
+            ProcScope::Tab(k) => tab_scope_words(ctx, k),
             other => format!("scope={}", program_scope_word(other)),
         };
         lines.push(line(
@@ -3109,11 +3314,13 @@ fn procs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) 
             scheduling_json(r.scheduling, ctx.machine.family).to_text(),
             rec(r.age_ms(s.at_unix_ms), unknown_why(s, "ages", BIRTH_UNREAD))
         );
-        if let RowScope::Tab(k) = r.scope
-            && !matches!(scope, ScopeArg::Pane | ScopeArg::Tab)
-            && let Some(n) = ctx.tab_number(k)
-        {
-            t.push_str(&format!(" tab={n}"));
+        if let RowScope::Tab(k) = r.scope {
+            if !matches!(scope, ScopeArg::Pane | ScopeArg::Tab)
+                && let Some(n) = ctx.tab_number(k)
+            {
+                t.push_str(&format!(" tab={n}"));
+            }
+            t.push_str(&format!(" {}", session_words(ctx, k)));
         }
         lines.push(line(format!("proc {}", r.pid), t));
     }
@@ -3460,6 +3667,7 @@ fn blockage_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
                     ]);
                     if let Some(k) = z.tab {
                         p.set("local", Jv::u(k));
+                        p.set("sid", session_json(ctx, k));
                         if let Some(n) = ctx.tab_number(k) {
                             p.set("tab", Jv::u(n as u64));
                         }
@@ -3719,6 +3927,7 @@ fn global_json(s: &Snapshot) -> Jv {
         "procs",
         stalled_lane(s, "procs").map_or_else(|| Jv::Int(i64::from(s.global.procs)), Jv::stalled),
     );
+    o.set("spotlight", spotlight_json(s));
     o.set("exact", Jv::s("exact"));
     o
 }
@@ -3765,7 +3974,7 @@ fn tab_obj(ctx: &Ctx<'_>, s: &Snapshot, keys: &[u64], f: &Fig) -> Jv {
                 .map_or_else(|| Jv::why("gone"), |t| Jv::u(t as u64)),
         ),
         ("local", Jv::u(ctx.target.key)),
-        ("sid", Jv::s(ctx.target.sid.clone())),
+        ("sid", session_json(ctx, ctx.target.key)),
     ]);
     if let Some(w) = ctx.target.window {
         o.set("window", Jv::u(w as u64));
@@ -3841,6 +4050,9 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
     }
     if let Some(sc) = q.view.default_scope().and(scope) {
         o.set("scope", Jv::s(sc.word()));
+        if matches!(sc, ScopeArg::Pane | ScopeArg::Tab) {
+            o.set("sid", session_json(ctx, ctx.target.key));
+        }
         if sc == ScopeArg::Request
             && let Some(request) = request_json(ctx)
         {
@@ -3948,6 +4160,7 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
             }
         }
         View::Jobs => {
+            o.set("sid", session_json(ctx, ctx.target.key));
             o.set(
                 "machine",
                 jobs_view::capacity_json(s, ctx.as_of_unix_ms, ctx.age_ms),
@@ -3973,7 +4186,11 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
                         Jv::Arr(
                             rows.iter()
                                 .take(q.top)
-                                .map(|r| jobs_view::row_json(r, ctx.tab_number(r.tab)))
+                                .map(|r| {
+                                    jobs_view::row_json(r, ctx.tab_number(r.tab), &|key| {
+                                        session_sid(ctx, key).map(str::to_owned)
+                                    })
+                                })
                                 .collect(),
                         ),
                     );
@@ -4246,13 +4463,29 @@ fn parts_json(ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
         let mut p = fig_json(&Fig::of(&t.scope));
         p.set("name", Jv::s("tab"));
         p.set("local", Jv::u(t.key));
+        p.set("sid", session_json(ctx, t.key));
         p.set(
             "tab",
-            ctx.tab_number(t.key)
-                .map_or_else(|| Jv::why("gone"), |n| Jv::u(n as u64)),
+            ctx.tab_number(t.key).map_or_else(
+                || {
+                    Jv::why(
+                        if ctx.tabs.iter().any(|fact| {
+                            fact.key == t.key && fact.window.is_none() && fact.tab.is_none()
+                        }) {
+                            "not_shown"
+                        } else {
+                            "gone"
+                        },
+                    )
+                },
+                |n| Jv::u(n as u64),
+            ),
         );
-        if let Some(f) = ctx.tabs.iter().find(|f| f.key == t.key) {
-            p.set("sid", Jv::s(f.sid.clone()));
+        if session_sid(ctx, t.key).is_some()
+            && let Some(f) = ctx.tabs.iter().find(|f| f.key == t.key)
+            && let Some(nonce) = &f.sampled_nonce
+        {
+            p.set("nonce", Jv::s(nonce.clone()));
         }
         tab_cpu_json(s, &[t.key], &mut p);
         parts.push(p);
@@ -4393,6 +4626,7 @@ fn gpu_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
                         ]);
                         if let RowScope::Tab(k) = r.scope {
                             c.set("local", Jv::u(k));
+                            c.set("sid", session_json(ctx, k));
                             if let Some(n) = ctx.tab_number(k) {
                                 c.set("tab", Jv::u(n as u64));
                             }
@@ -4516,6 +4750,7 @@ fn mem_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
     o.set(
         "tab",
         Jv::obj([
+            ("sid", session_json(ctx, ctx.target.key)),
             (
                 "tab",
                 ctx.target
@@ -4610,6 +4845,7 @@ fn proc_json(ctx: &Ctx<'_>, s: &Snapshot, r: &ProcView) -> Jv {
     ]);
     if let RowScope::Tab(k) = r.scope {
         o.set("local", Jv::u(k));
+        o.set("sid", session_json(ctx, k));
         if let Some(n) = ctx.tab_number(k) {
             o.set("tab", Jv::u(n as u64));
         }
@@ -4841,6 +5077,7 @@ fn program_json(ctx: &Ctx<'_>, s: &Snapshot, g: &ProgramGroup) -> Jv {
     ]);
     if let ProcScope::Tab(k) = g.scope {
         o.set("local", Jv::u(k));
+        o.set("sid", session_json(ctx, k));
         if let Some(n) = ctx.tab_number(k) {
             o.set("tab", Jv::u(n as u64));
         }
@@ -4863,7 +5100,7 @@ fn procs_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, scope: ScopeArg) -> Jv 
     }
     let rows = procs_in_scope(ctx, s, scope);
     let unread = rows.iter().filter(|r| r.refused).count();
-    Jv::obj([
+    let mut object = Jv::obj([
         ("scope", Jv::s(scope.word())),
         ("cpu_mc_scope", Jv::s("process_self")),
         ("live", Jv::u(rows.len() as u64)),
@@ -4893,7 +5130,11 @@ fn procs_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, scope: ScopeArg) -> Jv 
                     .collect(),
             ),
         ),
-    ])
+    ]);
+    if matches!(scope, ScopeArg::Pane | ScopeArg::Tab) {
+        object.set("sid", session_json(ctx, ctx.target.key));
+    }
+    object
 }
 
 fn disk_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
@@ -4928,6 +5169,7 @@ fn disk_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
             }
             if let Some(t) = r.tab {
                 o.set("tab", Jv::u(t as u64));
+                set_sessions_json(ctx, &r.keys, &mut o);
             }
             if let Some(state) = r.size.state_word() {
                 o.set("state", Jv::s(state));
@@ -4940,8 +5182,20 @@ fn disk_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
                 "shared_with_tabs",
                 Jv::Arr(r.shared_with.iter().map(|t| Jv::u(*t as u64)).collect()),
             );
+            if !r.shared_with.is_empty() {
+                o.set(
+                    "shared_with_sids",
+                    Jv::Arr(
+                        r.shared_with
+                            .iter()
+                            .map(|_| Jv::why("not_sampled"))
+                            .collect(),
+                    ),
+                );
+            }
             if let Some(t) = r.counted_in {
                 o.set("counted_in_tab", Jv::u(t as u64));
+                o.set("counted_in_sid", Jv::why("not_sampled"));
             }
             o.set(
                 "scopes",
@@ -5018,7 +5272,20 @@ fn disk_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
     if let Some(t) = ctx.disk {
         o.set(
             "scopes",
-            Jv::Arr(t.scopes.iter().map(disk::ScopeLine::json).collect()),
+            Jv::Arr(
+                t.scopes
+                    .iter()
+                    .map(|scope| {
+                        let mut object = scope.json();
+                        if let disk::ScopeLine::Bytes(b) = scope
+                            && b.name == "tab"
+                        {
+                            set_sessions_json(ctx, &b.keys, &mut object);
+                        }
+                        object
+                    })
+                    .collect(),
+            ),
         );
         let (panes, withheld) = disk_panes(ctx, t);
         o.set(
@@ -5026,7 +5293,12 @@ fn disk_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
             Jv::Arr(
                 panes
                     .iter()
-                    .map(|p| p.json(ctx.path_ok(&[p.key]), ctx.home, &|e| exe_word(e).to_owned()))
+                    .map(|p| {
+                        let mut object =
+                            p.json(ctx.path_ok(&[p.key]), ctx.home, &|e| exe_word(e).to_owned());
+                        object.set("sid", session_json(ctx, p.key));
+                        object
+                    })
                     .collect(),
             ),
         );
@@ -5066,6 +5338,7 @@ fn disk_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
             ]);
             if let ProcScope::Tab(k) = p.scope {
                 row.set("local", Jv::u(k));
+                row.set("sid", session_json(ctx, k));
                 if let Some(n) = ctx.tab_number(k) {
                     row.set("tab", Jv::u(n as u64));
                 }

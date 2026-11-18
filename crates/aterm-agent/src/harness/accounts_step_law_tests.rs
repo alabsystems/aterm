@@ -127,6 +127,17 @@ fn outside_step(line: &str) -> bool {
         || (line.starts_with("aterm harness accounts sync ") && line.contains("secrets"))
 }
 
+/// The account word `word` spells: a key's [`Word`] is the key, and a slug's the slug, so either
+/// prints back as itself.
+fn word_of(word: &str) -> crate::harness::account_names::Word {
+    crate::harness::account_names::Named {
+        pk: word.to_owned(),
+        row: None,
+        names: aterm_file::AccountNames::default(),
+    }
+    .word()
+}
+
 /// The [`Step`] `line` spells, which prints back as `line`.
 fn step_of(line: &str) -> Result<Step, String> {
     let mut words: Vec<&str> = line.split_whitespace().collect();
@@ -140,46 +151,24 @@ fn step_of(line: &str) -> Result<Step, String> {
         ["aterm", "harness", "accounts"] => Step::Report(cli),
         ["aterm", "harness", "accounts", "sync"] => Step::Sync(cli),
         ["aterm", "harness", "accounts", "use", "--auto"] => Step::Auto(cli),
-        ["aterm", "harness", "accounts", "use", label] => Step::Use(cli, (*label).to_owned()),
-        ["aterm", "harness", "accounts", "login", label] => Step::Login(cli, (*label).to_owned()),
-        ["aterm", "harness", "accounts", "renew", labels @ ..] if !labels.is_empty() => {
-            Step::Renew(cli, labels.join(" "))
+        ["aterm", "harness", "accounts", "use", word] => Step::Use(cli, word_of(word)),
+        ["aterm", "harness", "accounts", "login", word] => Step::Login(cli, word_of(word)),
+        ["aterm", "harness", "accounts", "renew", named @ ..] if !named.is_empty() => {
+            Step::Renew(cli, named.iter().map(|word| word_of(word)).collect())
         }
-        ["aterm", "harness", "accounts", "browser", label] => {
-            Step::Browser(cli, (*label).to_owned())
-        }
-        ["aterm", "harness", "accounts", "token", label] if cli == Cli::Claude => Step::Token {
-            label: (*label).to_owned(),
+        ["aterm", "harness", "accounts", "browser", word] => Step::Browser(cli, word_of(word)),
+        ["aterm", "harness", "accounts", "token", word] if cli == Cli::Claude => Step::Token {
+            word: word_of(word),
             replace: false,
         },
-        ["aterm", "harness", "accounts", "token", label, "--replace"] if cli == Cli::Claude => {
+        ["aterm", "harness", "accounts", "token", word, "--replace"] if cli == Cli::Claude => {
             Step::Token {
-                label: (*label).to_owned(),
+                word: word_of(word),
                 replace: true,
             }
         }
-        ["aterm", "harness", "accounts", "add", "<label>"] => Step::Add { cli, email: None },
-        [
-            "aterm",
-            "harness",
-            "accounts",
-            "add",
-            "<label>",
-            "--email",
-            email,
-        ] => Step::Add {
-            cli,
-            email: Some((*email).to_owned()),
-        },
-        [
-            "aterm",
-            "harness",
-            "accounts",
-            "adopt-default",
-            label,
-            "--email",
-            "<e>",
-        ] => Step::AdoptDefault(cli, (*label).to_owned()),
+        ["aterm", "harness", "accounts", "add", "<account>"] => Step::Add(cli),
+        ["aterm", "harness", "accounts", "adopt-default", "<account>"] => Step::AdoptDefault(cli),
         ["aterm", "pkg", "install", id] => Step::Install((*id).to_owned()),
         ["aterm", "pkg", "update", id] => Step::Update((*id).to_owned()),
         ["aterm", "ai", "login", id] => Step::AiLogin((*id).to_owned()),
@@ -233,7 +222,8 @@ struct Said {
 }
 
 /// What each surface of the laid world but a row's `accounts use` prints, every one read after one
-/// `lay`, and the labels of its rows, whose `accounts use` [`law_of_world`] runs itself. A Grok
+/// `lay`, and the words that name its rows' accounts (a row with no address has none, and no
+/// `accounts use` pins it), whose `accounts use` [`law_of_world`] runs itself. A Grok
 /// Build or Kimi Code CLI build here is a stand-in program with nothing laid in atpkg's store,
 /// where the doctor's facts read theirs, so only Codex's doctor is read.
 fn surfaces(pool: &Pool, host: &StepHost, lay: &dyn Fn()) -> (Vec<Said>, Vec<String>) {
@@ -296,27 +286,39 @@ fn surfaces(pool: &Pool, host: &StepHost, lay: &dyn Fn()) -> (Vec<Said>, Vec<Str
             after: None,
         })
         .collect();
-    let labels = records
+    let words = records
         .roster
         .rows
         .iter()
-        .map(|row| row.label.clone())
+        .filter_map(|row| {
+            crate::harness::account_names::word_of_row(cli, row, &records.roster.rows, None)
+        })
+        .map(|word| word.to_string())
         .collect();
-    (said, labels)
+    (said, words)
 }
 
-/// A step's command line for the real parser: a label and an address a person chooses filled in.
 /// What the facts say of `pool` under the launcher `host`'s build names.
 fn fact_on(pool: &Pool, host: &LawHost) -> crate::ai::facts::Facts {
     pool.lay_launcher(host);
     pool.law_fact()
 }
 
+/// A step's command line for the real parser: the account a person names filled in, a new one by
+/// its pool's provider word and an address no row holds (`claude fresh@example.com`).
 fn command_line(step: &Step) -> String {
-    step.to_string()
-        .replace("<label>", "fresh")
-        .replace("<e>", "fresh@example.com")
-        .replacen("aterm harness ", "", 1)
+    let line = step.to_string();
+    let line = match step {
+        Step::Add(cli) | Step::AdoptDefault(cli) => line.replace(
+            Step::CHOSEN_LABEL,
+            &format!(
+                "{} fresh@example.com",
+                crate::harness::account_names::provider_word_of(*cli)
+            ),
+        ),
+        _ => line,
+    };
+    line.replacen("aterm harness ", "", 1)
 }
 
 /// The real parser's and the real entry's answer to `step` in the world `lay` lays: `Ok` where it
@@ -367,8 +369,8 @@ fn take(pool: &Pool, build: LawBuild, host: &StepHost, step: &Step) -> Result<()
             // Its own sign-in in the default home, which is the vendor's program.
             return take(pool, build, host, &Step::VendorLogin(pool.cli));
         }
-        let (label, verb) = crate::ai::login::pool_target(pool.cli, row)?;
-        format!("accounts {verb} {label} --cli {id}")
+        let target = crate::ai::login::pool_target(pool.cli, row)?;
+        format!("accounts {} {} --cli {id}", target.verb, target.word)
     } else {
         command_line(step)
     };
@@ -437,15 +439,20 @@ fn ai_login_takes_the_step_a_moved_default_logins_refusal_names() {
         .expect("the pin");
     let fact = fact_on(&pool, &host);
     let row = fact.login_pool().expect("a pool");
+    let roster = pool.roster();
+    let main = crate::harness::account_names::sign_in_word(
+        Cli::Codex,
+        roster.row("main").expect("the row"),
+        &roster.rows,
+        None,
+    );
     assert_eq!(
         row.default_moved,
-        Some((
-            "main".to_owned(),
-            Step::Renew(Cli::Codex, "main".to_owned())
-        )),
+        Some(("main".to_owned(), Step::renew(Cli::Codex, main))),
         "CONTROL"
     );
-    let target = crate::ai::login::pool_target(Cli::Codex, row);
+    let target =
+        crate::ai::login::pool_target(Cli::Codex, row).map(|target| (target.label, target.verb));
     assert_eq!(target, Ok(("main", Cli::Codex.sign_in_verb(true))));
 
     pool.lay_moved(MovedWorld::PinOnWorkNoLogin);
@@ -457,7 +464,7 @@ fn ai_login_takes_the_step_a_moved_default_logins_refusal_names() {
     let row = fact.login_pool().expect("a pool");
     assert!(!row.moved_refuses_launch(), "CONTROL");
     let target = crate::ai::login::pool_target(Cli::Codex, row).expect("CONTROL");
-    assert_eq!(target.0, "work", "CONTROL");
+    assert_eq!(target.label, "work", "CONTROL");
 }
 
 /// `line`, through the real parser and the real entry: its exit, and what it printed.
@@ -706,11 +713,11 @@ fn law_of_world(
         host: build.program(pool),
         reached: Cell::new(0),
     };
-    let (said, labels) = surfaces(pool, &host, lay);
+    let (said, words) = surfaces(pool, &host, lay);
     let mut taken = BTreeSet::new();
-    for label in labels {
+    for word in words {
         lay();
-        let line = format!("accounts use {label} --cli {}", pool.cli.id());
+        let line = format!("accounts use {word} --cli {}", pool.cli.id());
         let (code, out, err) = pool.run_on(&line, &host.host);
         let used = Said {
             surface: format!("`{line}`"),

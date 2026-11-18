@@ -2142,10 +2142,12 @@ impl Inventory {
 /// `observation` and `legacy_observation`).
 type Opened = ([u8; 64], Option<[u8; 64]>);
 
-/// A table store a round opened ([`Round::open`]): kept between sessions, or opened once.
+/// A table store a round opened ([`Round::open`]): kept between sessions, or opened once. Either
+/// is boxed: a store is some four thousand bytes, a kept one more again, and each open hands its
+/// `OpenStore` back through a `Result` and each keep moves it into the kept list.
 enum OpenStore {
-    Kept(crate::table::store::kept::Kept),
-    Once(Store),
+    Kept(Box<crate::table::store::kept::Kept>),
+    Once(Box<Store>),
 }
 
 impl std::ops::Deref for OpenStore {
@@ -2542,7 +2544,9 @@ impl Round<'_> {
                             Ok(Enrollment::Absent | Enrollment::Pending)
                         ));
                 if !primary {
-                    return self.store(session, id).map(OpenStore::Once);
+                    return self
+                        .store(session, id)
+                        .map(|store| OpenStore::Once(Box::new(store)));
                 }
                 directory.path(*scope)?
             }
@@ -2555,10 +2559,10 @@ impl Round<'_> {
                 .map(|at| stores.remove(at))
         };
         match crate::table::store::kept::Kept::open(session, &dir, *scope, kept) {
-            Ok(kept) => Ok(OpenStore::Kept(kept)),
-            Err(_) if self.commons.is_some() && session.has_control_writer() => {
-                self.store(session, id).map(OpenStore::Once)
-            }
+            Ok(kept) => Ok(OpenStore::Kept(Box::new(kept))),
+            Err(_) if self.commons.is_some() && session.has_control_writer() => self
+                .store(session, id)
+                .map(|store| OpenStore::Once(Box::new(store))),
             Err(error) => Err(error),
         }
     }
@@ -2569,7 +2573,7 @@ impl Round<'_> {
         let OpenStore::Kept(kept) = opened else {
             return;
         };
-        let Some(kept) = kept.keep() else {
+        let Some(kept) = (*kept).keep() else {
             return;
         };
         let mut stores = self.stores.lock().unwrap_or_else(|p| p.into_inner());

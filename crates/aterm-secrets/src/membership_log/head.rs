@@ -158,6 +158,27 @@ pub(crate) struct Origin {
     written: Mutex<BTreeSet<[u8; 32]>>,
 }
 
+/// A query may reuse an authenticated head without publishing derived cache data into
+/// the namespace whose physical identity its authority reader is observing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Publication {
+    Allowed,
+    ReadOnly,
+}
+
+impl Publication {
+    /// Remove only this query's lazy cache-publication capability. The cached store keeps
+    /// its own origin, and authenticated head inputs and all verified records stay intact.
+    pub(crate) fn snapshot(self, mut store: Store) -> Store {
+        if self == Self::ReadOnly
+            && let Some(log) = store.log.as_mut()
+        {
+            log.origin = None;
+        }
+        store
+    }
+}
+
 impl Origin {
     /// The records file whose stamp is `stamp` and whose SHA-256 is `digest`, read whole under
     /// `context` ([`context`]) by a read that began at `began` ([`fsx::read_began`]), whose head
@@ -402,7 +423,8 @@ impl<'a> Fields<'a> {
 /// was opened, read into `store` (empty, as the reader made it under `context` for this vault),
 /// with the file's SHA-256 the head names: `None` where no head stands there that names this file
 /// as it is, under this identity and context, with a MAC that verifies, and whose records `store`
-/// takes, every one, in order.
+/// takes, every one, in order. Only a publishing query may restamp the sidecar or consume its
+/// origin's later publication opportunity.
 pub(crate) fn open(
     head: &Path,
     file: &std::fs::File,
@@ -410,6 +432,7 @@ pub(crate) fn open(
     context: [u8; 32],
     identity: &Identity,
     store: Store,
+    publication: Publication,
 ) -> Option<(Store, [u8; 32])> {
     let mut reader = fsx::open_private_reader(head).ok()??;
     if !names(&mut reader, stamp.len, context, identity) {
@@ -449,6 +472,7 @@ pub(crate) fn open(
     let reading = store.reading();
     let count = fields.len()?;
     let mut records = Vec::with_capacity(count.min(super::MAX_HELD_RECORDS));
+    let mut places = Places::new();
     let mut covered = 0u64;
     for _ in 0..count {
         let form = fields.take(1)?[0];
@@ -459,7 +483,7 @@ pub(crate) fn open(
             return None;
         }
         covered = covered.checked_add(u64::try_from(len).ok()?)?;
-        records.push(match form {
+        let record = match form {
             WHOLE => Record::vouched(fields.take(len)?, reading).ok()?,
             SHELVED => {
                 let id = fields.array::<32>()?;
@@ -468,7 +492,11 @@ pub(crate) fn open(
                 Record::shelved(id, len, frame, at, Arc::clone(&source), reading).ok()?
             }
             _ => return None,
-        });
+        };
+        if places.insert(*record.id(), (at, len)).is_some() {
+            return None;
+        }
+        records.push(record);
     }
     if covered != stamp.len {
         return None;
@@ -487,10 +515,16 @@ pub(crate) fn open(
     }
     let recipient = identity.recipient().0;
     let ops = Ops { recipient, ops };
-    let origin = Origin::new(head, stamp, file_digest, context, recipient, began);
-    origin.stood_for(recipient);
+    let mut origin = Origin::new(head, stamp, file_digest, context, recipient, began);
+    // A read-only query leaves publication for a later ordinary cache hit. Keep the
+    // authenticated positions it needs to encode that head without rereading records.
+    origin.places = places;
+    if publication == Publication::Allowed {
+        origin.stood_for(recipient);
+    }
     let read = store.read_through_head(records, ops, origin)?;
-    if named != stamp
+    if publication == Publication::Allowed
+        && named != stamp
         && fsx::stamp_settled(&stamp, began)
         && fsx::meta_of(file)
             .ok()

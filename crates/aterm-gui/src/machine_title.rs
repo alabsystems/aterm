@@ -244,7 +244,7 @@ fn read(
     aterm_uds::private_file::ensure_private_dir(state)?;
     let now_ms = aterm_netplace::unix_ms_now();
     let (name, _) = aterm_agent::machine_name::ensure_in_view(state, roster, now_ms)?;
-    let name = match aterm_agent::machine_name::follow_registry(state, now_ms) {
+    let name = match aterm_agent::machine_name::follow_registry(state) {
         Ok(moved) => moved.unwrap_or(name),
         Err(why) => {
             aterm_log::info!("machine name: the lab registry's nickname was not taken ({why})");
@@ -346,9 +346,9 @@ pub(crate) enum NameChange {
     Synchronize(Number),
     /// A successful explicit permission tab: reread canonical targets, never an old panel name.
     SynchronizeCurrent,
-    /// Undo Last Rename: take back this change, the newest the page's read showed, and no other
-    /// ([`aterm_agent::machine_name::undo_last`]'s `seen`).
-    Undo(aterm_agent::machine_name::file::Change),
+    /// Undo Last Rename: take back this Mac's registry row's newest rename as the page's read
+    /// showed it, and no other ([`aterm_agent::machine_name::undo_last`]'s `seen`).
+    Undo(aterm_agent::machine_name::history::Undo),
 }
 
 /// What Rename's answer `to` sets: a nickname alone, another number
@@ -527,8 +527,9 @@ fn queue(writer: &mut Option<NameWriter>, proxy: EventLoopProxy<Wake>, job: Job)
             &proxy,
             seq,
             page::PageFound {
-                snapshot: crate::machine_rename_sheet::Snapshot::Unread(why),
+                snapshot: crate::machine_rename_sheet::Snapshot::Unread(why.clone()),
                 fleet: None,
+                history: Err(why),
             },
         ),
     };
@@ -653,21 +654,22 @@ fn change_number(
     })
 }
 
-/// Undo Last Rename: take back `seen`, the newest change the page's read showed, as
-/// `aterm name undo` does ([`aterm_agent::machine_name::undo_last`], a person's), then publish
-/// what it leaves as a Save does. The naming policy is read first, for the number the undo
-/// publishes under ([`aterm_agent::machine_name::undo_publishes`]), so a naming hold or an
-/// unreadable aterm.toml refuses before any name changes.
+/// Undo Last Rename: take back `seen`, the registry row's newest rename as the page's read
+/// showed it, as `aterm name undo` does ([`aterm_agent::machine_name::undo_last`], a person's),
+/// then publish what it leaves as a Save does. The naming policy is read first, for the number
+/// the undo publishes under ([`aterm_agent::machine_name::undo_publishes`]), so a naming hold or
+/// an unreadable aterm.toml refuses before any name changes.
 ///
 /// # Errors
-/// This Mac's name cannot be read, or is none; the policy refuses; or the undo is refused,
-/// `seen` being no longer History's newest among the causes ([`Cause::Unseen`]), in its words.
+/// This Mac's name cannot be read, or is none; the policy refuses; or the undo is refused, the
+/// row no longer showing the rename `seen` takes back among the causes ([`Cause::Unseen`]), in
+/// its words.
 ///
 /// [`Cause::Unseen`]: aterm_agent::machine_name::Cause::Unseen
 fn change_undo(
     state: &Path,
     config: &Path,
-    seen: &aterm_agent::machine_name::file::Change,
+    seen: &aterm_agent::machine_name::history::Undo,
     system: &dyn aterm_agent::machine_name::publish::SystemNames,
     lab: impl FnOnce() -> io::Result<aterm_secrets::client::LabLabels>,
     roster: impl FnOnce() -> io::Result<Option<String>>,
@@ -678,10 +680,10 @@ fn change_undo(
     let current = file::read(state)
         .map_err(|why| why.to_string())?
         .ok_or("this Mac's saved name is unavailable")?;
-    let policy = undo_publishes(&current)
+    let policy = undo_publishes(&current, seen)
         .map(|number| publish::Policy::read(config, number))
         .transpose()?;
-    let set = undo_last(state, Some(seen), lab, ByKind::Person, roster, stamp, false)
+    let set = undo_last(state, seen, lab, ByKind::Person, roster, stamp, false)
         .map_err(|why| why.to_string())?;
     offer_number(state, set.renumbered, set.queued.as_ref());
     let publication = policy
@@ -783,8 +785,8 @@ fn synchronize_current(
 
 /// Write `change` to the name in `state`, published by the aterm.toml at `config` and
 /// `system`'s macOS names, at `stamp`: the writer's one dispatch for either surface's change,
-/// whose number and nickname edits, and the page's undo of the change it showed, record the
-/// person and this node in History.
+/// whose number and nickname edits, and the page's undo of the rename it showed, are a person's
+/// writes of this Mac's registry row, which the registry's History lists.
 ///
 /// # Errors
 /// Why the change was not set, as the surface that asked says it.

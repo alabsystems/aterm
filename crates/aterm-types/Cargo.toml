@@ -47,6 +47,10 @@ aterm-alloc = { workspace = true }
 # `is_verdict`): one list each, astream's. astream-wire has no dependencies and no platform
 # code, and it is in this graph already through aterm-codec and aterm-hash.
 astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
+# The one `mdutil -s` parser (`aterm_vitals::spotlight::volumes`), which the Spotlight scope's
+# indexing read (`macos_setup::spotlight_scope::indexing`) shares with System State. A pure model:
+# no clock, no platform, no dependencies.
+aterm-vitals = { workspace = true }
 # FNV-1a/64 for `RowsFence::hash_rows`: server and clients must compute one hash; and
 # for `state_notify::name`'s key of a state home, which a poster and a listener must agree on.
 aterm-hash = { workspace = true }

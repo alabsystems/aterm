@@ -41,6 +41,12 @@ pub(crate) struct View {
     /// a log set aside since it opened is no longer followed, since what the model loses is a
     /// power loss's, never a durable record, and the world's own laws judge the rest.
     pub(crate) retired_logs: u64,
+    /// The remints aterm forgot across (ATERM-KI-1116-7314): logs astream gave another id
+    /// keeping every record, which the bridge could not prove continue the one before, so aterm
+    /// forgot what it held. A slot opened before one is no longer followed: the model has no
+    /// step for a log that kept its records under an id nobody proved, and the world's own laws
+    /// judge the rest, as across a log set aside.
+    pub(crate) forgot_remints: u64,
     /// Where the inbox group resumes.
     pub(crate) group_start: u64,
     pub(crate) alive: bool,
@@ -60,6 +66,8 @@ struct Slot {
     gen0: u64,
     /// The logs set aside when it opened ([`View::retired_logs`]).
     retired0: u64,
+    /// The remints aterm forgot across when it opened ([`View::forgot_remints`]).
+    forgot0: u64,
     lost: bool,
     /// The model states this slot can be in.
     states: Vec<State>,
@@ -130,7 +138,7 @@ impl Tap {
 
     fn project(&self, slot: &mut Slot, view: &View, markers: &BTreeSet<String>) -> Option<Key> {
         let session = view.sessions.get(&slot.sid)?;
-        if view.retired_logs != slot.retired0 {
+        if view.retired_logs != slot.retired0 || view.forgot_remints != slot.forgot0 {
             return None;
         }
         let at = usize::try_from(slot.off).ok()?;
@@ -258,6 +266,7 @@ impl Tap {
                     later: None,
                     gen0: view.generation,
                     retired0: view.retired_logs,
+                    forgot0: view.forgot_remints,
                     lost: false,
                     states: initial(&self.model),
                     last: None,

@@ -180,27 +180,55 @@ pub fn lease_toolchain_checked(dir: &Path) -> std::result::Result<(), String> {
     retain_cut_lease(&mut leases, &layout.prefix, &dir)
 }
 
-/// Duplicate the retained lease for `dir` for one controlled in-place exec. An unmanaged
-/// toolchain has no atpkg lease and returns `None`.
-///
-/// # Errors
-/// The toolchain cannot be resolved or leased, its retained slot changed, its generated leaf
-/// is not representable, or its descriptor cannot be duplicated.
+/// Hold and offer the exact Trust subject under an already selected managed store.
+/// Selection and custody use the same namespace; no HOME or configuration is re-read here.
 #[cfg(unix)]
-pub fn offer_toolchain_lease(
+pub(crate) fn offer_managed_toolchain_lease(
+    prefix: &Path,
     dir: &Path,
-) -> std::result::Result<Option<ToolchainLeaseOffer>, String> {
-    let dir = dir.canonicalize().map_err(|e| {
-        format!(
-            "resolve toolchain {} before lease handover: {e}",
-            dir.display()
-        )
-    })?;
-    lease_toolchain_checked(&dir)?;
-    let leases = TOOLCHAIN_LEASES
+    build: u64,
+) -> std::result::Result<ToolchainLeaseOffer, String> {
+    let dir = dir.canonicalize().map_err(|error| error.to_string())?;
+    let mut leases = TOOLCHAIN_LEASES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    offer_cut_lease(&leases, &dir)
+    offer_managed_cut_lease(&mut leases, prefix, &dir, build)
+}
+
+#[cfg(unix)]
+fn offer_managed_cut_lease(
+    leases: &mut ToolchainLeases,
+    prefix: &Path,
+    dir: &Path,
+    build: u64,
+) -> std::result::Result<ToolchainLeaseOffer, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let expected = atpkg::lease::Subject::build("trust", build)
+        .ok_or("the selected Trust build has no managed subject")?;
+    let bin = atpkg::trust_lock::build_dir(prefix, build)
+        .join("bin")
+        .canonicalize()
+        .map_err(|error| format!("resolve the selected managed compiler slot: {error}"))?;
+    if bin != dir || atpkg::lease::Subject::of_dir(prefix, dir).as_ref() != Some(&expected) {
+        return Err("the compiler is not the selected Trust subject in its managed store".into());
+    }
+    retain_cut_lease(leases, prefix, dir)?;
+    let lease = leases
+        .get(dir)
+        .ok_or("the compiler has no retained managed lease")?;
+    if lease.subject() != &expected {
+        return Err("the compiler has no matching retained managed lease".into());
+    }
+    let namespace = std::fs::metadata(atpkg::lease::dir(prefix))
+        .map_err(|error| format!("inspect the selected lease namespace: {error}"))?;
+    let held_namespace = lease.path().parent().ok_or("the lease has no namespace")?;
+    let held_namespace = std::fs::metadata(held_namespace)
+        .map_err(|error| format!("inspect the retained lease namespace: {error}"))?;
+    if (namespace.dev(), namespace.ino()) != (held_namespace.dev(), held_namespace.ino()) {
+        return Err("the retained compiler lease belongs to another managed store".into());
+    }
+    offer_cut_lease(leases, dir)?.ok_or_else(|| "the compiler has no retained managed lease".into())
 }
 
 #[cfg(unix)]
@@ -393,7 +421,8 @@ fn resolve_trust_stage2_bin() -> Result<PathBuf> {
     }))
 }
 
-/// The way past a missing x86_64 slice, for a caller to append verbatim under its own `fix:` marker: `verify provision`'s rustup row puts the release chain's stable in place with that slice's std (`aterm_verify::provision::stock::RELEASE_TOOLCHAIN`), where a hand `rustup +stable target add` fails on a home whose auto-install it turned off and that holds no stable.
+/// The way past a missing x86_64 slice, for a caller to append verbatim under its own `fix:` marker:
+/// `verify provision`'s rustup row acquires the tree's locked stock release with that slice's std.
 pub const X86_SLICE_REMEDIES: &str = "targo --unverified verify provision rustup";
 
 /// How to build Trust from source, for every remedy that offers it.
@@ -1441,7 +1470,9 @@ pub fn toolchain_at(stage2: &Path) -> Result<String> {
 /// git cannot name the tree, a record cannot be read at all, or the seal cannot be taken: no
 /// answer either way.
 pub fn verified(git: &dyn GitRunner, commit: &str, macho_sha256: &str) -> Result<(bool, String)> {
-    verified_with_inputs(git, commit, macho_sha256, crate::build_inputs::current)
+    verified_with_inputs(git, commit, macho_sha256, || {
+        crate::build_inputs::for_commit(git, commit)
+    })
 }
 
 pub(crate) fn verified_with_inputs(
@@ -1460,7 +1491,7 @@ pub(crate) fn verified_with_inputs(
 /// # Errors
 /// Not verified, or not built yet, with the remedy; and a record or journal that cannot be read.
 pub fn verify_gate_at(git: &dyn GitRunner, commit: &str) -> Result<String> {
-    verify_gate_at_with_inputs(git, commit, crate::build_inputs::current)
+    verify_gate_at_with_inputs(git, commit, || crate::build_inputs::for_commit(git, commit))
 }
 
 fn verify_gate_at_with_inputs(
@@ -1997,6 +2028,22 @@ fn locked_metadata_gate_with(
     repo: &Path,
     cargo_home: Option<&Path>,
 ) -> std::result::Result<(), LockedMetadataError> {
+    locked_metadata_with_driver(repo, cargo_home, None)
+}
+
+/// The same metadata judgment with the candidate's already held native build driver.
+pub(crate) fn locked_metadata_for(
+    repo: &Path,
+    targo: &Path,
+) -> std::result::Result<(), LockedMetadataError> {
+    locked_metadata_with_driver(repo, None, Some(targo))
+}
+
+fn locked_metadata_with_driver(
+    repo: &Path,
+    cargo_home: Option<&Path>,
+    selected: Option<&Path>,
+) -> std::result::Result<(), LockedMetadataError> {
     use LockedMetadataError::{Lockfile, Unavailable};
     let lock_path = repo.join("Cargo.lock");
     let lock_before = read_bounded_bytes(&lock_path, 64 << 20).map_err(|error| {
@@ -2007,7 +2054,10 @@ fn locked_metadata_gate_with(
             Unavailable(why)
         }
     })?;
-    let targo = resolve_targo().map_err(|error| Unavailable(error.to_string()))?;
+    let targo = match selected {
+        Some(targo) => targo.to_path_buf(),
+        None => resolve_targo().map_err(|error| Unavailable(error.to_string()))?,
+    };
     let mut metadata = command(&targo);
     metadata
         .args(["metadata", "--locked", "--offline", "--format-version", "1"])
@@ -3234,57 +3284,6 @@ pub fn trustc_probe(repo: &Path) -> Result<PathBuf> {
         ))),
         Err(e) => Err(Error::new(format!("probe compile spawn: {e}"))),
     }
-}
-
-/// Probe stable's installed `x86_64-apple-darwin` target (STOCK EXCEPTION: Trust lacks an `x86_64-apple-darwin` std).
-pub fn x86_target_probe() -> Result<()> {
-    if stable_targets_missing(&["x86_64-apple-darwin"])?.is_empty() {
-        return Ok(());
-    }
-    Err(Error::new(
-        "x86_64-apple-darwin target missing from the stable toolchain — a universal \
-         build is impossible"
-            .to_string(),
-    ))
-}
-
-/// Which of `targets` upstream stable has no std installed for.
-///
-/// # Errors
-/// rustup cannot be run, or does not answer.
-pub fn stable_targets_missing(targets: &[&str]) -> Result<Vec<String>> {
-    let rustup = aterm_uds::host::tool("rustup").locate().map_err(|absent| {
-        Error::new(format!(
-            "{}; upstream stable carries the std of the targets Trust has none for.\n\
-             fix:  {}",
-            absent.why, absent.fix
-        ))
-    })?;
-    let out = command(&rustup)
-        .env("RUSTUP_TOOLCHAIN", "stable")
-        .args(["target", "list", "--installed"])
-        .output()
-        .map_err(|e| {
-            Error::new(format!(
-                "failed to run {} ({e}); upstream stable carries the std of the targets \
-                 Trust has none for.\n\
-                 fix:  {}",
-                rustup.display(),
-                aterm_uds::host::tool("rustup").remedy()
-            ))
-        })?;
-    if !out.status.success() {
-        return Err(Error::new(format!(
-            "`rustup target list --installed` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let installed = String::from_utf8_lossy(&out.stdout);
-    Ok(targets
-        .iter()
-        .filter(|t| !installed.lines().any(|l| l.trim() == **t))
-        .map(|t| (*t).to_string())
-        .collect())
 }
 
 /// The proof, before the release's one build (`artifact::build`), that this builder can build the x86_64 slice (`target`, the stable `x86_64-apple-darwin` std) and run it.

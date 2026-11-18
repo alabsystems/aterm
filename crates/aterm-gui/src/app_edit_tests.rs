@@ -1521,6 +1521,86 @@ fn t10_done_from_a_grid_commits_the_open_cell_saves_and_answers_finished() {
     );
 }
 
+/// The paths the stand-in host's commit of a saved face was handed
+/// (`crate::shared_face::install`).
+static FACES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+fn commit_records(path: &std::path::Path) -> bool {
+    FACES.lock().unwrap().push(path.to_path_buf());
+    true
+}
+
+/// SF-06 (docs/DESIGN-shared-files-2026-11-11.md §3): a durable save of a shared file's face in
+/// an Editor tab runs the commit the host installed, with the face's path, and the tab says it
+/// is committing; the same table saved anywhere else is a save and nothing more.
+///
+/// NEGATIVE CONTROL, observed: with `commit_saved_face` not called after a save lands, the face's
+/// save hands the host nothing: `` left: false right: true ``.
+#[test]
+fn a_saved_face_runs_the_hosts_commit_and_a_table_elsewhere_does_not() {
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+    crate::shared_face::install(commit_records);
+    let wid = WindowId(0);
+    for (folder, face) in [(".aterm/files/lab", true), ("tables/lab", false)] {
+        let mut app = app();
+        let sid = caller(&mut app, wid);
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-face-save-")
+            .tempdir()
+            .unwrap();
+        std::fs::create_dir_all(dir.path().join(folder)).unwrap();
+        let path = dir.path().join(folder).join("machines.tsv");
+        std::fs::write(&path, b"label\tnote\t=pk@1\nm7\t\tmc-1\n").unwrap();
+        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
+        let (ticket, line) = edit(&mut app, sid, request(&uri, None));
+        let edit_view = view(&ok(&line));
+        let (_, answer) = wait(&mut app, AwaitKey::Ticket(ticket));
+        for named in [NamedKey::ArrowDown, NamedKey::ArrowRight] {
+            let event = crate::input::InputEvent::Key {
+                key: Key::Named(named),
+                mods: Modifiers::empty(),
+                base_layout: None,
+                layout_text: None,
+                event_type: KeyEventType::Press,
+            };
+            assert!(app.native_input_event(wid, &event));
+        }
+        type_text(&mut app, wid, "desk");
+        let status = |app: &App| match app.native_runtime.view_state(edit_view) {
+            Some(AppViewState::Editor(state)) => state.status.clone(),
+            _ => None,
+        };
+        let before = FACES.lock().unwrap().len();
+        press(&mut app, wid, "C-x C-s");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "label\tnote\t=pk@1\nm7\tdesk\tmc-1\n",
+            "{folder}"
+        );
+        let handed: Vec<PathBuf> = FACES.lock().unwrap()[before..].to_vec();
+        assert_eq!(
+            handed
+                .iter()
+                .any(|handed| handed.ends_with(std::path::Path::new(folder).join("machines.tsv"))),
+            face,
+            "{folder}: {handed:?}"
+        );
+        assert_eq!(handed.len(), usize::from(face), "{folder}: {handed:?}");
+        assert_eq!(
+            status(&app).as_deref(),
+            Some(if face {
+                "Saved · committing lab/machines"
+            } else {
+                "Saved"
+            }),
+            "{folder}"
+        );
+        press(&mut app, wid, "C-c C-c");
+        let done = outcome(&answer);
+        assert_eq!(done.result, EditResult::Finished, "{folder}");
+    }
+}
+
 #[test]
 fn crlf_held_buffer_takes_typed_line_ends_as_its_own() {
     let wid = WindowId(0);

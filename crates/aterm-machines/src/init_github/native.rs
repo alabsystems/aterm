@@ -65,7 +65,7 @@ pub(crate) fn automatic_inventory_counts(
         return Ok(None);
     }
     let captured = InitialRepositoryInputs::capture_ready(sys, ctx)?;
-    automatic_inventory_counts_captured(sys, ctx, &captured, None)
+    automatic_inventory_counts_captured(sys, ctx, &captured, None, RepositoryWork::Repair)
 }
 
 /// Reuse an existing captured default source. A caller's materialization fence is
@@ -75,6 +75,7 @@ pub(crate) fn automatic_inventory_counts_captured(
     ctx: &Ctx,
     captured: &InitialRepositoryInputs,
     readback: Option<&RepositoryReadback>,
+    work: RepositoryWork,
 ) -> Result<Option<RepositoryCounts>, String> {
     captured.validate_default_context(sys, ctx)?;
     if captured.local.is_err()
@@ -95,8 +96,25 @@ pub(crate) fn automatic_inventory_counts_captured(
         .filter(|proof| {
             proof.user == captured.user && proof.source.as_ref() == captured.source.as_ref()
         })
-        .map_or(&[][..], |proof| proof.empty.as_slice());
-    let counts = repos::partition_with_empty(sys, &captured.user, listed, empty)?.counts();
+        .map(|proof| proof.empty.clone())
+        .unwrap_or_else(|| {
+            if work != RepositoryWork::Repair {
+                return Vec::new();
+            }
+            captured.refresh_scope(sys).map_or_else(
+                |_| Vec::new(),
+                |scope| {
+                    repos::remembered_empty(
+                        sys,
+                        &captured.user,
+                        listed,
+                        scope,
+                        &sys.repository_empty_checkouts(),
+                    )
+                },
+            )
+        });
+    let counts = repos::partition_with_empty(sys, &captured.user, listed, &empty)?.counts();
     // capture_ready released the shared materialization lock before any helper runs.
     let lookups = if !listed.is_empty() && counts.all_here() {
         let helper = super::helper(sys, &captured.user);
@@ -187,6 +205,33 @@ pub(super) fn run(sys: &dyn System, ctx: &Ctx, mode: Mode) -> Result<RepositoryR
         RepositorySteps::Both,
         None,
     )
+}
+
+pub(super) fn observe_empty_captured(
+    sys: &dyn System,
+    ctx: &Ctx,
+    inputs: InitialRepositoryInputs,
+    current: Box<dyn Fn() -> Result<bool, String> + Send + Sync>,
+) -> Result<Option<RepositoryReadback>, String> {
+    let [user] = ctx.users.as_slice() else {
+        return Err("repository observation requires exactly one local user".into());
+    };
+    inputs.validate_default_context(sys, ctx)?;
+    let item = NativeRepositories {
+        mode: Mode::Apply,
+        work: RepositoryWork::Repair,
+        observe_remote: true,
+        reuse_empty: false,
+        ..NativeRepositories::new(user.clone(), Some(Captured { inputs, current }))
+    };
+    let observed = item.probe(sys, ctx);
+    let result = if matches!(observed, Probe::Ok { .. }) {
+        item.readback(sys)
+    } else {
+        Ok(None)
+    };
+    item.row_ended();
+    result
 }
 
 pub(super) fn run_captured(
@@ -342,6 +387,7 @@ fn run_with(
         mode,
         work,
         observe_remote: mode == Mode::Apply || work == RepositoryWork::Refresh,
+        reuse_empty: steps != RepositorySteps::Acquisition,
         refresh_follows: steps == RepositorySteps::Both,
         ..NativeRepositories::new(user.clone(), captured)
     });
@@ -398,8 +444,8 @@ impl IntoIterator for RepositoryRun {
     }
 }
 
-/// Readback of complete empty remote advertisements. It lives only in the current
-/// item/pass; every reuse still checks current inputs and actual local storage.
+/// Pass-owned readback of complete empty-origin evidence. A local Repair may reconstitute
+/// durable observations; every reuse checks current inputs and actual local storage.
 pub struct RepositoryReadback {
     user: User,
     source: Option<super::source::Stamp>,
@@ -430,6 +476,9 @@ struct NativeRepositories {
     /// An apply acquires missing work; a Refresh also admits read-only remote observation.
     /// A Plan/Repair readback alone cannot turn unseen remote state into missing work.
     observe_remote: bool,
+    /// An explicit acquisition owes a new observation; only ordinary local passes borrow
+    /// durable evidence. Their post-apply readback still uses this pass's actual proof.
+    reuse_empty: bool,
     execution: Option<Execution>,
     /// The shared refresh ticket [`RepositoryRefresh`] holds between its admission and finish.
     refresh: Mutex<Option<ActiveRefresh>>,
@@ -838,6 +887,7 @@ impl NativeRepositories {
             mode: Mode::Plan,
             work: RepositoryWork::Refresh,
             observe_remote: true,
+            reuse_empty: true,
             execution: None,
             refresh: Mutex::new(None),
             lease: Mutex::new(None),
@@ -1050,6 +1100,15 @@ impl Item for NativeRepositories {
                 }
                 let lookups = self.lookups(sys, &plan)?;
                 self.ensure_current(sys).map_err(Block::from)?;
+                if lookups.ready()
+                    && self.observe_remote
+                    && !read_back
+                    && !standing.unborn.is_empty()
+                {
+                    // A new remote observation retires the older evidence before it starts.
+                    // A failed read must not let a later local repair revive that result.
+                    self.remember_empty(sys, &plan, true).map_err(Block::from)?;
+                }
                 if lookups.ready() && self.observe_remote && !standing.unborn.is_empty() {
                     let recorded =
                         super::develop_checkouts(sys, &self.user).map_err(Block::from)?;
@@ -1219,6 +1278,9 @@ impl Item for NativeRepositories {
             } else {
                 probe
             };
+            if ready && let Err(why) = self.remember_empty(sys, &plan, false) {
+                return Probe::Blocked { why };
+            }
             self.carry(Carried::Probed(plan, standing));
             probe
         })();
@@ -1486,6 +1548,38 @@ impl NativeRepositories {
         Ok(())
     }
 
+    /// Keep only empty advertisements that still name this captured source's exact local
+    /// checkouts. A plan never writes, and no account record is changed without its lease.
+    fn remember_empty(&self, sys: &dyn System, plan: &Plan, clear: bool) -> Result<(), String> {
+        if self.mode != Mode::Apply {
+            return Ok(());
+        }
+        let Ok(scope) = self.refresh_scope(sys) else {
+            // Explicit profiles have their own inventory policy; an unready scope proves none.
+            return Ok(());
+        };
+        let pass = self
+            .enclosing()
+            .map(|execution| Arc::clone(&execution.pass))
+            .or_else(|| {
+                self.lease
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                    .map(|lease| Arc::clone(&lease.pass))
+            });
+        let Some(pass) = pass else {
+            return Ok(());
+        };
+        let subjects = if clear {
+            Vec::new()
+        } else {
+            repos::empty_subjects(sys, &self.user, &plan.repositories, &plan.empty)
+        };
+        self.ensure_current(sys)?;
+        pass.record_empty(scope, subjects)
+    }
+
     /// The record of the pass's own writes to the watched checkouts ([`PassWrites`]), under
     /// the repository lease this run holds: none without one.
     fn own_writes(&self, sys: &dyn System) -> Option<PassWrites> {
@@ -1695,6 +1789,7 @@ impl NativeRepositories {
         };
         // A long batch can outlive changes to worktrees it did not touch. Completion reads
         // every local destination and required dependency again against this same inventory.
+        self.remember_empty(sys, &plan, false)?;
         self.carry(Carried::Applied(plan));
         acknowledged?;
         if !failed.is_empty() {
@@ -2505,9 +2600,9 @@ impl NativeRepositories {
             return Ok(Plan {
                 token,
                 empty_inventory: repositories.is_empty(),
+                empty: self.borrowed_empty(sys, &repositories),
                 repositories,
                 notes: Vec::new(),
-                empty: self.borrowed_empty(),
             });
         }
         let account = identity(sys, &self.user, &token).map_err(Block::github)?;
@@ -2570,13 +2665,17 @@ impl NativeRepositories {
         Ok(Plan {
             token,
             empty_inventory: false,
+            empty: self.borrowed_empty(sys, &listed.repositories),
             repositories: listed.repositories,
             notes: listed.notes,
-            empty: self.borrowed_empty(),
         })
     }
 
-    fn borrowed_empty(&self) -> Vec<repos::EmptyCheckout> {
+    fn borrowed_empty(
+        &self,
+        sys: &dyn System,
+        repositories: &[repos::Repo],
+    ) -> Vec<repos::EmptyCheckout> {
         let inputs = self
             .captured
             .as_ref()
@@ -2590,7 +2689,24 @@ impl NativeRepositories {
                         && proof.source == inputs.source
                 })
             })
-            .map_or_else(Vec::new, |proof| proof.empty.clone())
+            .map(|proof| proof.empty.clone())
+            .unwrap_or_else(|| {
+                if self.work != RepositoryWork::Repair || !self.reuse_empty {
+                    return Vec::new();
+                }
+                self.refresh_scope(sys).map_or_else(
+                    |_| Vec::new(),
+                    |scope| {
+                        repos::remembered_empty(
+                            sys,
+                            &self.user,
+                            repositories,
+                            scope,
+                            &sys.repository_empty_checkouts(),
+                        )
+                    },
+                )
+            })
     }
 }
 

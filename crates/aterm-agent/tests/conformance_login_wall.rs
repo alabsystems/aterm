@@ -847,9 +847,11 @@ fn real_renewal_is_clean() -> bool {
     };
     let host = Recording::default();
     let (mut out, mut err) = (Vec::new(), Vec::new());
+    // The renewal names the row by its account's address, as `renew` takes no label of a row
+    // with one.
     let code = run_accounts(
         &AccountsCmd::Renew {
-            labels: vec![LABEL.to_string()],
+            accounts: vec!["a@example.com".to_string()],
             due: false,
             on: None,
         },

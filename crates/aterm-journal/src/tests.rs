@@ -491,6 +491,17 @@ thread_local! {
 pub(super) fn hashing() {
     HASHES.with(|count| count.set(count.get() + 1));
 }
+thread_local! {
+    static HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+/// Count `bytes` a writer's checkpoint hashed ([`hashed_bytes`]).
+pub(super) fn hashed(bytes: usize) {
+    HASHED.with(|count| count.set(count.get() + bytes));
+}
+/// The bytes this thread's writer checkpoints have hashed so far.
+pub(super) fn hashed_bytes() -> usize {
+    HASHED.with(std::cell::Cell::get)
+}
 pub(super) fn read_step(step: Reading) {
     let hook = READ_HOOK.with(|hook| hook.borrow_mut().take());
     if let Some(mut hook) = hook {

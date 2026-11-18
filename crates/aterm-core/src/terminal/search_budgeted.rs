@@ -14,7 +14,7 @@ const MAX_MATCHES_PER_STEP: usize = 4_096;
 
 static NEXT_BUDGETED_SEARCH_CURSOR: AtomicU64 = AtomicU64::new(1);
 
-#[allow(deprecated)] // Trust renamed this to try_update; stable x86 slice still exposes fetch_update.
+#[allow(deprecated)] // Trust renamed it try_update; the stock x86 slice still has fetch_update.
 #[inline]
 fn allocate_cursor(counter: &AtomicU64) -> Option<u64> {
     counter

@@ -346,6 +346,16 @@ impl SysWait {
     pub fn names_slots(&self) -> bool {
         self.wait.terms.iter().any(|t| t.metric == Metric::Slots)
     }
+
+    /// Whether it names `spotlight`, whose reading only a split by coalition makes: a parked
+    /// wait on it arms the split, as `await sys spotlight=` does.
+    #[must_use]
+    pub fn names_spotlight(&self) -> bool {
+        self.wait
+            .terms
+            .iter()
+            .any(|t| t.metric == Metric::Spotlight)
+    }
 }
 
 impl fmt::Debug for SysWait {

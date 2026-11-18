@@ -993,3 +993,360 @@ fn a_plan_aterm_reads_is_written_once_and_read_as_the_accounts_observed_plan() {
             .contains(CANARY)
     );
 }
+
+/// A harness login row reaches the journal only in the journal's own words (`login`): each word
+/// it can say is one of the `login` row's, the times pass as they are, a login with a supervised
+/// session is `running`, and a row with a word outside the vocabulary, or keyed by a
+/// sub-account, is left out.
+/// NEGATIVE CONTROL: with `login` taking any `held` word as `linked` (`mine::Held::parse(..)
+/// .or(Some(mine::Held::Linked))`), the misspelt row is kept: `` a word outside is left out ``.
+#[test]
+fn a_harness_login_row_reaches_the_journal_only_in_its_words() {
+    let row = journal::LoginRow {
+        account: journal::Key::new("ac-0123456789abcdef").unwrap(),
+        cli: "claude",
+        place: "managed",
+        state: "signed-out",
+        proof: "status",
+        src: "vault-token",
+        tabs: 2,
+        held: "probation",
+        since: 10,
+        served_at: Some(11),
+        ends_by: Some(12),
+        ended_at: None,
+        attempt: "blocked",
+        attempt_at: Some(13),
+        attempt_route: Some("vault"),
+        plan: Some("max"),
+    };
+    let taken = login(&row).unwrap();
+    assert_eq!(taken.account.as_str(), "ac-0123456789abcdef");
+    assert_eq!(
+        (taken.state, taken.src, taken.use_, taken.tabs, taken.held),
+        (
+            mine::State::SignedOut,
+            mine::Src::VaultToken,
+            mine::Use::Running,
+            2,
+            mine::Held::Probation
+        )
+    );
+    assert_eq!(
+        (
+            taken.since,
+            taken.served_at,
+            taken.ends_by,
+            taken.attempt_at
+        ),
+        (10, Some(11), Some(12), Some(13))
+    );
+    assert_eq!(
+        (
+            taken.attempt,
+            taken.attempt_route,
+            taken.plan.map(|p| p.as_str().to_owned())
+        ),
+        (
+            mine::Attempt::Blocked,
+            Some(mine::Route::Vault),
+            Some("max".to_owned())
+        )
+    );
+    let idle = login(&journal::LoginRow {
+        tabs: 0,
+        ..row.clone()
+    })
+    .unwrap();
+    assert_eq!(idle.use_, mine::Use::Idle);
+    for word in ["signed-in", "signed-out", "ended", "wrong-account"] {
+        assert!(mine::State::parse(word).is_some(), "{word}");
+    }
+    for word in ["linked", "fill", "borrow", "stranded", "probation"] {
+        assert!(mine::Held::parse(word).is_some(), "{word}");
+    }
+    for word in ["profile", "auth-file", "cli-log", "vault-token"] {
+        assert!(mine::Src::parse(word).is_some(), "{word}");
+    }
+    for word in ["none", "signed-in", "failed", "blocked", "no-route"] {
+        assert!(mine::Attempt::parse(word).is_some(), "{word}");
+    }
+    for cli in Cli::ALL {
+        assert!(mine::Cli::parse(cli.id()).is_some(), "{}", cli.id());
+    }
+    for plan in journal::PLANS {
+        assert!(Word::<16>::new(plan).is_some(), "{plan}");
+    }
+    assert!(
+        login(&journal::LoginRow {
+            held: "lnked",
+            ..row.clone()
+        })
+        .is_none(),
+        "a word outside is left out"
+    );
+    assert!(
+        login(&journal::LoginRow {
+            account: journal::Key::new("sa-0123456789abcdef").unwrap(),
+            ..row
+        })
+        .is_none(),
+        "a sub-account holds no login"
+    );
+}
+
+/// THE LOGIN SOURCE READS EACH CLI APART (`logins_in`): a CLI with no roster holds nothing; a
+/// Claude Code row's login is what its store says, held `linked` where a preference of this Mac
+/// names its account and `fill` otherwise, keyed by the lab's account key; a row the upkeep last
+/// read on its vault token is signed in on it, and the reading's next turn (its token's end, the
+/// nearer) is reported beside the rows; a CLI whose store does not read, or that keeps its store
+/// under a home there is none of, reports `None`, and the other CLIs' reports stand; a lab that
+/// names no machine for this Mac reports nothing.
+/// NEGATIVE CONTROLS, each run on macOS: with `logins_in` leaving the token reading out (no
+/// `records.state.tokens_here = store.read_tokens_here()`), bob stays on his profile: `` bob
+/// signed in on his vault token `` (`left: (SignedOut, Profile) right: (SignedIn, VaultToken)`);
+/// with it keeping no turn (`turns` never set), `` the reading turns when bob's token ends ``
+/// (`left: None`); with a store that does not read reported as holding nothing
+/// (`out.insert(word, Some(read().unwrap_or_default()))`), `` a store that does not read reports
+/// none of its CLI `` (`left: Some([]) right: None`).
+#[cfg(unix)]
+#[test]
+fn logins_come_from_each_clis_store_apart_and_one_that_does_not_read_reports_none_of_its_cli() {
+    use aterm_agent::harness::{
+        accounts::{Account, Auth, Row, State, Vendor},
+        alab_roster::{LabAccount, MachineRef},
+        token_route::LAUNCHES_ON_TOKEN,
+    };
+    use std::collections::BTreeMap;
+    const NOW: i64 = 1_800_000_000;
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let config = scratch.path().join("aterm.toml");
+    let harness = scratch.path().join("harness");
+    let home = scratch.path().join("home");
+    std::fs::create_dir_all(&harness).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let me = MachineRef::from_registry("fixture-m22", Some("m22".into()));
+    let (ann, bob) = ("ann@x.example", "bob@x.example");
+    let pk = |email: &str| aterm_db::typed::keys::account_pk("claude", email).unwrap();
+    let account = |email: &str, label: &str, preferred: bool| LabAccount {
+        pk: pk(email),
+        cli: Cli::Claude,
+        vendor: Vendor::default(),
+        label: label.into(),
+        legacy_label: None,
+        email: email.into(),
+        identity: None,
+        browser: None,
+        joinable: true,
+        preferred: if preferred {
+            vec![(me.clone(), Some(1))]
+        } else {
+            Vec::new()
+        },
+    };
+    let lab = Lab {
+        me: Some(me.clone()),
+        accounts: vec![
+            account(ann, "claude-aaaaaa", true),
+            account(bob, "claude-bbbbbb", false),
+        ],
+        ..Lab::default()
+    };
+    let read = |home: Option<&Path>| logins_in(&lab, &config, &harness, home, NOW).unwrap();
+    let claude = |read: &LoginsRead| {
+        read.reports[&mine::Cli::Claude]
+            .as_ref()
+            .expect("Claude Code's store reads")
+            .iter()
+            .map(|login| {
+                (
+                    login.account.as_str().to_owned(),
+                    login.state,
+                    login.held,
+                    login.src,
+                    login.since,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let empty = read(Some(&home));
+    assert_eq!(empty.reports.len(), Cli::ALL.len(), "a report per CLI");
+    assert!(
+        empty
+            .reports
+            .values()
+            .all(|report| report.as_deref() == Some(&[][..])),
+        "no roster holds nothing: {:?}",
+        empty.reports
+    );
+    assert_eq!(empty.turns, None);
+
+    let roster = accounts::roster_beside_for(&config, Cli::Claude).unwrap();
+    let rows = [
+        Row {
+            label: "claude-aaaaaa".into(),
+            dir: Some(scratch.path().join("ann").display().to_string()),
+            email: Some(ann.into()),
+            ..Row::default()
+        },
+        Row {
+            label: "claude-bbbbbb".into(),
+            dir: Some(scratch.path().join("bob").display().to_string()),
+            email: Some(bob.into()),
+            ..Row::default()
+        },
+    ];
+    std::fs::write(
+        &roster,
+        accounts::append_rows_for(Cli::Claude, "", &rows).unwrap(),
+    )
+    .unwrap();
+    let store = accounts::Store::at(&harness);
+    let mut state = State::default();
+    for (label, auth, at) in [
+        ("claude-aaaaaa", Auth::Ok, NOW - 100),
+        ("claude-bbbbbb", Auth::SignedOut, NOW - 50),
+    ] {
+        state.accounts.insert(
+            label.into(),
+            Account {
+                auth,
+                auth_at: Some(at),
+                ..Account::default()
+            },
+        );
+    }
+    store.save(&state).unwrap();
+    let stated = read(Some(&home));
+    assert_eq!(
+        claude(&stated),
+        [
+            (
+                pk(ann),
+                mine::State::SignedIn,
+                mine::Held::Linked,
+                mine::Src::Profile,
+                (NOW - 100) as u64
+            ),
+            (
+                pk(bob),
+                mine::State::SignedOut,
+                mine::Held::Fill,
+                mine::Src::Profile,
+                (NOW - 50) as u64
+            ),
+        ]
+    );
+    assert_eq!(stated.turns, None, "no token reading");
+
+    let ends = NOW + 600;
+    store
+        .note_tokens_here(
+            Some(&BTreeMap::from([(
+                "claude-bbbbbb".to_owned(),
+                u64::try_from(ends).unwrap(),
+            )])),
+            NOW - 10,
+        )
+        .unwrap();
+    let tokened = read(Some(&home));
+    let bob_row = claude(&tokened)[1].clone();
+    if LAUNCHES_ON_TOKEN {
+        assert_eq!(
+            (bob_row.1, bob_row.3),
+            (mine::State::SignedIn, mine::Src::VaultToken),
+            "bob signed in on his vault token"
+        );
+        assert_eq!(
+            tokened.turns,
+            Some(ends),
+            "the reading turns when bob's token ends"
+        );
+    } else {
+        assert_eq!(
+            (bob_row.1, bob_row.3),
+            (mine::State::SignedOut, mine::Src::Profile)
+        );
+        assert_eq!(tokened.turns, None);
+    }
+
+    let codex_roster = accounts::roster_beside_for(&config, Cli::Codex).unwrap();
+    std::fs::write(
+        &codex_roster,
+        accounts::append_rows_for(
+            Cli::Codex,
+            "",
+            &[Row {
+                label: "codex-cccccc".into(),
+                email: Some("cal@x.example".into()),
+                ..Row::default()
+            }],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let codex_state = accounts::Store::at_for(&harness, Cli::Codex, &home).state_file();
+    std::fs::create_dir_all(codex_state.parent().unwrap()).unwrap();
+    std::fs::write(&codex_state, b"{ not a state").unwrap();
+    for home in [Some(home.as_path()), None] {
+        let broken = read(home);
+        assert_eq!(
+            broken.reports[&mine::Cli::Codex],
+            None,
+            "a store that does not read reports none of its CLI"
+        );
+        assert_eq!(
+            claude(&broken),
+            claude(&tokened),
+            "Claude Code's report stands"
+        );
+    }
+
+    let unnamed = Lab {
+        me: None,
+        ..lab.clone()
+    };
+    assert_eq!(
+        logins_in(&unnamed, &config, &harness, Some(&home), NOW),
+        None
+    );
+}
+
+/// A LOGIN MAY READ OTHERWISE once a file it is read from moves or its token reading turns
+/// (`moved_since`, `login_files`): before any report it may; a store's state saved again moves a
+/// stamp; a turn ahead of the clock waits and one the clock reached does not.
+/// NEGATIVE CONTROLS, each run: with `moved_since` ignoring the turn (`seen.stamps != stamps`
+/// alone), `` the turn came ``; with `login_files` leaving out the store's state files (no
+/// `files.extend(store.state_files())`), `` assertion failed:
+/// files.contains(&store.state_file()) ``.
+#[cfg(unix)]
+#[test]
+fn a_login_may_read_otherwise_once_its_files_move_or_its_token_reading_turns() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let config = scratch.path().join("aterm.toml");
+    let harness = scratch.path().join("harness");
+    std::fs::create_dir_all(&harness).unwrap();
+    let files = login_files(&config, &harness, None);
+    let store = accounts::Store::at(&harness);
+    assert!(files.contains(&store.state_file()));
+    assert!(
+        files.windows(2).all(|pair| pair[0] < pair[1]),
+        "each file once"
+    );
+    let before = stamps(&files);
+    assert!(moved_since(None, &before, 10), "nothing seen yet");
+    let seen = Seen {
+        stamps: before.clone(),
+        turns: Some(20),
+    };
+    assert!(!moved_since(Some(&seen), &before, 19), "nothing moved");
+    assert!(moved_since(Some(&seen), &before, 20), "the turn came");
+    store
+        .save(&aterm_agent::harness::accounts::State::default())
+        .unwrap();
+    assert!(
+        moved_since(Some(&seen), &stamps(&files), 19),
+        "a saved state moves a stamp"
+    );
+}

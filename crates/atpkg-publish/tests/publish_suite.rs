@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The crate's one integration-test binary, one directory per area: `shared/`, `artifact/`,
-//! `channel/` and `lane/`, and `adopt.rs`.
+//! `channel/` and `lane/`, and `adopt.rs`. Unix's, as the library is.
+#![cfg(unix)]
 
 #[cfg(test)]
 aterm_durable::plain_durable_flushes_in_tests!();

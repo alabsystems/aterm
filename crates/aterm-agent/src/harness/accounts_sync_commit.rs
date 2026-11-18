@@ -4,6 +4,9 @@
 //! Crash recovery for account state, sync, renewal and pool materialization. The pending receipt fences readers;
 //! replay installs exact admitted images, including their already allocated generations.
 //! This is not atomicity for unrelated transactions or independent unlocked paired reads.
+//!
+//! Traced by the accounts keeper: what this file reads of the file system itself, it reads
+//! through `aterm_uds::trace::fs` (census `traced-reads`).
 
 use super::*;
 use crate::harness::account_sync_error::{Retry, SyncError};
@@ -231,8 +234,12 @@ fn encode_stored_receipt(receipt: &Receipt) -> Result<String, String> {
     Ok(text)
 }
 
+/// The sync file at `path`, at most `max` bytes of text; `None` where nothing is there. With a
+/// trace scope armed it records the file's stamp before its open ([`trace::fs::opening`]), and a
+/// retry where the open or the read failed for a reason no stamp decides.
 pub(super) fn read(path: &Path, max: u64) -> Result<Option<String>, String> {
     use std::io::Read as _;
+    trace::fs::opening(path);
     let file = match astream_sys::open_nonblocking(path, astream_sys::Links::Refuse) {
         Ok(file) => file,
         Err(why) if why.kind() == io::ErrorKind::NotFound => {
@@ -241,9 +248,16 @@ pub(super) fn read(path: &Path, max: u64) -> Result<Option<String>, String> {
                 _ => Err(format!("{}: missing or linked sync file", path.display())),
             };
         }
-        Err(why) => return Err(format!("{}: {why}", path.display())),
+        Err(why) => {
+            trace::fs::failed(path, &why);
+            return Err(format!("{}: {why}", path.display()));
+        }
     };
-    let meta = file.metadata().map_err(|why| why.to_string())?;
+    let failed = |why: io::Error| {
+        trace::fs::failed(path, &why);
+        why.to_string()
+    };
+    let meta = file.metadata().map_err(failed)?;
     if !meta.is_file() {
         return Err(format!("{}: sync file is not regular", path.display()));
     }
@@ -251,9 +265,7 @@ pub(super) fn read(path: &Path, max: u64) -> Result<Option<String>, String> {
         return Err(format!("{}: sync file exceeds its limit", path.display()));
     }
     let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0).saturating_add(1));
-    file.take(max + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|why| why.to_string())?;
+    file.take(max + 1).read_to_end(&mut bytes).map_err(failed)?;
     if bytes.len() as u64 > max {
         return Err(format!("{}: sync file exceeds its limit", path.display()));
     }
@@ -273,7 +285,7 @@ pub(in crate::harness) fn usage_target(path: Option<&Path>) -> Result<Option<Pat
         let mut ancestor = path.as_path();
         let mut missing = Vec::new();
         loop {
-            match std::fs::canonicalize(ancestor) {
+            match trace::fs::canonicalize(ancestor) {
                 Ok(mut resolved) => {
                     for name in missing.into_iter().rev() {
                         resolved.push(name);
@@ -281,7 +293,7 @@ pub(in crate::harness) fn usage_target(path: Option<&Path>) -> Result<Option<Pat
                     return Ok(resolved);
                 }
                 Err(why) if why.kind() == io::ErrorKind::NotFound => {
-                    if std::fs::symlink_metadata(ancestor).is_ok() {
+                    if trace::fs::symlink_metadata(ancestor).is_ok() {
                         return Err(format!("{}: unresolved usage source", ancestor.display()));
                     }
                     missing.push(
@@ -324,7 +336,7 @@ fn publication_parent(path: &Path) -> &Path {
     let parent = path.parent().unwrap_or(Path::new("."));
     parent
         .ancestors()
-        .find(|ancestor| ancestor.is_dir())
+        .find(|ancestor| trace::fs::is_dir(ancestor))
         .unwrap_or(parent)
 }
 
@@ -339,7 +351,7 @@ fn judge_login_dir(dir: &Path) -> Result<(), String> {
     }
     #[cfg(not(unix))]
     {
-        match std::fs::symlink_metadata(dir) {
+        match trace::fs::symlink_metadata(dir) {
             Ok(meta) => {
                 #[cfg(windows)]
                 let linked = {
@@ -414,7 +426,7 @@ impl Plan {
             let retained = before
                 .row(&row.label)
                 .is_some_and(|before| before.dir == row.dir);
-            match std::fs::symlink_metadata(dir) {
+            match trace::fs::symlink_metadata(dir) {
                 Ok(_) if retained => continue,
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -946,11 +958,12 @@ impl Store {
     pub(in crate::harness) fn transact_roster_state_held(
         &self,
         held: &Lock,
-        now: i64,
+        now: impl Into<trace::Now>,
         note: &mut Option<String>,
         target: SyncTarget<'_>,
         (retire, edit): (bool, impl FnOnce(&mut State) -> Result<Vec<Event>, String>),
     ) -> Result<bool, SyncError> {
+        let now: trace::Now = now.into();
         self.transact_state_images_held(
             held,
             now,
@@ -989,12 +1002,13 @@ impl Store {
     pub(in crate::harness) fn transact_roster_admitted_held(
         &self,
         held: &Lock,
-        now: i64,
+        now: impl Into<trace::Now>,
         note: &mut Option<String>,
         target: SyncTarget<'_>,
         retire: bool,
         (source, admits): (Option<&super::super::alab_roster::ReceiptGuard>, Admits),
     ) -> Result<bool, SyncError> {
+        let now: trace::Now = now.into();
         self.transact_state_images_held(
             held,
             now,
@@ -1034,7 +1048,7 @@ impl Store {
     fn transact_state_images_held(
         &self,
         held: &Lock,
-        now: i64,
+        now: impl Into<trace::Now>,
         note: &mut Option<String>,
         target: Option<StateTarget<'_>>,
         edit: Option<impl FnOnce(&mut State) -> Result<Vec<Event>, SyncError>>,
@@ -1044,6 +1058,7 @@ impl Store {
             impl FnOnce() -> Result<(), String>,
         ),
     ) -> Result<(Vec<Event>, bool), SyncError> {
+        let now: trace::Now = now.into();
         let materialize = matches!(&target, Some(StateTarget::Roster(..)));
         let retire_legacy = matches!(
             &target,
@@ -1147,12 +1162,17 @@ impl Store {
             let auth_changed = auth_scope::clear(&mut state);
             let edited = state != before || (!events.is_empty() && old_state.is_none());
             if edited {
-                drop_stale_sessions(&mut state, now);
+                drop_unanswered_sessions(&mut state, now.raw());
             }
             // Attribute ledger rows, and record what the journal is told, before retaining the
-            // transaction's exact images.
-            let notes =
-                super::super::journal::observe(self.cli, &before, &mut state, &mut events, now);
+            // transaction's exact images. The journal's notes compare the reading as a number.
+            let notes = super::super::journal::observe(
+                self.cli,
+                &before,
+                &mut state,
+                &mut events,
+                now.raw(),
+            );
             let new_state = if edited || state != before {
                 Some(state.to_json() + "\n")
             } else {
@@ -1576,7 +1596,7 @@ impl Store {
 
     fn receipt(&self) -> Result<Option<Receipt>, String> {
         let Some(text) = read(&self.dir.join(RECEIPT), MAX_RECEIPT)? else {
-            return match std::fs::symlink_metadata(self.dir.join(WITNESS)) {
+            return match trace::fs::symlink_metadata(self.dir.join(WITNESS)) {
                 Err(why) if why.kind() == io::ErrorKind::NotFound => Ok(None),
                 _ => Err(
                     "account sync receipt is missing; retained witness prevents a fresh start"
@@ -2135,7 +2155,7 @@ impl Store {
         let old_logins = read(&self.logins_file(), MAX_LOGINS_BYTES)?;
         let edited = state != before.0 || (!events.is_empty() && old_state.is_none());
         if edited {
-            drop_stale_sessions(&mut state, now);
+            drop_unanswered_sessions(&mut state, now);
         }
         // Before the state's image: what the journal is told is recorded in it.
         let notes =
@@ -2226,11 +2246,17 @@ impl Store {
         Ok(Image { before, after })
     }
 
-    fn source_policy_image(&self, retire: bool, now: i64) -> Result<Option<Image>, String> {
+    fn source_policy_image(
+        &self,
+        retire: bool,
+        now: impl Into<trace::Now>,
+    ) -> Result<Option<Image>, String> {
+        let now: trace::Now = now.into();
         if !retire {
             return Ok(None);
         }
-        let (before, after) = self.retirement_image(now)?;
+        // A retirement is written, stamped with the reading.
+        let (before, after) = self.retirement_image(now.raw())?;
         Ok(Some(Image {
             before,
             after: Some(after),

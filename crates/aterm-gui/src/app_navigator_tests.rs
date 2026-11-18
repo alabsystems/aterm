@@ -910,53 +910,106 @@ fn a_shells_command_is_working_and_a_take_over_is_no_error() {
     );
 }
 
-/// THE SIDEBAR'S EDGE IS A HAIRLINE: the column between the list and the pane beside it takes
-/// the page's ground and a one-eighth rule in the separator's ink, in place of the pane
-/// divider's slab and the active pane's mark. NEGATIVE CONTROL: the cell is not the divider's.
+/// Under `chrome`, the navigator opened as the left split and its frame composed: `judge` reads
+/// the app, its plan, the column between the list and the pane beside it, and the list's rows.
+fn judge_sidebar_split(
+    chrome: crate::pane_chrome::SplitChrome,
+    judge: impl FnOnce(&App, &crate::tab_model::VisibleLeafPlan, usize, std::ops::Range<usize>),
+) {
+    crate::pane_chrome::with_split_chrome(chrome, || {
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let mut app = App::headless_for_test();
+        assert_eq!(app.open_navigator(true), Ok(true));
+        app.publish_navigators(Instant::now());
+        assert!(app.prepare_heterogeneous_input_scratch(WID).is_some());
+        let plan = app.active_visible_leaf_plan(WID).expect("a plan");
+        let list = plan.leaves[0].rect;
+        let gap = (list.origin.x + list.size.width).round() as usize;
+        assert_eq!(gap, usize::from(crate::navigator::SPLIT_COLS));
+        let top = list.origin.y.round() as usize;
+        let rows = top..top + list.size.height.round() as usize;
+        assert!(rows.len() > 1);
+        judge(&app, &plan, gap, rows);
+    });
+}
+
+/// THE SIDEBAR'S EDGE IS A HAIRLINE: under Classic split chrome (macOS and Linux; Windows'
+/// Fluent seam is the next test's) the column between the list and the pane beside it takes the
+/// page's ground and a one-eighth rule in the separator's ink, in place of the pane divider's
+/// slab and the active pane's mark. NEGATIVE CONTROL: the cell is not the divider's.
 #[test]
 fn the_sidebars_edge_is_a_hairline_in_the_separators_ink() {
-    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
-    let mut app = App::headless_for_test();
-    assert_eq!(app.open_navigator(true), Ok(true));
-    app.publish_navigators(Instant::now());
-    assert!(app.prepare_heterogeneous_input_scratch(WID).is_some());
-    let page = app.chrome_palette(crate::app_render::ChromeSurface::NativePage);
-    let roles = crate::native_appearance::default_roles(page);
-    let divider =
-        crate::app_render::divider_cell(app.chrome_palette(crate::app_render::ChromeSurface::Grid));
-    let plan = app.active_visible_leaf_plan(WID).expect("a plan");
-    let list = plan.leaves[0].rect;
-    let gap = (list.origin.x + list.size.width).round() as usize;
-    assert_eq!(gap, usize::from(crate::navigator::SPLIT_COLS));
-    let top = list.origin.y.round() as usize;
-    let rows = top..top + list.size.height.round() as usize;
-    let scratch = &app.windows[&WID].input_scratch;
-    assert!(rows.len() > 1);
-    for row in rows {
-        let cell = scratch.cells[row][gap];
-        assert_eq!(
-            (cell.ch, cell.fg, cell.bg, cell.overline),
-            ('\u{2595}', roles.separator, roles.surface, false),
-            "row {row}: a one-eighth rule on the page's ground"
-        );
-        assert_ne!(
-            (cell.ch, cell.bg),
-            (divider.ch, divider.bg),
-            "NEGATIVE CONTROL: not the pane divider's slab"
-        );
-    }
-    // The rule runs on across the list's header row, on the header's own ground.
-    let header = plan.leaves[0]
-        .header
-        .expect("a pane of a split has a header");
-    let band = crate::pane_header::header_colors(
-        app.chrome_palette(crate::app_render::ChromeSurface::Header),
-    )
-    .bar_bg;
-    let cell = scratch.cells[header.origin.y.round() as usize][gap];
-    assert_eq!(
-        (cell.ch, cell.fg, cell.bg),
-        ('\u{2595}', roles.separator, band)
+    judge_sidebar_split(
+        crate::pane_chrome::SplitChrome::Classic,
+        |app, plan, gap, rows| {
+            let page = app.chrome_palette(crate::app_render::ChromeSurface::NativePage);
+            let roles = crate::native_appearance::default_roles(page);
+            let divider = crate::app_render::divider_cell(
+                app.chrome_palette(crate::app_render::ChromeSurface::Grid),
+            );
+            let scratch = &app.windows[&WID].input_scratch;
+            for row in rows {
+                let cell = scratch.cells[row][gap];
+                assert_eq!(
+                    (cell.ch, cell.fg, cell.bg, cell.overline),
+                    ('\u{2595}', roles.separator, roles.surface, false),
+                    "row {row}: a one-eighth rule on the page's ground"
+                );
+                assert_ne!(
+                    (cell.ch, cell.bg),
+                    (divider.ch, divider.bg),
+                    "NEGATIVE CONTROL: not the pane divider's slab"
+                );
+            }
+            // The rule runs on across the list's header row, on the header's own ground.
+            let header = plan.leaves[0]
+                .header
+                .expect("a pane of a split has a header");
+            let band = crate::pane_header::header_colors(
+                app.chrome_palette(crate::app_render::ChromeSurface::Header),
+            )
+            .bar_bg;
+            let cell = scratch.cells[header.origin.y.round() as usize][gap];
+            assert_eq!(
+                (cell.ch, cell.fg, cell.bg),
+                ('\u{2595}', roles.separator, band)
+            );
+        },
+    );
+}
+
+/// UNDER FLUENT THE SEAM IS THE SIDEBAR'S EDGE: Windows' split chrome already draws one centred
+/// hairline down every gap, so the column beside the list keeps the seam's line on the
+/// terminal's ground (on the band between the two headers) and no page edge is drawn over it:
+/// one rule between the list and its neighbour, as between two panes. NEGATIVE CONTROL: no cell
+/// of the column is the Classic page edge's one-eighth rule.
+#[test]
+fn under_fluent_the_sidebars_edge_is_the_seams_hairline() {
+    judge_sidebar_split(
+        crate::pane_chrome::SplitChrome::Fluent,
+        |app, plan, gap, rows| {
+            let (inks, _) = app.fluent_seam(plan).expect("a Fluent split has a seam");
+            let scratch = &app.windows[&WID].input_scratch;
+            for row in rows {
+                let cell = scratch.cells[row][gap];
+                assert_eq!(
+                    (cell.ch, cell.fg, cell.bg, cell.overline),
+                    ('\u{2502}', inks.line, inks.ground, false),
+                    "row {row}: the seam's hairline on the terminal's ground"
+                );
+                assert_ne!(cell.ch, '\u{2595}', "NEGATIVE CONTROL: not the page edge");
+            }
+            let header = plan.leaves[0]
+                .header
+                .expect("a pane of a split has a header");
+            let cell = scratch.cells[header.origin.y.round() as usize][gap];
+            assert_eq!(
+                (cell.fg, cell.bg),
+                (inks.line, inks.band),
+                "the seam crosses the header row on the band"
+            );
+            assert_ne!(cell.ch, '\u{2595}', "NEGATIVE CONTROL: not the page edge");
+        },
     );
 }
 

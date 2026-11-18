@@ -9,12 +9,14 @@ use crate::system_state::LockupSpec;
 use crate::system_state::lockup::Baked;
 use aterm_effects::rainbow_road::{CatPose, RoadArt};
 
-/// A stand-in oven: it records how many bakes run at once, the most that ever did, and what it
-/// kept, in order.
+/// A stand-in oven: it records every key it is asked to bake, how many bakes run at once, the
+/// most that ever did, and what it kept, each in order.
 #[derive(Default)]
 struct Recorder {
     running: AtomicUsize,
     most: AtomicUsize,
+    /// Every key passed to [`Oven::bake`], in the order the bakes began, kept or not.
+    baked: Mutex<Vec<Key>>,
     kept: Mutex<Vec<Key>>,
     landed: AtomicUsize,
     /// A bake under way waits here until the test lets it go (a release mid-bake).
@@ -27,6 +29,8 @@ impl Oven for Arc<Recorder> {
     }
 
     fn bake(&self, key: Key) -> Arc<[u8]> {
+        // Recorded before it counts as running, so a test that saw it run sees it here.
+        self.baked.lock().unwrap().push(key);
         let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
         self.most.fetch_max(now, Ordering::SeqCst);
         drop(self.gate.lock().unwrap());
@@ -69,10 +73,21 @@ fn idle(baker: &Baker<Arc<Recorder>>) {
     }
 }
 
-/// A DRAG BAKES WHERE IT ENDS (§4.5): forty requests made while a bake is under way, as a live
-/// resize makes them, run on one worker, never two bakes at once, and the last bakes are the
-/// newest request's, every one of them; the requests in between bake nothing. NEGATIVE CONTROL:
-/// each bake that landed woke the window.
+/// A bake is under way, waiting at the gate the test holds: a hang detector, not a budget.
+fn under_way(recorder: &Recorder) {
+    let end = Instant::now() + Duration::from_secs(60);
+    while recorder.running.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < end, "the bake never began");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A DRAG BAKES WHERE IT ENDS (§4.5): of forty requests, the first one's bake under way while the
+/// other thirty-nine arrive as a live resize makes them, one worker bakes one at a time, and
+/// after the bake under way only the newest request's images, every one of them: the requests in
+/// between bake nothing. The bake under way, which the newest request no longer wants, is not
+/// kept when it lands. NEGATIVE CONTROL: each bake kept woke the window, and asked again for what
+/// is kept, nothing bakes.
 #[test]
 fn rapid_requests_bake_one_at_a_time_and_end_on_the_newest() {
     let recorder = Arc::new(Recorder::default());
@@ -80,9 +95,11 @@ fn rapid_requests_bake_one_at_a_time_and_end_on_the_newest() {
     let requests: Vec<[Key; 2]> = (0..40)
         .map(|at| [road(at * 10), road(at * 10 + 1)])
         .collect();
-    // The first request's bake holds at the gate while the rest arrive.
+    // The first request's first bake holds at the gate while the rest arrive.
     let gate = recorder.gate.lock().unwrap();
-    for keys in &requests {
+    baker.want(1, &requests[0]);
+    under_way(&recorder);
+    for keys in &requests[1..] {
         baker.want(1, keys);
     }
     drop(gate);
@@ -92,22 +109,56 @@ fn rapid_requests_bake_one_at_a_time_and_end_on_the_newest() {
         1,
         "one bake at a time"
     );
-    let kept = recorder.kept.lock().unwrap().clone();
     let newest = requests[requests.len() - 1];
-    assert!(
-        newest.iter().all(|key| kept.contains(key)),
-        "the newest request is baked: {kept:?}"
+    assert_eq!(
+        *recorder.baked.lock().unwrap(),
+        vec![road(0), newest[0], newest[1]],
+        "the bake under way, then the newest request's, and nothing in between"
     );
-    assert_eq!(kept[kept.len() - 2..], newest, "and baked last");
-    assert!(
-        kept.len() <= 3,
-        "the requests a newer one replaced bake nothing (one bake was under way): {kept:?}"
+    let kept = recorder.kept.lock().unwrap().clone();
+    assert_eq!(
+        kept, newest,
+        "the newest request is kept, the bake it replaced is not"
     );
     assert_eq!(recorder.landed.load(Ordering::SeqCst), kept.len());
     // Asked again for what is kept, nothing bakes.
     baker.want(1, &newest);
     idle(&baker);
-    assert_eq!(recorder.kept.lock().unwrap().len(), kept.len());
+    assert_eq!(
+        recorder.baked.lock().unwrap().len(),
+        3,
+        "nothing baked again"
+    );
+}
+
+/// A BAKE UNDER WAY THAT THE NEWER REQUEST STILL WANTS IS KEPT ONCE: the view's moment moved on
+/// while one of its images baked, and the new moment wants that image too (a step's cat whose
+/// pose and lean did not change). Not kept yet when the newer request came, it was queued again;
+/// it is kept as it lands, and when its turn in the queue comes it is not baked a second time.
+/// NEGATIVE CONTROL: the newer request's other image bakes after it and is kept, each kept image
+/// waking the window once.
+#[test]
+fn a_bake_under_way_the_newer_request_still_wants_is_kept_once() {
+    let recorder = Arc::new(Recorder::default());
+    let baker = Baker::new(Arc::clone(&recorder));
+    let gate = recorder.gate.lock().unwrap();
+    baker.want(1, &[road(3)]);
+    under_way(&recorder);
+    // road(3) is at the gate, not kept: the newer request queues it again.
+    baker.want(1, &[road(3), road(4)]);
+    drop(gate);
+    idle(&baker);
+    assert_eq!(
+        *recorder.baked.lock().unwrap(),
+        vec![road(3), road(4)],
+        "each baked once"
+    );
+    assert_eq!(
+        *recorder.kept.lock().unwrap(),
+        vec![road(3), road(4)],
+        "the bake under way kept as it landed, then the newer request's other image"
+    );
+    assert_eq!(recorder.landed.load(Ordering::SeqCst), 2, "one wake each");
 }
 
 /// ONCE NO PAGE IS SHOWN NOTHING IS KEPT: a release drops what is queued and what is kept, and a
@@ -122,11 +173,7 @@ fn a_release_drops_the_queue_the_bakes_and_a_bake_under_way() {
     let gate = recorder.gate.lock().unwrap();
     baker.want(1, &[road(1), road(2), road(3)]);
     // The worker is inside road(2)'s bake, waiting at the gate.
-    let end = Instant::now() + Duration::from_secs(60);
-    while recorder.running.load(Ordering::SeqCst) == 0 {
-        assert!(Instant::now() < end, "the bake never began");
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    under_way(&recorder);
     baker.release();
     assert!(recorder.kept.lock().unwrap().is_empty(), "the bakes went");
     drop(gate);
@@ -140,8 +187,9 @@ fn a_release_drops_the_queue_the_bakes_and_a_bake_under_way() {
 /// TWO VIEWS NEVER DROP EACH OTHER'S BAKES (§4.5): one view's newest request replaces its own
 /// older one alone. A second view whose images are all kept asks while the first's bakes are
 /// queued, and the first's still bake; the worker bakes the newest request first, then what the
-/// other view still wants. NEGATIVE CONTROL: the first view's own newer request does replace
-/// its older one.
+/// other view still wants, and never what is kept. NEGATIVE CONTROL: the first view's own newer
+/// request does replace its older one: its queued images never bake, and its bake under way is
+/// not kept.
 #[test]
 fn two_views_keep_each_others_queued_bakes() {
     let recorder = Arc::new(Recorder::default());
@@ -151,41 +199,38 @@ fn two_views_keep_each_others_queued_bakes() {
     // View 1's bakes queue behind one under way; view 2 asks for what it has.
     let gate = recorder.gate.lock().unwrap();
     baker.want(1, &[road(1), road(2), road(3)]);
-    let end = Instant::now() + Duration::from_secs(60);
-    while recorder.running.load(Ordering::SeqCst) == 0 {
-        assert!(Instant::now() < end, "the bake never began");
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    under_way(&recorder);
     baker.want(2, &[road(500)]);
     // View 2 then wants a new moment: it bakes before what view 1 still waits for.
     baker.want(2, &[road(600)]);
     drop(gate);
     idle(&baker);
+    assert_eq!(
+        *recorder.baked.lock().unwrap(),
+        vec![road(500), road(1), road(600), road(2), road(3)],
+        "view 1's bake under way, the newest request, then what view 1 still waits for"
+    );
     let kept = recorder.kept.lock().unwrap().clone();
     for key in [road(1), road(2), road(3), road(600)] {
-        assert!(kept.contains(&key), "{key:?} baked: {kept:?}");
+        assert!(kept.contains(&key), "{key:?} kept: {kept:?}");
     }
-    let at = |key| kept.iter().position(|k| *k == key).unwrap();
-    assert!(
-        at(road(600)) < at(road(2)),
-        "the newest request first: {kept:?}"
-    );
-    // View 1's newer request replaces its own older one: its queued images bake no more.
+    // View 1's newer request replaces its own older one: its queued images never bake, and the
+    // one under way is not kept when it lands.
     let gate = recorder.gate.lock().unwrap();
+    let from = recorder.baked.lock().unwrap().len();
     baker.want(1, &[road(7), road(8), road(9)]);
-    while recorder.running.load(Ordering::SeqCst) == 0 {
-        assert!(Instant::now() < end, "the bake never began");
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    under_way(&recorder);
     baker.want(1, &[road(10)]);
     drop(gate);
     idle(&baker);
+    assert_eq!(
+        recorder.baked.lock().unwrap()[from..],
+        [road(7), road(10)],
+        "the bake under way, then the newer request's"
+    );
     let kept = recorder.kept.lock().unwrap().clone();
     assert!(kept.contains(&road(10)));
-    assert!(
-        !kept.contains(&road(8)) && !kept.contains(&road(9)),
-        "replaced: {kept:?}"
-    );
+    assert!(!kept.contains(&road(7)), "replaced: {kept:?}");
 }
 
 /// WHAT IS KEPT IS WHAT THE VIEWS WANT AND DREW: a view's drawing pass that records what it drew
@@ -293,7 +338,7 @@ fn sorted(recorder: &Recorder) -> Vec<Key> {
 #[test]
 fn the_cache_keeps_two_moments_of_the_longest_road_within_its_budget() {
     let spec = |done| LockupSpec {
-        kitty: true,
+        road: true,
         px: 22.0,
         scale: 2.0,
         alab: true,
@@ -340,9 +385,11 @@ fn the_cache_keeps_two_moments_of_the_longest_road_within_its_budget() {
 }
 
 /// A RUN KEEPS ABOUT TWO MOMENTS (§4.5): a view 900 points wide on a 2x display drawn through a
-/// 16-step run, each step's bake landing a pass after it is asked for, keeps at most the
-/// moment it shows and the one it waits for, never the run's past. NEGATIVE CONTROL: the run's
-/// sixteen moments together are several times that.
+/// 16-step run, each step's bake landing a pass after it is asked for, keeps at most the moment
+/// it shows and the one just baked as that bake lands, and the one it shows once it draws it;
+/// never the run's past. NEGATIVE CONTROL: a view whose passes never say what they drew keeps
+/// the run's past, past two moments by its third (one pass that says nothing is not enough: the
+/// next pass's record of the moment it still shows drops the one before).
 #[test]
 fn a_sixteen_step_run_keeps_about_two_moments() {
     let view = crate::system_state::SystemStateViewState::default();
@@ -350,7 +397,7 @@ fn a_sixteen_step_run_keeps_about_two_moments() {
     let width = 900.0 - 2.0 * 24.0;
     let moment = |done| {
         LockupSpec {
-            kitty: true,
+            road: true,
             px: 22.0,
             scale: 2.0,
             alab: true,
@@ -368,10 +415,9 @@ fn a_sixteen_step_run_keeps_about_two_moments() {
             .map(|(_, w, h)| (w * h * 4) as usize)
             .sum()
     };
-    let all: usize = (0..=16).map(|done| bytes(moment(done))).sum();
+    let two = 2 * bytes(moment(16));
     hold(true);
     let mut drawn: Option<Baked> = None;
-    let mut most = 0;
     for done in 0..=16 {
         let wanted = moment(done);
         requester.want(&wanted.keys());
@@ -379,26 +425,39 @@ fn a_sixteen_step_run_keeps_about_two_moments() {
         let paint = wanted.spec.paint(width, drawn);
         drawn = paint.images.or(drawn);
         requester.drew(&drawn.map_or_else(Vec::new, |drawn| drawn.keys().to_vec()));
-        most = most.max(crate::widget::images_kept_bytes());
         settle();
+        // The most it ever keeps: the moment it shows and the one that just landed.
+        let landed = crate::widget::images_kept_bytes();
+        assert!(
+            landed <= two,
+            "{done}: at most two moments as its bake lands: {landed} of {two}"
+        );
         let paint = wanted.spec.paint(width, drawn);
         assert_eq!(paint.images, Some(wanted), "{done}: its bake landed");
         drawn = paint.images;
         requester.drew(&wanted.keys());
-        most = most.max(crate::widget::images_kept_bytes());
         assert!(
             crate::widget::images_kept_bytes() <= bytes(wanted),
             "{done}: one moment kept once it is drawn"
         );
     }
-    hold(false);
-    let two = 2 * bytes(moment(16));
-    assert!(most <= two, "at most two moments: {most} of {two}");
-    assert!(all > 4 * two, "the run's moments together: {all}");
     drop(view);
     assert_eq!(
         crate::widget::images_kept_bytes(),
         0,
         "the closed view's went"
     );
+    // Control: a view that asks for each moment and never says what it drew.
+    let careless = crate::system_state::SystemStateViewState::default();
+    for done in 0..3 {
+        careless.lockup_requester.want(&moment(done).keys());
+        settle();
+    }
+    let piled = crate::widget::images_kept_bytes();
+    assert!(
+        piled > two,
+        "control: its past moments pile up: {piled} of {two}"
+    );
+    drop(careless);
+    hold(false);
 }

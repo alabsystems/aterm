@@ -390,6 +390,9 @@ impl Item for Narrowed<'_> {
     fn probe(&self) -> Probe {
         self.inner.probe()
     }
+    fn observe(&self) -> Option<Result<(), String>> {
+        self.inner.observe()
+    }
     fn apply(&self) -> Result<(), String> {
         self.inner.apply()
     }

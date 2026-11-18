@@ -418,3 +418,112 @@ fn the_bench_takes_the_app_band_itself() {
         Band::NoRoles => panic!("macOS has darwin roles"),
     }
 }
+
+/// [`Budget::working`] over a scripted subject whose clock moves only by the wait's pauses: the
+/// subject runs while `runs` says so, its tree reads `generation(n)` at its `n`th reading, and
+/// `probe` answers from the time the wait has taken. Returns the outcome, the time taken and
+/// how often the probe was asked.
+fn scripted_wait(
+    budget: &Budget,
+    mut runs: impl FnMut() -> bool,
+    mut generation: impl FnMut(u64) -> Option<u64>,
+    mut probe: impl FnMut(Duration) -> bool,
+) -> (Result<(), CouldNotRun>, Duration, u64) {
+    let start = Instant::now();
+    let clock = std::cell::Cell::new(start);
+    let mut reads = 0;
+    let mut asked = 0;
+    let result = budget.working(
+        "the state",
+        Duration::from_secs(1),
+        Progress {
+            now: &mut || clock.get(),
+            runs: &mut runs,
+            read: &mut || {
+                reads += 1;
+                generation(reads)
+            },
+            pause: &mut |d| clock.set(clock.get() + d),
+        },
+        || {
+            asked += 1;
+            probe(clock.get() - start).then_some(())
+        },
+    );
+    (result, clock.get() - start, asked)
+}
+
+/// A wait held to the subject's progress outlasts the wall's minute while the subject works,
+/// and a tree that does not read is no evidence of a stall: each waits until the probe answers.
+#[test]
+fn a_wait_held_to_progress_outlasts_the_minute_while_the_subject_works() {
+    let budget = Budget::from_now(3600);
+    let late = |taken: Duration| taken >= Duration::from_secs(150);
+    let (got, taken, _) = scripted_wait(&budget, || true, Some, late);
+    assert_eq!(got, Ok(()), "a tree whose CPU moves at every reading");
+    assert!(
+        taken >= Duration::from_secs(150) && taken < MUST_HAPPEN * 3,
+        "{taken:?}"
+    );
+    let (got, _, _) = scripted_wait(&budget, || true, |_| None, late);
+    assert_eq!(got, Ok(()), "a tree that never reads");
+}
+
+/// A subject whose tree stops progressing is refused a minute after its last progress, naming
+/// what did not happen; a stall that ends before its minute keeps the wait open.
+#[test]
+fn a_subject_that_stops_progressing_is_refused_after_its_minute() {
+    let budget = Budget::from_now(3600);
+    let (got, taken, _) = scripted_wait(&budget, || true, |_| Some(0), |_| false);
+    match got {
+        Err(CouldNotRun::Refused(why)) => assert!(
+            why.starts_with("the state did not happen")
+                && why.contains("made no CPU or I/O progress for 60s"),
+            "{why}"
+        ),
+        other => panic!("a stalled tree: {other:?}"),
+    }
+    assert!(
+        taken >= MUST_HAPPEN && taken < MUST_HAPPEN + Duration::from_secs(2),
+        "{taken:?}"
+    );
+    // Still over its first 50 readings (49 s: the 1 s gap is longer than the tree's tick, so a
+    // reading a poll), then working again until the probe answers at 120 s.
+    let (got, _, _) = scripted_wait(
+        &budget,
+        || true,
+        |n| Some(n.saturating_sub(50)),
+        |taken| taken >= Duration::from_secs(120),
+    );
+    assert_eq!(got, Ok(()));
+}
+
+/// A subject that is gone is asked once more, since what it did as it ended may be the answer,
+/// and is refused where that has none; a spent budget refuses at once, after one probe, before
+/// it reads whether the subject runs, gone or not.
+#[test]
+fn a_gone_subject_is_asked_once_more_and_a_spent_budget_refuses() {
+    let budget = Budget::from_now(3600);
+    let mut answers = [false, true].into_iter();
+    let (got, _, asked) =
+        scripted_wait(&budget, || false, Some, |_| answers.next().unwrap_or(false));
+    assert_eq!((got, asked), (Ok(()), 2));
+    let (got, _, asked) = scripted_wait(&budget, || false, Some, |_| false);
+    assert_eq!(
+        (got, asked),
+        (
+            Err(CouldNotRun::Refused(
+                "the subject ended before the state".into()
+            )),
+            2
+        )
+    );
+    for runs in [true, false] {
+        let (got, _, asked) = scripted_wait(&Budget::from_now(0), || runs, Some, |_| false);
+        assert_eq!(
+            (got, asked),
+            (Err(Budget::from_now(0).spent("the wait for the state")), 1),
+            "runs={runs}"
+        );
+    }
+}

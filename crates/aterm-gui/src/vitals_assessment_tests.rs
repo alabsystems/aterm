@@ -48,16 +48,122 @@ fn input(epoch: Instant, observed: Instant, generation: u64) -> Input {
     let reads = req.tab_reads(epoch, || observed);
     Input::new(
         reads,
-        Some(vec![ProcessReading {
-            pid: 4242,
-            start: Some(generation),
-            ..ProcessReading::default()
-        }]),
-        true,
+        ProcessFacts::new(
+            Some(vec![ProcessReading {
+                pid: 4242,
+                start: Some(generation),
+                ..ProcessReading::default()
+            }]),
+            true,
+            None,
+            None,
+        ),
         &req,
         generation,
         false,
     )
+}
+
+fn zombie_input(
+    model: &mut aterm_vitals::Vitals,
+    epoch: Instant,
+    observed: Instant,
+    at_ms: u64,
+) -> (Input, Arc<aterm_vitals::blockage::ZombieFacts>) {
+    let req = Request {
+        jobs_now: true,
+        ..Request::default()
+    };
+    let rows = vec![ProcessReading {
+        pid: 4242,
+        ppid: 4241,
+        start: Some(42),
+        state: aterm_sysprobe::jobs::RunState::Zombie,
+        ..ProcessReading::default()
+    }];
+    let sample = aterm_vitals::Sample {
+        at_ns: at_ms * 1_000_000,
+        mono_ms: at_ms,
+        procs: Some(
+            rows.iter()
+                .map(|row| super::super::proc_sample(row, epoch))
+                .collect(),
+        ),
+        ..aterm_vitals::Sample::default()
+    };
+    let snapshot = model.absorb(&sample);
+    let receipt = model
+        .current_zombie_facts()
+        .expect("supported current sweep");
+    let facts = ProcessFacts::new(
+        Some(rows),
+        true,
+        Some((&sample, &snapshot)),
+        Some(Arc::clone(&receipt)),
+    );
+    (
+        Input::new(req.tab_reads(epoch, || observed), facts, &req, at_ms, false),
+        receipt,
+    )
+}
+
+/// Equal process identities on opposite sides of the age cutoff still belong to different
+/// canonical observations. Coalescing pending input must move the sweep and receipt together.
+#[test]
+fn one_zombie_book_gui_assessment_coalesces_sources_without_restamping_completed_views() {
+    let (entered, at_gate) = mpsc::sync_channel(1);
+    let (release, go) = mpsc::sync_channel(1);
+    let mut first = true;
+    let mut lane = Lane::threaded(move |core, input| {
+        if std::mem::take(&mut first) {
+            entered.send(()).unwrap();
+            go.recv_timeout(HANG).unwrap();
+        }
+        core.read(input)
+    });
+    let shared = shared(&lane);
+    let observed = Instant::now();
+    let epoch = observed - std::time::Duration::from_secs(20);
+    let mut model = aterm_vitals::Vitals::new();
+    let (before, first_receipt) = zombie_input(&mut model, epoch, observed, 1_000);
+    let (pending, skipped_receipt) = zombie_input(&mut model, epoch, observed, 10_999);
+    let (newest, last_receipt) = zombie_input(&mut model, epoch, observed, 11_000);
+    assert!(first_receipt.piles().is_empty() && skipped_receipt.piles().is_empty());
+    assert_eq!(last_receipt.parent_pile(4241).unwrap().count(), 1);
+    assert!(
+        before.evidence.matches(&newest.evidence),
+        "identity alone does not prove the age cutoff"
+    );
+
+    lane.read(before, true);
+    at_gate.recv_timeout(HANG).unwrap();
+    lane.read(pending, true);
+    lane.read(newest, true);
+    release.send(()).unwrap();
+    wait_ready(&shared, 1);
+    let first = lane.carried();
+    let first_facts = first.jobs.as_ref().unwrap().zombie_facts.as_ref().unwrap();
+    assert!(Arc::ptr_eq(first_facts, &first_receipt));
+    assert_eq!(first_facts.mono_ms(), 1_000);
+    assert!(first_facts.piles().is_empty());
+    lane.publish_names(Vec::new());
+
+    wait_ready(&shared, 3);
+    let last = lane.carried();
+    let last_facts = last.jobs.as_ref().unwrap().zombie_facts.as_ref().unwrap();
+    assert!(Arc::ptr_eq(last_facts, &last_receipt));
+    assert!(!Arc::ptr_eq(last_facts, &skipped_receipt));
+    assert_eq!(
+        (last_facts.seq(), last_facts.mono_ms()),
+        (last_receipt.seq(), 11_000)
+    );
+    assert_eq!(last_facts.parent_pile(4241).unwrap().count(), 1);
+    assert!(Arc::ptr_eq(
+        first.jobs.as_ref().unwrap().zombie_facts.as_ref().unwrap(),
+        &first_receipt
+    ));
+    lane.at_stop(&[], 0);
+    wait_dead(&shared);
 }
 
 /// Hold the real assessment boundary, not the machine source. Two whole machine readings
@@ -139,7 +245,7 @@ fn ordered_assessment_publication(serial_seed: u64) {
         let result = core.read(input);
         saw.send((
             input.serial,
-            input.sweep.as_ref().unwrap()[0].start,
+            input.facts.sweep().unwrap()[0].start,
             input.coalesced,
             input.req.jobs_now,
         ))

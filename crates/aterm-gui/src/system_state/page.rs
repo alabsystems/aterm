@@ -450,7 +450,7 @@ impl<'a, 'b> Page<'a, 'b> {
     /// leaves one line, so a taller window never sets a smaller lockup. A pane too narrow for
     /// the road shows the words alone in its place.
     fn size(&mut self, width: f32, height: f32) {
-        let road = self.kitty_shows();
+        let road = self.road_shows();
         for compact in [false, true] {
             self.m = Metrics::new(width, compact);
             let list = self.collapsed_list_h();
@@ -484,8 +484,8 @@ impl<'a, 'b> Page<'a, 'b> {
     /// be ALab's mid-run sets nothing smaller.
     fn lockup_sizes(&self, road: bool) -> Vec<(f32, bool)> {
         let m = &self.m;
-        let spec = |px: f32, kitty: bool| LockupSpec {
-            kitty,
+        let spec = |px: f32, road: bool| LockupSpec {
+            road,
             px,
             alab: true,
             ..self.lockup_spec()
@@ -652,7 +652,7 @@ impl<'a, 'b> Page<'a, 'b> {
     }
 
     /// Whether the road and the cat show: not in Serious Mode, not under High Contrast.
-    fn kitty_shows(&self) -> bool {
+    fn road_shows(&self) -> bool {
         !self.cx.motion.serious && !marks::Looks::now().high_contrast
     }
 
@@ -690,7 +690,7 @@ impl<'a, 'b> Page<'a, 'b> {
     fn lockup_spec(&self) -> LockupSpec {
         let m = &self.m;
         LockupSpec {
-            kitty: m.road,
+            road: m.road,
             px: m.lockup_px,
             scale: self.cx.terminal_scale.max(1.0),
             alab: lines::alab_lockup(&self.app.status, self.app.plan.selection),
@@ -718,7 +718,7 @@ impl<'a, 'b> Page<'a, 'b> {
     fn lockup(&self) -> UiNode {
         let m = &self.m;
         let spec = self.lockup_spec();
-        let paint = if self.drawing && spec.kitty {
+        let paint = if self.drawing && spec.road {
             let wanted = spec.wanted(m.inner);
             let requester = &self.view.lockup_requester;
             requester.want(&wanted.keys());
@@ -742,7 +742,7 @@ impl<'a, 'b> Page<'a, 'b> {
         };
         // VoiceOver hears the run as it is, whichever moment the images still show.
         let (done, total) = (spec.done, spec.total);
-        let below = if spec.kitty {
+        let below = if spec.road {
             on_grid(spec.glow_below())
         } else {
             0.0

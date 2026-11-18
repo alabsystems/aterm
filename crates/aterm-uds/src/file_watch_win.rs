@@ -140,7 +140,13 @@ const FILE_SHARE_ALL: u32 = 0x0001 | 0x0002 | 0x0004;
 const OPEN_EXISTING: u32 = 3;
 /// Opens a directory.
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+/// Opens a link or another reparse point as itself, never what it names.
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+/// Read a file's attributes and times, and nothing of its bytes.
+const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+/// 1970-01-01 in filetime ticks (100 ns since 1601-01-01 UTC).
+const FILETIME_UNIX_EPOCH: i128 = 116_444_736_000_000_000;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
 /// `GetQueuedCompletionStatus`'s error when its time ran out.
 const WAIT_TIMEOUT: i32 = 258;
@@ -359,6 +365,37 @@ fn wide(path: &Path) -> io::Result<Vec<u16>> {
     }
     wide.push(0);
     Ok(wide)
+}
+
+/// The [`super::FileStamp`] of what `path` names (through a link where `follow`, else the link
+/// itself), read through a handle opened for its attributes alone and refusing nobody else's
+/// use of it, as [`std::fs::metadata`]'s own is: its volume's serial number and its file id
+/// (`FILE_ID_INFO`, which a replace by rename changes), its length, and its last-write and
+/// change times (`FILE_BASIC_INFO`), in nanoseconds since 1970. `None` where no handle opens or
+/// the volume keeps no file ids (FAT, exFAT: [`aterm_dirfd::fstat`] refuses), for its caller to
+/// stamp what the path's metadata says.
+pub(super) fn stamp(path: &Path, follow: bool) -> Option<super::FileStamp> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    let link = if follow {
+        0
+    } else {
+        FILE_FLAG_OPEN_REPARSE_POINT
+    };
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_ALL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | link)
+        .open(path)
+        .ok()?;
+    let stat = aterm_dirfd::fstat(&file).ok()?;
+    let since_1970 = |ticks: i64| (i128::from(ticks) - FILETIME_UNIX_EPOCH) * 100;
+    Some(super::FileStamp {
+        dev: stat.st_dev,
+        ino: stat.st_ino,
+        len: stat.size,
+        modified_ns: since_1970(stat.last_write),
+        changed_ns: since_1970(stat.change_time),
+    })
 }
 
 /// Open the folder `path` names for its changes, refusing nobody else's use of it.

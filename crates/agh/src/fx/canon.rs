@@ -566,10 +566,16 @@ pub fn git_request(run: &crate::git::GitRun) -> Vec<u8> {
         }
         GitOp::CheckLocal { .. } => format!("git check-local {slug}\nread-only true"),
         GitOp::Mirror { .. } => format!("git clone-mirror {slug}"),
-        GitOp::Clone { depth, .. } => match depth {
-            Some(depth) => format!("git clone {slug}\ndepth {depth}"),
-            None => format!("git clone {slug}"),
-        },
+        GitOp::Clone { depth, cache, .. } => {
+            let mut text = format!("git clone {slug}");
+            if let Some(depth) = depth {
+                let _ = write!(text, "\ndepth {depth}");
+            }
+            if cache.is_some() {
+                text.push_str("\nsource object cache present");
+            }
+            text
+        }
         GitOp::Fetch { .. } => format!("git fetch {slug}"),
         GitOp::FetchMain { into, blobless, .. } => {
             let mut text = format!("git fetch-main {slug}\ninto {into}");

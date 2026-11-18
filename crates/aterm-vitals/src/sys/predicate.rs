@@ -20,8 +20,9 @@ pub const USAGE: &str = "ERR usage: await sys <predicate> [for=<n>(ms|s|m|h)] [s
                          jobs.running slots <n>, tab.mem aterm.mem avail <size>, \
                          swap <size>[/s], decompress <n>[/s], mem normal|warn|critical, \
                          thermal nominal|fair|serious|critical (the heuristic's \
-                         none|light|heavy|severe rank alike), thrash yes|no (= and != take a \
-                         comma list; thrash takes no other <op>); \
+                         none|light|heavy|severe rank alike), thrash yes|no, \
+                         spotlight idle|indexing|off (= and != take a comma list; thrash and \
+                         spotlight take no other <op>); \
                          <volume> := free>=<size|room> | free><size|room> | free<<size> | free<=<size> \
                          | disk=ok|low|short|emergency[,…], never with quiet, a <term>, for= or \
                          scope=; \
@@ -87,6 +88,8 @@ pub enum Metric {
     Avail,
     /// Build slots proven free, less those an orphaned build still fills.
     Slots,
+    /// The Spotlight family's state, `idle`/`indexing`/`off` ([`crate::spotlight::State`]).
+    Spotlight,
 }
 
 /// Which count a `jobs.<word>` term reads.
@@ -182,6 +185,7 @@ impl Metric {
             Self::CoresIdle => "cores_idle".into(),
             Self::Avail => "avail".into(),
             Self::Slots => "slots".into(),
+            Self::Spotlight => "spotlight".into(),
         }
     }
 
@@ -199,7 +203,7 @@ impl Metric {
             Self::Mem | Self::Thermal => Kind::Ordered,
             Self::Swap => Kind::Bps,
             Self::Decompress => Kind::PerS,
-            Self::Thrash => Kind::YesNo,
+            Self::Thrash | Self::Spotlight => Kind::YesNo,
             Self::TabMem | Self::AtermMem | Self::Avail => Kind::Bytes,
             Self::Jobs(_) | Self::Slots => Kind::Count,
             Self::Job(_) => Kind::Job,
@@ -212,6 +216,7 @@ impl Metric {
             Self::Mem => &["normal", "warn", "critical"],
             Self::Thermal => &["nominal", "fair", "serious", "critical"],
             Self::Thrash => &["no", "yes"],
+            Self::Spotlight => &crate::spotlight::State::WORDS,
             _ => &[],
         }
     }
@@ -721,6 +726,7 @@ fn term(tok: &str) -> Result<Tok, String> {
         "cores_idle" => Metric::CoresIdle,
         "avail" => Metric::Avail,
         "slots" => Metric::Slots,
+        "spotlight" => Metric::Spotlight,
         n => match n.strip_prefix("cpu.") {
             Some(label)
                 if !label.is_empty()
@@ -1098,6 +1104,12 @@ fn read(metric: &Metric, s: &Snapshot, tab_keys: &[u64], cores_want: bool) -> Re
             .map_or(Reading::Unavailable("unsupported"), |m| {
                 Reading::Num(m.sample.available as f64)
             }),
+        Metric::Spotlight => match (s.spotlight.as_ref(), s.coal_lane) {
+            (Some(r), _) => Reading::Rank(r.state.rank()),
+            (None, crate::explain::CoalLane::On) => Reading::Warming,
+            (None, crate::explain::CoalLane::Off) => Reading::Unavailable("lane_off:coalitions"),
+            (None, crate::explain::CoalLane::Unsupported) => Reading::Unavailable("unsupported"),
+        },
         Metric::Slots => match s.slots {
             None => Reading::Unavailable(SlotsUnread::NotSampled.word()),
             Some(_) if s.slots_age_ms.is_some_and(|a| a > SLOTS_FRESH_MS) => Reading::Warming,

@@ -57,12 +57,78 @@ fn a_start_suspended_child_is_not_an_exited_child() {
         .spawn()
         .unwrap();
     let stopped = child.exited();
+    let observed = child.exit_status_unreaped();
     child.resume().unwrap();
     let input = crate::deadline::cat_echoes(&mut child);
     drop(input);
     let status = child.wait().unwrap();
     assert!(!stopped.unwrap(), "CLD_STOPPED is not terminal evidence");
+    assert!(
+        observed.unwrap().is_none(),
+        "a suspended start has no exit status"
+    );
     assert!(status.success());
+}
+
+/// A terminal observation preserves the owning wait and agrees with its portable exit code.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[test]
+fn an_unreaped_wide_exit_matches_the_owning_wait() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    const NAME: &str = "spawnfd::command_tests::an_unreaped_wide_exit_matches_the_owning_wait";
+    if let Ok(value) = std::env::var(STAGE_ENV)
+        && let Some(code) = value.strip_prefix("wide-exit:")
+    {
+        if code == "kill" {
+            crate::process::kill_self_now();
+        }
+        std::process::exit(
+            code.parse()
+                .expect("the parent supplies a native exit value"),
+        );
+    }
+    for code in [
+        Some(0),
+        Some(7),
+        Some(255),
+        Some(256),
+        Some(-1),
+        Some(0x1234_5678),
+        None,
+    ] {
+        let case = code.map_or_else(|| "kill".to_owned(), |code| code.to_string());
+        let mut child = command(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--nocapture"])
+            .env(STAGE_ENV, format!("wide-exit:{case}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let observed = aterm_spec::wait::until_while_working(
+            child.id(),
+            "the native exit is observable without reaping",
+            || match child.exit_status_unreaped() {
+                Ok(Some(status)) => Some(Ok(status)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            },
+        );
+        let pinned = child.owns_unreaped();
+        let reaped = child.wait().unwrap();
+        assert!(
+            pinned,
+            "the observation still pins the owned child's identity"
+        );
+        let observed = observed.unwrap_or_else(|error| panic!("native exit {case}: {error}"));
+        assert_eq!(observed, reaped, "native exit {case}");
+        if let Some(code) = code {
+            assert_eq!(reaped.code(), Some(code & 0xff));
+        } else {
+            assert_eq!(reaped.signal(), Some(libc::SIGKILL));
+        }
+    }
 }
 
 /// The accounting handle owns the wait, including a nonblocking look while a

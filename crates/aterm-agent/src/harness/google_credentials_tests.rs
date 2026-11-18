@@ -26,6 +26,59 @@ fn bundles_bind_provider_and_identity_without_mailbox_fallbacks() {
     ));
 }
 
+/// A registry mailbox's bundle is revealed once, at its load, and every recheck after it asks
+/// the registry with nothing revealed: a drive that rechecks before each step, and again as
+/// it hands the page its password, journals the load's reveal alone.
+/// NEGATIVE CONTROL: with `check_current` revealing the bundle again to compare it (before the
+/// fix), the count after the rechecks is `left: 14, right: 2`.
+#[cfg(unix)]
+#[test]
+fn a_registry_bundle_is_revealed_at_its_load_and_rechecked_with_no_reveal() {
+    use super::super::alab_roster::{self, LabMailbox, Part};
+    let source = "[[identities]]\nid='one'\nemail='person@example.com'\nregistry_mailbox='mb-0123456789abcdef'\n[[bindings]]\nprovider='agy'\naccount='work'\nidentity='one'\nexpected_email='person@example.com'\n";
+    let registry = super::super::google_identity::Registry::parse(source).unwrap();
+    let identity = registry.resolve("agy", "work").unwrap().0;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let mailbox = LabMailbox {
+        pk: "mb-0123456789abcdef".into(),
+        login: "person@example.com".into(),
+        service: Some("gmail".into()),
+        webmail: None,
+        receives: Vec::new(),
+        held: vec![Part::Password, Part::Totp],
+    };
+    alab_roster::with_mail(
+        vec![mailbox.clone()],
+        vec![
+            ((&mailbox.pk, Part::Password), "fixture-registry-password"),
+            ((&mailbox.pk, Part::Totp), "JBSWY3DPEHPK3PXP"),
+        ],
+        || {
+            let mut credentials = Credentials::load(identity, root.path()).unwrap();
+            assert_eq!(
+                alab_roster::reveals(),
+                2,
+                "the load's: a password and a seed"
+            );
+            for _ in 0..5 {
+                credentials.check_current().unwrap();
+            }
+            credentials
+                .with_google_page("https://accounts.google.com/login", |password, seed| {
+                    assert_eq!(password, "fixture-registry-password");
+                    assert_eq!(seed, Some("JBSWY3DPEHPK3PXP"));
+                })
+                .unwrap();
+            assert_eq!(alab_roster::reveals(), 2, "no recheck revealed");
+            assert_eq!(
+                alab_roster::looks(),
+                6,
+                "each recheck asked the registry once"
+            );
+        },
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn explicit_registry_credentials_bind_service_identity_and_current_secret() {

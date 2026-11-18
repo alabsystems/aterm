@@ -14,7 +14,6 @@
 
 use std::io::Read as _;
 use std::path::Path;
-use std::time::Instant;
 
 pub mod activity;
 pub mod blockio;
@@ -650,7 +649,9 @@ pub fn memory_pressure() -> Option<MemoryLevel> {
     }
 }
 
-/// KiB swapped in plus out since boot (`HOST_VM_INFO64` swapins plus swapouts times `vm.pagesize` on macOS, `/proc/vmstat` `pswpin` plus `pswpout` times the page size on Linux): the counter whose rate the memory ceiling reads (`warn` plus a thrash). Windows keeps no such count for a reader without privilege, so there it is the page files' pages in use, in KiB: a level, whose rise is what was paged out less what was let go, so a [`SwapMeter`] over it reads the page files' growth (never more than was written) and 0 while they shrink.
+/// Native swap observation in KiB: cumulative swap-ins plus swap-outs on macOS and Linux.
+/// Windows supplies page-file pages currently in use instead, a level rather than a cumulative
+/// write counter. Consumers retain that distinction when deriving rates.
 #[must_use]
 pub fn swapped_kib() -> Option<u64> {
     #[cfg(target_os = "macos")]
@@ -683,61 +684,6 @@ pub fn swapped_kib() -> Option<u64> {
     )))]
     {
         None
-    }
-}
-
-/// The shortest span a [`SwapMeter`] takes a rate over: readings closer than this answer the last rate (two agents measured a millisecond apart must not read a burst, or nothing, off one page).
-pub const SWAP_SPAN_MIN: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// The longest: a rate averaged over more than this says nothing about now, so the meter starts again and reads no rate until the next reading.
-pub const SWAP_SPAN_MAX: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// THE SWAP RATE of a caller that reads [`swapped_kib`] at its own times (the memory ceiling reads it with each agent's measure, every few seconds): KiB per second over the span since the last reading at least [`SWAP_SPAN_MIN`] before, never one longer than [`SWAP_SPAN_MAX`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SwapMeter {
-    /// The reading the next rate is taken from.
-    base: Option<(Instant, u64)>,
-    /// The last rate taken, KiB/s.
-    rate: Option<u32>,
-}
-
-impl SwapMeter {
-    /// A meter that has read nothing.
-    #[inline]
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            base: None,
-            rate: None,
-        }
-    }
-
-    /// Read the counter `kib` ([`swapped_kib`]; `None`: unknown) at `at`, and answer the swap rate in KiB/s: the rate since the base reading once [`SWAP_SPAN_MIN`] has passed (the base moves here), the last rate before then, and `None` with no base, an unknown counter, or a base older than [`SWAP_SPAN_MAX`] (the meter starts again from this reading).
-    pub fn observe(&mut self, at: Instant, kib: Option<u64>) -> Option<u32> {
-        let Some(kib) = kib else {
-            *self = Self::new();
-            return None;
-        };
-        let Some((base_at, base_kib)) = self.base else {
-            self.base = Some((at, kib));
-            return None;
-        };
-        let span = at.saturating_duration_since(base_at);
-        if span > SWAP_SPAN_MAX {
-            *self = Self {
-                base: Some((at, kib)),
-                rate: None,
-            };
-            return None;
-        }
-        if span < SWAP_SPAN_MIN {
-            return self.rate;
-        }
-        let ms = u64::try_from(span.as_millis()).unwrap_or(u64::MAX).max(1);
-        let rate = kib.saturating_sub(base_kib).saturating_mul(1000) / ms;
-        self.rate = Some(u32::try_from(rate).unwrap_or(u32::MAX));
-        self.base = Some((at, kib));
-        self.rate
     }
 }
 

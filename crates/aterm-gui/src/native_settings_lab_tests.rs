@@ -290,7 +290,7 @@ fn an_accounts_token_offer_is_one_step_that_asks_for_its_tab() {
     );
     lab.accounts.rows[0].offer = Some(crate::token_shown::TokenOffer {
         line: "a vault token would keep fixture-account signed in: make one".into(),
-        label: "fixture-account".into(),
+        word: "claude-fixture-x".into(),
         replace: false,
     });
     publish(&mut runtime, instance, view, lab, 2);

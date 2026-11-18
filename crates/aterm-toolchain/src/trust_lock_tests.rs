@@ -296,7 +296,43 @@ fn the_compiler_commit_is_what_trustc_answers() {
         &trustc,
         &format!("#!/bin/sh\necho 'rustc 1.101.0-dev'\necho 'commit-hash: {COMMIT}'\n"),
     );
-    assert_eq!(compiler_commit(&bin).as_deref(), Some(COMMIT));
+    assert_eq!(compiler_commit(&bin).as_deref(), Ok(COMMIT));
     crate::test_script::script(&trustc, "#!/bin/sh\necho 'commit-hash: unknown'\n");
-    assert_eq!(compiler_commit(&bin), None);
+    assert_eq!(
+        compiler_commit(&bin),
+        Err(CompilerCommitError::MissingCommitHash)
+    );
+    crate::test_script::script(&trustc, "#!/bin/sh\nexit 7\n");
+    let error = compiler_commit(&bin).expect_err("a failed process supplied no identity");
+    assert!(
+        matches!(&error, CompilerCommitError::Probe(why) if why.contains('7')),
+        "{error}"
+    );
+    crate::test_script::script(&trustc, "#!/bin/sh\nprintf '\\377'\n");
+    let error = compiler_commit(&bin).expect_err("non-UTF-8 output supplies no identity");
+    assert!(
+        matches!(&error, CompilerCommitError::Probe(why) if why.contains("UTF-8")),
+        "{error}"
+    );
+    let absent = bin.join("absent-trustc");
+    assert!(matches!(
+        compiler_commit_of(&absent),
+        Err(CompilerCommitError::Probe(_))
+    ));
+}
+
+#[test]
+fn a_compiler_reply_must_name_one_commit() {
+    let single = format!("rustc 1.101.0-dev\ncommit-hash: {COMMIT}\nhost: example\n");
+    assert_eq!(commit_hash_line(&single).as_deref(), Some(COMMIT));
+    for other in [
+        format!("commit-hash: {COMMIT}"),
+        format!("commit-hash: {}", "a".repeat(40)),
+        "commit-hash: unknown".to_owned(),
+        format!("commit-hash:{COMMIT}"),
+    ] {
+        for reply in [format!("{single}{other}\n"), format!("{other}\n{single}")] {
+            assert_eq!(commit_hash_line(&reply), None, "ambiguous reply: {reply}");
+        }
+    }
 }

@@ -195,6 +195,12 @@ pub(crate) struct SessionMeta {
     /// must not forget what was acknowledged. Keyed on the claimant's proof
     /// ([`Self::open_stream`]); never serialized.
     pub(crate) stream: Option<StreamState>,
+    /// The version of the build the standing scoped claim's proof admitted, with the claimant
+    /// it was read for ([`crate::harness_claim::ClaimProof`]): what `supervisor_version=`
+    /// prints ([`Self::verified_version`]). Written at each scoped claim placement and dropped
+    /// when the claim ends or another claimant holds it ([`Self::set_supervisor`]); never
+    /// serialized, so a successor process reads it at the claimant's next claim.
+    pub(crate) supervisor_verified: Option<(crate::harness_claim::Proven, String)>,
     /// The actual host runner carrying this session's task across a process replacement.
     /// A claim's release or a new claim does not end the runner's responsibility.
     pub(crate) task_exit_owner: crate::harness_host::task_exit::Slot,
@@ -266,6 +272,7 @@ impl PartialEq for SessionMeta {
             supervisor_revision: _,
             claim_placements: _,
             stream: _,
+            supervisor_verified: _,
             task_exit_owner: _,
             builtin_relaunch_epoch: _,
             supervisor_builtin: _,
@@ -406,6 +413,7 @@ impl SessionMeta {
             supervisor_revision: 0,
             claim_placements: 0,
             stream: None,
+            supervisor_verified: None,
             task_exit_owner: Default::default(),
             builtin_relaunch_epoch: RelaunchEpoch::default(),
             supervisor_builtin: false,
@@ -573,6 +581,18 @@ impl SessionMeta {
         }
     }
 
+    /// The version of the build the live scoped claim's proof admitted at `now_us`: its
+    /// manifest's, or `link` for a development link's checkout. `None` under any other claim,
+    /// and where the proof read no version. It is never the `version=` the claim states.
+    #[must_use]
+    pub(crate) fn verified_version(&self, now_us: u64) -> Option<&str> {
+        let scoped = self.live_scoped(now_us)?;
+        self.supervisor_verified
+            .as_ref()
+            .filter(|(proven, _)| *proven == scoped.proven)
+            .map(|(_, version)| version.as_str())
+    }
+
     /// The live claim's proven scoped claim at `now_us` ([`SupervisorClaim::scoped`]): a
     /// registered harness's contract 3 or 4 claim, with the versions it announced and the child
     /// aterm kept for it.
@@ -692,11 +712,11 @@ impl SessionMeta {
     /// proven claim bound to a connection is recorded in
     /// [`Self::claimant_conn`] until that connection closes, and an unproven claim bound to a
     /// connection clears any earlier proof recorded for that connection. The revision stays where
-    /// it was for a renewal in place: `claim` is the claim live at `now_us` again with only its
-    /// `ttl=` lease moved ([`SupervisorClaim::renews_in_place`]) and the authority the session
-    /// shows ([`Self::supervisor_authority`]) is unchanged, so a seal, a native operation or a
-    /// typed input bound to the revision outlives its own holder's reconfirmations. Every call
-    /// moves [`Self::claim_placements`].
+    /// it was for a renewal in place: `claim` retains the live claim's authority at `now_us`,
+    /// while its lease or requested words may move ([`SupervisorClaim::renews_in_place`]), and
+    /// the authority the session shows ([`Self::supervisor_authority`]) is unchanged, so a seal,
+    /// a native operation or a typed input bound to the revision outlives its own holder's
+    /// reconfirmations. Every call moves [`Self::claim_placements`].
     #[cfg_attr(
         all(unix, any(test, debug_assertions)),
         aterm_spec_anchor::refines(
@@ -863,6 +883,14 @@ impl SessionMeta {
             self.claim_needs = None;
         }
         self.supervisor = claim;
+        let claimant = self
+            .supervisor
+            .as_ref()
+            .and_then(|claim| claim.scoped.as_ref())
+            .map(|scoped| &scoped.proven);
+        if self.supervisor_verified.as_ref().map(|(proven, _)| proven) != claimant {
+            self.supervisor_verified = None;
+        }
         if !in_place || self.supervisor_authority(now_us) != before {
             self.supervisor_revision = self.supervisor_revision.wrapping_add(1);
         }
@@ -1123,10 +1151,46 @@ impl SessionMeta {
             .is_some_and(SupervisorClaim::is_proven)
     }
 
-    /// When the `ttl=` claim lapses ([`crate::metrics::now_us`]), live or not.
+    /// When the claim lapses ([`crate::metrics::now_us`]), live or not: a `ttl=` claim's lease,
+    /// or the end of the re-exec grace of a contract 4 claim whose connection closed
+    /// ([`Self::keep_through_grace`]). A claim bound to an open connection has none.
     #[must_use]
     pub(crate) fn supervisor_expiry(&self) -> Option<u64> {
         self.supervisor.as_ref().and_then(|claim| claim.expires_us)
+    }
+
+    /// THE RE-EXEC GRACE (`docs/HARNESS-CONTRACT.md`, "The re-exec grace"): connection `conn`
+    /// closed at `now_us`, and where the live claim is a proven contract 4 claim bound to it,
+    /// the claim is kept for `grace_us` more, with that deadline as its expiry
+    /// ([`Self::supervisor_expiry`]), so the window's lapse timer releases it
+    /// ([`publish_lapse_supervisor`]) unless the same claimant claims again first. Whether the
+    /// claim is kept, and whether this call is what armed the grace.
+    ///
+    /// The claim is changed in place and not placed again ([`Self::set_supervisor`]): a closing
+    /// connection is not a claim, so [`Self::claim_placements`] does not move (the restart
+    /// watch reads a placement as the harness having claimed again), and the revision and the
+    /// authority stand, the closed connection's serial included, which no later connection
+    /// takes. A grace already armed is not armed again: a second close of the same serial does
+    /// not extend it.
+    pub(crate) fn keep_through_grace(&mut self, conn: u64, now_us: u64, grace_us: u64) -> Grace {
+        let Some(claim) = self
+            .supervisor
+            .as_mut()
+            .filter(|claim| claim.expires_us.is_none_or(|at| at > now_us))
+            .filter(|claim| claim.conn == Some(conn))
+            .filter(|claim| {
+                claim.scoped.as_ref().is_some_and(|scoped| {
+                    scoped.claim.contract == aterm_agent::harness::contract::UNIVERSAL
+                })
+            })
+        else {
+            return Grace::None;
+        };
+        if claim.expires_us.is_some() {
+            return Grace::Standing;
+        }
+        claim.expires_us = Some(now_us.saturating_add(grace_us));
+        Grace::Armed
     }
 
     /// The claim a seamless update carries at `now_us`, as `(row, claim_known)` for the handoff
@@ -1498,6 +1562,17 @@ impl AttentionOwners {
     }
 }
 
+/// What a closed connection's claim is kept under ([`SessionMeta::keep_through_grace`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Grace {
+    /// No contract 4 claim is bound to the connection: whatever it held is released.
+    None,
+    /// This close armed the grace: the claim's expiry is now the grace's end.
+    Armed,
+    /// The claim is in a grace an earlier close armed.
+    Standing,
+}
+
 /// The `state` record's kind, by its wire word, as [`StreamState::applied`] names it.
 pub(crate) const STATE_KIND: &str = "state";
 
@@ -1532,6 +1607,17 @@ pub(crate) struct StreamState {
         expect(dead_code, reason = "kept by the unix-only `control_stream::judge`")
     )]
     pub(crate) last_beat_ms: Option<u64>,
+    /// A `claim` record moved the grant's words or the claim's revision, and the harness has
+    /// not been told to read its grant again: the stream owes it a `policy` record. Set where
+    /// the record is served; the sender of aterm's own records (HX-15c) takes it.
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "set by the unix-only `control_stream::serve_claim`"
+        )
+    )]
+    pub(crate) policy_due: bool,
 }
 
 impl StreamState {
@@ -1547,6 +1633,7 @@ impl StreamState {
             unapplied: 0,
             titles: 0,
             last_beat_ms: None,
+            policy_due: false,
         }
     }
 
@@ -2167,9 +2254,9 @@ impl SupervisorClaim {
         duty.filter(|duty| self.takes(*duty)).map(|_| proven)
     }
 
-    /// Whether `next` is this claim again with only its `ttl=` lease moved: the same holder,
-    /// connection, proof and scoped claim (its scopes and versions), so it names no new authority
-    /// ([`SessionMeta::set_supervisor`]).
+    /// Whether `next` retains this claim's authority: the same holder, connection, proof and
+    /// scoped authority (its grant, versions and child), while its lease or requested words may
+    /// move, so it names no new authority ([`SessionMeta::set_supervisor`]).
     fn renews_in_place(&self, next: &Self) -> bool {
         let Self {
             holder,
@@ -2181,7 +2268,7 @@ impl SupervisorClaim {
         *holder == next.holder
             && *conn == next.conn
             && *proven == next.proven
-            && *scoped == next.scoped
+            && crate::harness_claim::same_authority(scoped.as_ref(), next.scoped.as_ref())
     }
 
     /// Whether the claim takes `duty` on its session (`docs/DESIGN-harness-repos-2026-10-24.md`
@@ -2841,6 +2928,7 @@ pub(crate) fn claim_supervisor_scoped(
         .map(SupervisorTransition::acknowledge)
 }
 
+#[cfg(test)]
 pub(crate) fn publish_claim_supervisor_scoped(
     ctx: &crate::SessionCtx,
     holder: &str,
@@ -2849,7 +2937,32 @@ pub(crate) fn publish_claim_supervisor_scoped(
     now_us: u64,
     by: aterm_slog::Actor,
 ) -> Result<SupervisorTransition<Claimed>, String> {
-    claim_supervisor_with(ctx, holder, conn, None, None, Some(scoped), now_us, by)
+    publish_claim_supervisor_admitted(ctx, holder, conn, scoped, None, now_us, by)
+}
+
+/// [`publish_claim_supervisor_scoped`] with the version of the build the claim's proof admitted
+/// (`admitted`, [`crate::harness_claim::ClaimProof::version`]), kept beside the claim in the
+/// same hold that places it ([`SessionMeta::verified_version`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn publish_claim_supervisor_admitted(
+    ctx: &crate::SessionCtx,
+    holder: &str,
+    conn: Option<u64>,
+    scoped: crate::harness_claim::Scoped,
+    admitted: Option<String>,
+    now_us: u64,
+    by: aterm_slog::Actor,
+) -> Result<SupervisorTransition<Claimed>, String> {
+    claim_supervisor_with(
+        ctx,
+        holder,
+        conn,
+        None,
+        None,
+        Some((scoped, admitted)),
+        now_us,
+        by,
+    )
 }
 
 /// A published authority transition and the exact prior revisions its explicit ACK owes.
@@ -2890,10 +3003,18 @@ fn claim_supervisor_with(
     conn: Option<u64>,
     expires_us: Option<u64>,
     proven: Option<crate::self_claim::Proven>,
-    scoped: Option<crate::harness_claim::Scoped>,
+    scoped: Option<(crate::harness_claim::Scoped, Option<String>)>,
     now_us: u64,
     by: aterm_slog::Actor,
 ) -> Result<SupervisorTransition<Claimed>, String> {
+    // A scoped claim comes with the version its proof admitted, kept beside it below.
+    let (scoped, verified) = match scoped {
+        Some((scoped, admitted)) => {
+            let verified = admitted.map(|version| (scoped.proven.clone(), version));
+            (Some(scoped), verified)
+        }
+        None => (None, None),
+    };
     let looked = {
         let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
         meta.live_claim(now_us).and_then(|c| c.identity().cloned())
@@ -2924,7 +3045,7 @@ fn claim_supervisor_with(
     let renewed_identity_changed =
         rule == ClaimRule::Renew && standing.as_ref().is_some_and(|(_, old)| *old != identity);
     let renewed_scoped_changed = rule == ClaimRule::Renew
-        && meta.live_scoped(now_us).map(|s| &s.claim) != scoped.as_ref().map(|s| &s.claim);
+        && !crate::harness_claim::same_authority(meta.live_scoped(now_us), scoped.as_ref());
     let prior = meta.supervisor_revision;
     let drain = ctx.fenced_writes.capture_drain();
     let (revision, lapsed) = meta.set_supervisor(
@@ -2937,6 +3058,7 @@ fn claim_supervisor_with(
         }),
         now_us,
     );
+    meta.supervisor_verified = verified;
     let placement = meta.claim_placements;
     // A renewal in place keeps the revision and supersedes no admitted write, so its ACK owes no
     // drain; a drain of the revision it keeps would also wait on every write admitted after it.
@@ -3420,7 +3542,7 @@ pub(crate) fn close_claim_connection(ctx: &crate::SessionCtx, conn: u64, now_us:
     lapsed.any() || held
 }
 
-/// Release the session's claim only while it is still the very scoped claim `scoped` (a claim
+/// Release the session's claim only while it still holds the scoped authority `scoped` (a claim
 /// whose proof no longer stands, [`crate::harness_claim::reprove`]).
 pub(crate) fn publish_release_scoped(
     ctx: &crate::SessionCtx,
@@ -3429,7 +3551,7 @@ pub(crate) fn publish_release_scoped(
     by: aterm_slog::Actor,
 ) -> SupervisorTransition<bool> {
     release_supervisor_if(ctx, now_us, by, |claim| {
-        claim.scoped.as_ref() == Some(scoped)
+        crate::harness_claim::same_authority(claim.scoped.as_ref(), Some(scoped))
     })
 }
 
@@ -3437,10 +3559,29 @@ pub(crate) fn publish_release_scoped(
 /// claimant binding. True when either moved. The control EOF does this at once unless a native
 /// operation kept the claim ([`crate::native_act::retain_exec_claim`]); that operation does it
 /// when its custody ends.
-pub(crate) fn release_closed_connection(ctx: &crate::SessionCtx, conn: u64, now_us: u64) -> bool {
-    let released =
-        publish_release_supervisor(ctx, Some(conn), now_us, aterm_slog::Actor::Aterm).published();
-    close_claim_connection(ctx, conn, now_us) || released
+///
+/// A proven contract 4 claim is not released here: it is kept through the re-exec grace
+/// (`grace_us`, the wire contract's, [`crate::control::reexec_grace_us`]; `None` where this
+/// platform proves no such claim), with the grace's end as its expiry
+/// ([`SessionMeta::keep_through_grace`]). The connection's own bindings go as always, and what
+/// its claimant told stands while that claim does ([`SessionMeta::close_connection`]). Arming
+/// the grace counts as a move, so the window reads the new expiry and sets its lapse timer.
+pub(crate) fn release_closed_connection(
+    ctx: &crate::SessionCtx,
+    conn: u64,
+    now_us: u64,
+    grace_us: Option<u64>,
+) -> bool {
+    let grace = grace_us.map_or(Grace::None, |grace_us| {
+        ctx.meta
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keep_through_grace(conn, now_us, grace_us)
+    });
+    let released = grace == Grace::None
+        && publish_release_supervisor(ctx, Some(conn), now_us, aterm_slog::Actor::Aterm)
+            .published();
+    close_claim_connection(ctx, conn, now_us) || released || grace == Grace::Armed
 }
 
 /// `meta unset supervisor holder=<h>`.
@@ -3507,8 +3648,10 @@ fn release_supervisor_if(
     }
 }
 
-/// Remove a `ttl=` claim lapsed at `now_us` and record `meta-change field=supervisor value=-`,
-/// as a release does.
+/// Remove a claim whose expiry passed at `now_us` (a `ttl=` lease, or the re-exec grace of a
+/// contract 4 claim whose connection closed, [`SessionMeta::keep_through_grace`]) and record
+/// `meta-change field=supervisor value=-`, as a release does. The record ends a stream's
+/// stand-down and wakes the session's readers.
 pub(crate) fn publish_lapse_supervisor(
     ctx: &crate::SessionCtx,
     now_us: u64,

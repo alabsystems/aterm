@@ -2,19 +2,47 @@
 // Copyright 2026 Andrew Yates
 
 //! The road: the dot lanes and the star ahead (under everything), the ribbon's underglow, the
-//! ribbon, the white line along its top edge, and, done, the sparkles along it.
+//! ribbon, the white line along its top edge, and, done, the sparkles along it behind the loaf.
 
 use super::canvas::{self, Canvas, Shape};
-use super::{HALF, Ink, ROAD_X, Road, STAR_R, centre_y, offset_point};
+use super::{CAT_SHORT, HALF, Ink, ROAD_X, Road, STAR_R, centre_y, offset_point};
 
-/// Where along the road (its share from the start to the box's edge) the done sparkles stand,
-/// how high above the ribbon, their radius, whether pale (else teal), and their strength.
+/// The done sparkles along the road: where each stands on the design's artboard, how high above
+/// the ribbon, their radius, whether pale (else teal), and their strength.
 const ROAD_SPARKLES: [(f32, f32, f32, bool, f32); 4] = [
-    (0.4015, 20.0, 3.0, true, 0.55),
-    (0.5362, 30.0, 3.8, false, 0.7),
-    (0.6559, 24.0, 4.6, true, 0.85),
-    (0.7481, 44.0, 5.6, false, 0.9),
+    (560.0, 20.0, 3.0, true, 0.55),
+    (668.0, 30.0, 3.8, false, 0.7),
+    (764.0, 24.0, 4.6, true, 0.85),
+    (LAST_SPARKLE, 44.0, 5.6, false, 0.9),
 ];
+/// The artboard's road: 802 units past the words, its loaf's feet [`CAT_SHORT`] short of the end.
+const ARTBOARD_LENGTH: f32 = 802.0;
+/// The last sparkle's x on the artboard, and how far behind the loaf's feet it stands there. On
+/// a road of any length the sparkles keep their shares of the way from the road's start to that
+/// spot behind the loaf, so the loaf (its tail 101 units back, its outline 2.6 more) covers none
+/// of them, and at the artboard's length they stand where it put them.
+const LAST_SPARKLE: f32 = 838.0;
+const SPARKLES_BEHIND: f32 = ROAD_X + ARTBOARD_LENGTH - CAT_SHORT - LAST_SPARKLE;
+/// The star's halo: its radius and its blur.
+const HALO_R: f32 = 13.0;
+const HALO_BLUR: f32 = 2.5;
+
+/// The done sparkles on `road`: each one's centre, radius, whether pale, and strength.
+pub(super) fn sparkles(road: Road) -> impl Iterator<Item = ((f32, f32), f32, bool, f32)> {
+    let end = road.cat_x() - SPARKLES_BEHIND;
+    let stretch = (end - ROAD_X) / (LAST_SPARKLE - ROAD_X);
+    ROAD_SPARKLES
+        .into_iter()
+        .map(move |(at, up, r, pale, alpha)| {
+            let x = ROAD_X + (at - ROAD_X) * stretch;
+            ((x, centre_y(x) - HALF - up), r, pale, alpha)
+        })
+}
+
+/// The star's halo, a teal disc blurred on a layer just its size.
+pub(super) fn halo(c: &mut Canvas, star: (f32, f32), ink: &Ink) {
+    c.dot_glow(star, HALO_R, ink.teal, HALO_BLUR, 0.22);
+}
 
 pub(super) fn paint(c: &mut Canvas, road: Road, ink: &Ink) {
     let nose = road.nose();
@@ -23,9 +51,7 @@ pub(super) fn paint(c: &mut Canvas, road: Road, ink: &Ink) {
             c.dot(x, y, 1.15, ink.stripes[lane], ink.dots);
         }
         let (sx, sy) = road.star();
-        let mut halo = c.layer();
-        halo.dot(sx, sy, 13.0, ink.teal, 1.0);
-        c.glow(&halo.tile, 2.5, 0.22, (0.0, 0.0));
+        halo(c, (sx, sy), ink);
         c.fill(&Shape::star(sx, sy, STAR_R), ink.teal, 1.0);
     }
     // The ribbon on a layer of its own: blurred under itself as its glow, then drawn.
@@ -48,7 +74,7 @@ pub(super) fn paint(c: &mut Canvas, road: Road, ink: &Ink) {
     // image runs [`super::GLOW_BELOW`] units past the design box, where the glow has all but
     // faded, and its last few units fade out the rest.
     c.glow_fading(
-        &ribbon.tile,
+        &ribbon,
         9.0,
         ink.glow,
         (0.0, 7.0),
@@ -58,7 +84,7 @@ pub(super) fn paint(c: &mut Canvas, road: Road, ink: &Ink) {
             bottom: 6.0,
         },
     );
-    c.draw(&ribbon.tile);
+    c.draw(&ribbon);
     let mut line = Vec::new();
     let mut x = ROAD_X + 30.0;
     while x < nose - HALF - 2.0 {
@@ -69,10 +95,9 @@ pub(super) fn paint(c: &mut Canvas, road: Road, ink: &Ink) {
         c.stroke(&Shape::polyline(&line), 1.1, (1.0, 1.0, 1.0), ink.highlight);
     }
     if road.done {
-        for (share, up, r, pale, alpha) in ROAD_SPARKLES {
-            let x = ROAD_X + share * (road.right() - ROAD_X);
+        for ((x, y), r, pale, alpha) in sparkles(road) {
             let rgb = if pale { ink.spark } else { ink.teal };
-            c.fill(&Shape::star(x, centre_y(x) - HALF - up, r), rgb, alpha);
+            c.fill(&Shape::star(x, y, r), rgb, alpha);
         }
     }
 }

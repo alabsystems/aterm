@@ -53,6 +53,33 @@ fn lab(accounts: Vec<LabAccount>) -> Lab {
     }
 }
 
+/// The slug the lab names the account labelled `label` by: never its label, as LabView labels a
+/// pooled account with its reserved slug, which names nothing.
+fn slug_of(label: &str) -> String {
+    format!("{label}-s")
+}
+
+/// `lab` with each account named as the lab names it, its slug [`slug_of`] its label
+/// ([`Lab::names`]): what [`asked_row`] resolves a word among.
+fn named(mut lab: Lab) -> Lab {
+    lab.names = lab
+        .accounts
+        .iter()
+        .map(|account| {
+            let names = aterm_file::AccountNames {
+                realm: "claude".to_owned(),
+                slug: slug_of(&account.label),
+                name: aterm_db::typed::keys::account_name("claude", &account.email),
+                email: Some(account.email.clone()),
+                login: Some(account.email.clone()),
+                live: true,
+            };
+            (account.pk.clone(), names)
+        })
+        .collect();
+    lab
+}
+
 /// Account `x`'s row under `label`, at its own login directory or, as the default login's, at none.
 fn row(label: &str, dirless: bool, class: Class) -> Row {
     Row {
@@ -172,7 +199,12 @@ pub(crate) fn order_transition(state: &State, action: &str) -> State {
     match action {
         "Sync" => order_project(state, x_row(&sync(&lab, &existing, None)), false),
         "Ask" => {
-            let asked = with_lab(lab, || asked_row(Cli::Claude, LAB))
+            let lab = named(lab);
+            assert!(
+                with_lab(lab.clone(), || asked_row(Cli::Claude, LAB)).is_none(),
+                "the lab's label names nothing"
+            );
+            let asked = with_lab(lab, || asked_row(Cli::Claude, &slug_of(LAB)))
                 .expect("the lab knows x")
                 .expect("x may be asked for");
             order_project(state, Some(&asked), true)

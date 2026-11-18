@@ -36,11 +36,18 @@ pub const LEDGER_SEAM: &str = "ATERM_DEBUG_RECOVERY_LEDGER";
 /// private `$TMPDIR`), in a directory made for it ([`world`]); removed on drop, after the
 /// keeper and every instance (declared after it, so dropped first), past the hung-up shell's
 /// last history write, unless it holds a copy of the keeper's code that never showed it ran
-/// ([`unrun_copies`]), or that check could not finish.
+/// ([`unrun_copies`]), that check could not finish, or the test is unwinding after failure.
 pub struct World(pub PathBuf);
 
 impl Drop for World {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!(
+                "KEPT {}: the keeper test failed; retain its logs and code custody",
+                self.0.display()
+            );
+            return;
+        }
         match unrun_copies(&self.0) {
             Ok(unrun) if unrun.is_empty() => headless_boot::remove_world(&self.0),
             Ok(unrun) => eprintln!(
@@ -205,8 +212,7 @@ pub fn await_keeper(root: &Path, word: &str) {
 /// Fresh copies share macOS's code-admission service: serialize their startup within this
 /// test process, then let the running keepers and their recovery scenarios proceed together.
 pub fn keeper(root: &Path) -> Proc {
-    static KEEPER_START: Mutex<()> = Mutex::new(());
-    let _start = KEEPER_START.lock_or_recover();
+    let _start = keeper_start();
     let log = root.join("keeper.log");
     let file = std::fs::File::create(&log).expect("the keeper's log");
     #[expect(
@@ -279,6 +285,13 @@ pub fn keeper(root: &Path) -> Proc {
         headless_boot::log_tail(&log)
     );
     keeper
+}
+
+/// Admit one fresh keeper image at a time, including a window's automatic launchd startup.
+/// Drop once its keeper answers; running recovery scenarios can proceed together.
+pub fn keeper_start() -> std::sync::MutexGuard<'static, ()> {
+    static KEEPER_START: Mutex<()> = Mutex::new(());
+    KEEPER_START.lock_or_recover()
 }
 
 /// Keep the foreground test keeper tied to its test process even after an abrupt exit.

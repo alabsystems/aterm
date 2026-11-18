@@ -8,7 +8,7 @@ fn focused_pacing_builds_no_conformance_matrices() {
         crate::scope::Scope::workspace(),
     );
     context.cursor_pacing = true;
-    let stages = super::plan(&context);
+    let stages = super::plan(&context).expect("complete graph and plan");
     assert_eq!(
         stages.iter().map(|stage| stage.id).collect::<Vec<_>>(),
         [super::StageId::GuiSmoke]

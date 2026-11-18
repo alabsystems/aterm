@@ -23,13 +23,14 @@ mod measuring {
     use aterm_conformance::measure::spin::{
         BLINK_LANE, EFFECT_LANE, LIVE_LANE, NEEDLE_LANE, SpinRow, SpinScene, measure,
     };
-    use aterm_conformance::measure::starvation::ShapeVerdict;
+    use aterm_conformance::measure::starvation::Disposition;
 
     const MAX_ARMS: u64 = 100;
     const RESTING_MAX_WAKES: u64 = 60;
     const RESTING_MAX_FRAMES: u64 = 20;
     const HIDDEN_MAX_WAKES: u64 = 200;
     const HIDDEN_MIN_PARKED: u64 = 5;
+    const UNATTENDED_MAX_WAKES: u64 = 3 * RESTING_MAX_WAKES;
 
     // `max_wakes` bounds every loop wake in the window (`event_wakes`), not only its timers: a loop
     // that wakes itself as it parks takes wait-cancelled wakes and turns, which neither
@@ -287,6 +288,68 @@ mod measuring {
                 min_hidden_parked: None,
             },
         ),
+        // A window at the shipped motion, rest and effect defaults (its head writes no motion,
+        // rest or effect line: `motion = "auto"`, the window never rests, the rainbow cursor
+        // beside the cat) in the take's scratch world (its bell silent and its automatic lanes
+        // off), raised and then left untouched: the take waits out the attention window after the
+        // raise (40 s, `window_rest::ATTENTION`; the focus the raise brings is a touch), then for
+        // `trail status` to read it focused, unattended, on glass and with its pet in deep sleep
+        // or not drawn. That wait is refused once the instance made no CPU or I/O progress for a
+        // minute; an instance that still answers its reads or takes its readings works, and is
+        // waited on for up to the 15-minute guard the take's budget holds. It then lets the
+        // readings settle on their background cadence (5 s, `unattended::SETTLE`) and measures
+        // 60 s from `metrics reset`. Its motion stage and shed are recorded, never required. A
+        // window event in the window, or an edge that lost that state, is a refusal
+        // (`unattended::decide`). An unattended deck holds still (`window_rest::Rest::deck_moves`
+        // needs attention), its needle with it, and a pet in deep sleep takes no frame, so the
+        // needle and cursor-effect lanes are bounded at 0. The deck's live edge then fires only at
+        // its grey, 15 s after the newest reading's sample: the decision leaves a take with a few
+        // such fires undecided (a reading handed over that late, as by a starved probe thread)
+        // and fails one with more than a grey a reading slot and one more (a live edge that
+        // moved). What such a window still does is its shared readings, one every 5 s on a
+        // wall-clock grid (`vitals_host::BACKGROUND_PERIOD`, `due_on_phase`), a frame each, and
+        // in a scratch world the Network State band's poll every 60 s (`lab_deck::Feed::EVERY`)
+        // under the same owner, `system_vitals`: more fires than the slots of those two grids the
+        // window can touch (15 over a 60.15 s window) is work under that owner they do not
+        // account for, a fail, and fewer than a reading for each whole 5 s and a poll for each
+        // whole 60 s, less one fire another owner's wake may book (12), is a loop that fell
+        // behind their cadence, undecided. Its frames are bounded at a frame for each slot of the
+        // readings' and the band's grids the window can touch and for each blink fire (a reduced
+        // motion stage leaves the caret to its 530 ms blink clock, `BLINK_INTERVAL`): 15 over a
+        // 60.15 s window without the blink. Frames past that which only a grey, or a flip a wake
+        // of another owner carried where the blink ran, explains leave the take undecided; more
+        // fail it. Its wakes are bounded at the resting row's 60 a 20 s window held over the 60 s
+        // (180), two for each blink fire and grey (its timer, and its frame's surface-ready wake
+        // where that frame waits for its drawable), and one for each flip another owner's wake
+        // may carry. The CPU the window took is reported (`cpu_ms_per_s`,
+        // from `proc_pid_rusage` samples every 50 ms), never judged. Taken 2026-11-17 on m111 (18
+        // cores), three takes on each build of 03735595bf8, every window focused, unattended, on
+        // glass and its pet in deep sleep at both edges, and every take a pass: its dev bundle,
+        // admitted at one-minute loads of 7.4, 4.6 and 5.3, measured 13 readings, 12 frames, no
+        // live-edge, needle, cursor-effect or blink fire, and 48, 44 and 44 wakes (31, 29 and 29
+        // timer wakes, 12 of them devtools hand-overs); its debug build, at 5.6, 4.1 and 3.5, the
+        // same readings, frames and fires and 32 wakes (17 timer wakes) each. Proven red that day
+        // on the debug build by three mutants (never committed), each failed on its first take:
+        // `Rest::deck_moves` without its `self.attended` term (load 5.3), why= "deck_clock fired
+        // 50 times, at most 0; stats_live fired 35 times, past the 14 greys …; frames=101, past
+        // the 29 …"; a deadline 100 ms ahead folded on every turn under the owner `none` (6.7),
+        // why= "event_wakes=615, past the 180 …"; `BACKGROUND_PERIOD` cut to 2 s (9.8), why=
+        // "system_vitals fired 31 times, past the 15 …; frames=30, past the 15 …".
+        (
+            "an_unattended_window_does_no_work_its_readings_do_not_ask",
+            SpinRow {
+                recording: true,
+                scene: SpinScene::Unattended,
+                window: Duration::from_secs(60),
+                max_arms: MAX_ARMS,
+                max_timer_wakes: None,
+                max_owner_fires: &[(EFFECT_LANE, 0), (NEEDLE_LANE, 0)],
+                needle_owed: false,
+                max_wakes: UNATTENDED_MAX_WAKES,
+                max_frames: None,
+                min_hidden_parked: None,
+            },
+        ),
         // The recording-off arm: the claude-shaped, idle and windowed scenes above with recording
         // off, each under its recording-on row's bounds.
         (
@@ -347,15 +410,25 @@ mod measuring {
                 ));
             }
         };
-        if report.verdict == ShapeVerdict::Pass {
-            Outcome::Pass(report.to_string())
-        } else {
-            Outcome::Fail(format!(
+        match (report.verdict, &report.unattended) {
+            (Disposition::Pass, _) => Outcome::Pass(report.to_string()),
+            (Disposition::Fail, Some(decision)) => Outcome::Fail(format!(
+                "SPIN CONFORMANCE FAILED [{:?}]: an unattended window did work its readings do \
+                 not ask: {}.\n  {report}",
+                row.scene, decision.why
+            )),
+            (Disposition::Fail, None) => Outcome::Fail(format!(
                 "SPIN CONFORMANCE FAILED [{:?}]: an idle instance armed wakes past its own \
                  observation gate, or woke for timers or at all far past its quiet rate.\n  \
                  {report}",
                 row.scene
-            ))
+            )),
+            (Disposition::Unproved, decision) => Outcome::Undecided(format!(
+                "SPIN UNPROVED [{:?}]: the take is no evidence about an unattended window ({}); \
+                 take it on an unloaded machine.\n  {report}",
+                row.scene,
+                decision.as_ref().map_or("", |d| d.why.as_str())
+            )),
         }
     }
 
@@ -385,8 +458,13 @@ mod measuring {
             &rows,
             |row| {
                 // B14 excludes Windowed's matched wake shift (p=8/252), and conservatively
-                // excludes Pet after its selected-policy frames/needle shift (p=6/252).
-                if matches!(row.scene, SpinScene::Windowed | SpinScene::PetAsleep) {
+                // excludes Pet after its selected-policy frames/needle shift (p=6/252). The
+                // unattended row runs alone too: the CPU rate it reports is the subject's only
+                // where no other row's instance shares the machine with it.
+                if matches!(
+                    row.scene,
+                    SpinScene::Windowed | SpinScene::PetAsleep | SpinScene::Unattended
+                ) {
                     support::Kind::Timing
                 } else {
                     support::Kind::Count {

@@ -10,7 +10,11 @@ pub const APP_INSPECTION_V1: &str = "app/v1";
 
 const MAX_VIEW_ID_BYTES: usize = 64;
 const MAX_UI_KEY_BYTES: usize = 256;
-const MAX_ACTION_BYTES: usize = 64;
+/// An action names a control of the live semantic tree as its UI key does, and `act` must name
+/// that control's own action exactly (a page's action ids carry a record's digest, as the
+/// Tables page's history lines do), so it has the UI key's bound: a smaller one only leaves a
+/// control a person can press and a driver cannot.
+const MAX_ACTION_BYTES: usize = MAX_UI_KEY_BYTES;
 const MAX_VALUE_BYTES: usize = 16 * 1024;
 const MAX_URI_BYTES: usize = 16 * 1024;
 
@@ -425,6 +429,20 @@ fn take_token<'a>(input: &mut &'a str) -> Option<&'a str> {
 
 fn remainder(input: &str) -> &str {
     input.trim_matches(char::is_whitespace)
+}
+
+/// Whether `key` is a UI key `act app/v1` takes: what a native page names a control by must be
+/// one, or no driver can reach that control.
+#[must_use]
+pub fn is_wire_ui_key(key: &str) -> bool {
+    valid_token(key, MAX_UI_KEY_BYTES, "ui key").is_ok()
+}
+
+/// Whether `action` is an action `act app/v1` takes ([`is_wire_ui_key`]'s twin for a control's
+/// action id).
+#[must_use]
+pub fn is_wire_action(action: &str) -> bool {
+    valid_token(action, MAX_ACTION_BYTES, "action").is_ok()
 }
 
 fn valid_token<'a>(

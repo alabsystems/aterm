@@ -48,10 +48,20 @@ fn adding_a_native_account_requires_receipt_admission_before_any_directory_or_ro
     let env = env_at(&tmp);
     let store = env.accounts_store();
     let machine = alab_roster::test_machine("m16");
+    let pk = aterm_db::typed::keys::account_pk("claude", "native@example.test").expect("a key");
+    let names = aterm_file::AccountNames {
+        realm: "claude".into(),
+        slug: "claude-native".into(),
+        name: Some("claude native@example.test".into()),
+        email: Some("native@example.test".into()),
+        login: Some("native@example.test".into()),
+        live: true,
+    };
     let _source = TestSourceOverride::new(SourceSnapshot::Present(std::sync::Arc::new(Lab {
         me: Some(machine.clone()),
+        names: [(pk.clone(), names)].into_iter().collect(),
         accounts: vec![LabAccount {
-            pk: "ac-native-add".into(),
+            pk,
             cli: Cli::Claude,
             vendor: Default::default(),
             label: "native".into(),
@@ -70,10 +80,9 @@ fn adding_a_native_account_requires_receipt_admission_before_any_directory_or_ro
     let result = run_accounts_add(
         Cli::Claude,
         &env,
-        &accounts::Row {
-            label: "native".into(),
-            ..Default::default()
-        },
+        &FakeHost::new(&never_asked),
+        "claude native@example.test",
+        &Listing::default(),
         &mut out,
         &mut err,
     );
@@ -360,6 +369,19 @@ impl AccountsHost for SignInHost {
     }
 }
 
+/// The word a step that signs `cli`'s roster row `label` in types for it, in the roster `env`
+/// reads, with no lab ([`crate::harness::account_names::RowName`]).
+fn step_word(env: &Env, cli: Cli, label: &str) -> String {
+    crate::harness::account_names::tests::row_name_of(cli, env, label)
+        .word
+        .to_string()
+}
+
+/// `cli`'s roster row `label`, in the roster `env` reads, as a message names it.
+fn shown_of(env: &Env, cli: Cli, label: &str) -> String {
+    crate::harness::account_names::tests::row_name_of(cli, env, label).shown
+}
+
 fn renew(line: &str, env: &Env, host: &dyn AccountsHost) -> (String, String, String) {
     let mut out = Vec::new();
     let mut err = Vec::new();
@@ -395,11 +417,15 @@ fn kimi_env(tag: &str) -> (Tmp, Env) {
     let tmp = tmp_dir(tag);
     let mut env = env_at(&tmp);
     env.sock = None;
-    let (code, _, err) = run_line(
-        "accounts add kimi-one --cli kimi --email kimi-one@example.com --region global",
+    listed_by_hand(
         &env,
+        Cli::Kimi,
+        kimi_by_hand(
+            "kimi-one",
+            Some("kimi-one@example.com"),
+            Some(crate::ai::connector::Region::Global),
+        ),
     );
-    assert_eq!(code, exit(0), "{err}");
     (tmp, env)
 }
 
@@ -414,7 +440,11 @@ fn a_kimi_row_renews_through_its_own_sign_in_and_a_failed_one_preserves_its_bind
     let logins_root = home.join(".aterm/logins/kimi");
 
     let failing = SignInHost::new(Script::Kimi("kimi 1"), &home);
-    let (code, out, err) = renew("accounts renew kimi-one --cli kimi", &env, &failing);
+    let (code, out, err) = renew(
+        "accounts renew kimi-one@example.com --cli kimi",
+        &env,
+        &failing,
+    );
     assert_eq!(code, exit(1), "{out}{err}");
     let prepared = store.load_logins(env.now).unwrap().0;
     let binding = prepared.get("kimi-one").unwrap();
@@ -427,7 +457,11 @@ fn a_kimi_row_renews_through_its_own_sign_in_and_a_failed_one_preserves_its_bind
         },
         "failed authentication leaves only its generation fence"
     );
-    let (code, _, _) = renew("accounts renew kimi-one --cli kimi", &env, &failing);
+    let (code, _, _) = renew(
+        "accounts renew kimi-one@example.com --cli kimi",
+        &env,
+        &failing,
+    );
     assert_eq!(code, exit(1));
     let after = store.load_logins(env.now).unwrap().0;
     let mut retained = after.clone();
@@ -465,7 +499,11 @@ fn a_kimi_row_renews_through_its_own_sign_in_and_a_failed_one_preserves_its_bind
     }
 
     let host = SignInHost::new(Script::Kimi("kimi 0"), &home);
-    let (code, out, err) = renew("accounts renew kimi-one --cli kimi", &env, &host);
+    let (code, out, err) = renew(
+        "accounts renew kimi-one@example.com --cli kimi",
+        &env,
+        &host,
+    );
     assert_eq!(code, exit(0), "{out}{err}");
     assert_eq!(
         *host.handed.borrow(),
@@ -481,7 +519,10 @@ fn a_kimi_row_renews_through_its_own_sign_in_and_a_failed_one_preserves_its_bind
         "{logins}"
     );
     assert!(
-        out.contains("kimi-one: renewed") && !out.contains("QXR4"),
+        out.contains(&format!(
+            "{}: renewed",
+            shown_of(&env, Cli::Kimi, "kimi-one")
+        )) && !out.contains("QXR4"),
         "{out}"
     );
     let claude_logins = tmp.path().join("state/accounts/logins.json");
@@ -520,19 +561,32 @@ fn a_codex_row_is_proved_by_its_app_servers_account_and_another_account_is_refus
     let tmp = tmp_dir("signin-codex");
     let mut env = env_at(&tmp);
     env.sock = None;
-    let (code, _, err) = run_line(
-        "accounts add codex-one --cli codex --email login-alias@example.com --identity-email codex-one@example.com",
+    listed_by_hand(
         &env,
+        Cli::Codex,
+        accounts::Row {
+            identity_email: Some("codex-one@example.com".to_owned()),
+            ..by_hand("codex-one", Some("login-alias@example.com"))
+        },
     );
-    assert_eq!(code, exit(0), "{err}");
     let home = tmp.path().join("home");
     let store = env.accounts_store_for(Cli::Codex).expect("codex's store");
     let logins_root = home.join(".aterm/logins/codex");
 
     let other = SignInHost::new(Script::Codex(Some("someone-else@example.com")), &home);
-    let (code, out, err) = renew("accounts renew codex-one --cli codex", &env, &other);
+    let (code, out, err) = renew(
+        "accounts renew codex-one@example.com --cli codex",
+        &env,
+        &other,
+    );
     assert_eq!(code, exit(1), "{out}{err}");
-    assert!(out.contains("codex-one: REFUSED: wrong account"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "{}: REFUSED: wrong account",
+            shown_of(&env, Cli::Codex, "codex-one")
+        )),
+        "{out}"
+    );
     assert!(
         stagings(&logins_root, "codex-one").len() == 1,
         "completed wrong-account login retained"
@@ -544,7 +598,11 @@ fn a_codex_row_is_proved_by_its_app_servers_account_and_another_account_is_refus
     );
 
     let host = SignInHost::new(Script::Codex(Some("codex-one@example.com")), &home);
-    let (code, out, err) = renew("accounts renew codex-one --cli codex", &env, &host);
+    let (code, out, err) = renew(
+        "accounts renew codex-one@example.com --cli codex",
+        &env,
+        &host,
+    );
     assert_eq!(code, exit(0), "{out}{err}");
     assert_eq!(
         *host.handed.borrow(),
@@ -568,11 +626,11 @@ fn unavailable_browser_records_codex_renewal_failure_without_a_person_task() {
     let tmp = tmp_dir("codex-browser-unavailable");
     let mut env = env_at(&tmp);
     env.sock = None;
-    let (code, _, err) = run_line(
-        "accounts add codex-one --cli codex --email codex-one@example.com",
+    listed_by_hand(
         &env,
+        Cli::Codex,
+        by_hand("codex-one", Some("codex-one@example.com")),
     );
-    assert_eq!(code, exit(0), "{err}");
     let home = tmp.path().join("home");
     let host = SignInHost::new(
         Script::Ends(login_drive::Outcome::NotRun(
@@ -580,7 +638,11 @@ fn unavailable_browser_records_codex_renewal_failure_without_a_person_task() {
         )),
         &home,
     );
-    let (code, out, err) = renew("accounts renew codex-one --cli codex", &env, &host);
+    let (code, out, err) = renew(
+        "accounts renew codex-one@example.com --cli codex",
+        &env,
+        &host,
+    );
     assert_eq!(code, exit(1), "{out}{err}");
     assert!(!out.contains("NEEDS YOU"), "{out}");
     assert!(err.contains("pinned browser fetch is unavailable"), "{err}");
@@ -611,16 +673,25 @@ fn a_bounded_background_sign_in_reports_the_machine_held_without_starting() {
         automatic: true,
         ..SignInHost::new(Script::Kimi("kimi 0"), &home)
     };
-    let (code, out, err) = renew("accounts renew kimi-one --cli kimi", &env, &host);
+    let (code, out, err) = renew(
+        "accounts renew kimi-one@example.com --cli kimi",
+        &env,
+        &host,
+    );
     assert_eq!(code, exit(1), "{out}{err}");
     assert!(
-        out.contains("kimi-one: held") && out.contains(accounts::SIGNIN_HELD),
+        out.contains(&format!("{}: held", shown_of(&env, Cli::Kimi, "kimi-one")))
+            && out.contains(accounts::SIGNIN_HELD),
         "{out}"
     );
     assert_eq!(host.calls.get(), 0, "nothing ran under another's lock");
     assert!(stagings(&home.join(".aterm/logins/kimi"), "kimi-one").is_empty());
     drop(held);
-    let (code, out, err) = renew("accounts renew kimi-one --cli kimi", &env, &host);
+    let (code, out, err) = renew(
+        "accounts renew kimi-one@example.com --cli kimi",
+        &env,
+        &host,
+    );
     assert_eq!(code, exit(0), "{out}{err}");
     assert_eq!(host.calls.get(), 1, "once it is free the renewal runs");
 }
@@ -632,14 +703,18 @@ fn a_codex_sign_ins_staging_home_keeps_only_auth_json_under_codex_auth_path_and_
     let tmp = tmp_dir("signin-codex-auth-path");
     let mut env = env_at(&tmp);
     env.sock = None;
-    let (code, _, err) = run_line(
-        "accounts add codex-one --cli codex --email codex-one@example.com",
+    listed_by_hand(
         &env,
+        Cli::Codex,
+        by_hand("codex-one", Some("codex-one@example.com")),
     );
-    assert_eq!(code, exit(0), "{err}");
     let home = tmp.path().join("home");
     let host = SignInHost::new(Script::Codex(Some("codex-one@example.com")), &home);
-    let (code, out, err) = renew("accounts renew codex-one --cli codex", &env, &host);
+    let (code, out, err) = renew(
+        "accounts renew codex-one@example.com --cli codex",
+        &env,
+        &host,
+    );
     assert_eq!(code, exit(0), "{out}{err}");
     let said = out
         .lines()
@@ -677,7 +752,11 @@ fn a_codex_sign_ins_staging_home_keeps_only_auth_json_under_codex_auth_path_and_
     )
     .expect("config");
     let keyring = SignInHost::new(Script::Codex(Some("codex-one@example.com")), &home);
-    let (code, out, err) = renew("accounts renew codex-one --cli codex", &env, &keyring);
+    let (code, out, err) = renew(
+        "accounts renew codex-one@example.com --cli codex",
+        &env,
+        &keyring,
+    );
     assert_eq!(code, exit(1), "{out}{err}");
     assert!(err.contains("OS keyring"), "{err}");
     assert_eq!(keyring.calls.get(), 0);
@@ -725,11 +804,19 @@ fn under_a_keyring_login_the_default_rows_renewal_refusal_is_its_own() {
     .expect("config");
     for (label, own) in [("main", true), ("work", false)] {
         let host = SignInHost::new(Script::Codex(Some("main@example.com")), &home);
-        let (code, out, err) = renew(&format!("accounts renew {label} --cli codex"), &env, &host);
+        let (code, out, err) = renew(
+            &format!("accounts renew {label}@example.com --cli codex"),
+            &env,
+            &host,
+        );
         assert_eq!(code, exit(1), "{label}: {out}{err}");
-        assert!(err.contains(&keyring_staging(label, own)), "{label}: {err}");
+        let shown = shown_of(&env, Cli::Codex, label);
         assert!(
-            !err.contains(&keyring_staging(label, !own)),
+            err.contains(&keyring_staging(&shown, own)),
+            "{label}: {err}"
+        );
+        assert!(
+            !err.contains(&keyring_staging(&shown, !own)),
             "{label}: {err}"
         );
         assert_eq!(host.calls.get(), 0, "{label}: no sign-in ran");
@@ -748,7 +835,11 @@ fn ledger_accounts_reads_the_named_clis_ledger() {
     let (tmp, env) = kimi_env("ledger-cli");
     let home = tmp.path().join("home");
     let failing = SignInHost::new(Script::Kimi("kimi 1"), &home);
-    let (code, _, _) = renew("accounts renew kimi-one --cli kimi", &env, &failing);
+    let (code, _, _) = renew(
+        "accounts renew kimi-one@example.com --cli kimi",
+        &env,
+        &failing,
+    );
     assert_eq!(code, exit(1));
     assert_eq!(
         parsed("ledger accounts --cli kimi 5"),
@@ -761,13 +852,20 @@ fn ledger_accounts_reads_the_named_clis_ledger() {
     let (code, out, err) = run_line("ledger accounts --cli kimi", &env);
     assert_eq!(code, exit(0), "{err}");
     assert!(
-        out.contains("kimi-one") && out.contains("exited-1"),
+        out.contains(" sign-in ") && out.contains("exited-1"),
         "kimi's own ledger: {out}"
+    );
+    // The failed sign-in learned no key, so its row is named as the account the row held then,
+    // never by its label or its address.
+    assert!(
+        !out.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+            .any(|word| word == "kimi-one"),
+        "neither the row's label nor its address: {out}"
     );
     // Negative: Claude Code's ledger holds none of it, and `--cli` names a pool or nothing.
     let (code, out, _) = run_line("ledger accounts", &env);
     assert_eq!(code, exit(0));
-    assert!(!out.contains("kimi-one"), "{out}");
+    assert!(!out.contains("exited-1"), "{out}");
     assert!(parsed("ledger accounts --cli nope").is_err());
     assert!(parsed("ledger disk --cli kimi").is_err());
     assert!(parsed("ledger accounts --cli kimi --region global").is_err());
@@ -784,7 +882,11 @@ fn a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links() {
     let store = env.accounts_store_for(Cli::Kimi).expect("kimi's store");
     let before = read(&store.logins_file());
     let host = SignInHost::new(Script::Kimi("kimi 0"), &home);
-    let (code, out, err) = renew("accounts renew kimi-one --cli kimi", &env, &host);
+    let (code, out, err) = renew(
+        "accounts renew kimi-one@example.com --cli kimi",
+        &env,
+        &host,
+    );
     let said = format!("{out}{err}");
     assert_eq!(code, exit(1), "{said}");
     assert!(
@@ -814,13 +916,20 @@ fn accounts_cli_all_lists_each_kept_pool_and_none_is_claudes_empty_report() {
     let (_, none, _) = run_line("accounts list", &env);
     let (_, all, _) = run_line("accounts --cli all list", &env);
     assert_eq!(all, none, "no pool kept: Claude Code's own report");
-    for line in [
-        "accounts add kimi-one --cli kimi --email kimi-one@example.com --region global",
-        "accounts add codex-one --cli codex --email codex-one@example.com",
-    ] {
-        let (code, _, err) = run_line(line, &env);
-        assert_eq!(code, exit(0), "{err}");
-    }
+    listed_by_hand(
+        &env,
+        Cli::Kimi,
+        kimi_by_hand(
+            "kimi-one",
+            Some("kimi-one@example.com"),
+            Some(crate::ai::connector::Region::Global),
+        ),
+    );
+    listed_by_hand(
+        &env,
+        Cli::Codex,
+        by_hand("codex-one", Some("codex-one@example.com")),
+    );
     let (code, out, err) = run_line("accounts --cli all list", &env);
     assert_eq!(code, exit(0), "{err}");
     let codex = out.find("cli: codex").expect(&out);
@@ -879,43 +988,58 @@ fn a_codex_adopt_default_takes_the_email_its_app_server_names() {
     let host = PoolHost {
         account: Some("codex-one@example.com"),
     };
-    let (code, out, err) = renew("accounts adopt-default codex-1 --cli codex", &env, &host);
+    let (code, out, err) = renew("accounts adopt-default --cli codex", &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
     let roster = read(&tmp.path().join("accounts-codex.toml"));
+    let label =
+        crate::harness::account_names::tests::added_label(Cli::Codex, "codex-one@example.com");
     assert!(
-        roster.contains("label = \"codex-1\"") && roster.contains("codex-one@example.com"),
+        roster.contains(&format!("label = \"{label}\""))
+            && roster.contains("codex-one@example.com"),
         "{roster}"
     );
+    assert!(
+        out.contains("Codex's default login names the account "),
+        "{out}"
+    );
 
-    // Negative: a Codex login reader that names no account writes nothing. Kimi may adopt an
-    // existing default login without a verified email; Claude Code still requires --email.
+    // Negative: a Codex login reader that names no account, with no account named, writes
+    // nothing. Every row adopt-default lists has an address, so another pool's parse needs an
+    // account or --email.
     let other = tmp_dir("adopt-codex-none");
     let mut env = env_at(&other);
     env.sock = None;
     let silent = PoolHost { account: None };
-    let (code, _, err) = renew("accounts adopt-default codex-1 --cli codex", &env, &silent);
+    let (code, _, err) = renew("accounts adopt-default --cli codex", &env, &silent);
     assert_eq!(code, exit(1), "{err}");
     assert!(err.contains("--email"), "{err}");
     assert!(!other.path().join("accounts-codex.toml").exists());
-    assert!(parsed("accounts adopt-default kimi-1 --cli kimi --region global").is_ok());
-    assert!(
-        parsed("accounts adopt-default main").is_err(),
-        "Claude Code's needs it"
-    );
+    assert!(parsed("accounts adopt-default kimi sol@x.example --cli kimi --region global").is_ok());
+    for (line, pool) in [
+        (
+            "accounts adopt-default --cli kimi --region global",
+            "Kimi Code's",
+        ),
+        ("accounts adopt-default", "Claude Code's"),
+    ] {
+        assert!(parsed(line).is_err(), "{pool} needs an account or --email");
+    }
 }
 
+/// The account `adopt-default` names is the identity Codex's default login must report, with or
+/// without the alias `--email` its login signs in with: a login that reports another account, or
+/// none, is refused and nothing is written.
 #[cfg(unix)]
 #[test]
 fn codex_adopt_default_checks_an_explicit_canonical_identity() {
+    let label = crate::harness::account_names::tests::added_label(Cli::Codex, "owner@example.test");
     for alias in ["", " --email alias@example.test"] {
         for report in [Some("owner@example.test"), Some("other@example.test"), None] {
             let tmp = tmp_dir("adopt-codex-identity");
             let env = env_at(&tmp);
             let host = PoolHost { account: report };
             let (code, out, err) = renew(
-                &format!(
-                    "accounts adopt-default account --cli codex --identity-email owner@example.test{alias}"
-                ),
+                &format!("accounts adopt-default oai owner@example.test --cli codex{alias}"),
                 &env,
                 &host,
             );
@@ -926,18 +1050,68 @@ fn codex_adopt_default_checks_an_explicit_canonical_identity() {
             if matched {
                 let roster = Roster::load_for(Cli::Codex, &path).unwrap();
                 assert_eq!(
-                    roster.row("account").unwrap().identity_email.as_deref(),
+                    roster.row(&label).unwrap().identity_email.as_deref(),
                     report
                 );
                 let store = env.accounts_store_for(Cli::Codex).unwrap();
+                assert!(store.load_logins(env.now).unwrap().0.get(&label).is_none());
+            }
+        }
+    }
+}
+
+/// Whether `text` holds `word` as a word of its own (a roster label printed).
+#[cfg(unix)]
+fn prints_word(text: &str, word: &str) -> bool {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
+        .any(|token| token == word)
+}
+
+/// `adopt-default <account> --cli codex` completes the default login's row already on the roster
+/// (the row with no `dir`, which the first `add` lists as `main`), as the form that names no
+/// account does, where `auth.json` reports the account named: a row with no address takes the
+/// login's, and a row that has it already is completed again, which changes nothing. Its receipt
+/// names the account, never the row's label. CONTROL: where `auth.json` reports another account,
+/// it is refused as such and the roster is as it was.
+/// NEGATIVE CONTROL: with `complete_with` comparing the identity asked for with the row's stored
+/// `identity_email` alone (`existing == Some(supplied)`), the row with no address is refused (exit
+/// 1, not 0) (2026-11-16, by hand on SF-07H S6's review settle, then restored).
+#[cfg(unix)]
+#[test]
+fn codex_adopt_default_naming_the_account_completes_the_default_row() {
+    for original in [
+        "[[account]]\nlabel = 'main'\nclass = 'dedicated'\n",
+        "[[account]]\nlabel = 'main'\nclass = 'dedicated'\nemail = 'owner@example.test'\n",
+    ] {
+        for report in ["owner@example.test", "other@example.test"] {
+            let tmp = tmp_dir("codex-adopt-named-default");
+            let env = env_at(&tmp);
+            std::fs::create_dir_all(env.home.as_ref().unwrap().join(".codex")).unwrap();
+            let path = tmp.path().join("accounts-codex.toml");
+            std::fs::write(&path, original).unwrap();
+            let host = PoolHost {
+                account: Some(report),
+            };
+            let (code, out, err) = renew(
+                "accounts adopt-default oai owner@example.test --cli codex",
+                &env,
+                &host,
+            );
+            if report == "owner@example.test" {
+                assert_eq!(code, exit(0), "{original}: {out}{err}");
                 assert!(
-                    store
-                        .load_logins(env.now)
-                        .unwrap()
-                        .0
-                        .get("account")
-                        .is_none()
+                    out.contains("completed this machine's own login as oai owner@example.test"),
+                    "{original}: {out}"
                 );
+                assert!(!prints_word(&out, "main"), "{original}: {out}");
+                let rows = Roster::load_for(Cli::Codex, &path).unwrap().rows;
+                assert_eq!(rows.len(), 1, "{original}: no second row");
+                assert_eq!(rows[0].label, "main");
+                assert_eq!(rows[0].email.as_deref(), Some("owner@example.test"));
+            } else {
+                assert_eq!(code, exit(1), "CONTROL {original}: {out}{err}");
+                assert!(err.contains("reports another account"), "CONTROL: {err}");
+                assert_eq!(read(&path), original, "CONTROL");
             }
         }
     }
@@ -962,7 +1136,7 @@ fn codex_stats_and_adoption_leave_non_file_credentials_untouched() {
         let home = env.home.as_ref().unwrap().join(".codex");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(home.join("config.toml"), configuration).unwrap();
-        let (code, out, err) = renew("accounts adopt-default new --cli codex", &env, &host);
+        let (code, out, err) = renew("accounts adopt-default --cli codex", &env, &host);
         assert_eq!(code, exit(1), "{configuration}: {out}{err}");
         assert!(
             !path.exists(),
@@ -973,7 +1147,7 @@ fn codex_stats_and_adoption_leave_non_file_credentials_untouched() {
             "cli_auth_credentials_store = 'file'",
         )
         .unwrap();
-        let (code, out, err) = renew("accounts adopt-default existing --cli codex", &env, &host);
+        let (code, out, err) = renew("accounts adopt-default --cli codex", &env, &host);
         assert_eq!(code, exit(0), "{out}{err}");
         let before = read(&path);
         std::fs::write(home.join("config.toml"), configuration).unwrap();
@@ -994,21 +1168,26 @@ fn a_pools_stats_list_each_row_alike_as_text_and_json() {
     assert_eq!(json_code, text_code, "both forms exit alike");
     assert!(
         text.contains("Kimi Code CLI usage is read from its `/usage` panel")
-            && text.contains("kimi-one: not-enrolled")
+            && text.contains("kimi kimi-one@example.com: not-enrolled")
             && text.contains("no reading yet"),
         "{text}"
     );
     let doc: Value = aterm_json::from_str(json.trim()).expect("json");
     let rows = doc["rows"].as_array().expect("rows");
-    assert!(rows.iter().any(|r| r["label"] == Value::from("kimi-one")));
+    assert!(
+        rows.iter()
+            .any(|r| r["name"] == Value::from("kimi kimi-one@example.com")
+                && r.get("label").is_none()),
+        "each row by its account's name, never its label: {json}"
+    );
 
     // Codex: the report asks no provider. It shows what a launch or a session last read, with its
     // age, and a row nobody read says so.
-    let (code, _, err) = run_line(
-        "accounts add codex-one --cli codex --email codex-one@example.com",
+    listed_by_hand(
         &env,
+        Cli::Codex,
+        by_hand("codex-one", Some("codex-one@example.com")),
     );
-    assert_eq!(code, exit(0), "{err}");
     // `main`, the default home's row, is signed in here only while its login file is there.
     std::fs::create_dir_all(tmp.path().join("home/.codex")).expect("default home");
     std::fs::write(tmp.path().join("home/.codex/auth.json"), "{}").expect("default login");
@@ -1048,10 +1227,11 @@ fn a_pools_stats_list_each_row_alike_as_text_and_json() {
     let (code, out, err) = renew("accounts stats --cli codex", &env, &reads);
     assert_eq!(code, exit(0), "{err}");
     assert!(
-        out.contains("main: limited")
+        out.contains("main (no address): limited")
             && out.contains("5h 0% left")
             && out.contains("read 2025-09-20T22:00:00Z")
-            && out.contains("codex-one: not-enrolled · login idle · no reading yet"),
+            && out
+                .contains("oai codex-one@example.com: not-enrolled · login idle · no reading yet"),
         "the reading stands with its age: {out}"
     );
 
@@ -1082,7 +1262,11 @@ fn accounts_browser_opens_the_rows_own_profile_at_its_regions_page_and_records_n
     let home = tmp.path().join("home");
     let store = env.accounts_store_for(Cli::Kimi).expect("kimi's store");
     let host = SignInHost::desk(&home);
-    let (code, out, err) = renew("accounts browser kimi-one --cli kimi", &env, &host);
+    let (code, out, err) = renew(
+        "accounts browser kimi-one@example.com --cli kimi",
+        &env,
+        &host,
+    );
     assert_eq!(code, exit(0), "{out}{err}");
     let profile = crate::harness::headless_oauth::row_browser_profile(
         Cli::Kimi,
@@ -1099,7 +1283,10 @@ fn accounts_browser_opens_the_rows_own_profile_at_its_regions_page_and_records_n
     assert!(
         out.contains("in Google Chrome for Testing")
             && out.contains("sign in there as kimi-one@example.com")
-            && out.contains("next: aterm harness accounts renew kimi-one --cli kimi"),
+            && out.contains(&format!(
+                "next: aterm harness accounts renew {} --cli kimi",
+                step_word(&env, Cli::Kimi, "kimi-one")
+            )),
         "{out}"
     );
     let ledger = read(&store.ledger_path());
@@ -1117,12 +1304,20 @@ fn accounts_browser_opens_the_rows_own_profile_at_its_regions_page_and_records_n
     );
     assert_eq!(host.calls.get(), 0, "no CLI sign-in ran");
 
-    let (code, _, err) = run_line(
-        "accounts add kimi-cn --cli kimi --email kimi-cn@example.com --region mainland-cn",
+    listed_by_hand(
         &env,
+        Cli::Kimi,
+        kimi_by_hand(
+            "kimi-cn",
+            Some("kimi-cn@example.com"),
+            Some(crate::ai::connector::Region::MainlandCn),
+        ),
     );
-    assert_eq!(code, exit(0), "{err}");
-    let (code, out, err) = renew("accounts browser kimi-cn --cli kimi", &env, &host);
+    let (code, out, err) = renew(
+        "accounts browser kimi-cn@example.com --cli kimi",
+        &env,
+        &host,
+    );
     assert_eq!(code, exit(0), "{out}{err}");
     assert_eq!(
         host.opened.borrow().last().map(|o| o.2.as_str()),
@@ -1137,7 +1332,11 @@ fn accounts_browser_opens_the_rows_own_profile_at_its_regions_page_and_records_n
         state: tmp.path().join("other-state"),
         ..env_at(&tmp)
     };
-    let (code, out, err) = renew("accounts browser kimi-one --cli kimi", &other_env, &empty);
+    let (code, out, err) = renew(
+        "accounts browser kimi-one@example.com --cli kimi",
+        &other_env,
+        &empty,
+    );
     assert_eq!(code, exit(1), "{out}{err}");
     assert!(out.contains("nothing was signed in"), "{out}");
 }
@@ -1166,7 +1365,11 @@ fn accounts_browser_fetches_its_own_window_browser_where_none_is_installed() {
         fetched: (Ok(fetched.clone()), Cell::new(0)),
         ..SignInHost::desk(&home)
     };
-    let (code, out, err) = renew("accounts browser kimi-one --cli kimi", &env, &fetching);
+    let (code, out, err) = renew(
+        "accounts browser kimi-one@example.com --cli kimi",
+        &env,
+        &fetching,
+    );
     assert_eq!(code, exit(0), "{out}{err}");
     assert_eq!(fetching.fetched.1.get(), 1);
     assert_eq!(
@@ -1175,7 +1378,10 @@ fn accounts_browser_fetches_its_own_window_browser_where_none_is_installed() {
         "the window opens in the fetched browser"
     );
     let says = out.find("aterm fetches the pinned Google Chrome for Testing");
-    let opens = out.find("opening `kimi-one`'s own browser profile");
+    let opens = out.find(&format!(
+        "opening the browser profile aterm keeps for {}",
+        shown_of(&env, Cli::Kimi, "kimi-one")
+    ));
     assert!(
         says.is_some() && says < opens && out.contains("held to its pinned size and sha256"),
         "{out}"
@@ -1201,7 +1407,11 @@ fn accounts_browser_fetches_its_own_window_browser_where_none_is_installed() {
         "kimi-one",
         Some("kimi-one@example.com"),
     );
-    let (code, out, err) = renew("accounts browser kimi-one --cli kimi", &other_env, &failing);
+    let (code, out, err) = renew(
+        "accounts browser kimi-one@example.com --cli kimi",
+        &other_env,
+        &failing,
+    );
     assert_eq!(code, exit(1), "{out}{err}");
     assert_eq!(failing.fetched.1.get(), 1);
     assert!(failing.opened.borrow().is_empty(), "nothing was opened");
@@ -1220,7 +1430,11 @@ fn accounts_browser_fetches_its_own_window_browser_where_none_is_installed() {
     drop(lock);
 
     let installed = SignInHost::desk(&home);
-    let (code, out, err) = renew("accounts browser kimi-one --cli kimi", &env, &installed);
+    let (code, out, err) = renew(
+        "accounts browser kimi-one@example.com --cli kimi",
+        &env,
+        &installed,
+    );
     assert_eq!(code, exit(0), "{out}{err}");
     assert_eq!(
         installed.fetched.1.get(),
@@ -1228,11 +1442,18 @@ fn accounts_browser_fetches_its_own_window_browser_where_none_is_installed() {
         "CONTROL: one installed is opened"
     );
     assert!(!out.contains("fetches the pinned"), "{out}");
-    let (code, _, err) = run_line("accounts add kimi-bare --cli kimi --region global", &env);
-    assert_eq!(code, exit(0), "{err}");
+    listed_by_hand(
+        &env,
+        Cli::Kimi,
+        kimi_by_hand(
+            "kimi-bare",
+            None,
+            Some(crate::ai::connector::Region::Global),
+        ),
+    );
     let (code, _, err) = renew("accounts browser kimi-bare --cli kimi", &env, &fetching);
     assert_eq!(code, exit(1));
-    assert!(err.contains("`kimi-bare` has no email"), "{err}");
+    assert!(err.contains("kimi-bare (no address) has no email"), "{err}");
     assert_eq!(fetching.fetched.1.get(), 1, "a refused row fetches nothing");
 }
 
@@ -1260,7 +1481,11 @@ fn accounts_browser_stopped_as_its_fetch_placed_the_build_opens_nothing() {
         ),
         ..SignInHost::desk(&home)
     };
-    let (code, out, err) = renew("accounts browser kimi-one --cli kimi", &env, &stopped);
+    let (code, out, err) = renew(
+        "accounts browser kimi-one@example.com --cli kimi",
+        &env,
+        &stopped,
+    );
     assert_eq!(code, exit(1), "{out}{err}");
     assert_eq!(stopped.fetched.1.get(), 1);
     assert!(stopped.opened.borrow().is_empty(), "nothing was opened");
@@ -1308,7 +1533,11 @@ fn accounts_browser_holds_its_ends_through_the_pass_after_the_window_and_marks_i
     );
     let mark = profile.join(crate::harness::browser_window::UNTIDIED_MARK);
     let host = SignInHost::desk(&home);
-    let (code, out, err) = renew("accounts browser kimi-one --cli kimi", &env, &host);
+    let (code, out, err) = renew(
+        "accounts browser kimi-one@example.com --cli kimi",
+        &env,
+        &host,
+    );
     assert_eq!(code, exit(0), "{out}{err}");
     assert_eq!(
         host.marked_at_window.get(),
@@ -1331,7 +1560,11 @@ fn accounts_browser_holds_its_ends_through_the_pass_after_the_window_and_marks_i
         tidy: Err("the headless browser did not start".to_owned()),
         ..SignInHost::desk(&home)
     };
-    let (code, out, err) = renew("accounts browser kimi-one --cli kimi", &env, &failing);
+    let (code, out, err) = renew(
+        "accounts browser kimi-one@example.com --cli kimi",
+        &env,
+        &failing,
+    );
     assert_eq!(code, exit(1), "{out}{err}");
     assert_eq!(failing.at_tidy.get(), Some((1, true)));
     assert_eq!(failing.holds.get(), 0);
@@ -1436,7 +1669,7 @@ fn accounts_browser_refuses_off_a_desk_without_a_terminal_over_ssh_under_a_held_
     let (tmp, env) = kimi_env("browser-refusals");
     let home = tmp.path().join("home");
     let store = env.accounts_store_for(Cli::Kimi).expect("kimi's store");
-    let line = "accounts browser kimi-one --cli kimi";
+    let line = "accounts browser kimi-one@example.com --cli kimi";
     // No browser installed, so a refusal that came after the fetch would count one.
     let no_desk = SignInHost {
         no_desk: crate::harness::browser_window::no_window_desk_in(true, true, &|_| None),
@@ -1588,11 +1821,12 @@ fn live_desk_stand_in() {
     };
     let (_tmp, env) = kimi_env("browser-live-desk-run");
     let (mut out, mut err) = (Vec::new(), Vec::new());
+    // The row by its account's address: its label names nothing, as it has one.
     let code = run_accounts_browser(
         Cli::Kimi,
         &env,
         &LiveAccounts::default(),
-        "kimi-one",
+        "kimi-one@example.com",
         &mut out,
         &mut err,
     );
@@ -1603,8 +1837,9 @@ fn live_desk_stand_in() {
     .expect("its run's words");
 }
 
-/// `ACCOUNTS BROWSER` opens nothing for a row with no email, an unknown label, a Kimi row with no
-/// region (whose roster is refused whole) or a machine with no window browser.
+/// `ACCOUNTS BROWSER` opens nothing for a row with no email, a word that names no account (the
+/// roster label of a row with an address among them), a Kimi row with no region (whose roster is
+/// refused whole) or a machine with no window browser.
 ///
 /// Each of these refusals comes before `accounts browser` asks its host's desk
 /// ([`AccountsHost::no_window_desk`]), and off Unix a run's own desk refuses the row with none of
@@ -1614,23 +1849,30 @@ fn live_desk_stand_in() {
 /// head).
 #[cfg(unix)]
 #[test]
-fn accounts_browser_refuses_no_email_no_region_no_window_browser_and_an_unknown_label() {
+fn accounts_browser_refuses_no_email_no_region_no_window_browser_and_an_unknown_account() {
     let (tmp, env) = kimi_env("browser-rows");
     let home = tmp.path().join("home");
-    let (code, _, err) = run_line("accounts add kimi-bare --cli kimi", &env);
-    assert_eq!(code, exit(0), "{err}");
+    listed_by_hand(&env, Cli::Kimi, kimi_by_hand("kimi-bare", None, None));
     let host = SignInHost::desk(&home);
     let (code, _, err) = renew("accounts browser kimi-bare --cli kimi", &env, &host);
     assert_eq!(code, exit(1));
-    assert!(err.contains("`kimi-bare` has no email"), "{err}");
+    assert!(err.contains("kimi-bare (no address) has no email"), "{err}");
     let (code, _, err) = renew("accounts browser nobody --cli kimi", &env, &host);
     assert_eq!(code, exit(1));
-    assert!(err.contains("`nobody` is not in the roster"), "{err}");
+    assert!(err.contains(&aterm_file::no_account("nobody")), "{err}");
+    // A row with an address is named by its account, never by its label.
+    let (code, _, err) = renew("accounts browser kimi-one --cli kimi", &env, &host);
+    assert_eq!(code, exit(1));
+    assert!(err.contains(&aterm_file::no_account("kimi-one")), "{err}");
     let bare = SignInHost {
         window: None,
         ..SignInHost::desk(&home)
     };
-    let (code, _, err) = renew("accounts browser kimi-one --cli kimi", &env, &bare);
+    let (code, _, err) = renew(
+        "accounts browser kimi-one@example.com --cli kimi",
+        &env,
+        &bare,
+    );
     assert_eq!(code, exit(1));
     assert!(
         err.contains("no Chromium that opens a window is installed here")
@@ -1646,10 +1888,95 @@ fn accounts_browser_refuses_no_email_no_region_no_window_browser_and_an_unknown_
          email = \"kimi-nowhere@example.com\"\n",
     );
     std::fs::write(&roster, text).expect("roster");
-    let (code, _, err) = renew("accounts browser kimi-nowhere --cli kimi", &env, &host);
+    let (code, _, err) = renew(
+        "accounts browser kimi-nowhere@example.com --cli kimi",
+        &env,
+        &host,
+    );
     assert_eq!(code, exit(1));
     assert!(err.contains("no region"), "{err}");
     assert!(host.opened.borrow().is_empty());
+}
+
+/// A POOL'S SIGN-IN VERBS TAKE AN ACCOUNT'S WORD AND REFUSE A ROW'S LABEL, UNDER `--cli`: Kimi
+/// Code's row `m4-1`, whose address is `kai@x.example`, is reached by `accounts renew` from its
+/// key, its provider word and address as two argv words, `kimi:<address>` and its address alone,
+/// and each renewal names it by its name and types its key in the step it leaves (no lab slugs
+/// it here); its label is refused by `renew` and by `login` with the resolver's no-account
+/// words, and nothing runs. `login` from its key reaches the row (and stops, with no terminal).
+/// Nothing either verb prints holds the label.
+/// NEGATIVE CONTROL: with `run_accounts_renew_for` and `run_accounts_login_for` taking the row
+/// labelled with the word first (`file_roster.row(word)`), `accounts renew m4-1 --cli kimi` runs
+/// a sign-in and this fails on the label's refusal (2026-11-16, by hand, then restored).
+#[cfg(unix)]
+#[test]
+fn a_pools_sign_in_verbs_take_each_account_word_and_refuse_a_rows_label() {
+    let tmp = tmp_dir("signin-words-kimi");
+    let mut env = env_at(&tmp);
+    env.sock = None;
+    listed_by_hand(
+        &env,
+        Cli::Kimi,
+        kimi_by_hand(
+            "m4-1",
+            Some("kai@x.example"),
+            Some(crate::ai::connector::Region::Global),
+        ),
+    );
+    let home = tmp.path().join("home");
+    let host = SignInHost::new(
+        Script::Ends(login_drive::Outcome::NeedsYou(
+            "no headless browser is installed here".to_owned(),
+        )),
+        &home,
+    );
+    let key = aterm_db::typed::keys::account_pk("kimi:global", "kai@x.example").expect("a key");
+    let labelled = |text: &str| {
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+            .any(|token| token == "m4-1")
+    };
+    for (at, word) in [
+        key.as_str(),
+        "kimi kai@x.example",
+        "kimi:kai@x.example",
+        "kai@x.example",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (code, out, err) = renew(&format!("accounts renew {word} --cli kimi"), &env, &host);
+        assert_eq!(code, exit(1), "`{word}`: {out}{err}");
+        assert_eq!(
+            host.calls.get(),
+            at + 1,
+            "`{word}` reached the row: {out}{err}"
+        );
+        assert!(
+            out.contains("NEEDS YOU: approve the Kimi Code CLI sign-in for kimi kai@x.example")
+                && out.contains(&format!("accounts login {key} --cli kimi")),
+            "`{word}`: {out}"
+        );
+        assert!(!labelled(&out) && !labelled(&err), "`{word}`: {out}{err}");
+    }
+    let calls = host.calls.get();
+    for verb in ["renew", "login"] {
+        let (code, out, err) = renew(&format!("accounts {verb} m4-1 --cli kimi"), &env, &host);
+        assert_eq!(code, exit(1), "{verb}: {out}{err}");
+        assert!(
+            err.contains(&aterm_file::no_account("m4-1")),
+            "{verb}: {err}"
+        );
+        assert_eq!(host.calls.get(), calls, "{verb} of the label ran nothing");
+    }
+    let (code, out, err) = renew(&format!("accounts login {key} --cli kimi"), &env, &host);
+    assert_eq!(code, exit(1), "{out}{err}");
+    assert!(err.contains("not run: stdin is not a terminal"), "{err}");
+    assert!(!err.contains(&aterm_file::no_account(&key)), "{err}");
+    assert_eq!(
+        host.calls.get(),
+        calls,
+        "login with no terminal ran nothing"
+    );
 }
 
 /// A renewal whose page stops on the vendor's sign-in names `accounts browser` in its NEEDS YOU
@@ -1669,14 +1996,20 @@ fn a_renewal_finding_the_profile_signed_out_names_accounts_browser() {
         )),
         &home,
     );
-    let (code, out, err) = renew("accounts renew kimi-one --cli kimi", &env, &signed_out);
+    let (code, out, err) = renew(
+        "accounts renew kimi-one@example.com --cli kimi",
+        &env,
+        &signed_out,
+    );
     assert_eq!(code, exit(1), "{out}{err}");
     assert!(
-        out.contains(
-            "NEEDS YOU: sign `kimi-one` in once in its own browser profile at this machine's \
-             desk (`aterm harness accounts browser kimi-one --cli kimi` opens it); aterm's later \
-             renewals approve its sign-in there by themselves"
-        ),
+        out.contains(&format!(
+            "NEEDS YOU: sign {} in once in its own browser profile at this machine's desk \
+             (`aterm harness accounts browser {} --cli kimi` opens it); aterm's later \
+             renewals approve its sign-in there by themselves",
+            shown_of(&env, Cli::Kimi, "kimi-one"),
+            step_word(&env, Cli::Kimi, "kimi-one")
+        )),
         "{out}"
     );
     assert!(
@@ -1700,12 +2033,79 @@ fn a_renewal_finding_the_profile_signed_out_names_accounts_browser() {
         )),
         &home,
     );
-    let (code, out, _) = renew("accounts renew kimi-one --cli kimi", &env, &no_browser);
+    let (code, out, _) = renew(
+        "accounts renew kimi-one@example.com --cli kimi",
+        &env,
+        &no_browser,
+    );
     assert_eq!(code, exit(1));
     assert!(
-        out.contains("NEEDS YOU: approve the Kimi Code CLI sign-in for kimi-one")
-            && out.contains("accounts login kimi-one --cli kimi")
-            && !out.contains("accounts browser"),
+        out.contains(&format!(
+            "NEEDS YOU: approve the Kimi Code CLI sign-in for {}",
+            shown_of(&env, Cli::Kimi, "kimi-one")
+        )) && out.contains(&format!(
+            "accounts login {} --cli kimi",
+            step_word(&env, Cli::Kimi, "kimi-one")
+        )) && !out.contains("accounts browser"),
+        "{out}"
+    );
+}
+
+/// A RENEWAL'S STOP NAMES THE ROW BY THE WORD ITS OWN LINES TYPE: under a lab that slugs Kimi
+/// Code's `kimi-one` (`kimi-one-x`), the sign-in a renewal hands its host carries that slug
+/// ([`Request::word`]), the word its `NEEDS YOU:` line types for the row, so the headless
+/// approver's stop on the vendor's sign-in page types it too (`headless_vendor_tests`'
+/// `the_window_and_the_headless_approver_open_one_profile_per_row` holds the approver to the
+/// word it is handed), never the account's key beside the slug in the same run.
+/// NEGATIVE CONTROL: with `SignInPlan::drive` handing its host no word (`word: None`), this
+/// fails on the word the request carries (2026-11-16, by hand, then restored).
+///
+/// Unix only, as the overlay staging home it signs in to is; off Unix,
+/// `a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links` holds the refusal.
+#[cfg(unix)]
+#[test]
+fn a_renewals_sign_in_carries_the_word_its_lines_type_for_the_row() {
+    let (tmp, env) = kimi_env("browser-renew-word");
+    let home = tmp.path().join("home");
+    let email = "kimi-one@example.com";
+    let realm = "kimi:global";
+    let pk = aterm_db::typed::keys::account_pk(realm, email).expect("a key");
+    let lab = crate::harness::alab_roster::Lab {
+        names: [(
+            pk,
+            aterm_file::AccountNames {
+                realm: realm.to_owned(),
+                slug: "kimi-one-x".to_owned(),
+                name: aterm_db::typed::keys::account_name(realm, email),
+                email: Some(email.to_owned()),
+                login: Some(email.to_owned()),
+                live: true,
+            },
+        )]
+        .into(),
+        ..crate::harness::alab_roster::Lab::default()
+    };
+    let carried = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let seen = std::rc::Rc::clone(&carried);
+    let host = SignInHost {
+        during: Some(Box::new(move |req: &Request<'_>| {
+            seen.borrow_mut()
+                .push(req.word.map(|word| word.as_str().to_owned()));
+        })),
+        ..SignInHost::new(
+            Script::Ends(login_drive::Outcome::NeedsSignIn(
+                "the sign-in waits on `www.kimi.ai/code/authorize_device` for a person".to_owned(),
+            )),
+            &home,
+        )
+    };
+    let (code, out, err) = crate::harness::alab_roster::with_lab(lab, || {
+        renew("accounts renew kimi-one-x --cli kimi", &env, &host)
+    });
+    assert_eq!(code, exit(1), "{out}{err}");
+    assert_eq!(*carried.borrow(), [Some("kimi-one-x".to_owned())]);
+    assert!(
+        out.contains("(`aterm harness accounts browser kimi-one-x --cli kimi` opens it)"),
         "{out}"
     );
 }
@@ -1714,7 +2114,7 @@ fn a_renewal_finding_the_profile_signed_out_names_accounts_browser() {
 /// headless browser with a block page, so `add`'s `run:` step, `accounts --cli grok` and
 /// `accounts stats --cli grok` for a row that needs a sign-in (before any renewal stopped for it:
 /// the window's upkeep starts none), `browser`'s `next:` step and a renewal that found the
-/// profile signed out (and the task it records) each name `accounts login <label> --cli grok`,
+/// profile signed out (and the task it records) each name `accounts login <account> --cli grok`,
 /// and none promises that a renewal approves the page. CONTROLS: a Kimi row's `add` names
 /// `renew`, its report and stats name no sign-in step (aterm signs it in by itself), its
 /// signed-out renewal names `accounts browser` then `renew`, and a stored browser task names
@@ -1726,22 +2126,26 @@ fn a_grok_rows_next_steps_name_its_login_never_a_renewal() {
     let home = tmp.path().join("home");
     let mut env = env_at(&tmp);
     env.sock = None;
-    let (code, out, err) = run_line(
-        "accounts add grok-one --cli grok --email grok-one@example.com",
-        &env,
-    );
+    let (code, out, err) = run_line("accounts add xai grok-one@example.com --cli grok", &env);
     assert_eq!(code, exit(0), "{err}");
+    let grok_one =
+        crate::harness::account_names::tests::added_label(Cli::Grok, "grok-one@example.com");
+    let kimi_one =
+        crate::harness::account_names::tests::added_label(Cli::Kimi, "kimi-one@example.com");
     assert!(
-        out.contains("run: aterm harness accounts login grok-one --cli grok"),
+        out.contains(&format!(
+            "run: aterm harness accounts login {} --cli grok",
+            step_word(&env, Cli::Grok, &grok_one)
+        )),
         "{out}"
     );
-    let (code, out, err) = run_line(
-        "accounts add kimi-one --cli kimi --email kimi-one@example.com --region global",
-        &env,
-    );
+    let (code, out, err) = run_line("accounts add kimi kimi-one@example.com --cli kimi", &env);
     assert_eq!(code, exit(0), "{err}");
     assert!(
-        out.contains("run: aterm harness accounts renew kimi-one --cli kimi"),
+        out.contains(&format!(
+            "run: aterm harness accounts renew {} --cli kimi",
+            step_word(&env, Cli::Kimi, &kimi_one)
+        )),
         "CONTROL: {out}"
     );
     let pool = PoolHost { account: None };
@@ -1755,9 +2159,10 @@ fn a_grok_rows_next_steps_name_its_login_never_a_renewal() {
         assert_eq!(code, exit(0), "{line}: {out}{err}");
         if cli == Cli::Grok {
             assert!(
-                out.contains(
-                    "sign-in needed: Run aterm harness accounts login grok-one --cli grok"
-                ),
+                out.contains(&format!(
+                    "sign-in needed: Run aterm harness accounts login {} --cli grok",
+                    step_word(&env, Cli::Grok, &grok_one)
+                )),
                 "{line}: {out}"
             );
         } else {
@@ -1770,21 +2175,22 @@ fn a_grok_rows_next_steps_name_its_login_never_a_renewal() {
         let (code, out, err) = renew(&line, &env, &pool);
         assert_eq!(code, exit(0), "{line}: {out}{err}");
         let needed = if cli == Cli::Grok {
-            "\"sign_in_needed\":\"Run aterm harness accounts login grok-one --cli grok\""
+            format!(
+                "\"sign_in_needed\":\"Run aterm harness accounts login {} --cli grok\"",
+                step_word(&env, Cli::Grok, &grok_one)
+            )
         } else {
-            "\"sign_in_needed\":null"
+            "\"sign_in_needed\":null".to_owned()
         };
-        assert!(out.contains(needed), "{line}: {out}");
+        assert!(out.contains(&needed), "{line}: {out}");
         if !stats {
             let label = if cli == Cli::Grok {
-                "grok-one"
+                grok_one.as_str()
             } else {
-                "kimi-one"
+                kimi_one.as_str()
             };
             let doc: Value = aterm_json::from_str(out.trim()).expect("json");
-            let row = doc["accounts"]
-                .as_array()
-                .and_then(|rows| rows.iter().find(|row| row["label"].as_str() == Some(label)))
+            let row = crate::harness::account_names::tests::report_row(cli, &env, label, &doc)
                 .unwrap_or_else(|| panic!("{line}: no {label} row: {out}"));
             assert_eq!(
                 row["renews"].as_bool(),
@@ -1795,12 +2201,18 @@ fn a_grok_rows_next_steps_name_its_login_never_a_renewal() {
     }
 
     let desk = SignInHost::desk(&home);
-    let (code, out, err) = renew("accounts browser grok-one --cli grok", &env, &desk);
+    let (code, out, err) = renew(
+        "accounts browser grok-one@example.com --cli grok",
+        &env,
+        &desk,
+    );
     assert_eq!(code, exit(0), "{out}{err}");
     assert_eq!(desk.opened.borrow().len(), 1, "one window");
     assert!(
-        out.contains("next: aterm harness accounts login grok-one --cli grok")
-            && !out.contains("accounts renew")
+        out.contains(&format!(
+            "next: aterm harness accounts login {} --cli grok",
+            step_word(&env, Cli::Grok, &grok_one)
+        )) && !out.contains("accounts renew")
             && !out.contains("the renewal checks it")
             && !out.contains("headlessly"),
         "{out}"
@@ -1813,13 +2225,19 @@ fn a_grok_rows_next_steps_name_its_login_never_a_renewal() {
         )),
         &home,
     );
-    let (code, out, err) = renew("accounts renew grok-one --cli grok", &env, &signed_out);
+    let (code, out, err) = renew(
+        "accounts renew grok-one@example.com --cli grok",
+        &env,
+        &signed_out,
+    );
     assert_eq!(code, exit(1), "{out}{err}");
     assert!(
-        out.contains(
-            "NEEDS YOU: approve the Grok Build sign-in for grok-one: run `aterm harness accounts \
-             login grok-one --cli grok`"
-        ) && !out.contains("accounts browser"),
+        out.contains(&format!(
+            "NEEDS YOU: approve the Grok Build sign-in for {}: run `aterm harness accounts login \
+             {} --cli grok`",
+            shown_of(&env, Cli::Grok, &grok_one),
+            step_word(&env, Cli::Grok, &grok_one)
+        )) && !out.contains("accounts browser"),
         "{out}"
     );
     let task = |store: &accounts::Store, label: &str| {
@@ -1831,36 +2249,48 @@ fn a_grok_rows_next_steps_name_its_login_never_a_renewal() {
             .and_then(|b| b.sign_in_task)
             .map(|t| t.action)
     };
-    assert_eq!(
-        task(&store, "grok-one"),
-        Some(accounts::SignInAction::Login)
-    );
+    assert_eq!(task(&store, &grok_one), Some(accounts::SignInAction::Login));
 
     // The Kimi CONTROL signs in to an overlay staging home, which aterm links only on Unix
     // (`a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links`).
     let kimi = env.accounts_store_for(Cli::Kimi).expect("kimi's store");
     if cfg!(unix) {
-        let (code, out, _) = renew("accounts renew kimi-one --cli kimi", &env, &signed_out);
+        let (code, out, _) = renew(
+            "accounts renew kimi-one@example.com --cli kimi",
+            &env,
+            &signed_out,
+        );
         assert_eq!(code, exit(1), "CONTROL: {out}");
         assert!(
-            out.contains("accounts browser kimi-one --cli kimi")
-                && out.contains("aterm's later renewals approve its sign-in there by themselves"),
+            out.contains(&format!(
+                "accounts browser {} --cli kimi",
+                step_word(&env, Cli::Kimi, &kimi_one)
+            )) && out.contains("aterm's later renewals approve its sign-in there by themselves"),
             "CONTROL: {out}"
         );
         assert_eq!(
-            task(&kimi, "kimi-one"),
+            task(&kimi, &kimi_one),
             Some(accounts::SignInAction::Browser)
         );
     }
 
+    // Each step names the row by its account's word, `accounts browser`'s too.
+    let word =
+        |cli, label| crate::harness::account_names::tests::row_name_of(cli, &env, label).word;
     assert_eq!(
-        accounts::SignInAction::Browser.next_step(Cli::Grok, "grok-one"),
-        "Run aterm harness accounts login grok-one --cli grok"
+        accounts::SignInAction::Browser.next_step(Cli::Grok, &word(Cli::Grok, &grok_one)),
+        format!(
+            "Run aterm harness accounts login {} --cli grok",
+            word(Cli::Grok, &grok_one)
+        )
     );
-    assert!(
-        accounts::SignInAction::Browser
-            .next_step(Cli::Kimi, "kimi-one")
-            .starts_with("Run aterm harness accounts browser kimi-one --cli kimi"),
+    assert_eq!(
+        accounts::SignInAction::Browser.next_step(Cli::Kimi, &word(Cli::Kimi, &kimi_one)),
+        format!(
+            "Run aterm harness accounts browser {0} --cli kimi, then aterm harness accounts renew \
+             {0} --cli kimi",
+            word(Cli::Kimi, &kimi_one)
+        ),
         "CONTROL"
     );
 }
@@ -1887,7 +2317,11 @@ fn a_renewal_on_a_bot_check_records_a_quiet_human_login_task() {
         )),
         &home,
     );
-    let (code, out, err) = renew("accounts renew kimi-one --cli kimi", &env, &checked);
+    let (code, out, err) = renew(
+        "accounts renew kimi-one@example.com --cli kimi",
+        &env,
+        &checked,
+    );
     assert_eq!(code, exit(1), "{out}{err}");
     assert!(!out.contains("NEEDS YOU"), "{out}");
     assert!(
@@ -1905,7 +2339,13 @@ fn a_renewal_on_a_bot_check_records_a_quiet_human_login_task() {
     let tasks = accounts::sign_in_tasks(&records.raw_roster, &records.logins);
     assert_eq!(tasks, [("kimi-one".into(), accounts::SignInAction::Login)]);
     assert!(out.contains("human browser challenge recorded"), "{out}");
-    assert!(out.contains("accounts login kimi-one --cli kimi"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "accounts login {} --cli kimi",
+            step_word(&env, Cli::Kimi, "kimi-one")
+        )),
+        "{out}"
+    );
     let before = records.logins.get("kimi-one").cloned();
     assert!(
         before
@@ -1916,11 +2356,18 @@ fn a_renewal_on_a_bot_check_records_a_quiet_human_login_task() {
     // With nobody at this terminal, the row the check stopped is not signed in again, on any
     // clock: the run names the person's step and changes nothing.
     let failed = SignInHost::new(Script::Ends(login_drive::Outcome::Failed), &home);
-    let (code, out, err) = renew("accounts renew kimi-one --cli kimi", &env, &failed);
+    let (code, out, err) = renew(
+        "accounts renew kimi-one@example.com --cli kimi",
+        &env,
+        &failed,
+    );
     assert_eq!(code, exit(1), "{out}{err}");
     assert!(
         err.contains("not run: its last sign-in stopped where only a person at this Mac can go on")
-            && err.contains("a person runs `aterm harness accounts login kimi-one --cli kimi`"),
+            && err.contains(&format!(
+                "a person runs `aterm harness accounts login {} --cli kimi`",
+                step_word(&env, Cli::Kimi, "kimi-one")
+            )),
         "{err}"
     );
     assert_eq!(
@@ -1933,7 +2380,11 @@ fn a_renewal_on_a_bot_check_records_a_quiet_human_login_task() {
         terminal: true,
         ..SignInHost::new(Script::Ends(login_drive::Outcome::Failed), &home)
     };
-    let (_, out, _) = renew("accounts renew kimi-one --cli kimi", &env, &failed);
+    let (_, out, _) = renew(
+        "accounts renew kimi-one@example.com --cli kimi",
+        &env,
+        &failed,
+    );
     assert!(!out.contains("human browser challenge"), "{out}");
     assert!(!out.contains("NEEDS YOU"), "{out}");
     let after = store.load_logins(env.now).unwrap().0;
@@ -1954,7 +2405,11 @@ fn a_renewal_on_a_bot_check_records_a_quiet_human_login_task() {
             &home,
         )
     };
-    let (_, out, _) = renew("accounts renew kimi-one --cli kimi", &env, &signed_out);
+    let (_, out, _) = renew(
+        "accounts renew kimi-one@example.com --cli kimi",
+        &env,
+        &signed_out,
+    );
     assert!(out.contains("NEEDS YOU"), "CONTROL: {out}");
     assert!(
         read(&store.dir.join("logins.json")).contains("sign_in_task"),
@@ -2094,10 +2549,13 @@ fn accounts_browser_serves_claude_codes_pool() {
     let tmp = tmp_dir("browser-claude");
     let mut env = env_at(&tmp);
     env.sock = None;
-    let (code, _, err) = run_line("accounts add work-1 --email work-1@example.com", &env);
-    assert_eq!(code, exit(0), "{err}");
+    listed_by_hand(
+        &env,
+        Cli::Claude,
+        by_hand("work-1", Some("work-1@example.com")),
+    );
     let host = SignInHost::desk(&tmp.path().join("home"));
-    let (code, out, err) = renew("accounts browser work-1", &env, &host);
+    let (code, out, err) = renew("accounts browser work-1@example.com", &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
     let store = env.accounts_store();
     let profile = crate::harness::headless_oauth::resolve_browser_profile_dir(
@@ -2113,8 +2571,10 @@ fn accounts_browser_serves_claude_codes_pool() {
         Some((profile, "https://claude.ai/login".to_owned()))
     );
     assert!(
-        out.contains("next: aterm harness accounts renew work-1   (")
-            && out.contains("aterm cannot see from here whether claude.ai signed you in"),
+        out.contains(&format!(
+            "next: aterm harness accounts renew {}   (",
+            step_word(&env, Cli::Claude, "work-1")
+        )) && out.contains("aterm cannot see from here whether claude.ai signed you in"),
         "{out}"
     );
     assert_eq!(
@@ -2129,23 +2589,25 @@ fn accounts_browser_serves_claude_codes_pool() {
     );
 }
 
-/// `accounts browser` takes one label, with or without `--cli`.
+/// `accounts browser` takes one account word, with or without `--cli`: its provider word and
+/// address as two argv words are one name. Two words that are not one name, a flag it does not
+/// take and none at all are refused, saying how many words it was given and never repeating them.
 #[test]
-fn accounts_browser_takes_one_label() {
+fn accounts_browser_takes_one_account() {
     assert_eq!(
         parsed("accounts browser grok-1 --cli grok"),
         Ok(Cmd::AccountsOf(AccountsOf {
             cli: Cli::Grok,
             form: AccountsCmd::Browser {
-                label: "grok-1".to_owned()
+                account: "grok-1".to_owned()
             },
             vendor: accounts::Vendor::default(),
         }))
     );
     assert_eq!(
-        parsed("accounts browser work-1"),
+        parsed("accounts browser claude ada@x.example"),
         Ok(Cmd::Accounts(AccountsCmd::Browser {
-            label: "work-1".to_owned()
+            account: "claude ada@x.example".to_owned()
         }))
     );
     for line in [
@@ -2155,9 +2617,13 @@ fn accounts_browser_takes_one_label() {
     ] {
         assert!(parsed(line).is_err(), "{line}");
     }
-    assert!(parsed("accounts browser").unwrap_err().contains(
-        "accounts browser takes one label: `aterm harness accounts browser <label> [--cli <id>]`"
-    ));
+    let why = parsed("accounts browser ada@x.example bea@x.example").unwrap_err();
+    assert!(
+        why.starts_with("accounts browser takes one account: its slug, its key, or its provider word and address")
+            && why.ends_with("not 2 words")
+            && !why.contains("bea@"),
+        "{why}"
+    );
 }
 
 /// `ACCOUNTS BROWSER` judges the sign-in by the vendor's own session, never by a cookie store:
@@ -2188,7 +2654,7 @@ fn accounts_browser_judges_the_sign_in_by_the_vendors_session_never_a_cookie_sto
     );
     std::fs::create_dir_all(profile.join("Default")).expect("a used profile");
     std::fs::write(profile.join("Default/Cookies"), "used by a renewal").expect("cookies");
-    let line = "accounts browser kimi-one --cli kimi";
+    let line = "accounts browser kimi-one@example.com --cli kimi";
     let empty = SignInHost {
         ends: (WindowEnd::Done, false),
         tidy: Ok(3),
@@ -2199,8 +2665,11 @@ fn accounts_browser_judges_the_sign_in_by_the_vendors_session_never_a_cookie_sto
     assert!(
         out.contains("3 identity providers' cookies were removed from it")
             && out.contains("www.kimi.ai keeps no session in it, so nothing was signed in there")
-            && out
-                .contains("next: sign in there, then press Enter: aterm harness accounts browser")
+            && out.contains(&format!(
+                "next: sign in there, then press Enter: aterm harness accounts browser {} --cli \
+                 kimi",
+                step_word(&env, Cli::Kimi, "kimi-one")
+            ))
             && !out.contains("accounts renew"),
         "{out}"
     );
@@ -2227,7 +2696,10 @@ fn accounts_browser_judges_the_sign_in_by_the_vendors_session_never_a_cookie_sto
     assert!(
         out.contains(
             "it holds no identity provider's cookies; www.kimi.ai keeps its session in it"
-        ) && out.contains("next: aterm harness accounts renew kimi-one --cli kimi"),
+        ) && out.contains(&format!(
+            "next: aterm harness accounts renew {} --cli kimi",
+            step_word(&env, Cli::Kimi, "kimi-one")
+        )),
         "{out}"
     );
 
@@ -2240,7 +2712,10 @@ fn accounts_browser_judges_the_sign_in_by_the_vendors_session_never_a_cookie_sto
     assert!(
         err.contains("could not be opened again to remove the identity providers' cookies")
             && err.contains("a Google or other sign-in may be left in it")
-            && err.contains("accounts browser kimi-one --cli kimi"),
+            && err.contains(&format!(
+                "run `aterm harness accounts browser {} --cli kimi` again",
+                step_word(&env, Cli::Kimi, "kimi-one")
+            )),
         "{err}"
     );
     assert!(!out.contains("next: aterm harness accounts renew"), "{out}");
@@ -2268,7 +2743,7 @@ fn accounts_browser_leaves_a_profile_it_made_unproven_until_a_sign_in_is_kept() 
         Some("kimi-one@example.com"),
     );
     assert!(!profile.exists());
-    let line = "accounts browser kimi-one --cli kimi";
+    let line = "accounts browser kimi-one@example.com --cli kimi";
     let empty = SignInHost {
         ends: (WindowEnd::Done, false),
         ..SignInHost::desk(&home)
@@ -2300,7 +2775,11 @@ fn accounts_browser_opens_nothing_on_a_profile_a_headless_sign_in_holds() {
     std::fs::create_dir_all(&profile).expect("profile");
     let held = crate::harness::browser_window::ProfileLock::claim(&profile).expect("free");
     let host = SignInHost::desk(&home);
-    let (code, out, err) = renew("accounts browser kimi-one --cli kimi", &env, &host);
+    let (code, out, err) = renew(
+        "accounts browser kimi-one@example.com --cli kimi",
+        &env,
+        &host,
+    );
     assert_eq!(code, exit(1), "{out}{err}");
     assert!(
         err.contains(&format!(
@@ -2311,7 +2790,11 @@ fn accounts_browser_opens_nothing_on_a_profile_a_headless_sign_in_holds() {
     );
     assert!(host.opened.borrow().is_empty());
     drop(held);
-    let (code, out, err) = renew("accounts browser kimi-one --cli kimi", &env, &host);
+    let (code, out, err) = renew(
+        "accounts browser kimi-one@example.com --cli kimi",
+        &env,
+        &host,
+    );
     assert_eq!(code, exit(0), "CONTROL: {out}{err}");
     assert_eq!(host.opened.borrow().len(), 1);
 }
@@ -2429,7 +2912,10 @@ fn a_background_renewal_keeps_its_human_step_when_both_output_streams_are_discar
     );
     let (_, text, _) = run_line("accounts --cli kimi", &env);
     assert!(
-        text.contains("accounts browser kimi-one --cli kimi"),
+        text.contains(&format!(
+            "accounts browser {} --cli kimi",
+            step_word(&env, Cli::Kimi, "kimi-one")
+        )),
         "{text}"
     );
     let (_, json, _) = run_line("accounts --cli kimi --json", &env);
@@ -2439,7 +2925,11 @@ fn a_background_renewal_keeps_its_human_step_when_both_output_streams_are_discar
     );
     assert!(!read(&store.logins_file()).contains("private vendor text"));
     let host = SignInHost::new(Script::Kimi("kimi 0"), &home);
-    let (code, out, err) = renew("accounts renew kimi-one --cli kimi", &env, &host);
+    let (code, out, err) = renew(
+        "accounts renew kimi-one@example.com --cli kimi",
+        &env,
+        &host,
+    );
     assert_eq!(code, exit(0), "{out}{err}");
     let (logins, _) = store.load_logins(env.now).expect("read success");
     assert!(accounts::sign_in_tasks(&roster, &logins).is_empty());
@@ -2506,17 +2996,20 @@ fn codex_signin_binds_auth_path_overlay_suffixes_reconcile_and_due_renewals_orde
     let mut env = env_at(&tmp);
     env.sock = None;
     let home = tmp.path().join("home");
-    for line in [
-        "accounts add codex-one --cli codex --email codex-one@example.com",
-        "accounts add codex-two --cli codex --email codex-two@example.com",
+    for (label, email) in [
+        ("codex-one", "codex-one@example.com"),
+        ("codex-two", "codex-two@example.com"),
     ] {
-        let (code, _, err) = run_line(line, &env);
-        assert_eq!(code, exit(0), "{err}");
+        listed_by_hand(&env, Cli::Codex, by_hand(label, Some(email)));
     }
     let host = OrderHost {
         order: std::cell::RefCell::new(Vec::new()),
     };
-    let (code, out, err) = renew("accounts renew codex-one --cli codex", &env, &host);
+    let (code, out, err) = renew(
+        "accounts renew codex-one@example.com --cli codex",
+        &env,
+        &host,
+    );
     assert_eq!(code, exit(0), "{out}{err}");
     let staging_one = home
         .join(".aterm")
@@ -2588,16 +3081,20 @@ fn codex_signin_binds_auth_path_overlay_suffixes_reconcile_and_due_renewals_orde
 
     // Due renewals order ready rows ahead of rows holding an unaddressed sign_in_task.
     let (_kimi_tmp, mut kimi_env) = kimi_env("due-order-sign-in-task");
-    let (code, _, err) = run_line(
-        "accounts add kimi-two --cli kimi --email kimi-two@example.com --region global",
+    listed_by_hand(
         &kimi_env,
+        Cli::Kimi,
+        kimi_by_hand(
+            "kimi-two",
+            Some("kimi-two@example.com"),
+            Some(crate::ai::connector::Region::Global),
+        ),
     );
-    assert_eq!(code, exit(0), "{err}");
     let seed = OrderHost {
         order: std::cell::RefCell::new(Vec::new()),
     };
     let (code, out, err) = renew(
-        "accounts renew kimi-one kimi-two --cli kimi",
+        "accounts renew kimi-one@example.com kimi-two@example.com --cli kimi",
         &kimi_env,
         &seed,
     );
@@ -2656,7 +3153,13 @@ fn codex_signin_binds_auth_path_overlay_suffixes_reconcile_and_due_renewals_orde
         ["kimi-two"],
         "ready kimi-two runs ahead of kimi-one with an unaddressed sign_in_task"
     );
-    assert!(out.contains("kimi-one: not run yet: "), "{out}");
+    assert!(
+        out.contains(&format!(
+            "{}: not run yet: ",
+            shown_of(&kimi_env, Cli::Kimi, "kimi-one")
+        )),
+        "{out}"
+    );
     kimi_env.now += crate::harness::sign_in_ladder::SPACING_S - 1;
     assert_eq!(
         due_pass(&kimi_env).0,
@@ -2671,9 +3174,18 @@ fn codex_signin_binds_auth_path_overlay_suffixes_reconcile_and_due_renewals_orde
     used_here(kimi_env.now);
     let (order, out) = due_pass(&kimi_env);
     assert_eq!(order, ["kimi-one"]);
-    assert!(out.contains("kimi-two: not run yet: "), "{out}");
+    assert!(
+        out.contains(&format!(
+            "{}: not run yet: ",
+            shown_of(&kimi_env, Cli::Kimi, "kimi-two")
+        )),
+        "{out}"
+    );
 }
 
+/// NEGATIVE CONTROL: with the completion's receipt naming the row by its label (`completed this
+/// machine's own login as main`), it fails `completed this machine's own login as oai
+/// owner@example.test` (2026-11-16, by hand on SF-07H S6's review settle, then restored).
 #[cfg(unix)]
 #[test]
 fn codex_default_completion_preserves_metadata_and_is_idempotent() {
@@ -2701,8 +3213,14 @@ fn codex_default_completion_preserves_metadata_and_is_idempotent() {
         };
         assert_renewal_metadata(false);
         for _ in 0..2 {
-            let (code, out, err) = renew("accounts adopt-default main --cli codex", &env, &host);
+            let (code, out, err) = renew("accounts adopt-default --cli codex", &env, &host);
             assert_eq!(code, exit(0), "{out}{err}");
+            // The receipt names the account the row completed is, never the row's label.
+            assert!(
+                out.contains("completed this machine's own login as oai owner@example.test"),
+                "{out}"
+            );
+            assert!(!prints_word(&out, "main"), "{out}");
         }
         assert_renewal_metadata(true);
         let edited = read(&path);
@@ -2788,7 +3306,7 @@ fn codex_default_completion_respects_holds_explicit_metadata_and_backend() {
         let host = PoolHost {
             account: Some("owner@example.test"),
         };
-        let (code, _, _) = renew("accounts adopt-default main --cli codex", &env, &host);
+        let (code, _, _) = renew("accounts adopt-default --cli codex", &env, &host);
         assert_eq!(code, exit(1));
         assert_eq!(read(&path), original);
     }
@@ -2843,7 +3361,7 @@ fn codex_default_completion_runs_in_init_and_upkeep_and_obeys_policy() {
                 home,
                 &env.state,
                 &tmp.path().join("accounts.toml"),
-                env.now,
+                aterm_uds::trace::Now::at(env.now),
                 crate::harness::accounts_sync::UpkeepStep::Sync,
             );
         }
@@ -2869,13 +3387,13 @@ fn codex_default_completion_retains_alias_and_respects_native_auth_lock() {
     let host = PoolHost {
         account: Some("owner@example.test"),
     };
-    let (code, out, err) = renew("accounts adopt-default main --cli codex", &env, &host);
+    let (code, out, err) = renew("accounts adopt-default --cli codex", &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
     assert_eq!(read(&path), original);
     let lock = crate::harness::codex_app_login::AuthLock::try_take(&login.join("auth.json"))
         .unwrap()
         .unwrap();
-    let (code, _, err) = renew("accounts adopt-default main --cli codex", &env, &host);
+    let (code, _, err) = renew("accounts adopt-default --cli codex", &env, &host);
     assert_eq!(code, exit(1), "{err}");
     assert!(err.contains("being changed"), "{err}");
     assert_eq!(read(&path), original);
@@ -3085,7 +3603,10 @@ fn a_person_can_borrow_another_macs_account_and_the_report_says_whose_it_is() {
     let (_, report, _) = renew("accounts --cli kimi", &env, &host());
     assert!(
         report.contains("this pool's source gives it to m22")
-            && report.contains("accounts renew kimi-one")
+            && report.contains(&format!(
+                "accounts renew {}",
+                step_word(&env, Cli::Kimi, "kimi-one")
+            ))
             && report.contains("list another"),
         "{report}"
     );
@@ -3111,7 +3632,11 @@ fn a_person_can_borrow_another_macs_account_and_the_report_says_whose_it_is() {
     );
 
     let named = host();
-    let _ = renew("accounts renew kimi-one --cli kimi", &env, &named);
+    let _ = renew(
+        "accounts renew kimi-one@example.com --cli kimi",
+        &env,
+        &named,
+    );
     assert_eq!(*named.0.borrow(), ["kimi-one"], "a person named the row");
 }
 
@@ -3124,24 +3649,24 @@ fn no_report_asks_for_a_sign_in_of_another_macs_account() {
     let tmp = tmp_dir("other-macs-report");
     let mut env = env_at(&tmp);
     env.sock = None;
-    let (code, _, err) = run_line(
-        "accounts add grok-one --cli grok --email grok-one@example.com",
+    listed_by_hand(
         &env,
+        Cli::Grok,
+        by_hand("grok-one", Some("grok-one@example.com")),
     );
-    assert_eq!(code, exit(0), "{err}");
     let sheet = |computer: &str| {
         sheet_of_other_macs(&tmp, &env, ",,1,", "grok-one@example.com", computer);
     };
-    let asks = "sign-in needed: Run aterm harness accounts login grok-one";
+    let asks = &format!(
+        "sign-in needed: Run aterm harness accounts login {}",
+        step_word(&env, Cli::Grok, "grok-one")
+    );
     let needed = |json: &str| {
         let doc: Value = aterm_json::from_str(json).unwrap();
-        let row = doc["accounts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["label"] == Value::from("grok-one"))
-            .cloned()
-            .unwrap();
+        let row =
+            crate::harness::account_names::tests::report_row(Cli::Grok, &env, "grok-one", &doc)
+                .cloned()
+                .unwrap();
         (row["sign_in_needed"].clone(), row["belongs_to"].clone())
     };
 
@@ -3165,4 +3690,252 @@ fn no_report_asks_for_a_sign_in_of_another_macs_account() {
     let (asked, whose) = needed(&json);
     assert_eq!(asked, Value::Null, "{json}");
     assert_eq!(whose, Value::from("m22"), "{json}");
+}
+
+/// Set, [`a_test_host_holds_no_end_signal_through_any_account_verb`] is the child its own run
+/// started, which runs the account verbs ([`account_verbs_read_sigterm`]) and writes what their
+/// host read to the file this names, instead of starting another child.
+#[cfg(unix)]
+const VERB_DISPOSITION_ENV: &str = "ATERM_TEST_ACCOUNT_VERB_DISPOSITION";
+
+/// A test host whose stand-ins read this process's SIGTERM action in the middle of an account
+/// verb: each poll of its work's cancellation and each read of the Codex default login's identity
+/// notes how many of its own holds ([`AccountsHost::hold_window_ends`]) are alive and what
+/// SIGTERM does now ([`sigterm_action`]), then cancels (or reads no identity), so the verb runs
+/// nothing past it.
+#[cfg(unix)]
+#[derive(Default)]
+struct DispositionHost {
+    holds: std::rc::Rc<Cell<i32>>,
+    read: RefCell<std::collections::BTreeSet<String>>,
+}
+
+#[cfg(unix)]
+impl DispositionHost {
+    fn note(&self) {
+        self.read.borrow_mut().insert(format!(
+            "held={} sigterm={}",
+            self.holds.get(),
+            sigterm_action()
+        ));
+    }
+}
+
+#[cfg(unix)]
+impl AccountsHost for DispositionHost {
+    fn work_cancelled(&self) -> bool {
+        self.note();
+        true
+    }
+    fn codex_account(&self, _: &Path) -> Option<String> {
+        self.note();
+        None
+    }
+    fn hold_window_ends(&self) -> WindowEnds {
+        self.holds.set(self.holds.get() + 1);
+        let holds = std::rc::Rc::clone(&self.holds);
+        WindowEnds::noting(move || holds.set(holds.get() - 1))
+    }
+    fn stdin_is_terminal(&self) -> bool {
+        false
+    }
+    fn auth_status(&self, login: &str) -> Result<Captured, String> {
+        panic!("no account verb here runs `claude` (asked under {login:?})");
+    }
+    fn unaskable(&self) -> Option<String> {
+        None
+    }
+    fn login(&self, _: Option<&str>) -> Result<i32, String> {
+        Err("not here".to_owned())
+    }
+    fn now(&self) -> i64 {
+        1_758_412_900
+    }
+}
+
+/// What SIGTERM does in this process now: `default`, `ignored` or `handled`.
+#[cfg(unix)]
+fn sigterm_action() -> &'static str {
+    // SAFETY: `sigaction` is plain data for which all-zero is a valid value (an empty mask, no flags).
+    let mut now: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: a null new action changes nothing; SIGTERM's current one is read into `now`.
+    if unsafe { libc::sigaction(libc::SIGTERM, std::ptr::null(), &mut now) } != 0 {
+        return "unread";
+    }
+    match now.sa_sigaction {
+        libc::SIG_DFL => "default",
+        libc::SIG_IGN => "ignored",
+        _ => "handled",
+    }
+}
+
+/// The child's run ([`VERB_DISPOSITION_ENV`]): `harness agy login`, `accounts add`, `accounts
+/// adopt-default`, `accounts adopt-default --cli codex` (the hold [`run_accounts_of`] takes
+/// itself) and `signin --cli grok`, each on a fresh [`DispositionHost`] in one scratch world
+/// that reaches the step its host is read at, one line each (`<verb>: <readings>`, a tab, then
+/// its exit and standard error), then SIGTERM's action under the hold of the host the CLI's `run`
+/// passes ([`LiveAccounts`], which in this build holds none, so the tests that drive the verbs
+/// through `run` hold none either), then the CONTROL line: SIGTERM's action under a live hold.
+#[cfg(unix)]
+fn account_verbs_read_sigterm(said: &Path) {
+    let tmp = tmp_dir("verb-disposition-child");
+    let mut env = env_at(&tmp);
+    // `signin --cli grok` tells no session of its need.
+    env.sid.clear();
+    env.sock = None;
+    let home = env.home.clone().expect("a home");
+    // `harness agy login` signs in with the managed agy.
+    let shim = versions_layout(&env)
+        .expect("a layout")
+        .shim(&atpkg::store::ToolName::new("agy").expect("agy"));
+    std::fs::create_dir_all(shim.parent().expect("its bin")).expect("bin");
+    std::fs::write(&shim, "").expect("a managed agy");
+    // `accounts adopt-default --cli codex` completes the default row from the default login.
+    std::fs::create_dir_all(home.join(".codex")).expect("codex home");
+    std::fs::write(
+        tmp.path().join("accounts-codex.toml"),
+        "[[account]]\nlabel = 'main'\nclass = 'shared'\n",
+    )
+    .expect("codex roster");
+    let codex = match parsed("accounts adopt-default oai adopted@example.test --cli codex") {
+        Ok(Cmd::AccountsOf(of)) => of,
+        other => panic!("not another pool's adopt-default: {other:?}"),
+    };
+    let row = |label: &str, email: Option<&str>| accounts::Row {
+        label: label.into(),
+        email: email.map(str::to_owned),
+        ..accounts::Row::default()
+    };
+    type Verb<'a> = &'a dyn Fn(&dyn AccountsHost, &mut Vec<u8>, &mut Vec<u8>) -> ExitCode;
+    let verbs: [(&str, Verb<'_>); 5] = [
+        ("agy login", &|host, out, _| {
+            run_agy_login(&env, host, "primary", true, out)
+        }),
+        ("accounts add", &|host, out, err| {
+            run_accounts_add(
+                Cli::Claude,
+                &env,
+                host,
+                "claude added@example.test",
+                &Listing::default(),
+                out,
+                err,
+            )
+        }),
+        ("accounts adopt-default", &|host, out, err| {
+            let asked = row("adopted", None);
+            run_accounts_adopt(Cli::Claude, &env, host, &asked, None, out, err)
+        }),
+        ("accounts adopt-default --cli codex", &|host, out, err| {
+            run_accounts_of(&codex, &env, host, out, err)
+        }),
+        ("signin --cli grok", &|host, out, err| {
+            run_signin(&env, host, false, true, out, err)
+        }),
+    ];
+    let mut lines = Vec::new();
+    for (name, verb) in verbs {
+        let host = DispositionHost::default();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = verb(&host, &mut out, &mut err);
+        let read = host.read.borrow();
+        let read = if read.is_empty() {
+            "nothing read".to_owned()
+        } else {
+            read.iter().cloned().collect::<Vec<_>>().join(", ")
+        };
+        lines.push(format!(
+            "{name}: {read}\t{code:?} {}{}",
+            crate::harness::one_line(&String::from_utf8_lossy(&out), 200),
+            crate::harness::one_line(&String::from_utf8_lossy(&err), 200)
+        ));
+    }
+    let cli = LiveAccounts::default().hold_window_ends();
+    lines.push(format!("LiveAccounts: sigterm={}", sigterm_action()));
+    drop(cli);
+    let live = WindowEnds::hold();
+    let control = sigterm_action();
+    drop(live);
+    lines.push(format!("CONTROL a live hold: sigterm={control}"));
+    std::fs::write(said, lines.join("\n")).expect("its lines");
+}
+
+/// A TEST HOST HOLDS NO END SIGNAL THROUGH ANY ACCOUNT VERB: each of them takes its hold on the
+/// signals that end a window ([`WindowEnds`]) from its host, so on a test's host a stop sent to
+/// the test binary (verify's SIGTERM at its first red) ends it at once, instead of being noted as
+/// the person cancelling every sign-in test running beside it. This test binary, run again as its
+/// own child with this test alone on one thread ([`VERB_DISPOSITION_ENV`]), so no live hold
+/// another test takes meanwhile can change what it reads, runs each verb on a
+/// [`DispositionHost`], which reads SIGTERM's action inside the verb: inside its host's one hold,
+/// at its default action; and so does the host the CLI's `run` passes in this build. CONTROL:
+/// under a live hold the same read finds a handler. NEGATIVE CONTROL: with `run_signin` taking
+/// `WindowEnds::hold()` itself, its line reads `held=0 sigterm=handled`; with `LiveAccounts`
+/// holding in this build too, its line reads `sigterm=handled`.
+#[cfg(unix)]
+#[test]
+fn a_test_host_holds_no_end_signal_through_any_account_verb() {
+    if let Some(said) = std::env::var_os(VERB_DISPOSITION_ENV) {
+        account_verbs_read_sigterm(Path::new(&said));
+        return;
+    }
+    let tmp = tmp_dir("verb-disposition");
+    let said = tmp.path().join("said");
+    let exe = std::env::current_exe().expect("test exe");
+    let name = format!(
+        "{}::a_test_host_holds_no_end_signal_through_any_account_verb",
+        module_path!().split_once("::").map_or("", |(_, rest)| rest)
+    );
+    let mut cmd = aterm_uds::spawnfd::command(&exe);
+    cmd.args(["--exact", &name, "--test-threads=1"])
+        .env(VERB_DISPOSITION_ENV, &said)
+        // Every signal starts at its default action, whatever this binary's other tests hold now.
+        .default_signals()
+        // The Grok sign-in reads this process's environment: no login is named there, and no
+        // session is asked to show its need.
+        .env_remove("ATERM_SESSION_ID");
+    for name in crate::harness::grok_signin::CREDENTIAL_ENV
+        .into_iter()
+        .chain([
+            crate::harness::grok_signin::LOGIN_FILE_ENV,
+            crate::harness::grok_signin::HOME_ENV,
+        ])
+    {
+        cmd.env_remove(name);
+    }
+    let ran = aterm_uds::deadline::output_while_process_progressing(
+        &mut cmd,
+        aterm_spec::wait::MUST_HAPPEN,
+        "the account verbs' child",
+    )
+    .expect("the child ran");
+    let told = format!(
+        "{}{}",
+        String::from_utf8_lossy(&ran.stdout),
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    assert!(
+        ran.status.success(),
+        "the child failed ({:?}):\n{told}",
+        ran.status
+    );
+    assert!(told.contains("1 passed"), "the child ran no test:\n{told}");
+    let said = std::fs::read_to_string(&said)
+        .unwrap_or_else(|why| panic!("the child wrote no readings ({why}):\n{told}"));
+    let heads: Vec<&str> = said
+        .lines()
+        .map(|line| line.split('\t').next().unwrap_or(line))
+        .collect();
+    assert_eq!(
+        heads,
+        [
+            "agy login: held=1 sigterm=default",
+            "accounts add: held=1 sigterm=default",
+            "accounts adopt-default: held=1 sigterm=default",
+            "accounts adopt-default --cli codex: held=1 sigterm=default",
+            "signin --cli grok: held=1 sigterm=default",
+            "LiveAccounts: sigterm=default",
+            "CONTROL a live hold: sigterm=handled",
+        ],
+        "{said}\n{told}"
+    );
 }

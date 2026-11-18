@@ -1640,6 +1640,51 @@ fn passing_stage(_: &Ctx, spec: &plan::StageSpec) -> Report {
 }
 
 #[test]
+fn a_census_red_stops_the_bootstrap_and_compiled_stages() {
+    use std::sync::Mutex;
+    static RAN: Mutex<Vec<plan::StageId>> = Mutex::new(Vec::new());
+    fn stage(_: &Ctx, spec: &plan::StageSpec) -> Report {
+        RAN.lock().unwrap().push(spec.id);
+        let mut report = Report::new(&spec.title);
+        if spec.id == plan::StageId::Census {
+            report.fail("planted static source finding");
+        } else {
+            report.pass("work ran");
+        }
+        report
+    }
+    let ctx = Ctx::new(
+        PathBuf::from("/repo"),
+        Scope::crate_only("aterm-verify"),
+        EnvSnapshot::default(),
+        PathBuf::from("/tmp"),
+    )
+    .with_checks(&[
+        Check::Census,
+        Check::ReleasedShim,
+        Check::Fmt,
+        Check::Lint,
+        Check::Test,
+    ])
+    .with_halt(sched::Halt::at_first_red("the run", |_| {}));
+    let code = run_with(
+        &ctx,
+        &mut std::io::sink(),
+        &mut std::io::sink(),
+        &Show::default(),
+        Seams {
+            stage,
+            prepare_cells: None,
+            prepare_build_dir: |_| Ok(()),
+            ..LIVE
+        },
+    )
+    .unwrap();
+    assert_eq!(code, exit::FAILED);
+    assert_eq!(*RAN.lock().unwrap(), [plan::StageId::Census]);
+}
+
+#[test]
 fn the_tree_half_collects_every_report_after_a_red() {
     let args = cli::parse(["release", "--tree"]).unwrap();
     assert!(args.tree_only);
@@ -1652,7 +1697,7 @@ fn the_tree_half_collects_every_report_after_a_red() {
         PathBuf::from("/tmp"),
     )
     .with_checks(&args.checks);
-    let specs = plan::plan(&ctx);
+    let specs = plan::plan(&ctx).expect("complete graph and plan");
     let mut seen = Vec::new();
     let reports = sched::run_stages(
         &specs,

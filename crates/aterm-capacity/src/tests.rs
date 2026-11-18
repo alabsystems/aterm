@@ -8400,21 +8400,40 @@ fn link_sweep(slice_gib: u64, link: Option<Proc>, extra: &[Proc]) -> Procs {
 }
 
 /// Whether a waiter of the process `asker`'s look decides `need` (its claim of `order`) beside
-/// `records`, every other claim, on `procs` and `available` ([`counted_by`], [`decide`]).
+/// `records`, every other claim, on `procs` and `available`, preserving the complete ledger
+/// observation through the decision, including qualified ended-sponsor memory.
 fn asks_beside(
     records: &[&Record],
     asker: &Record,
     procs: &Procs,
     available: u64,
 ) -> Result<crate::admit::Grant, crate::Shortfall> {
-    let counted = counted_by(records.to_vec(), asker.pid, Some(procs), Some(available));
-    let others: Vec<Other<'_>> = counted.into_iter().map(plain).collect();
-    decide(
+    let reading = Reading {
+        available: Some(available),
+        ..Reading::of_gib(64, 0, 14)
+    };
+    let read: Vec<&Record> = records
+        .iter()
+        .copied()
+        .chain(std::iter::once(asker))
+        .collect();
+    let observed = crate::admit::look_read(&read, asker, Some(procs), &reading);
+    let own = observed.wide.reckoned.get(&asker.order()).copied();
+    let others = crate::admit::others(
+        &observed.counted,
+        read.iter().map(|record| record.pid).collect(),
+        &observed.used.trees,
+        &crate::admit::waiter_lines(read.iter().copied(), procs),
+        &observed.wide,
+    );
+    crate::admit::decide_with(
         &asker.need,
         asker.order(),
-        &Reading::of_gib(64, available / GIB, 14),
+        &reading,
         &others,
         20,
+        crate::admit::DiskRule::Reserved,
+        own,
     )
 }
 

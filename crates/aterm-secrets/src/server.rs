@@ -2640,7 +2640,9 @@ enum Body {
     Empty,
     Text(String),
     Envelope(Arc<Vec<u8>>),
-    Records(Vec<crate::membership_log::Record>),
+    /// A records reply: its records, then the frame its store serves where its log is rooted at
+    /// a final checkpoint ([`crate::membership_log::served`]), which no store of this build is.
+    Records(Vec<crate::membership_log::Record>, Option<Vec<u8>>),
 }
 
 impl Reply {
@@ -2761,7 +2763,15 @@ fn write_reply_to(
         Body::Empty => (0, "text/plain; charset=utf-8"),
         Body::Text(text) => (text.len(), "text/plain; charset=utf-8"),
         Body::Envelope(bytes) => (bytes.len(), "text/plain; charset=utf-8"),
-        Body::Records(records) => (record_reply_len(records)?, "application/octet-stream"),
+        Body::Records(records, served) => (
+            record_reply_len(records)?
+                .checked_add(served.as_ref().map_or(0, Vec::len))
+                .filter(|length| *length <= crate::membership_log::MAX_RECORDS_STREAM)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "record reply is too large")
+                })?,
+            "application/octet-stream",
+        ),
     };
     let mut head = format!(
         "HTTP/1.1 {} {}\r\nConnection: close\r\nCache-Control: no-store\r\n",
@@ -2822,8 +2832,11 @@ fn write_reply_to(
             Body::Empty => {}
             Body::Text(text) => send(stream, text.as_bytes(), stall, deadline)?,
             Body::Envelope(bytes) => send(stream, bytes, stall, deadline)?,
-            Body::Records(records) => {
+            Body::Records(records, served) => {
                 record_chunks(records, |bytes| send(stream, bytes, stall, deadline))?;
+                if let Some(served) = served {
+                    send(stream, served, stall, deadline)?;
+                }
             }
         }
     }
@@ -2907,6 +2920,8 @@ struct Request {
     subscriber: Option<String>,
     observer: bool,
     no_wait: bool,
+    /// Whether a records GET takes a served frame ([`crate::transport::RECORDS_SERVED_HEADER`]).
+    records_served: bool,
     /// What the client stated of its records ([`crate::transport::RECORDS_BOUND_HEADER`]):
     /// `None` where it sent none, sent it twice, or sent a value that is not a bound's.
     records_bound: Option<crate::crossing::RecordsBound>,
@@ -3047,6 +3062,7 @@ fn parse_head(head: &[u8], early: Vec<u8>) -> Result<Request, Reply> {
     let mut subscriber: Option<String> = None;
     let mut observer = false;
     let mut no_wait = false;
+    let mut records_served = false;
     // `Some(None)` once the bound header came twice or did not parse.
     let mut records_bound: Option<Option<crate::crossing::RecordsBound>> = None;
     for line in lines {
@@ -3100,6 +3116,9 @@ fn parse_head(head: &[u8], early: Vec<u8>) -> Result<Request, Reply> {
             subscriber = Some(value.to_owned());
         } else if name.eq_ignore_ascii_case(crate::transport::NO_WAIT_HEADER) && value == "1" {
             no_wait = true;
+        } else if name.eq_ignore_ascii_case(crate::transport::RECORDS_SERVED_HEADER) && value == "1"
+        {
+            records_served = true;
         } else if name.eq_ignore_ascii_case(crate::transport::OBSERVER_HEADER) && value == "1" {
             observer = true;
         } else if name.eq_ignore_ascii_case(crate::transport::RECORDS_BOUND_HEADER) {
@@ -3122,6 +3141,7 @@ fn parse_head(head: &[u8], early: Vec<u8>) -> Result<Request, Reply> {
         subscriber,
         observer,
         no_wait,
+        records_served,
         records_bound: records_bound.flatten(),
         early,
     })
@@ -3345,6 +3365,7 @@ fn answer(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: Re
                     query: request.query.as_deref(),
                     subscriber: request.subscriber.as_deref(),
                     no_wait: request.no_wait,
+                    served: request.records_served,
                     local,
                     stated: request.records_bound,
                 },
@@ -4275,10 +4296,17 @@ fn records_reply(
     records_need: bool,
     heads: Option<[u8; 32]>,
 ) -> Reply {
-    let crate::membership_log::store::Missing { records, more } = missing;
+    let crate::membership_log::store::Missing {
+        records,
+        more,
+        served,
+    } = missing;
     Reply {
         status: 200,
-        body: Body::Records(records),
+        body: Body::Records(
+            records,
+            served.as_ref().map(crate::membership_log::Served::encode),
+        ),
         etag: None,
         vault_head: None,
         allow: None,
@@ -4303,13 +4331,31 @@ fn records_digest_of(state: &State, name: &str) -> [u8; 32] {
         })
 }
 
+/// What a records GET naming `have` is sent under `cap`: with a served frame where it takes one
+/// (`served`) and the store is rooted at a final checkpoint whose cut `have` does not show
+/// ([`crate::membership_log::Store::missing_served`]), records alone otherwise. No client of this
+/// build asks for a frame and no store of it is rooted, so every reply is records alone.
+fn missing_of(
+    store: &crate::membership_log::Store,
+    have: &[crate::membership_log::RecordId],
+    cap: usize,
+    served: bool,
+) -> crate::membership_log::store::Missing {
+    if served {
+        store.missing_served(have, cap)
+    } else {
+        store.missing_within(have, cap)
+    }
+}
+
+/// Whether `have` names a record the vault's store neither holds nor dropped
+/// ([`crate::membership_log::Store::lacks_any`]), or there is no store to hold it.
 fn server_lacks_have(state: &State, name: &str, have: &[crate::membership_log::RecordId]) -> bool {
     !have.is_empty()
-        && !state
+        && state
             .records
             .get(name)
-            .and_then(|slot| slot.store.log())
-            .is_some_and(|log| have.iter().all(|id| log.get(id).is_some()))
+            .is_none_or(|slot| slot.store.lacks_any(have))
 }
 
 /// What a records GET asks ([`get_records`]).
@@ -4320,6 +4366,9 @@ struct RecordsGet<'a> {
     subscriber: Option<&'a str>,
     /// Whether it asks the server not to wait ([`crate::transport::NO_WAIT_HEADER`]).
     no_wait: bool,
+    /// Whether it takes a served frame ([`crate::transport::RECORDS_SERVED_HEADER`]): a rooted
+    /// store serves its roots and stubs only to one that does ([`crate::membership_log::Store::missing_served`]).
+    served: bool,
     /// Whether it came from this host.
     local: bool,
     /// What it states of the client's records ([`crate::transport::RECORDS_BOUND_HEADER`]).
@@ -4337,6 +4386,7 @@ fn get_records(shared: &Shared, stream: &TcpStream, name: &str, get: &RecordsGet
         query,
         subscriber,
         no_wait,
+        served,
         local,
         stated,
     } = get;
@@ -4375,6 +4425,7 @@ fn get_records(shared: &Shared, stream: &TcpStream, name: &str, get: &RecordsGet
                     crate::membership_log::store::Missing {
                         records: first,
                         more: false,
+                        served: None,
                     },
                     false,
                     None,
@@ -4396,7 +4447,7 @@ fn get_records(shared: &Shared, stream: &TcpStream, name: &str, get: &RecordsGet
     }
     let cap = shared.tuning.reply_cap;
     if let Some(slot) = state.records.get(name) {
-        let missing = slot.store.missing_within(&have, cap);
+        let missing = missing_of(&slot.store, &have, cap, served);
         if !missing.records.is_empty() {
             let need = server_lacks_have(&state, name, &have);
             let heads = slot.store.records_digest();
@@ -4450,7 +4501,7 @@ fn get_records(shared: &Shared, stream: &TcpStream, name: &str, get: &RecordsGet
         match state
             .records
             .get(name)
-            .map(|slot| slot.store.missing_within(&have, cap))
+            .map(|slot| missing_of(&slot.store, &have, cap, served))
         {
             Some(missing) if !missing.records.is_empty() => records_reply(missing, lacks, heads),
             _ => {
@@ -6149,7 +6200,7 @@ struct Proof {
 /// rounds ([`PullGate::pace`]): a round runs on each ring as well as each [`ADVERTISE_EVERY`], and
 /// anyone on the LAN can ring one (a browse Add, a TXT that cycles its `rec`), so no group is
 /// pulled at the rate rings come. A pull held back is made by the first round past it whose gate still says it is due.
-const PULL_SPACING: Duration = Duration::from_secs(5);
+pub(crate) const PULL_SPACING: Duration = Duration::from_secs(5);
 
 /// How often a vault-tend round sweeps each server it resolves, pulling it whatever its TXT says
 /// ([`PullGate::sweep_due`]), within ±20% drawn afresh at each sweep ([`sweep_after`]): with the
@@ -6439,8 +6490,9 @@ impl PullGate {
 }
 
 /// How long after a sweep the next one comes ([`ANTI_ENTROPY_EVERY`] ±20%), `unit` a uniform
-/// draw over `u64`.
-fn sweep_after(unit: u64) -> Duration {
+/// draw over `u64`: a vault-tend round's sweep of a group, and a subscriber's of its peers
+/// (`crate::client`'s `Sweeps`).
+pub(crate) fn sweep_after(unit: u64) -> Duration {
     let low = ANTI_ENTROPY_EVERY.as_millis() * 4 / 5;
     let span = ANTI_ENTROPY_EVERY.as_millis() * 2 / 5;
     let millis = low + u128::from(unit) * span / u128::from(u64::MAX);
@@ -6449,7 +6501,7 @@ fn sweep_after(unit: u64) -> Duration {
 
 /// A uniform draw over `u64` ([`sweep_after`]); 0 where the system's generator fails, which only
 /// brings the sweep to its earliest.
-fn draw() -> u64 {
+pub(crate) fn draw() -> u64 {
     let mut bytes = [0u8; 8];
     if aterm_uds::rand::fill(&mut bytes).is_err() {
         return 0;

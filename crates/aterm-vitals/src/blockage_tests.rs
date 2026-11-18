@@ -60,6 +60,87 @@ fn reading(t: u64, procs: Option<Vec<ProcSample>>, dstate: DStateRead) -> Sample
     }
 }
 
+fn job_reading(t: u64, mut procs: Vec<ProcSample>) -> Sample {
+    for process in &mut procs {
+        process.uid = Some(501);
+        process.pgid = if process.pid == 601 || (2000..3000).contains(&process.pid) {
+            601
+        } else {
+            process.pid
+        };
+        process.sid = if process.pid == SHELL || process.pgid == 601 {
+            SHELL
+        } else {
+            process.pid
+        };
+    }
+    Sample {
+        self_uid: Some(501),
+        ..reading(t, Some(procs), DStateRead::Unsupported)
+    }
+}
+
+fn jobs_reading(
+    jobs: &mut crate::jobs::Jobs,
+    sample: &Sample,
+    snapshot: &Snapshot,
+    receipt: Arc<ZombieFacts>,
+    assessment_ms: u64,
+) -> crate::jobs::JobsView {
+    let state = |state| match state {
+        ProcState::Run => crate::jobs::ProcState::Running,
+        ProcState::Stopped => crate::jobs::ProcState::Stopped,
+        ProcState::Zombie => crate::jobs::ProcState::Zombie,
+        ProcState::Uninterruptible => crate::jobs::ProcState::Uninterruptible,
+        ProcState::Unknown => crate::jobs::ProcState::Unknown,
+    };
+    let rows = sample.procs.as_ref().unwrap();
+    jobs.absorb(&crate::jobs::JobTick {
+        at_ms: assessment_ms,
+        read_ms: assessment_ms.max(sample.mono_ms),
+        probe_ms: assessment_ms.max(sample.mono_ms),
+        source_seq: Some(snapshot.seq),
+        zombie_facts: Some(receipt),
+        self_uid: sample.self_uid,
+        sweep: rows
+            .iter()
+            .map(|process| crate::jobs::SweepProc {
+                pid: process.pid,
+                ppid: process.ppid,
+                pgid: process.pgid,
+                uid: process.uid,
+                name: process.name.clone(),
+                state: state(process.state),
+                ..crate::jobs::SweepProc::default()
+            })
+            .collect(),
+        procs: rows
+            .iter()
+            .map(|process| crate::jobs::JobProc {
+                pid: process.pid,
+                ppid: process.ppid,
+                pgid: process.pgid,
+                sid: Some(process.sid),
+                start: process.start,
+                age_ms: Some(0),
+                uid: process.uid,
+                name: process.name.clone(),
+                state: state(process.state),
+                tty: Some(SHELL),
+                tpgid: Some(SHELL),
+                counters: Some(crate::jobs::JobCounters::default()),
+                ..crate::jobs::JobProc::default()
+            })
+            .collect(),
+        tabs: vec![crate::jobs::JobTab {
+            key: 41,
+            shell_pid: SHELL,
+            ..crate::jobs::JobTab::default()
+        }],
+        ..crate::jobs::JobTick::default()
+    })
+}
+
 fn zombies(s: &Snapshot) -> ZombiesView {
     match &s.facts.zombies {
         Zombies::Read(v) => v.clone(),
@@ -121,6 +202,317 @@ fn zombies_are_counted_machine_wide_by_parent_once_aged() {
     let s = v.absorb(&reading(23, Some(moved), DStateRead::Unsupported));
     assert_eq!(zombies(&s).count, 3);
     assert_eq!(zombies(&s).piles[0].ppid, 1);
+}
+
+#[test]
+fn one_zombie_book_skipped_assessments_keep_the_canonical_pile_start_and_rate() {
+    let mut model = Vitals::new();
+    let initial = job_reading(0, sweep(0, 0));
+    let initial_snapshot = model.absorb(&initial);
+    let mut jobs = crate::jobs::Jobs::new();
+    jobs_reading(
+        &mut jobs,
+        &initial,
+        &initial_snapshot,
+        model.current_zombie_facts().unwrap(),
+        0,
+    );
+    let mut old_jobs = ZombieBook::default();
+    old_jobs.note(0, []);
+    for at in [1, 7] {
+        model.absorb(&job_reading(at, sweep(3, 0)));
+    }
+    let sample = job_reading(11, sweep(3, 0));
+    let snap = model.absorb(&sample);
+    let held = model.current_zombie_facts().unwrap();
+    let pile = held.parent_pile(601).unwrap();
+    assert_eq!(
+        (held.seq(), held.at_ns(), held.mono_ms()),
+        (snap.seq, snap.at_ns, 11_000)
+    );
+    assert!(held.whole());
+    assert_eq!(
+        (
+            pile.count(),
+            pile.since_ms(),
+            pile.elapsed_ms(),
+            pile.per_min_deci()
+        ),
+        (3, 1000, 10_000, 30)
+    );
+    assert_eq!(pile.count(), zombies(&snap).count);
+    let assessed = jobs_reading(&mut jobs, &sample, &snap, Arc::clone(&held), 10_999);
+    let actual = assessed
+        .rows
+        .iter()
+        .find(|row| row.leader.0 == 601)
+        .unwrap()
+        .zombies
+        .unwrap();
+    assert_eq!(
+        (actual.count, actual.parent, actual.per_min_deci),
+        (pile.count(), pile.parent(), pile.per_min_deci())
+    );
+    assert_eq!(
+        assessed
+            .findings
+            .zombies
+            .iter()
+            .find(|pile| pile.ppid == 601)
+            .unwrap()
+            .count,
+        zombies(&snap).count
+    );
+    assert!(Arc::ptr_eq(assessed.zombie_facts.as_ref().unwrap(), &held));
+    old_jobs.note(11_000, (2000..2003).map(|pid| (pid, 601)));
+    assert!(
+        old_jobs.piles(11_000).is_empty(),
+        "the old Jobs-only cadence first sees the already-aged children too late"
+    );
+
+    let sample = job_reading(71, sweep(3, 0));
+    let snap = model.absorb(&sample);
+    let current = model.current_zombie_facts().unwrap();
+    let pile = current.parent_pile(601).unwrap();
+    assert_eq!(
+        (pile.since_ms(), pile.elapsed_ms(), pile.per_min_deci()),
+        (1000, 70_000, 25)
+    );
+    let later = jobs_reading(&mut jobs, &sample, &snap, Arc::clone(&current), 99_000);
+    let actual = later
+        .rows
+        .iter()
+        .find(|row| row.leader.0 == 601)
+        .unwrap()
+        .zombies
+        .unwrap();
+    assert_eq!(
+        (actual.count, actual.per_min_deci),
+        (pile.count(), pile.per_min_deci())
+    );
+    assert!(Arc::ptr_eq(later.zombie_facts.as_ref().unwrap(), &current));
+    old_jobs.note(71_000, (2000..2003).map(|pid| (pid, 601)));
+    let old_rate = per_min_deci(3, 71_000 - old_jobs.pile_since(601).unwrap());
+    assert_eq!(old_rate, 30);
+    assert_ne!(
+        pile.per_min_deci(),
+        old_rate,
+        "a second history changes the rate too"
+    );
+    assert_eq!(
+        (held.mono_ms(), held.parent_pile(601).unwrap().elapsed_ms()),
+        (11_000, 10_000),
+        "a later model reading cannot mutate a queued observation"
+    );
+}
+
+#[test]
+fn one_zombie_book_observed_absence_and_reparenting_reset_age_between_assessments() {
+    let mut model = Vitals::new();
+    let initial = job_reading(1, sweep(1, 0));
+    let initial_snapshot = model.absorb(&initial);
+    let mut jobs = crate::jobs::Jobs::new();
+    jobs_reading(
+        &mut jobs,
+        &initial,
+        &initial_snapshot,
+        model.current_zombie_facts().unwrap(),
+        1000,
+    );
+    let mut old_jobs = ZombieBook::default();
+    old_jobs.note(1000, [(2000, 601)]);
+    model.absorb(&job_reading(6, sweep(0, 0)));
+    let mut reused = sweep(1, 0);
+    reused.iter_mut().find(|p| p.pid == 2000).unwrap().start = Some(99_999);
+    model.absorb(&job_reading(7, reused.clone()));
+    let sample = job_reading(11, reused.clone());
+    let snap = model.absorb(&sample);
+    let facts = model.current_zombie_facts().unwrap();
+    assert!(facts.piles().is_empty());
+    assert_eq!(zombies(&snap).count, 0);
+    let assessed = jobs_reading(&mut jobs, &sample, &snap, Arc::clone(&facts), 11_000);
+    assert!(
+        assessed
+            .rows
+            .iter()
+            .find(|row| row.leader.0 == 601)
+            .unwrap()
+            .zombies
+            .is_none()
+    );
+    assert!(assessed.findings.zombies.is_empty());
+    assert!(Arc::ptr_eq(assessed.zombie_facts.as_ref().unwrap(), &facts));
+    old_jobs.note(11_000, [(2000, 601)]);
+    assert_eq!(
+        old_jobs.piles(11_000).get(&601),
+        Some(&1),
+        "the old history missed the whole-sweep absence and donates the previous age"
+    );
+
+    reused.iter_mut().find(|p| p.pid == 2000).unwrap().ppid = 1;
+    model.absorb(&job_reading(12, reused.clone()));
+    let sample = job_reading(22, reused);
+    let snap = model.absorb(&sample);
+    let current = model.current_zombie_facts().unwrap();
+    assert!(current.parent_pile(601).is_none());
+    let moved = current.parent_pile(1).unwrap();
+    assert_eq!(
+        (moved.count(), moved.since_ms(), moved.elapsed_ms()),
+        (1, 12_000, 10_000)
+    );
+    let assessed = jobs_reading(&mut jobs, &sample, &snap, Arc::clone(&current), 22_000);
+    assert!(
+        assessed
+            .rows
+            .iter()
+            .find(|row| row.leader.0 == 601)
+            .unwrap()
+            .zombies
+            .is_none()
+    );
+    let actual = assessed
+        .findings
+        .zombies
+        .iter()
+        .find(|pile| pile.ppid == 1)
+        .unwrap();
+    assert_eq!(
+        (actual.count, actual.per_min_deci),
+        (moved.count(), moved.per_min_deci())
+    );
+    old_jobs.note(22_000, [(2000, 1)]);
+    assert!(
+        old_jobs.piles(22_000).is_empty(),
+        "a skipped reparenting is dated too late"
+    );
+}
+
+#[test]
+fn one_zombie_book_receipts_never_reage_at_an_assessments_clock() {
+    for (canonical, other, counted) in [(9999, 10_000, 0), (10_000, 9999, 1)] {
+        let mut model = Vitals::new();
+        model.absorb(&reading(0, Some(sweep(1, 0)), DStateRead::Unsupported));
+        let mut sample = reading(10, Some(sweep(1, 0)), DStateRead::Unsupported);
+        sample.mono_ms = canonical;
+        sample.at_ns = canonical * 1_000_000;
+        let snap = model.absorb(&sample);
+        let facts = model.current_zombie_facts().unwrap();
+        assert_eq!(facts.mono_ms(), canonical);
+        assert_eq!(facts.parent_pile(601).map_or(0, ZombiePile::count), counted);
+        assert_eq!(zombies(&snap).count, counted);
+        let mut mutable_clock_control = ZombieBook::default();
+        mutable_clock_control.note(0, [(2000, 601)]);
+        assert_ne!(
+            mutable_clock_control
+                .piles(other)
+                .get(&601)
+                .copied()
+                .unwrap_or(0),
+            counted,
+            "an earlier assessment start or later detail-probe clock crosses the wrong cutoff"
+        );
+        assert_eq!(facts.parent_pile(601).map_or(0, ZombiePile::count), counted);
+    }
+}
+
+#[test]
+fn one_zombie_book_current_receipts_distinguish_missing_unsupported_and_empty() {
+    let mut model = Vitals::new();
+    let absent = model.absorb(&reading(1, None, DStateRead::Unsupported));
+    assert!(model.current_zombie_facts().is_none());
+    assert_eq!(absent.facts.zombies, Zombies::Unread(Unread::NotSampled));
+    let empty = model.absorb(&reading(2, Some(Vec::new()), DStateRead::Unsupported));
+    let empty_facts = model.current_zombie_facts().unwrap();
+    assert_eq!(
+        (empty_facts.seq(), empty_facts.mono_ms()),
+        (empty.seq, 2000)
+    );
+    assert!(empty_facts.whole() && empty_facts.piles().is_empty());
+    assert_eq!(zombies(&empty).count, 0);
+    let unsupported = model.absorb(&Sample {
+        zombie_read: ZombieRead::Unsupported,
+        ..reading(3, Some(Vec::new()), DStateRead::Unsupported)
+    });
+    assert!(model.current_zombie_facts().is_none());
+    assert_eq!(
+        unsupported.facts.zombies,
+        Zombies::Unread(Unread::Unsupported)
+    );
+    assert_eq!(
+        (empty_facts.seq(), empty_facts.mono_ms()),
+        (empty.seq, 2000)
+    );
+
+    model.absorb(&reading(4, Some(sweep(3, 0)), DStateRead::Unsupported));
+    let full = model.absorb(&reading(14, Some(sweep(3, 0)), DStateRead::Unsupported));
+    let full_facts = model.current_zombie_facts().unwrap();
+    let unread = model.absorb(&reading(15, None, DStateRead::Unsupported));
+    assert!(
+        model.current_zombie_facts().is_none(),
+        "an absent/refused current census has no new receipt"
+    );
+    assert_eq!((zombies(&unread).count, zombies(&unread).age_ms), (3, 1000));
+    assert_eq!(
+        (full_facts.seq(), full_facts.at_ns(), full_facts.mono_ms()),
+        (full.seq, full.at_ns, 14_000)
+    );
+}
+
+#[test]
+fn one_zombie_book_receipts_keep_every_parent_and_the_cap_recovery_qualification() {
+    let mut many = sweep(0, 0);
+    for parent in 10_000..10_032 {
+        many.push(proc(parent, 1, "parent", ProcState::Run));
+        many.push(proc(parent + 10_000, parent, "child", ProcState::Zombie));
+    }
+    let mut model = Vitals::new();
+    model.absorb(&reading(1, Some(many.clone()), DStateRead::Unsupported));
+    let all = model.absorb(&reading(11, Some(many), DStateRead::Unsupported));
+    let facts = model.current_zombie_facts().unwrap();
+    assert_eq!(
+        facts.piles().len(),
+        32,
+        "the receipt is not a global display-top list"
+    );
+    assert_eq!(zombies(&all).count, 32);
+    assert_eq!(facts.parent_pile(10_031).unwrap().count(), 1);
+    assert!(
+        facts
+            .piles()
+            .windows(2)
+            .all(|pair| pair[0].parent() < pair[1].parent())
+    );
+
+    let mut model = Vitals::new();
+    let mut old_control = ZombieBook::default();
+    for at in [0, 70, 80, 81, 91, 150, 151, 160, 170] {
+        let mut rows = sweep(if at >= 160 { 4 } else { 3 }, 0);
+        if at == 80 {
+            rows.retain(|p| p.pid != 2000);
+        }
+        old_control.note(
+            at * 1000,
+            rows.iter()
+                .filter(|p| p.state == ProcState::Zombie)
+                .map(|p| (p.pid, p.ppid)),
+        );
+        let snap = model.absorb(&Sample {
+            procs_truncated: at == 80,
+            ..reading(at, Some(rows), DStateRead::Unsupported)
+        });
+        let facts = model.current_zombie_facts().unwrap();
+        assert_eq!(facts.whole(), at != 80);
+        let grows = facts.piles().iter().any(ZombiePile::growing);
+        assert_eq!(grows, zombies(&snap).growing);
+        assert_eq!(grows, at == 170, "canonical cap recovery at {at}");
+        if at == 150 {
+            assert!(
+                old_control.grows(601, at * 1000),
+                "the old unqualified book falsely grows"
+            );
+            assert!(!grows);
+        }
+    }
 }
 
 #[test]

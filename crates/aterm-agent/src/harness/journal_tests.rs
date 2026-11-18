@@ -452,6 +452,39 @@ fn a_rows_word_is_told_only_where_the_store_holds_it() {
     assert_eq!(cursor, said(SignWord::Ended, 200));
 }
 
+/// A blocked renewal of a login that still works here keeps its word: the `error` it is kept as
+/// says `blocked`, the form the journal sends out in its next pass
+/// (`aterm_db::alab::journal::Event::sharp`), so its `ai/logins` row goes with it; one that
+/// failed otherwise says `sign-in-failed`, which waits for the routine pass. A displacement of a
+/// login by the vendor's own sign-in is told as `displaced`, the store's sign-out, which is sharp
+/// too.
+/// NEGATIVE CONTROL, run: with `settle` keeping every failed sign-in of a working login as
+/// `sign-in-failed` (its `blocked` arm removed), the blocked renewal's `error` says
+/// `sign-in-failed`: `` left: [("error", Some("sign-in-failed"), 200)] right: [("error",
+/// Some("blocked"), 200)] ``.
+#[test]
+fn a_blocked_renewal_of_a_working_login_is_kept_as_blocked_and_a_displacement_is_told() {
+    let held = said(SignWord::In, 100);
+    let blocked = vec![
+        Event::sign_in(200, "ann", SignInStep::Failed).because(&renewal(
+            crate::harness::login_drive::Outcome::BotCheck(String::new()),
+            Some("claude.ai"),
+            crate::ai::connector::Flow::Browser,
+        )),
+    ];
+    let (told, cursor) = told_of(Auth::Ok, held, blocked, 200);
+    assert_eq!(told, [("error", Some("blocked"), 200)]);
+    assert_eq!(cursor, held, "the fleet's word stands");
+    let failed =
+        vec![Event::sign_in(200, "ann", SignInStep::Failed).because("auto failed: device")];
+    let (told, _) = told_of(Auth::Ok, held, failed, 200);
+    assert_eq!(told, [("error", Some("sign-in-failed"), 200)]);
+    let displaced = vec![Event::new(300, Kind::Displaced, "ann").with_to("bob")];
+    let (told, cursor) = told_of(Auth::SignedOut, held, displaced, 300);
+    assert_eq!(told, [("displaced", None, 300)]);
+    assert_eq!(cursor, said(SignWord::Out, 300));
+}
+
 /// THE AUDIT'S SECOND FINDING: a word no ledger row states is told from the state. A login that
 /// reads working again (a served turn proves it, with no auth row) is `signed-in`; one found
 /// signed out is `signed-out`; a word this Mac held before it kept a record of what it told is
@@ -595,6 +628,7 @@ fn observe_notes_sessions_readings_and_walls_from_the_diff() {
         account: account.into(),
         at: 1,
         held: None,
+        owner: None,
     };
     before.sessions.insert("s1".into(), row("ann"));
     before.sessions.insert("s2".into(), row("ann"));
@@ -916,4 +950,345 @@ fn a_workspace_reading_names_its_sub_account_and_another_macs_is_left() {
     );
     assert_eq!(bob.iter().find(|n| n.kind == "quota").unwrap().sub, None);
     assert_eq!(bob.len(), 2, "{bob:?}");
+}
+
+/// What a login row must never carry, planted in every free-text field of the three stores: a
+/// Claude token, a session cookie, an OAuth code, a refresh token, an address and a path. Each
+/// is split so no source line reads as a credential.
+const PLANTED: [&str; 6] = [
+    concat!("sk-", "ant-oat01-", "SENTINELsentinel0123456789"),
+    concat!("sessionKey=", "sk-", "ant-sid01-", "cookievalue"),
+    "4/0AbCdEfGhIjKlMnOpQrStUvWxYz-oauth-code",
+    concat!("refresh_token=", "rt-", "refreshvalue0123"),
+    "ada.private@x.example",
+    "/Users//someone/.claude-login-ada",
+];
+
+/// VALUE-FREE AND KEYED (docs/DESIGN-shared-files-2026-11-11.md §10 file 3): each login row is
+/// keyed by its account (the claims email's key, else the state's learned key; a row with
+/// neither is left out) and says its store's word, the one the journal is told: a row on its
+/// vault token in the upkeep's reading is signed in on the token; a signed-in login stays
+/// `signed-in` though a renewal since answered another account, which is only its attempt
+/// (`failed`); a signed-out one is `ended` where an end was seen since its renewal; a row with no
+/// word on record is left out. Its since is when the journal was last told that word, else its
+/// renewal, else when the word was learned. Two rows of one account are one login, the signed-in
+/// row's, with the sessions of both. Its proof, place and source are words, its tabs a count,
+/// its blocked attempt and when, its route only for a sign-in that found the vault token, and its
+/// plan only where the word is one. A token, a cookie, an OAuth code, a refresh token, an address
+/// and a path planted in every free-text field of the stores (a login directory, its retained
+/// ones, the proved address and directory, the routes line, a subscription, a bot check's
+/// address, a session's hold, a label) reach no row.
+/// NEGATIVE CONTROLS, each run: with `login_rows` taking the subscription unchecked (its
+/// `.and_then(plan_word)` replaced by a `.map` that keeps the text), bob's row carries the
+/// planted token: `` bob's subscription is no plan ``; with the first row of an account kept
+/// whatever its word (the `rank > slot.0` arm removed), fay's login is her signed-out row: ``
+/// fay `` (`left: ("signed-out", 1300, "managed", 3) right: ("signed-in", 1350, "default", 3)`).
+#[test]
+fn login_rows_are_value_free_keyed_by_account_and_say_the_stores_words() {
+    use crate::harness::accounts::{
+        AccountRecords, AttemptOutcome, Binding, CheckStop, Logins, SignInAttempt, TokensHere,
+    };
+    const CAL: &str = "ac-00112233445566aa";
+    const DEE: &str = "ac-00112233445566bb";
+    const FAY: &str = "ac-00112233445566dd";
+    const NOW: i64 = 5_000;
+    let [token, cookie, oauth, refresh, address, path] = PLANTED;
+    let row = |label: &str, email: &str, dir: Option<&str>| Row {
+        label: label.into(),
+        email: Some(email.into()),
+        dir: dir.map(str::to_owned),
+        ..Row::default()
+    };
+    let roster = Roster {
+        rows: vec![
+            row("ann", "ann@example.invalid", Some(path)),
+            row("bob", "bob@example.invalid", None),
+            // Keyed by neither the keyer nor a learned key: never stated, under its label or
+            // otherwise.
+            row(token, address, Some(path)),
+            row("cal", "cal@example.invalid", None),
+            row("dee", "dee@example.invalid", None),
+            // Keyed, with no word on record: left out.
+            row("eve", "eve@example.invalid", None),
+            // Two rows of one account: a stale managed login signed out, then the default home
+            // signed in, each with sessions.
+            row("fay", "fay@example.invalid", Some(path)),
+            row("fay2", "fay@example.invalid", None),
+        ],
+    };
+    let mut state = State::default();
+    state.contextual_auth = true;
+    let account = |auth, auth_at, pk: Option<&str>| Account {
+        auth,
+        auth_at,
+        pk: pk.map(str::to_owned),
+        ..Account::default()
+    };
+    state
+        .accounts
+        .insert("ann".into(), account(Auth::Ok, Some(1_000), None));
+    state
+        .accounts
+        .insert("bob".into(), account(Auth::SignedOut, Some(1_400), None));
+    state.accounts.insert(
+        "cal".into(),
+        account(Auth::SignedOut, Some(1_600), Some(CAL)),
+    );
+    state
+        .accounts
+        .insert("dee".into(), account(Auth::Ok, Some(1_900), Some(DEE)));
+    state.accounts.insert(
+        "eve".into(),
+        account(Auth::Unseen, None, Some("ac-00112233445566cc")),
+    );
+    state.accounts.insert(
+        "fay".into(),
+        account(Auth::SignedOut, Some(1_300), Some(FAY)),
+    );
+    state
+        .accounts
+        .insert("fay2".into(), account(Auth::Ok, Some(1_350), Some(FAY)));
+    // Ann's word was told when she signed in; the store has noted it again since.
+    state.told.insert(
+        ANN.into(),
+        Told {
+            word: SignWord::In,
+            t: 950,
+        },
+    );
+    for (sid, label) in [
+        ("s1", "ann"),
+        ("s2", token),
+        ("s3", "fay"),
+        ("s4", "fay2"),
+        ("s5", "fay2"),
+    ] {
+        state.sessions.insert(
+            sid.into(),
+            SessionRow {
+                account: label.into(),
+                at: 1_050,
+                held: Some(format!("{cookie} {refresh}")),
+                owner: None,
+            },
+        );
+    }
+    // The upkeep's reading: cal runs on its vault token here.
+    state.tokens_here = Some(TokensHere {
+        read_at: NOW - 60,
+        ends: [("cal".to_owned(), NOW + 3_600)].into(),
+        vouched: false,
+    });
+    let attempt = |outcome, routes: String, since, tried_at| SignInAttempt {
+        outcome,
+        routes,
+        since,
+        tried_at,
+        stop: None,
+    };
+    let mut logins = Logins::default();
+    logins.labels.insert(
+        "ann".into(),
+        Binding {
+            dir: Some(path.into()),
+            renewed_at: Some(900),
+            subscription: Some("max".into()),
+            was: vec![Some(format!("{path}-old"))],
+            proved_email: Some(address.into()),
+            proved_dir: Some(path.into()),
+            sign_in_attempt: Some(attempt(
+                AttemptOutcome::Blocked,
+                format!("browser({address}) https://claude.ai/x?code={oauth} {path} {token}"),
+                1_100,
+                1_200,
+            )),
+            check_stop: Some(CheckStop {
+                account: Some(address.into()),
+                region: None,
+                at: 1_150,
+            }),
+            ..Binding::default()
+        },
+    );
+    logins.labels.insert(
+        "bob".into(),
+        Binding {
+            renewed_at: Some(1_500),
+            ended_at: Some(1_800),
+            // A subscription that is no plan word is left out.
+            subscription: Some(token.into()),
+            ..Binding::default()
+        },
+    );
+    logins.labels.insert(
+        "cal".into(),
+        Binding {
+            sign_in_attempt: Some(attempt(
+                AttemptOutcome::OnToken,
+                format!("vault {refresh}"),
+                1_700,
+                1_700,
+            )),
+            ..Binding::default()
+        },
+    );
+    logins.labels.insert(
+        "dee".into(),
+        Binding {
+            renewed_at: Some(2_000),
+            wrong_at: Some(2_100),
+            ..Binding::default()
+        },
+    );
+    let records = AccountRecords {
+        raw_roster: roster.clone(),
+        roster,
+        roster_present: true,
+        state,
+        logins,
+        notes: Vec::new(),
+    };
+    let held = |key: &Key| {
+        if key.as_str() == ANN {
+            "linked"
+        } else {
+            "fill"
+        }
+    };
+    let rows = login_rows(Cli::Claude, &records, &keyer, &held, NOW);
+    let keys: Vec<&str> = rows.iter().map(|row| row.account.as_str()).collect();
+    assert_eq!(
+        keys,
+        [ANN, BOB, CAL, DEE, FAY],
+        "the unkeyed and the unseen are left out, and fay is one login"
+    );
+
+    let ann = &rows[0];
+    assert_eq!(
+        (
+            ann.state, ann.since, ann.place, ann.proof, ann.src, ann.tabs, ann.held
+        ),
+        (
+            "signed-in",
+            950,
+            "managed",
+            "status",
+            "profile",
+            1,
+            "linked"
+        ),
+        "since the word was told, not when the store last noted it"
+    );
+    assert_eq!(
+        (ann.attempt, ann.attempt_at, ann.attempt_route, ann.plan),
+        ("blocked", Some(1_200), None, Some("max"))
+    );
+    let bob = &rows[1];
+    assert_eq!(
+        (
+            bob.state,
+            bob.since,
+            bob.ended_at,
+            bob.place,
+            bob.held,
+            bob.plan
+        ),
+        ("ended", 1_800, Some(1_800), "default", "fill", None),
+        "bob's subscription is no plan"
+    );
+    let cal = &rows[2];
+    let on_token = crate::harness::token_route::LAUNCHES_ON_TOKEN;
+    assert_eq!(
+        (cal.state, cal.since, cal.src),
+        if on_token {
+            ("signed-in", 1_700, "vault-token")
+        } else {
+            ("signed-out", 1_600, "profile")
+        },
+        "on its token where a launch starts on one"
+    );
+    assert_eq!(
+        (cal.attempt, cal.attempt_route, cal.proof),
+        ("signed-in", Some("vault"), "unchecked")
+    );
+    let dee = &rows[3];
+    assert_eq!(
+        (dee.state, dee.since, dee.attempt, dee.attempt_at),
+        ("signed-in", 2_000, "failed", Some(2_100)),
+        "a wrong renewal leaves the working login signed in"
+    );
+    let fay = &rows[4];
+    assert_eq!(
+        (fay.state, fay.since, fay.place, fay.tabs),
+        ("signed-in", 1_350, "default", 3),
+        "fay"
+    );
+
+    let said = format!("{rows:?}");
+    for planted in PLANTED {
+        assert!(!said.contains(planted), "a row carries {planted:?}");
+    }
+    for word in ["@", "/", "=", "sk-"] {
+        assert!(!said.contains(word), "a row carries {word:?}: {said}");
+    }
+    for row in &rows {
+        assert_eq!(row.cli, "claude");
+        assert!(["managed", "default"].contains(&row.place));
+        assert!(["signed-in", "signed-out", "ended", "wrong-account"].contains(&row.state));
+        assert!(["status", "page", "unchecked"].contains(&row.proof));
+        assert!(["profile", "auth-file", "cli-log", "vault-token"].contains(&row.src));
+        assert!(["none", "signed-in", "failed", "blocked", "no-route"].contains(&row.attempt));
+        assert!(row.plan.is_none_or(|plan| PLANS.contains(&plan)));
+    }
+}
+
+/// A signed-out login that a renewal since its last one answered another account is
+/// `wrong-account`, and so is a row with no word on record that one did; with no word and no
+/// wrong renewal a row is left out.
+/// NEGATIVE CONTROL, run: with `login_rows` leaving out every row with no word on record (the
+/// `Auth::Unseen` arm always `continue`), the unseen wrong renewal is not stated: `` keys ``
+/// (one key on the left, both on the right).
+#[test]
+fn a_wrong_renewal_of_a_signed_out_login_is_wrong_account() {
+    use crate::harness::accounts::{AccountRecords, Binding, Logins};
+    let mut state = State::default();
+    for (label, auth, pk) in [("ann", Auth::SignedOut, ANN), ("bob", Auth::Unseen, BOB)] {
+        state.accounts.insert(
+            label.into(),
+            Account {
+                auth,
+                auth_at: Some(100),
+                pk: Some(pk.into()),
+                ..Account::default()
+            },
+        );
+    }
+    let mut logins = Logins::default();
+    for label in ["ann", "bob"] {
+        logins.labels.insert(
+            label.into(),
+            Binding {
+                renewed_at: Some(150),
+                wrong_at: Some(200),
+                ..Binding::default()
+            },
+        );
+    }
+    let records = AccountRecords {
+        raw_roster: roster(),
+        roster: roster(),
+        roster_present: true,
+        state,
+        logins,
+        notes: Vec::new(),
+    };
+    let rows = login_rows(Cli::Claude, &records, &keyer, &|_| "fill", 300);
+    let keys: Vec<&str> = rows.iter().map(|row| row.account.as_str()).collect();
+    assert_eq!(keys, [ANN, BOB], "keys");
+    for row in &rows {
+        assert_eq!(
+            (row.state, row.since, row.attempt, row.attempt_at),
+            ("wrong-account", 200, "failed", Some(200))
+        );
+    }
 }

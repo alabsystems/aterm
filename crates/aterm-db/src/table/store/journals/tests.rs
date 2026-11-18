@@ -1332,3 +1332,58 @@ fn full_and_compact_replay_entries_obey_allocator_measured_byte_limits() {
         }
     }
 }
+
+/// A store kept across sessions answers an observer's reopen from the read of its journal it
+/// kept ([`read_held`]) while the journal stands as that read's witness showed it, with nothing
+/// read, though this process keeps nothing of the table (a bound no table fits, as a table past
+/// [`JOURNAL_BYTES`] does not fit the process's); a write moves the journal's witness, and the
+/// next reopen reads the journal again and holds the write.
+/// NEGATIVE CONTROL: with `read_held` ignoring what is held, each reopen reads the journal:
+/// `` an unchanged journal is read by no reopen left: 3 right: 0 ``.
+#[test]
+fn a_kept_observer_reopens_an_unchanged_journal_with_nothing_read() {
+    use crate::table::store::kept::Kept;
+    const REOPENS: usize = 3;
+    let lab = crate::table::tests::Lab::new(&[Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let dir = lab._home.path().join("kept");
+    let scope = {
+        let session = Session::open(&bootstrap).unwrap();
+        let mut store = Store::create(&session, &dir).unwrap();
+        store.commit_catalog(&session, b"first").unwrap();
+        store.scope()
+    };
+    // Keeps no table: each ask it is asked reads the journal.
+    let journals = Arc::new(Journals::new(KEPT_TABLES, 1 << 30, 0));
+    let session = Session::observe(&bootstrap).unwrap();
+    let reopen = |kept: Kept| Kept::open(&session, &dir, scope, kept.keep()).unwrap();
+    let held = |kept: &Kept| kept.inventory(&session).unwrap().count();
+    with_own(Arc::clone(&journals), || {
+        as_if_later(HANG, || {
+            let mut kept = Kept::open(&session, &dir, scope, None).unwrap();
+            let before = reads(&journals);
+            for _ in 0..REOPENS {
+                kept = reopen(kept);
+            }
+            assert_eq!(
+                reads(&journals) - before,
+                0,
+                "an unchanged journal is read by no reopen"
+            );
+            assert_eq!(held(&kept), 1);
+            {
+                let writer = Session::open(&bootstrap).unwrap();
+                let mut store = Store::open(&writer, &dir, scope).unwrap();
+                store.commit_catalog(&writer, b"second").unwrap();
+            }
+            let before = reads(&journals);
+            kept = reopen(kept);
+            assert_eq!(
+                reads(&journals) - before,
+                1,
+                "a written journal is read again"
+            );
+            assert_eq!(held(&kept), 2, "and the reopen holds the write");
+        });
+    });
+}

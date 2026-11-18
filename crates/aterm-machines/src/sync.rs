@@ -50,6 +50,9 @@ pub const SPEC: u32 = 14;
 /// The pass's record, in `<state_dir>/converge` ([`FileJournal::DIR`]).
 pub const RECORD: &str = "aligned.json";
 
+/// The private record reader's byte budget, shared by every record writer.
+const RECORD_BYTES: usize = 1 << 20;
+
 /// The lock one pass holds, beside the record ([`try_lock`], [`wait_lock`]).
 pub const LOCK: &str = "align.lock";
 
@@ -101,7 +104,8 @@ pub const REQUESTS: &str = "sync.requests";
 pub const ACCOUNTS: &str = "sync.accounts";
 /// `sync.release`: automatic private keychain setup and a real signing proof.
 pub const RELEASE: &str = "sync.release";
-/// `sync.fabric`: the message bus (fabric), on by default, and its broker renewed on a new build.
+/// `sync.fabric`: the message bus (fabric), on by default, its broker renewed on a new build, and
+/// a program aterm wrote for it that names no file pointed at the installed app.
 pub const FABRIC: &str = "sync.fabric";
 /// `sync.awake`: aCaffeine keeping this Mac awake, with no window open too.
 pub const AWAKE: &str = "sync.awake";
@@ -273,15 +277,17 @@ pub fn due(record: Option<&Record>, build: &str, routes: &[String], now_ms: u64)
 /// then due as on a new build, the direction that leaves nothing out).
 #[must_use]
 pub fn read_record(state_dir: &Path) -> Option<Record> {
-    let bytes =
-        aterm_uds::private_file::read_private(&state_dir.join(FileJournal::DIR), RECORD, 1 << 20)
-            .ok()?;
+    let bytes = aterm_uds::private_file::read_private(
+        &state_dir.join(FileJournal::DIR),
+        RECORD,
+        RECORD_BYTES,
+    )
+    .ok()?;
     aterm_json::from_slice(&bytes).ok()
 }
 
-fn write_record(dir: &Path, record: &Record) -> Result<(), String> {
-    let mut text = aterm_json::to_string(record).map_err(|why| why.to_string())?;
-    text.push('\n');
+fn write_record(dir: &Path, record: &mut Record) -> Result<(), String> {
+    let text = repository_refresh::encode_record(record)?;
     aterm_uds::private_file::write_private(dir, RECORD, text.as_bytes())
         .map_err(|why| format!("{}: {why}", dir.join(RECORD).display()))
 }
@@ -594,10 +600,18 @@ pub enum FabricRead {
     NotApplicable(String),
     /// The broker runs this build: what it reads.
     Current(String),
-    /// The broker is due a restart by the job `aterm fabric on` installed: it runs a build an
-    /// update replaced, or none holds its socket while that job is not loaded or runs none (an
-    /// update's restart that left it unloaded): which.
-    Due(String),
+    /// The broker is due a restart by the job `aterm fabric on` installed (it runs a build an
+    /// update replaced or that is gone, or none holds its socket while that job is not loaded or
+    /// runs none, as an update's restart that left it unloaded), or a program aterm wrote for it
+    /// (that job's, or `[fabric] command`'s) names no file, and is rewritten to the installed app.
+    Due {
+        /// What is due: which, and the program as written.
+        from: String,
+        /// What the apply leaves (the installed app the programs that move run, the broker
+        /// renewed, and what is left as it is), which the pass's change journal records beside
+        /// `from`.
+        to: String,
+    },
     /// It is off and the person never turned it off (no `aterm fabric off` record): what was
     /// found. A pass with an aterm window turns it on ([`Ports::turn_on_fabric`]).
     Unset(String),
@@ -650,6 +664,11 @@ pub trait Ports: Sync {
     /// class, and the subscriber's leaves its band (`aterm_secrets::converge::runner`), so it
     /// lowers its own.
     fn background(&self, trigger: Trigger);
+    /// The starter explicitly understands independent identity completion in the runner status.
+    /// A caller without that negotiation receives ordinary whole-pass exit statuses.
+    fn identity_result_requested(&self) -> bool {
+        false
+    }
     /// Begin this pass's record of checkout facts: forget the one the systems its rows read
     /// through keep ([`crate::port::CheckoutRecords::new_pass`]), so the pass's rows share what
     /// each of them reads of a checkout and nothing read before the pass stands for it. A pass
@@ -925,6 +944,18 @@ pub trait Ports: Sync {
                 _ => None,
             })
     }
+    /// Read remote heads for otherwise unobserved unborn checkouts, without acquiring or
+    /// repairing anything. A complete readback lets the row finish before journaling a change.
+    ///
+    /// # Errors
+    /// The selected source or current caller authority changed before readback.
+    fn observe_empty_repositories(
+        &self,
+        _execution: Option<repository_refresh::Execution>,
+    ) -> Result<Option<crate::init_github::RepositoryReadback>, String> {
+        Ok(None)
+    }
+
     /// `sync.clone`'s apply: that step's acquisition, run once ([`crate::init::clone_owed`]).
     /// The keychain row's retry is `sync.github`'s.
     ///
@@ -993,8 +1024,8 @@ pub trait Ports: Sync {
     /// # Errors
     /// The fabric's config or broker cannot be read.
     fn fabric(&self) -> Result<FabricRead, String>;
-    /// `sync.fabric`'s apply where the broker is [`FabricRead::Due`]: the broker renewed on this
-    /// build.
+    /// `sync.fabric`'s apply where the fabric is [`FabricRead::Due`]: the broker renewed on this
+    /// build, and the programs that move rewritten to the installed app.
     ///
     /// # Errors
     /// The renewal failed.
@@ -1163,6 +1194,9 @@ struct Synced<'a> {
     repository_execution: Option<repository_refresh::Execution>,
     /// Only this item can use its actual native empty-origin readback; it dies with the pass.
     repository_readback: Mutex<Option<std::sync::Arc<crate::init_github::RepositoryReadback>>>,
+    /// The last local probe needs a remote observation. Retain that typed decision without
+    /// repeating checkout validation at the engine's observation boundary.
+    repository_unobserved: std::sync::atomic::AtomicBool,
     /// Why System State holds the vault out, read as the row starts ([`Ports::vault_held`]): a
     /// Stop pressed while an earlier row ran holds this one.
     held: std::sync::OnceLock<Option<String>>,
@@ -1197,6 +1231,7 @@ impl<'a> Synced<'a> {
             repository_work: aterm_secrets::converge::RepositoryWork::Refresh,
             repository_execution: None,
             repository_readback: Mutex::new(None),
+            repository_unobserved: std::sync::atomic::AtomicBool::new(false),
             held: std::sync::OnceLock::new(),
             said: Mutex::new(None),
             aside: Mutex::new(None),
@@ -1385,6 +1420,9 @@ impl Item for Synced<'_> {
     }
 
     fn probe(&self) -> Probe {
+        *self.aside.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.repository_unobserved
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         if self.kind == Kind::StewardServerStandby
             && let Some(stale) = self.stale_server()
         {
@@ -1443,26 +1481,47 @@ impl Item for Synced<'_> {
                     return self.forget_owed_clone(why);
                 }
                 match owed {
-                    crate::init::OwedClone::Nothing(why) => not_applicable(why),
+                    crate::init::OwedClone::Nothing(why) => {
+                        // A successful acquisition can retire its own debt. That read-back
+                        // completes this row; before an apply, there is simply no work owed.
+                        if self
+                            .said
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .is_some()
+                        {
+                            Probe::Ok { now: why }
+                        } else {
+                            not_applicable(why)
+                        }
+                    }
                     crate::init::OwedClone::Verified(counts) => Probe::Ok {
                         now: format!(
                             "vault repositories: {}, verified on this machine",
                             counts.summary()
                         ),
                     },
-                    // Acquisition reads each such remote and takes any commits it finds; its
-                    // read-back must then verify them, or the row fails.
-                    crate::init::OwedClone::Unobserved(counts) => Probe::Change {
-                        from: format!(
-                            "vault repositories: {}: their remotes are not read yet",
-                            counts.summary()
-                        ),
-                        to: "their remotes read, as aterm init reads them".to_owned(),
-                    },
+                    // Observe remote heads before journaling acquisition. An empty observation
+                    // can finish verified; actual acquisition must verify its own readback.
+                    crate::init::OwedClone::Unobserved(counts) => {
+                        self.repository_unobserved
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        Probe::Change {
+                            from: format!(
+                                "vault repositories: {}: their remotes are not read yet",
+                                counts.summary()
+                            ),
+                            to: "their remotes read, as aterm init reads them".to_owned(),
+                        }
+                    }
                     crate::init::OwedClone::Off(why) | crate::init::OwedClone::Held(why) => {
                         not_applicable(why)
                     }
                     crate::init::OwedClone::Waiting(why) => Probe::Deferred { why },
+                    crate::init::OwedClone::Inputs(why) => {
+                        self.stand_aside(StoodAside::Inputs(why.clone()));
+                        Probe::Deferred { why }
+                    }
                     crate::init::OwedClone::Due(from) => Probe::Change {
                         from,
                         to: "cloned, as aterm init clones".to_owned(),
@@ -1508,7 +1567,8 @@ impl Item for Synced<'_> {
                         crate::init::OwedClone::Nothing(why)
                         | crate::init::OwedClone::Off(why)
                         | crate::init::OwedClone::Held(why) => not_applicable(why),
-                        crate::init::OwedClone::Waiting(why) => not_applicable(format!(
+                        crate::init::OwedClone::Waiting(why)
+                        | crate::init::OwedClone::Inputs(why) => not_applicable(format!(
                             "no checkout is refreshed while repository setup waits: {why}"
                         )),
                         crate::init::OwedClone::Person(how) => not_applicable(format!(
@@ -1636,11 +1696,7 @@ impl Item for Synced<'_> {
             Kind::Fabric => read(self.ports.fabric(), |fabric| match fabric {
                 FabricRead::NotApplicable(why) => not_applicable(why),
                 FabricRead::Current(now) => Probe::Ok { now },
-                FabricRead::Due(from) => Probe::Change {
-                    from,
-                    to: "the broker runs this build, under the job `aterm fabric on` installed"
-                        .to_owned(),
-                },
+                FabricRead::Due { from, to } => Probe::Change { from, to },
                 FabricRead::Unset(from) if self.turns_fabric_on() => Probe::Change {
                     from,
                     to: "on, as `aterm fabric on` turns it on".to_owned(),
@@ -1718,6 +1774,30 @@ impl Item for Synced<'_> {
             && self.repository_work == aterm_secrets::converge::RepositoryWork::Refresh
     }
 
+    fn observe(&self) -> Option<Result<(), String>> {
+        if self.kind != Kind::OwedClone
+            || !self
+                .repository_unobserved
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
+        }
+        match self
+            .ports
+            .observe_empty_repositories(self.repository_execution.clone())
+        {
+            Ok(Some(readback)) => {
+                *self
+                    .repository_readback
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(std::sync::Arc::new(readback));
+                Some(Ok(()))
+            }
+            Ok(None) => None,
+            Err(why) => Some(Err(why)),
+        }
+    }
+
     fn refresh(&self) -> Option<Result<(), String>> {
         self.refresh_changes().then(|| self.apply())
     }
@@ -1760,10 +1840,13 @@ impl Item for Synced<'_> {
                             outcome.readback.map(std::sync::Arc::new);
                         outcome.said
                     }
-                    // A step only a person can finish waits for them: no pass runs it again
-                    // until the token or init.toml changes.
+                    // A recorded block waits for its input: repeating this pass on the clock
+                    // cannot finish it.
                     Err(why) => {
-                        if let Ok(crate::init::OwedClone::Person(how)) = self
+                        if let Ok(
+                            crate::init::OwedClone::Person(how)
+                            | crate::init::OwedClone::Inputs(how),
+                        ) = self
                             .ports
                             .owed_clone(None, aterm_secrets::converge::RepositoryWork::Repair)
                         {
@@ -1874,7 +1957,7 @@ impl Item for Synced<'_> {
                 .map_err(|why| format!("{why}; the next pass tries again"))?,
             // Read again: the probe planned one of the two, and only it changes the fabric.
             Kind::Fabric => match self.ports.fabric()? {
-                FabricRead::Due(_) => self.ports.renew_broker()?,
+                FabricRead::Due { .. } => self.ports.renew_broker()?,
                 FabricRead::Unset(_) if self.turns_fabric_on() => self.ports.turn_on_fabric()?,
                 FabricRead::Unset(_) | FabricRead::Current(_) | FabricRead::NotApplicable(_) => {
                     return Ok(());
@@ -1967,6 +2050,10 @@ impl Item for Synced<'_> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    fn read_aside(&self) -> Option<StoodAside> {
+        self.stood_aside()
     }
 }
 
@@ -2245,6 +2332,21 @@ pub struct Pass {
 }
 
 impl Pass {
+    /// The identity row actually settled, independently of another row or record-write failure.
+    /// A missing, planned, failed or unresolved row grants no completion evidence.
+    #[must_use]
+    pub fn identity_complete(&self) -> bool {
+        self.rows
+            .iter()
+            .find(|row| row.id == IDENTITY)
+            .is_some_and(|row| {
+                matches!(
+                    row.outcome,
+                    Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
+                )
+            })
+    }
+
     /// Whether admitted work has settled and no record write failed.
     #[must_use]
     pub fn complete(&self) -> bool {

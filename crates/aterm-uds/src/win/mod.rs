@@ -501,7 +501,7 @@ impl CtlStream {
         });
         loop {
             if let Some(n) = attempt() {
-                return Ok(n);
+                return self.delivered(n);
             }
             let err = last_wsa_error();
             match err.raw_os_error() {
@@ -530,6 +530,34 @@ impl CtlStream {
                 }
                 _ => return Err(err),
             }
+        }
+    }
+
+    /// What a send that took `sent` bytes answers. afunix takes the first send into a connection
+    /// whose peer has closed and fails only the next one, where a Unix socket fails that first
+    /// write (`EPIPE`): a relay that forwards one byte to a host that has gone would see nothing
+    /// wrong. A zero-length send right after the send writes nothing the peer can read and reads
+    /// the connection's state, so a peer found gone fails this write as it fails on Unix. It reads
+    /// what a send found, not the peer's end: a peer that read the bytes and closed after the send
+    /// leaves this write its count (the next write fails, as on Unix), and one that closed with
+    /// them unread reset the connection, so this write, whose bytes nothing will read, fails. A
+    /// peer that shut only its write half still reads, and a send that cannot tell (any other
+    /// answer) leaves the write's own count.
+    fn delivered(&self, sent: usize) -> io::Result<usize> {
+        if sent == 0 {
+            return Ok(0);
+        }
+        let none = [0u8; 1];
+        // SAFETY: `raw` is this stream's live socket, and a zero length reads nothing from the
+        // one-byte buffer, which outlives the call.
+        let rc = unsafe { ffi::send(self.0.raw, none.as_ptr(), 0, 0) };
+        if rc != ffi::SOCKET_ERROR {
+            return Ok(sent);
+        }
+        let err = last_wsa_error();
+        match err.raw_os_error() {
+            Some(ffi::WSAECONNRESET | ffi::WSAECONNABORTED) => Err(err),
+            _ => Ok(sent),
         }
     }
 }

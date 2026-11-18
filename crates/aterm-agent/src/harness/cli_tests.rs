@@ -165,9 +165,11 @@ fn commons_accounts_are_readable_without_a_spreadsheet_or_local_pool() {
         report["shared_accounts"][0]["catalog"]["accounts"][0]["key"].as_str(),
         Some("shared-account")
     );
+    let shared = &report["shared_accounts"][0]["catalog"]["accounts"][0];
     assert_eq!(
-        report["shared_accounts"][0]["catalog"]["accounts"][0]["local_label"],
-        Value::Null
+        (shared.get("local"), shared.get("local_own")),
+        (Some(&Value::Null), Some(&Value::from(false))),
+        "no row here holds it, and it is not this Mac's own login: {shared}"
     );
     assert!(!env.accounts_roster_for(Cli::Codex).unwrap().exists());
 }
@@ -273,16 +275,78 @@ fn pending_kimi_env(tag: &str) -> (Tmp, Env) {
     (tmp, env)
 }
 
+/// Whether `text` prints a pending source row's label (`kimi-m16`, `kimi-m22`): every import line
+/// names the account instead.
+#[cfg(unix)]
+fn prints_a_source_label(text: &str) -> bool {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
+        .any(|token| matches!(token, "kimi-m16" | "kimi-m22"))
+}
+
+/// Runs `accounts import <word> --cli kimi`, `--region` `region`, on `env`: its exit, stdout and
+/// stderr.
+#[cfg(unix)]
+fn import_kimi(
+    env: &Env,
+    word: &str,
+    region: Option<crate::ai::connector::Region>,
+) -> (ExitCode, String, String) {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let vendor = accounts::Vendor { region, flow: None };
+    let code = run_accounts_import(
+        Cli::Kimi,
+        env,
+        &FakeHost::new(&never_asked),
+        word,
+        vendor,
+        &mut out,
+        &mut err,
+    );
+    (
+        code,
+        String::from_utf8_lossy(&out).into_owned(),
+        String::from_utf8_lossy(&err).into_owned(),
+    )
+}
+
+/// `accounts import` takes the pending source row's account by its provider word and address and
+/// lists it under the source's label, which the next sync keeps it by; its receipt names the
+/// account. CONTROL: the source's label names no account, so it is refused and nothing is written.
 #[cfg(unix)]
 #[test]
 fn pending_import_uses_the_source_identity_and_explicit_region() {
     let (_tmp, env) = pending_kimi_env("import-success");
+    let global = accounts::Vendor {
+        region: Some(crate::ai::connector::Region::Global),
+        flow: None,
+    };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = run_accounts_import(
+        Cli::Kimi,
+        &env,
+        &FakeHost::new(&never_asked),
+        "kimi-m16",
+        global,
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(code, ExitCode::from(1), "CONTROL");
+    assert!(
+        String::from_utf8_lossy(&err).contains(&aterm_file::no_account("kimi-m16")),
+        "CONTROL: {}",
+        String::from_utf8_lossy(&err)
+    );
+    assert!(
+        !env.accounts_roster_for(Cli::Kimi).unwrap().exists(),
+        "CONTROL"
+    );
     let mut out = Vec::new();
     let mut err = Vec::new();
     let code = run_accounts_import(
         Cli::Kimi,
         &env,
-        "kimi-m16",
+        &FakeHost::new(&never_asked),
+        "kimi pending@example.test",
         accounts::Vendor {
             region: Some(crate::ai::connector::Region::Global),
             flow: None,
@@ -292,14 +356,30 @@ fn pending_import_uses_the_source_identity_and_explicit_region() {
     );
     assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
     let roster = Roster::load_for(Cli::Kimi, &env.accounts_roster_for(Cli::Kimi).unwrap()).unwrap();
-    let row = roster.row("kimi-m16").expect("the imported row");
+    let row = roster
+        .row("kimi-m16")
+        .expect("the imported row, under the source's label");
     assert_eq!(row.email.as_deref(), Some("pending@example.test"));
+    assert!(
+        String::from_utf8_lossy(&out).contains("listed kimi pending@example.test"),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+    assert!(
+        !prints_a_source_label(&String::from_utf8_lossy(&out)),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
     assert_eq!(
         row.vendor.region,
         Some(crate::ai::connector::Region::Global)
     );
 }
 
+/// The pending source row preferred for another Mac is refused, naming the account and never the
+/// source's label.
+/// NEGATIVE CONTROL: with the refusal naming the source row's label (`kimi-m22 is preferred for
+/// m22`), it fails its `starts_with` (2026-11-16, by hand on SF-07H S6's review settle, then restored).
 #[cfg(unix)]
 #[test]
 fn pending_import_requires_the_preferred_machine() {
@@ -314,7 +394,8 @@ fn pending_import_requires_the_preferred_machine() {
     let code = run_accounts_import(
         Cli::Kimi,
         &env,
-        "kimi-m22",
+        &FakeHost::new(&never_asked),
+        "kimi pending@example.test",
         accounts::Vendor {
             region: Some(crate::ai::connector::Region::Global),
             flow: None,
@@ -323,7 +404,14 @@ fn pending_import_requires_the_preferred_machine() {
         &mut err,
     );
     assert_eq!(code, ExitCode::from(1));
-    assert!(String::from_utf8_lossy(&err).contains("preferred for m22"));
+    let (out, err) = (String::from_utf8_lossy(&out), String::from_utf8_lossy(&err));
+    assert!(
+        err.starts_with(
+            "aterm harness accounts import: kimi pending@example.test is preferred for m22"
+        ),
+        "{err}"
+    );
+    assert!(!prints_a_source_label(&format!("{out}{err}")), "{out}{err}");
     assert!(!env.accounts_roster_for(Cli::Kimi).unwrap().exists());
 }
 
@@ -336,13 +424,21 @@ fn pending_import_does_not_guess_a_missing_region() {
     let code = run_accounts_import(
         Cli::Kimi,
         &env,
-        "kimi-m16",
+        &FakeHost::new(&never_asked),
+        "kimi pending@example.test",
         accounts::Vendor::default(),
         &mut out,
         &mut err,
     );
     assert_eq!(code, ExitCode::from(1));
-    assert!(String::from_utf8_lossy(&err).contains("explicit --region"));
+    let (out, err) = (String::from_utf8_lossy(&out), String::from_utf8_lossy(&err));
+    assert!(
+        err.starts_with(
+            "aterm harness accounts import: kimi pending@example.test needs an explicit --region"
+        ),
+        "{err}"
+    );
+    assert!(!prints_a_source_label(&format!("{out}{err}")), "{out}{err}");
     assert!(!env.accounts_roster_for(Cli::Kimi).unwrap().exists());
 }
 
@@ -360,7 +456,8 @@ fn pending_import_refuses_a_real_region_conflict() {
     let code = run_accounts_import(
         Cli::Kimi,
         &env,
-        "kimi-m16",
+        &FakeHost::new(&never_asked),
+        "kimi pending@example.test",
         accounts::Vendor {
             region: Some(crate::ai::connector::Region::MainlandCn),
             flow: None,
@@ -369,29 +466,153 @@ fn pending_import_refuses_a_real_region_conflict() {
         &mut err,
     );
     assert_eq!(code, ExitCode::from(1));
+    let (out, err) = (String::from_utf8_lossy(&out), String::from_utf8_lossy(&err));
     assert!(
-        String::from_utf8_lossy(&err).contains("another Kimi region"),
-        "{}",
-        String::from_utf8_lossy(&err)
+        err.starts_with(
+            "aterm harness accounts import: kimi pending@example.test belongs to another Kimi region"
+        ),
+        "{err}"
     );
+    assert!(!prints_a_source_label(&format!("{out}{err}")), "{out}{err}");
     assert!(!env.accounts_roster_for(Cli::Kimi).unwrap().exists());
 }
 
+/// A pending source row with no region is the account of the region `--region` names: its word
+/// in that region names it (`kimicn …` with `--region mainland-cn`), and the row it imports is
+/// that account, under the source's label with that region, its receipt naming the account the
+/// word named and never the source's label; a word of the other region names the other account,
+/// which `--region` does not import, and is refused so. Each word for the account (its key, its
+/// provider word and address in either spelling, its address alone) imports it, and a word that
+/// names an account this Mac lists but the source does not is no pending row of it.
 #[cfg(unix)]
 #[test]
-fn kimi_adopts_its_existing_default_login_without_inventing_an_email() {
+fn pending_import_names_the_account_of_the_region_imported() {
+    use crate::ai::connector::Region;
+    let (_tmp, env) = pending_kimi_env("import-region-word");
+    let (code, out, err) = import_kimi(
+        &env,
+        "kimicn pending@example.test",
+        Some(Region::MainlandCn),
+    );
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert!(out.contains("listed kimicn pending@example.test"), "{out}");
+    assert!(!prints_a_source_label(&format!("{out}{err}")), "{out}{err}");
+    let roster = Roster::load_for(Cli::Kimi, &env.accounts_roster_for(Cli::Kimi).unwrap()).unwrap();
+    assert_eq!(
+        roster.row("kimi-m16").and_then(|row| row.vendor.region),
+        Some(Region::MainlandCn)
+    );
+
+    let (_tmp, env) = pending_kimi_env("import-region-word-other");
+    let (code, out, err) = import_kimi(&env, "kimi pending@example.test", Some(Region::MainlandCn));
+    assert_eq!(code, ExitCode::from(1), "{out}{err}");
+    assert!(
+        err.contains(&aterm_file::no_account("kimi pending@example.test")),
+        "the global account is no pending row in mainland-cn: {err}"
+    );
+    assert!(!env.accounts_roster_for(Cli::Kimi).unwrap().exists());
+
+    let pk = aterm_db::typed::keys::account_pk("kimi:global", "pending@example.test").unwrap();
+    for word in [
+        pk.as_str(),
+        "kimi pending@example.test",
+        "kimi:pending@example.test",
+        "pending@example.test",
+    ] {
+        let (_tmp, env) = pending_kimi_env("import-each-word");
+        let (code, out, err) = import_kimi(&env, word, Some(Region::Global));
+        assert_eq!(code, ExitCode::SUCCESS, "{word}: {err}");
+        assert!(
+            out.contains("listed kimi pending@example.test"),
+            "{word}: {out}"
+        );
+        assert!(
+            !prints_a_source_label(&format!("{out}{err}")),
+            "{word}: {out}{err}"
+        );
+    }
+
+    let (_tmp, env) = pending_kimi_env("import-not-pending");
+    let here = accounts::Row {
+        label: "kimi-here".into(),
+        email: Some("here@example.test".into()),
+        vendor: accounts::Vendor {
+            region: Some(Region::Global),
+            flow: None,
+        },
+        ..accounts::Row::default()
+    };
+    std::fs::write(
+        env.accounts_roster_for(Cli::Kimi).unwrap(),
+        accounts::append_rows_for(Cli::Kimi, "", std::slice::from_ref(&here)).unwrap(),
+    )
+    .unwrap();
+    let (code, out, err) = import_kimi(&env, "kimi here@example.test", Some(Region::Global));
+    assert_eq!(code, ExitCode::from(1), "{out}{err}");
+    assert!(
+        err.starts_with(
+            "aterm harness accounts import: kimi here@example.test is no pending row of the shared \
+             source"
+        ),
+        "{err}"
+    );
+    assert!(!err.contains("kimi-here"), "{err}");
+}
+
+/// Kimi Code's default login is adopted as the account a person names only where Kimi Code's own
+/// profile proves it signs in to that account (`adopt_identity`'s native adoption holds the
+/// proof), which this scratch home has none of: it is refused and nothing is written. The account
+/// `--email` names is the login's own, listed unproved, its region `--region`'s, under its
+/// reserved slug and with its address: every row it lists is renewable. CONTROL: with no account
+/// and no address there is no account to list, and nothing is written (decision 5: no new row has
+/// no address).
+#[cfg(unix)]
+#[test]
+fn kimi_adopts_its_existing_default_login_as_the_account_named() {
     let tmp = tmp_dir("kimi-adopt-default");
     let env = env_at(&tmp);
+    assert!(
+        parse(&words("accounts adopt-default --cli kimi")).is_err(),
+        "CONTROL: no account and no address"
+    );
+    let roster_path = env.accounts_roster_for(Cli::Kimi).unwrap();
     let (cmd, _) = parse(&words(
-        "accounts adopt-default kimi-m22 --cli kimi --region mainland-cn",
+        "accounts adopt-default kimicn sol@example.test --cli kimi",
+    ))
+    .expect("the adoption of an account named parses");
+    let (ok, _, err) = go(&cmd, &env);
+    assert!(!ok && err.contains("nothing was written"), "{err}");
+    assert!(!roster_path.exists(), "an unproved account named is no row");
+    // An address alone says no region, and a sign-in on the other region's site can make a new
+    // account: refused, naming the two ways to say it.
+    let (cmd, _) = parse(&words(
+        "accounts adopt-default --email sol@example.test --cli kimi",
+    ))
+    .expect("the local adoption with no region parses");
+    let (ok, _, err) = go(&cmd, &env);
+    assert!(
+        !ok && err.contains("names no region here")
+            && err.contains("--region mainland-cn")
+            && err.contains("`kimicn ada@x.example`")
+            && err.contains("nothing was written"),
+        "{err}"
+    );
+    assert!(!roster_path.exists(), "a login of no region is no row");
+    let (cmd, _) = parse(&words(
+        "accounts adopt-default --email sol@example.test --cli kimi --region mainland-cn",
     ))
     .expect("the local adoption parses");
     let (ok, _, err) = go(&cmd, &env);
     assert!(ok, "{err}");
-    let roster = Roster::load_for(Cli::Kimi, &env.accounts_roster_for(Cli::Kimi).unwrap()).unwrap();
-    let row = roster.row("kimi-m22").expect("the adopted row");
+    let roster = Roster::load_for(Cli::Kimi, &roster_path).unwrap();
+    let label = aterm_db::typed::keys::reserved_slug(
+        "kimi:mainland-cn",
+        &aterm_db::typed::keys::account_pk("kimi:mainland-cn", "sol@example.test").expect("a key"),
+    );
+    let row = roster.row(&label).expect("the adopted row");
     assert_eq!(row.dir, None);
-    assert_eq!(row.email, None);
+    assert_eq!(row.email.as_deref(), Some("sol@example.test"));
+    assert_eq!(row.identity_email, None, "unproved: no identity to report");
     assert_eq!(
         row.vendor.region,
         Some(crate::ai::connector::Region::MainlandCn)
@@ -446,15 +667,33 @@ fn the_account_table_separates_assignment_readiness_and_local_logins() {
     assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
     let doc: Value = aterm_json::from_slice(&out).unwrap();
     let rows = doc["pools"][0]["accounts"].as_array().unwrap();
-    let readiness = |label: &str| {
+    // A row is named by its account where it has an address, else by its label.
+    let readiness = |field: &str, word: &str| {
         rows.iter()
-            .find(|row| row["label"].as_str() == Some(label))
+            .find(|row| row[field].as_str() == Some(word))
             .and_then(|row| row["readiness"].as_str())
-            .unwrap()
+            .unwrap_or_else(|| panic!("no row of {field} {word}: {doc}"))
     };
-    assert_eq!(readiness("kimi-m16"), "elsewhere");
-    assert_eq!(readiness("kimi-m22"), "needs-region");
-    assert_eq!(readiness("kimi-local"), "usable");
+    assert_eq!(readiness("name", "kimi first@example.test"), "elsewhere");
+    // A pending row that names no region could be either region's account: it has no key and
+    // keeps its label.
+    let needs_region: Vec<&Value> = rows
+        .iter()
+        .filter(|row| row["readiness"] == Value::from("needs-region"))
+        .collect();
+    assert!(
+        matches!(needs_region.as_slice(), [one] if one["ac"].is_null()
+            && one["name"].is_null()
+            && one["label"].as_str().is_some()),
+        "{doc}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row["name"] == Value::from("kimi second@example.test")),
+        "{doc}"
+    );
+    assert_eq!(readiness("label", "kimi-local"), "usable");
     let (mut out, mut err) = (Vec::new(), Vec::new());
     assert_eq!(
         run_accounts_source_table(Some(Cli::Grok), &env, true, &mut out, &mut err),
@@ -606,35 +845,49 @@ fn the_grammar_parses_what_the_help_text_advertises() {
             }),
         ),
         (
-            "accounts add work-2",
+            "accounts add claude work2@x.example",
             Cmd::Accounts(AccountsCmd::Add {
-                label: "work-2".to_string(),
+                account: "claude work2@x.example".to_string(),
                 class: Class::Preferred,
                 email: None,
-                identity_email: None,
                 browser: None,
             }),
         ),
         (
-            "accounts add pool-a --pool",
+            "accounts add claude-pool --pool --email pool@y.example",
             Cmd::Accounts(AccountsCmd::Add {
-                label: "pool-a".to_string(),
+                account: "claude-pool".to_string(),
                 class: Class::Pool,
-                email: None,
-                identity_email: None,
+                email: Some("pool@y.example".to_string()),
+                browser: None,
+            }),
+        ),
+        (
+            "accounts adopt-default --email ada@x.example",
+            Cmd::Accounts(AccountsCmd::AdoptDefault {
+                account: None,
+                email: Some("ada@x.example".to_string()),
+                browser: None,
+            }),
+        ),
+        (
+            "accounts adopt-default claude:ada@x.example --email ada.alias@x.example",
+            Cmd::Accounts(AccountsCmd::AdoptDefault {
+                account: Some("claude:ada@x.example".to_string()),
+                email: Some("ada.alias@x.example".to_string()),
                 browser: None,
             }),
         ),
         (
             "accounts login work-2",
             Cmd::Accounts(AccountsCmd::Login {
-                label: "work-2".to_string(),
+                account: "work-2".to_string(),
             }),
         ),
         (
-            "accounts use work-2",
+            "accounts use claude ada@x.example",
             Cmd::Accounts(AccountsCmd::Use {
-                label: "work-2".to_string(),
+                account: "claude ada@x.example".to_string(),
             }),
         ),
         ("accounts use --auto", Cmd::Accounts(AccountsCmd::Auto)),
@@ -801,6 +1054,10 @@ fn the_grammar_refuses_what_it_does_not_know() {
         "accounts check",
         "accounts add",
         "accounts add work-2 extra",
+        "accounts add claude ada@x.example bea@y.example",
+        "accounts adopt-default claude ada@x.example extra",
+        "accounts import",
+        "accounts import a b --cli kimi",
         "accounts login",
         "accounts use",
         "accounts use work-2 --auto",
@@ -2051,19 +2308,24 @@ impl Ctl for TabCtl {
     }
 }
 
+/// The control socket a Kimi quota tab (`accounts refresh --cli kimi`) runs over: each call
+/// answered in its order, a failure, a timeout or Kimi's sign-in wall injected where it is set.
 #[derive(Default)]
-struct RefreshCtl {
-    calls: Vec<String>,
+pub(crate) struct RefreshCtl {
+    pub(crate) calls: Vec<String>,
     fail_at: Option<usize>,
     already_gone: bool,
-    timeout_at: Option<usize>,
+    pub(crate) timeout_at: Option<usize>,
     empty_usage: bool,
     /// The panel's five-hour window reads this share used (36 where `None`).
     session_pct: Option<u32>,
     /// The panel's monthly window reads this share used (13 where `None`).
     monthly_pct: Option<u32>,
     /// The screen a failed read's last look meets: Kimi's own sign-in wall where set.
-    signed_out_screen: bool,
+    pub(crate) signed_out_screen: bool,
+    /// The panel's screen also holds Kimi Code's quota wall: its `Error: …` row standing last
+    /// above the composer ([`aterm_phase::kimi::fixtures::WALL_QUOTA`]'s rows).
+    pub(crate) quota_wall: bool,
     /// The tab was awaited gone: nothing is asked of it after.
     closed: bool,
 }
@@ -2123,12 +2385,26 @@ impl Ctl for RefreshCtl {
                     "   │   Monthly limit  ███░░░░  {}% used  resets in 26d 20h 27m │",
                     self.monthly_pct.unwrap_or(13)
                 );
-                text_json(&rows(&[
+                let mut screen = rows(&[
                     "   ╭ Usage ─────────────────────────────────────────╮",
                     session.as_str(),
                     monthly.as_str(),
                     "   ╰─────────────────────────────────────────────────╯",
-                ]))
+                ]);
+                if self.quota_wall {
+                    let wall: Vec<String> = aterm_phase::kimi::fixtures::WALL_QUOTA
+                        .lines()
+                        .filter(|line| !line.starts_with('#'))
+                        .map(str::to_owned)
+                        .collect();
+                    let error = wall
+                        .iter()
+                        .position(|line| line.trim_start().starts_with("Error:"))
+                        .expect("the fixture's quota error row");
+                    screen.push(String::new());
+                    screen.extend(wall[error..].iter().cloned());
+                }
+                text_json(&screen)
             }
             _ if args.get(1) == Some(&"await") => format!("OK {} 1", args[2]),
             _ => "OK".to_owned(),
@@ -2241,7 +2517,7 @@ fn a_kimi_limits_read_persists_the_month_and_session() {
     let text = String::from_utf8(stats(false)).unwrap();
     let row = text
         .lines()
-        .find(|l| l.starts_with("  kimi-m22: "))
+        .find(|l| l.starts_with("  kimi-m22 (no address): "))
         .expect("the row's line");
     assert!(
         row.contains(&format!(
@@ -2369,7 +2645,7 @@ fn a_kimi_row_with_no_monthly_reading_says_why() {
     let text = String::from_utf8(out).unwrap();
     let row = text
         .lines()
-        .find(|l| l.starts_with("  kimi-m22: "))
+        .find(|l| l.starts_with("  kimi-m22 (no address): "))
         .expect("the row's line");
     assert!(
         row.contains("no reading yet \u{b7} monthly \u{2013} (no reading yet)"),
@@ -2604,8 +2880,8 @@ fn kimi_refresh_starts_no_kimi_on_a_row_on_record_as_signed_out() {
             assert!(ctl.calls.is_empty(), "no tab, no kimi: {:?}", ctl.calls);
             assert!(reads.is_empty(), "no provider read: {reads:?}");
             assert!(
-                err.contains("m22@example.test is signed out on this Mac"),
-                "named by its email: {err}"
+                err.contains("kimi m22@example.test is signed out on this Mac"),
+                "named by its account's name: {err}"
             );
             assert!(err.contains("aterm harness accounts"), "its sign-in: {err}");
         } else {
@@ -2920,6 +3196,88 @@ fn limits_reads_each_tab_by_its_own_programs_grammar() {
     assert!(
         claude.contains("message=You've hit your session limit"),
         "{claude}"
+    );
+}
+
+/// THE LIMITS WALL'S ACCOUNTS LINE NAMES EACH ACCOUNT, AND IS CLAUDE CODE'S ALONE: under a wall
+/// on a Claude Code tab, `account=` and each `not next:` row name the account as the report does
+/// (`claude ada@x.example`), never by its roster label, and a step it offers types the account's
+/// word; a tab of another CLI's (a Kimi Code tab at its quota wall) gets no line about Claude
+/// Code's rotation at all. NEGATIVE CONTROLS, each its own run: with `limits_accounts_line`
+/// printing the tab's account by its label, the Claude Code tab's line reads `account=m2-2`;
+/// with `run_limits_read` printing the line on every tab, the Kimi Code tab gets `account=claude
+/// ada@x.example next=none …`; each fails this (2026-11-16, mutation runs on SF-07H S7b's review
+/// settle, then restored from HEAD).
+#[test]
+fn the_limits_accounts_line_names_each_account_on_a_claude_tab_alone() {
+    let tmp = tmp_dir("limits-accounts-line");
+    let env = env_at(&tmp);
+    let later = tmp.path().join("logins/m2-3");
+    std::fs::write(
+        env.accounts_roster().expect("a roster path"),
+        format!(
+            "[[account]]\nlabel = \"m2-2\"\nclass = \"dedicated\"\nemail = \"ada@x.example\"\n\
+             [[account]]\nlabel = \"m2-3\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+             email = \"bea@y.example\"\n",
+            later.display()
+        ),
+    )
+    .expect("the roster");
+    let read = |program: &'static str, rows: Vec<String>| {
+        let mut ctl = TabCtl {
+            program: Some(program),
+            rows,
+            asked: Vec::new(),
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_limits_with(
+            &mut ctl,
+            &env,
+            Some("@s-worker"),
+            0,
+            false,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(
+            format!("{code:?}"),
+            format!("{:?}", ExitCode::SUCCESS),
+            "{}",
+            String::from_utf8_lossy(&err)
+        );
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    let claude = read("claude", limited_screen());
+    let line = claude
+        .lines()
+        .find(|line| line.starts_with("account="))
+        .unwrap_or_else(|| panic!("no accounts line: {claude}"));
+    assert!(
+        line.starts_with("account=claude ada@x.example next="),
+        "{line}"
+    );
+    assert!(
+        line.contains("claude bea@y.example: not-enrolled"),
+        "{line}"
+    );
+    for label in ["m2-2", "m2-3"] {
+        assert!(
+            !line
+                .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+                .any(|word| word == label),
+            "the label `{label}` is printed: {line}"
+        );
+    }
+    let wall = aterm_phase::kimi::fixtures::WALL_QUOTA
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let kimi = read("kimi", wall);
+    assert!(kimi.starts_with("wall=usage-session"), "{kimi}");
+    assert!(
+        !kimi.lines().any(|line| line.starts_with("account=")),
+        "a Kimi Code tab gets Claude Code's accounts line: {kimi}"
     );
 }
 
@@ -6548,21 +6906,46 @@ fn on_record(env: &Env, seen: &[(&str, Auth)]) {
         .expect("recorded");
 }
 
+/// `accounts add` of the Claude account at `email`, named by its provider word and address.
 #[cfg(unix)]
-fn add(label: &str, class: Class) -> AccountsCmd {
+fn add(email: &str, class: Class) -> AccountsCmd {
+    add_word(&format!("claude {email}"), class)
+}
+
+/// `accounts add <word>`, the word as a person types it.
+#[cfg(unix)]
+fn add_word(word: &str, class: Class) -> AccountsCmd {
     AccountsCmd::Add {
-        label: label.to_string(),
+        account: word.to_string(),
         class,
         email: None,
-        identity_email: None,
         browser: None,
     }
+}
+
+/// The label `accounts add` gives the Claude account at `email`: its reserved slug.
+#[cfg(unix)]
+fn added(email: &str) -> String {
+    crate::harness::account_names::tests::added_label(Cli::Claude, email)
 }
 
 fn login_made_in(dir: impl AsRef<Path>) {
     let dir = dir.as_ref();
     std::fs::create_dir_all(dir).expect("mkdir");
     std::fs::write(dir.join("a-login-file"), "{}").expect("write");
+}
+
+/// Gives each `(label, address)` row of `env`'s Claude Code roster that address, so `accounts
+/// use` can name its account: a row with no address has no key, and no word names it.
+fn address_rows(env: &Env, rows: &[(&str, &str)]) {
+    let path = env.accounts_roster().expect("a config dir");
+    let mut roster = Roster::load(&path).expect("the roster");
+    for (label, email) in rows {
+        let row = roster.rows.iter_mut().find(|row| row.label == *label);
+        row.expect("the row").email = Some((*email).to_owned());
+    }
+    let text = accounts::append_rows_for(Cli::Claude, "", &roster.rows).expect("the rows admit");
+    std::fs::write(&path, text).expect("write");
 }
 
 fn three_accounts(tmp: &Tmp, env: &Env) -> (String, String) {
@@ -6729,12 +7112,12 @@ fn a_refused_roster_is_said_by_name_and_nothing_acts_on_it() {
 
     for form in [
         AccountsCmd::Login {
-            label: "main".to_string(),
+            account: "main".to_string(),
         },
         AccountsCmd::Use {
-            label: "main".to_string(),
+            account: "main".to_string(),
         },
-        add("work-2", Class::Preferred),
+        add("work2@x.example", Class::Preferred),
     ] {
         let (code, out, err) = acc_quiet(form.clone(), &env);
         assert_eq!(code, exit(1), "{form:?}");
@@ -6765,6 +7148,16 @@ fn a_refused_roster_is_said_by_name_and_nothing_acts_on_it() {
     assert!(out.contains("pool-a"), "{out}");
 }
 
+/// The first `accounts add` lists this machine's own login, then the account named, under its
+/// reserved slug and with its address; its receipt names the account by its name and slug and
+/// prints no label.
+///
+/// INTERIM (SF-07H decision 5): the own login's row is still the address-less `main`, the one row
+/// whose label a receipt prints (`main (no address)`). Decision 5 has no new row without an
+/// address; this one stays until the default login is listed by its account, since the
+/// `AccountCreateLabel` model's first-add case and Claude Code's one-row pool (`Roster::own`, the
+/// usage recorded under `main`) rest on it. Until then `adopt-default` refuses over it, and this
+/// test pins that interim row.
 #[cfg(unix)]
 #[test]
 fn the_first_add_lists_this_machines_own_login_then_the_new_row() {
@@ -6773,10 +7166,20 @@ fn the_first_add_lists_this_machines_own_login_then_the_new_row() {
     let roster = env.accounts_roster().expect("a config dir");
     let store = env.accounts_store();
 
-    let (code, _, err) = acc_quiet(add("work-2", Class::Preferred), &env);
+    let (code, out, err) = acc_quiet(add("work2@x.example", Class::Preferred), &env);
     assert_eq!(code, exit(0), "{err}");
-    let dir = store.login_dir("work-2").expect("a label");
+    let work = added("work2@x.example");
+    let dir = store.login_dir(&work).expect("a label");
     assert!(err.is_empty(), "{err}");
+    // No lab gives this account a slug, so its name alone shows it; the reserved slug that
+    // labels its row is never printed.
+    assert!(
+        out.contains(&format!(
+            "listed claude work2@x.example (preferred) in {}",
+            roster.display()
+        )) && !out.contains(&work),
+        "{out}"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -6797,25 +7200,27 @@ fn the_first_add_lists_this_machines_own_login_then_the_new_row() {
                 ..accounts::Row::default()
             },
             accounts::Row {
-                label: "work-2".to_string(),
+                label: work.clone(),
                 class: Class::Preferred,
                 dir: Some(dir.to_str().expect("utf-8").to_string()),
+                email: Some("work2@x.example".to_string()),
                 ..accounts::Row::default()
             },
         ]
     );
 
-    let (code, _, err) = acc_quiet(add("pool-a", Class::Pool), &env);
+    let (code, _, err) = acc_quiet(add("pool@x.example", Class::Pool), &env);
     assert_eq!(code, exit(0), "{err}");
     let read = Roster::load(&roster).expect("still admits");
+    let pool = added("pool@x.example");
     assert_eq!(
         read.rows
             .iter()
             .map(|r| r.label.as_str())
             .collect::<Vec<_>>(),
-        ["main", "work-2", "pool-a"]
+        ["main", work.as_str(), pool.as_str()]
     );
-    assert_eq!(read.row("pool-a").map(|r| r.class), Some(Class::Pool));
+    assert_eq!(read.row(&pool).map(|r| r.class), Some(Class::Pool));
 }
 
 #[cfg(unix)]
@@ -6823,12 +7228,16 @@ fn the_first_add_lists_this_machines_own_login_then_the_new_row() {
 fn a_row_whose_login_directory_is_empty_is_listed_and_not_enrolled() {
     let tmp = tmp_dir("accounts-empty-dir");
     let env = env_at(&tmp);
-    let (code, _, err) = acc_quiet(add("check-2", Class::Preferred), &env);
-    assert_eq!(code, exit(0), "{err}");
+    // A row with no address, listed by hand with its empty login directory: `login` signs in
+    // only a row that holds none, and every row `accounts add` lists holds one.
     let dir = env.accounts_store().login_dir("check-2").expect("a label");
+    std::fs::create_dir_all(&dir).expect("its login directory");
     let dir_text = dir.to_str().expect("utf-8").to_string();
+    let text = accounts::append_row("", "main", Class::Preferred, None)
+        .and_then(|t| accounts::append_row(&t, "check-2", Class::Preferred, Some(&dir_text)))
+        .expect("the rows admit");
+    std::fs::write(env.accounts_roster().expect("a config dir"), text).expect("write");
     assert_eq!(std::fs::read_dir(&dir).expect("made").count(), 0, "empty");
-    let login_line = "aterm harness accounts login check-2";
 
     let (_, json, _) = acc_quiet(AccountsCmd::Report { json: true }, &env);
     let doc: Value = aterm_json::from_str(json.trim()).expect("json");
@@ -6837,7 +7246,7 @@ fn a_row_whose_login_directory_is_empty_is_listed_and_not_enrolled() {
     let not = next.get("not").and_then(Value::as_array).expect("not");
     let word = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_owned);
     assert_eq!(
-        (word(&not[1], "label"), word(&not[1], "why")),
+        (word(&not[1], "account"), word(&not[1], "why")),
         (
             Some("check-2".to_string()),
             Some("not-enrolled".to_string())
@@ -6852,20 +7261,35 @@ fn a_row_whose_login_directory_is_empty_is_listed_and_not_enrolled() {
     assert_eq!(rows[1].get("enrolled"), Some(&Value::from(false)), "{json}");
     assert_eq!(word(&rows[1], "condition").as_deref(), Some("not-enrolled"));
 
+    // Its account, named by its address while the row holds one, is refused as not enrolled,
+    // with its sign-in step, which types the account's word; the row's address is taken back for
+    // the sign-ins below, which `login` refuses for a row that holds one.
+    let roster_path = env.accounts_roster().expect("a config dir");
+    let unaddressed = std::fs::read_to_string(&roster_path).expect("the roster");
+    address_rows(&env, &[("check-2", "check@x.example")]);
     let (code, _, err) = acc_quiet(
         AccountsCmd::Use {
-            label: "check-2".to_string(),
+            account: "check@x.example".to_string(),
         },
         &env,
     );
     assert_eq!(code, exit(1));
-    assert!(err.contains(login_line), "{err}");
+    assert!(
+        err.contains("claude check@x.example is not-enrolled")
+            && err.contains(&format!(
+                "sign it in with `aterm harness accounts renew {}`",
+                crate::harness::account_names::tests::row_name_of(Cli::Claude, &env, "check-2")
+                    .word
+            )),
+        "{err}"
+    );
+    std::fs::write(&roster_path, unaddressed).expect("the roster");
 
     let mut tty = FakeHost::new(&never_asked);
     tty.tty = true;
     let (code, out, _) = acc(
         AccountsCmd::Login {
-            label: "check-2".to_string(),
+            account: "check-2".to_string(),
         },
         &env,
         &tty,
@@ -6881,7 +7305,7 @@ fn a_row_whose_login_directory_is_empty_is_listed_and_not_enrolled() {
     tty.writes_home = true;
     let (code, _, err) = acc(
         AccountsCmd::Login {
-            label: "check-2".to_string(),
+            account: "check-2".to_string(),
         },
         &env,
         &tty,
@@ -6903,7 +7327,7 @@ fn an_add_to_a_roster_with_rows_lists_no_login_of_its_own() {
         abs("/logins/pool-a")
     );
     std::fs::write(&roster, &hand).expect("write");
-    let (code, _, err) = acc_quiet(add("work-2", Class::Preferred), &env);
+    let (code, _, err) = acc_quiet(add("work2@x.example", Class::Preferred), &env);
     assert_eq!(code, exit(0), "{err}");
     let text = std::fs::read_to_string(&roster).expect("read");
     assert!(text.starts_with(&hand), "what was there is kept: {text}");
@@ -6914,46 +7338,89 @@ fn an_add_to_a_roster_with_rows_lists_no_login_of_its_own() {
             .iter()
             .map(|r| r.label.clone())
             .collect::<Vec<_>>(),
-        ["pool-a", "work-2"]
+        ["pool-a".to_owned(), added("work2@x.example")]
     );
 }
 
+/// `accounts add` lists only an account a word names: a would-be label, a provider word alone or
+/// with no address, a word of no provider, and an address alone of an account nobody holds (nothing
+/// says its provider) names no account and is refused so; another pool's provider word and address
+/// says which `--cli` takes it; an account already listed is named with its sign-in step; and
+/// nothing is written. CONTROL: the provider word and address of an account no row holds lists it.
 #[cfg(unix)]
 #[test]
-fn add_refuses_a_listed_or_inadmissible_label_by_name_and_writes_nothing() {
+fn add_refuses_a_word_naming_no_account_or_a_listed_account_and_writes_nothing() {
     let tmp = tmp_dir("accounts-add-refused");
     let env = env_at(&tmp);
     let roster = env.accounts_roster().expect("a config dir");
 
-    for label in ["Work", "-x", "a/b", "", "with space"] {
-        let (code, out, _) = acc_quiet(add(label, Class::Preferred), &env);
-        assert_eq!(code, exit(1), "{label:?}");
-        assert!(out.is_empty(), "{label:?}: {out}");
+    for word in [
+        "Work",
+        "-x",
+        "a/b",
+        "",
+        "with space",
+        "help",
+        "main",
+        "work-2",
+        "claude",
+        "claude not-an-address",
+        "nobody work2@x.example",
+        "work9@x.example",
+    ] {
+        let (code, out, err) = acc_quiet(add_word(word, Class::Preferred), &env);
+        assert_eq!(code, exit(1), "{word:?}");
+        assert!(out.is_empty(), "{word:?}: {out}");
+        assert!(
+            err.contains(&aterm_file::no_account(word)),
+            "{word:?} names no account: {err}"
+        );
     }
-    let (code, out, _) = acc_quiet(add("help", Class::Preferred), &env);
-    assert_eq!(code, exit(1));
-    assert!(out.is_empty(), "{out}");
-    let (code, _, _) = acc_quiet(add("main", Class::Preferred), &env);
-    assert_eq!(code, exit(1));
+    let (code, out, err) = acc_quiet(add_word("oai work2@x.example", Class::Preferred), &env);
+    assert_eq!(code, exit(1), "{out}{err}");
+    assert!(
+        out.is_empty() && err.contains("--cli codex"),
+        "another pool's account says its --cli: {err}"
+    );
     assert!(!roster.exists(), "no refusal made a roster");
     assert!(
         !env.accounts_store().logins_dir().exists(),
         "no refusal made a login directory"
     );
 
-    let (code, _, err) = acc_quiet(add("work-2", Class::Preferred), &env);
-    assert_eq!(code, exit(0), "{err}");
+    let (code, _, err) = acc_quiet(add("work2@x.example", Class::Preferred), &env);
+    assert_eq!(code, exit(0), "CONTROL: {err}");
     let before = std::fs::read_to_string(&roster).expect("read");
-    let (code, out, _) = acc_quiet(add("work-2", Class::Pool), &env);
-    assert_eq!(code, exit(1));
-    assert!(out.is_empty(), "{out}");
-    let (code, _, _) = acc_quiet(add("main", Class::Preferred), &env);
-    assert_eq!(code, exit(1));
+    let work = added("work2@x.example");
+    for word in [
+        "claude work2@x.example".to_owned(),
+        "claude:WORK2@x.example".to_owned(),
+        "work2@x.example".to_owned(),
+        work.clone(),
+        "main".to_owned(),
+    ] {
+        let (code, out, err) = acc_quiet(add_word(&word, Class::Pool), &env);
+        assert_eq!(code, exit(1), "{word}");
+        assert!(out.is_empty(), "{word}: {out}");
+        // A roster label names nothing, the reserved slug `add` labelled the row with too.
+        let labelled = word == "main" || word == work;
+        assert!(
+            if labelled {
+                err.contains(&aterm_file::no_account(&word))
+            } else {
+                err.contains(&format!(
+                    "is already listed in {}; `aterm harness accounts renew",
+                    roster.display()
+                )) && err.trim_end().ends_with("nothing was written")
+            },
+            "{word}: {err}"
+        );
+    }
     assert_eq!(std::fs::read_to_string(&roster).expect("read"), before);
 
     let mut relative = env_at(&tmp);
     relative.state = PathBuf::from("relative-state");
-    let (code, _, _) = acc_quiet(add("pool-a", Class::Pool), &relative);
+    let (code, _, _) = acc_quiet(add("pool@x.example", Class::Pool), &relative);
     assert_eq!(code, exit(1));
     assert_eq!(std::fs::read_to_string(&roster).expect("read"), before);
     assert!(
@@ -6973,7 +7440,7 @@ fn login_runs_only_at_a_terminal_and_fails_elsewhere() {
         .expect("the rows admit");
     std::fs::write(env.accounts_roster().expect("a config dir"), text).expect("write");
     let login = |label: &str| AccountsCmd::Login {
-        label: label.to_string(),
+        account: label.to_string(),
     };
     let piped = FakeHost::new(&never_asked);
     let (code, out, err) = acc(login("work-2"), &env, &piped);
@@ -7037,7 +7504,7 @@ fn a_claude_login_with_claude_absent_names_its_install() {
         .expect("the rows admit");
     std::fs::write(env.accounts_roster().expect("a config dir"), text).expect("write");
     let login = || AccountsCmd::Login {
-        label: "work-2".to_string(),
+        account: "work-2".to_string(),
     };
     let install = Step::install(Cli::Claude).to_string();
 
@@ -7071,7 +7538,7 @@ fn a_failed_flow_preserves_current_accounts_and_unbound_staging_files() {
     on_record(&env, &[("main", Auth::Ok), ("work-2", Auth::Ok)]);
     let store = env.accounts_store();
     let login = |label: &str| AccountsCmd::Login {
-        label: label.to_string(),
+        account: label.to_string(),
     };
     let files = || {
         [store.state_file(), store.ledger_path(), store.wake_path()]
@@ -7109,15 +7576,18 @@ fn a_failed_flow_preserves_current_accounts_and_unbound_staging_files() {
     #[cfg(unix)]
     assert_eq!(wake_id(&store), woken, "nobody is woken");
 
-    let (code, _, err) = acc_quiet(add("work-3", Class::Preferred), &env);
-    assert_eq!(code, exit(0), "{err}");
-    #[cfg(unix)]
-    let woken = {
-        let now = wake_id(&store);
-        assert_ne!(now, woken, "the add wakes a waiting host for its row");
-        now
-    };
+    // A row no login was made for yet, with no address, listed by hand: `login` signs in only a
+    // row that holds none, and every row `accounts add` lists holds one.
     let fresh = store.login_dir("work-3").expect("a label");
+    let roster_path = env.accounts_roster().expect("a config dir");
+    let text = accounts::append_row(
+        &std::fs::read_to_string(&roster_path).expect("the roster"),
+        "work-3",
+        Class::Preferred,
+        fresh.to_str(),
+    )
+    .expect("admits");
+    std::fs::write(&roster_path, text).expect("write");
     tty.login = Ok(3);
     tty.writes_home = false;
     let (code, out, _) = acc(login("work-3"), &env, &tty);
@@ -7152,13 +7622,20 @@ fn a_failed_flow_preserves_current_accounts_and_unbound_staging_files() {
     );
     #[cfg(unix)]
     assert_eq!(wake_id(&store), woken, "nobody is woken");
-    let (code, _, _) = acc_quiet(
+    // The failed flows bound no login of `work-3`: its account, named by its address, is
+    // refused as not enrolled, with its sign-in step.
+    address_rows(&env, &[("work-3", "work3@x.example")]);
+    let (code, _, err) = acc_quiet(
         AccountsCmd::Use {
-            label: "work-3".to_string(),
+            account: "work3@x.example".to_string(),
         },
         &env,
     );
     assert_eq!(code, exit(1));
+    assert!(
+        err.contains("claude work3@x.example is not-enrolled") && err.contains("sign it in"),
+        "{err}"
+    );
 }
 
 /// The wake marker's file identity — what a waiting session's watcher wakes
@@ -7178,37 +7655,36 @@ fn a_roster_write_wakes_a_waiting_host_and_a_refused_one_wakes_nobody() {
     let tmp = tmp_dir("accounts-add-wakes");
     let env = env_at(&tmp);
     let store = env.accounts_store();
-    let (code, _, _) = acc_quiet(add("Work", Class::Preferred), &env);
+    let (code, _, _) = acc_quiet(add_word("Work", Class::Preferred), &env);
     assert_eq!(code, exit(1));
     assert_eq!(wake_id(&store), None, "a refused add wakes nobody");
 
-    let (code, _, err) = acc_quiet(add("work-2", Class::Preferred), &env);
+    let (code, _, err) = acc_quiet(add("work2@x.example", Class::Preferred), &env);
     assert_eq!(code, exit(0), "{err}");
     assert!(err.is_empty(), "{err}");
     let woken = wake_id(&store);
     assert!(woken.is_some(), "the add wakes a waiting host");
-    let (code, _, _) = acc_quiet(add("work-2", Class::Pool), &env);
+    let (code, _, _) = acc_quiet(add("work2@x.example", Class::Pool), &env);
     assert_eq!(code, exit(1));
-    assert_eq!(wake_id(&store), woken, "a listed label wakes nobody");
-    let (code, _, err) = acc_quiet(add("pool-a", Class::Pool), &env);
+    assert_eq!(wake_id(&store), woken, "a listed account wakes nobody");
+    let (code, _, err) = acc_quiet(add("pool@x.example", Class::Pool), &env);
     assert_eq!(code, exit(0), "{err}");
     assert_ne!(wake_id(&store), woken, "each add wakes it again");
 
     let other = tmp_dir("accounts-adopt-wakes");
     let env = env_at(&other);
     let store = env.accounts_store();
-    let adopt = |label: &str| AccountsCmd::AdoptDefault {
-        label: label.to_string(),
-        email: Some("owner@example.test".to_string()),
-        identity_email: None,
+    let adopt = |email: &str| AccountsCmd::AdoptDefault {
+        account: None,
+        email: Some(email.to_string()),
         browser: None,
     };
-    let (code, out, err) = acc_quiet(adopt("mine"), &env);
+    let (code, out, err) = acc_quiet(adopt("owner@example.test"), &env);
     assert_eq!(code, exit(0), "{out}{err}");
     assert!(err.is_empty(), "{err}");
     let woken = wake_id(&store);
     assert!(woken.is_some(), "adopt-default wakes a waiting host");
-    let (code, _, _) = acc_quiet(adopt("mine-2"), &env);
+    let (code, _, _) = acc_quiet(adopt("other@example.test"), &env);
     assert_eq!(code, exit(1), "the default login is listed already");
     assert_eq!(wake_id(&store), woken, "and that refusal wakes nobody");
 }
@@ -7234,7 +7710,7 @@ fn login_at_a_terminal_asks_that_one_login_and_records_that_it_works() {
     tty.writes_home = true;
     let (code, out, err) = acc(
         AccountsCmd::Login {
-            label: "work-2".to_string(),
+            account: "work-2".to_string(),
         },
         &env,
         &tty,
@@ -7285,7 +7761,7 @@ fn a_flow_that_ends_signed_out_preserves_the_prior_login_and_exits_1() {
     let store = env.accounts_store();
     on_record(&env, &[("main", Auth::Ok), ("work-2", Auth::Ok)]);
     let login = AccountsCmd::Login {
-        label: "work-2".to_string(),
+        account: "work-2".to_string(),
     };
 
     let signed_out = |_: &str| said(false);
@@ -7331,7 +7807,7 @@ fn a_login_nobody_could_ask_afterwards_is_not_started() {
     for label in ["work-2", "main"] {
         let (code, out, _) = acc(
             AccountsCmd::Login {
-                label: label.to_string(),
+                account: label.to_string(),
             },
             &env,
             &tty,
@@ -7347,7 +7823,7 @@ fn a_login_nobody_could_ask_afterwards_is_not_started() {
     tty.writes_home = true;
     let (code, _, err) = acc(
         AccountsCmd::Login {
-            label: "work-2".to_string(),
+            account: "work-2".to_string(),
         },
         &env,
         &tty,
@@ -7549,7 +8025,7 @@ fn a_login_that_could_not_be_asked_is_said_and_never_recorded() {
     three_accounts(&tmp, &env);
     let store = env.accounts_store();
     let login = AccountsCmd::Login {
-        label: "work-2".to_string(),
+        account: "work-2".to_string(),
     };
     let cases: [(Result<Captured, String>, &str); 4] = [
         (
@@ -7585,7 +8061,10 @@ fn a_login_that_could_not_be_asked_is_said_and_never_recorded() {
         tty.writes_home = true;
         let (code, _, err) = acc(login.clone(), &env, &tty);
         assert_eq!(code, exit(1), "{case}");
-        assert!(err.contains("work-2: could not run ("), "{case}: {err}");
+        assert!(
+            err.contains("work-2 (no address): could not run ("),
+            "{case}: {err}"
+        );
         assert!(!store.state_file().exists(), "{case}: nothing recorded");
     }
     let signed_in = |_: &str| said(true);
@@ -7644,7 +8123,7 @@ fn login_keeps_no_byte_of_the_vendors_output() {
     for (label, code) in [("main", 0), ("work-2", 1), ("pool-a", 1)] {
         let (ran, said_out, said_err) = acc(
             AccountsCmd::Login {
-                label: label.to_string(),
+                account: label.to_string(),
             },
             &env,
             &host,
@@ -7655,11 +8134,11 @@ fn login_keeps_no_byte_of_the_vendors_output() {
     }
     assert_eq!(host.asked.borrow().len(), 3, "all three were run");
     assert!(
-        out.contains("main: signed in"),
+        out.contains("main (no address): signed in"),
         "the document was read: {out}"
     );
-    assert!(err.contains("work-2: could not run"), "{err}");
-    assert!(err.contains("pool-a: could not run"), "{err}");
+    assert!(err.contains("work-2 (no address): could not run"), "{err}");
+    assert!(err.contains("pool-a (no address): could not run"), "{err}");
 
     let (_, report, report_err) = acc_quiet(AccountsCmd::Report { json: false }, &env);
     let (_, json, _) = acc_quiet(AccountsCmd::Report { json: true }, &env);
@@ -7711,14 +8190,18 @@ fn login_keeps_no_byte_of_the_vendors_output() {
     }
 }
 
+/// `accounts use <account>` pins the row of the account it names, recorded under the row's label,
+/// and names the account by its name in what it prints, never the label; `use --auto` ends the
+/// pin, naming it alike.
 #[test]
 fn use_records_the_owners_pin_and_claims_no_move() {
     let tmp = tmp_dir("accounts-use");
     let env = env_at(&tmp);
     three_accounts(&tmp, &env);
+    address_rows(&env, &[("work-2", "work@x.example")]);
     let store = env.accounts_store();
-    let using = |label: &str| AccountsCmd::Use {
-        label: label.to_string(),
+    let using = |account: &str| AccountsCmd::Use {
+        account: account.to_string(),
     };
 
     let (code, _, _) = acc_quiet(AccountsCmd::Auto, &env);
@@ -7726,8 +8209,12 @@ fn use_records_the_owners_pin_and_claims_no_move() {
     assert!(!store.state_file().exists(), "nothing to write");
     assert!(!store.ledger_path().exists());
 
-    let (code, _, err) = acc_quiet(using("work-2"), &env);
+    let (code, out, err) = acc_quiet(using("work@x.example"), &env);
     assert_eq!(code, exit(0), "{err}");
+    assert_eq!(
+        out,
+        format!("claude work@x.example: the active account, pinned\n{ACCOUNTS_USE_RECORDED}\n")
+    );
     let (state, _) = store.load(env.now).expect("this build's state");
     assert_eq!(state.active.as_deref(), Some("work-2"));
     assert!(state.proven && state.pinned);
@@ -7739,8 +8226,12 @@ fn use_records_the_owners_pin_and_claims_no_move() {
         (accounts::Kind::Use, "work-2", env.now)
     );
 
-    let (code, _, _) = acc_quiet(AccountsCmd::Auto, &env);
+    let (code, out, _) = acc_quiet(AccountsCmd::Auto, &env);
     assert_eq!(code, exit(0));
+    assert_eq!(
+        out,
+        format!("claude work@x.example: no longer pinned\n{ACCOUNTS_AUTO_RECORDED}\n")
+    );
     let (state, _) = store.load(env.now).expect("this build's state");
     assert!(!state.pinned);
     assert_eq!(
@@ -7762,24 +8253,65 @@ fn use_records_the_owners_pin_and_claims_no_move() {
     assert_eq!(store.tail(20).expect("ledger").len(), 2, "no pin: no row");
 }
 
+/// `accounts use` refuses a word that names no account (a roster label names none) and an account
+/// whose row is not enrolled here or is signed out, naming the account by its name at the head of
+/// the refusal, never as `` `<label>` is ``; the sign-in step the refusal ends in types the
+/// account's word (`accounts renew <account>`). A refusal changes
+/// nothing, and once the row is signed in the pin is made.
 #[cfg(unix)]
 #[test]
-fn use_refuses_an_unlisted_unenrolled_or_signed_out_label_by_name() {
+fn use_refuses_a_label_and_an_unenrolled_or_signed_out_account_naming_it() {
     let tmp = tmp_dir("accounts-use-refused");
     let env = env_at(&tmp);
     three_accounts(&tmp, &env);
+    address_rows(
+        &env,
+        &[("work-2", "work@x.example"), ("pool-a", "pool@x.example")],
+    );
     let store = env.accounts_store();
-    let using = |label: &str| AccountsCmd::Use {
-        label: label.to_string(),
+    let using = |account: &str| AccountsCmd::Use {
+        account: account.to_string(),
     };
     on_record(&env, &[("main", Auth::Ok), ("work-2", Auth::SignedOut)]);
     let before = std::fs::read_to_string(store.state_file()).expect("state");
     let rows = store.tail(20).expect("ledger").len();
 
-    for label in ["nobody", "pool-a", "work-2"] {
-        let (code, out, _) = acc_quiet(using(label), &env);
-        assert_eq!(code, exit(1), "{label}");
-        assert!(out.is_empty(), "{label}: {out}");
+    for (account, why, remedy) in [
+        ("nobody", aterm_file::no_account("nobody"), None),
+        ("work-2", aterm_file::no_account("work-2"), None),
+        (
+            "pool@x.example",
+            "claude pool@x.example is not-enrolled".to_owned(),
+            Some("pool-a"),
+        ),
+        (
+            "work@x.example",
+            "claude work@x.example is signed-out".to_owned(),
+            Some("work-2"),
+        ),
+    ] {
+        let (code, out, err) = acc_quiet(using(account), &env);
+        assert_eq!(code, exit(1), "{account}");
+        assert!(out.is_empty(), "{account}: {out}");
+        assert!(
+            err.starts_with(&format!("aterm harness accounts use: {why}")),
+            "{account}: {err}"
+        );
+        // The sign-in step types the account's word.
+        if let Some(label) = remedy {
+            let word =
+                crate::harness::account_names::tests::row_name_of(Cli::Claude, &env, label).word;
+            assert!(
+                err.contains(&format!("`aterm harness accounts renew {word}`")),
+                "{account}: {err}"
+            );
+        }
+        for label in ["pool-a", "work-2"] {
+            assert!(
+                account == label || !err.contains(&format!("`{label}` is")),
+                "{account}: {err}"
+            );
+        }
     }
     assert_eq!(
         std::fs::read_to_string(store.state_file()).expect("state"),
@@ -7788,20 +8320,149 @@ fn use_refuses_an_unlisted_unenrolled_or_signed_out_label_by_name() {
     );
     assert_eq!(store.tail(20).expect("ledger").len(), rows);
 
-    let signed_in = |_: &str| said(true);
-    let mut tty = FakeHost::new(&signed_in);
-    tty.tty = true;
-    tty.writes_home = true;
-    let (code, _, err) = acc(
-        AccountsCmd::Login {
-            label: "work-2".to_string(),
-        },
+    on_record(&env, &[("main", Auth::Ok), ("work-2", Auth::Ok)]);
+    let (code, _, err) = acc_quiet(using("work@x.example"), &env);
+    assert_eq!(code, exit(0), "{err}");
+}
+
+/// The pin is made only on the row the word named while that row still holds the account named,
+/// read again under the lock: a row labelled as the named one that holds another account's key
+/// by then (a sync relabelled the rows between the word's resolve and the lock) is refused, and
+/// the records and the ledger stay as they were. CONTROL: the row with its own key is pinned.
+/// NEGATIVE CONTROL: with the lock's check taking any row of that label, the pin exits 0, not 1
+/// (2026-11-16, by hand, then restored).
+#[cfg(unix)]
+#[test]
+fn use_refuses_a_row_that_holds_another_account_by_the_lock() {
+    let tmp = tmp_dir("accounts-use-moved");
+    let env = env_at(&tmp);
+    three_accounts(&tmp, &env);
+    address_rows(
         &env,
-        &tty,
+        &[("work-2", "work@x.example"), ("pool-a", "pool@x.example")],
     );
-    assert_eq!(code, exit(0), "{err}");
-    let (code, _, err) = acc_quiet(using("work-2"), &env);
-    assert_eq!(code, exit(0), "{err}");
+    on_record(&env, &[("work-2", Auth::Ok)]);
+    let store = env.accounts_store();
+    let before = std::fs::read_to_string(store.state_file()).expect("state");
+    let rows = store.tail(20).expect("ledger").len();
+    let roster = Roster::load(&env.accounts_roster().expect("a config dir")).expect("the roster");
+    let row_of = |label: &str| {
+        UseRow::of(Cli::Claude, roster.row(label).expect("the row")).expect("an address")
+    };
+    let moved = UseRow {
+        label: "work-2".to_owned(),
+        pk: row_of("pool-a").pk,
+    };
+    let host = FakeHost::new(&never_asked);
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let (code, _) =
+        accounts_use_decided((Cli::Claude, &host), &env, Some(&moved), &mut out, &mut err);
+    assert_eq!(code, ExitCode::from(1));
+    assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&err),
+        "aterm harness accounts use: the roster changed under the account named; nothing was \
+         selected\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(store.state_file()).expect("state"),
+        before,
+        "a refusal changes nothing"
+    );
+    assert_eq!(store.tail(20).expect("ledger").len(), rows);
+
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let (code, _) = accounts_use_decided(
+        (Cli::Claude, &host),
+        &env,
+        Some(&row_of("work-2")),
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(
+        code,
+        ExitCode::SUCCESS,
+        "CONTROL: {}",
+        String::from_utf8_lossy(&err)
+    );
+}
+
+/// `use --auto` names the row whose pin it ended by the roster as it stands: a row with no
+/// address by its label marked so (`work-2 (no address)`), the one place a roster label is
+/// printed; a label no row holds now as the pinned account no longer in the roster; and where the
+/// roster cannot be read, as the pinned account the roster could not be read to name, with the
+/// roster's refusal on stderr, never as a row gone from it. The pin ends each time, since its end
+/// reads no roster. NEGATIVE CONTROL: with an unread roster named as a row gone, the last line
+/// reads `the pinned account, whose row is no longer in the roster: no longer pinned` and this
+/// fails (2026-11-16, by hand, then restored).
+#[test]
+fn use_auto_names_the_pin_it_ended_by_the_roster_as_it_stands() {
+    let tmp = tmp_dir("accounts-auto-named");
+    let env = env_at(&tmp);
+    three_accounts(&tmp, &env);
+    let store = env.accounts_store();
+    let pin = |label: &str| {
+        store
+            .transact(env.now, &mut None, |state| {
+                state.active = Some(label.to_owned());
+                state.proven = true;
+                state.pinned = true;
+                Ok(Vec::new())
+            })
+            .expect("pinned");
+    };
+    let ended = |named: &str| {
+        let (code, out, err) = acc_quiet(AccountsCmd::Auto, &env);
+        assert_eq!(code, exit(0), "{named}: {err}");
+        assert_eq!(
+            out,
+            format!("{named}: no longer pinned\n{ACCOUNTS_AUTO_RECORDED}\n")
+        );
+        let (state, _) = store.load(env.now).expect("this build's state");
+        assert!(!state.pinned, "{named}");
+        err
+    };
+    pin("work-2");
+    ended("work-2 (no address)");
+    pin("gone-1");
+    ended("the pinned account, whose row is no longer in the roster");
+    pin("work-2");
+    let roster = env.accounts_roster().expect("a config dir");
+    std::fs::write(&roster, "[[account]\nlabel = \n").expect("a roster no load admits");
+    let err = ended("the pinned account (the roster could not be read to name it)");
+    assert!(err.contains("is REFUSED"), "{err}");
+}
+
+/// `accounts use`'s parse refusal counts what it was given and repeats none of it: the words may
+/// be addresses, and a parse refusal reaches captured stderr. NEGATIVE CONTROL: with the count
+/// followed by the words, it fails on `` "… not 2 words [\"claude bea@y.example\",
+/// \"claude-cy-z\"]" `` (2026-11-16, by hand, then restored).
+#[test]
+fn use_refuses_two_accounts_or_an_account_and_auto_repeating_neither() {
+    for (line, given) in [
+        (
+            "accounts use claude bea@y.example claude-cy-z",
+            "not 2 words",
+        ),
+        (
+            "accounts use claude fay@u.example --auto",
+            "not an account and --auto",
+        ),
+        ("accounts use", "not nothing"),
+    ] {
+        let why = parsed(line).expect_err(line);
+        assert!(
+            why.starts_with("accounts use takes ONE of an account"),
+            "{line}: {why}"
+        );
+        assert!(why.ends_with(given), "{line}: {why}");
+        for word in ["bea@y.example", "claude-cy-z", "fay@u.example"] {
+            assert!(
+                !why.contains(word),
+                "{line}: a refusal repeats no word typed: {why}"
+            );
+        }
+    }
 }
 
 fn reported_state(env: &Env) {
@@ -7861,7 +8522,7 @@ fn the_json_report_has_every_key_and_null_for_what_nobody_read() {
     let text = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_owned);
     let null = |v: &Value, key: &str| v.get(key) == Some(&Value::Null);
 
-    assert_eq!(int(&doc, "schema"), Some(2));
+    assert_eq!(int(&doc, "schema"), Some(3));
     assert_eq!(text(&doc, "kind").as_deref(), Some("accounts"));
     assert_eq!(int(&doc, "as_of"), Some(now));
     assert_eq!(text(&doc, "as_of_rfc3339"), Some(rfc3339_utc(now)));
@@ -7884,13 +8545,16 @@ fn the_json_report_has_every_key_and_null_for_what_nobody_read() {
 
     let rows = doc.get("accounts").and_then(Value::as_array).expect("rows");
     assert_eq!(rows.len(), 3);
-    const KEYS: [&str; 22] = [
-        "label",
+    const KEYS: [&str; 25] = [
+        "ac",
+        "slug",
+        "name",
         "class",
         "enrolled",
         "condition",
         "limited_until",
         "limited_until_rfc3339",
+        "model_walls",
         "auth",
         "auth_at",
         "auth_at_rfc3339",
@@ -7915,7 +8579,9 @@ fn the_json_report_has_every_key_and_null_for_what_nobody_read() {
     }
     let (main, work_2, pool_a) = (&rows[0], &rows[1], &rows[2]);
 
+    // A row with no address has no account to name it by: its label stands for it.
     assert_eq!(text(main, "label").as_deref(), Some("main"));
+    assert!(null(main, "ac") && null(main, "slug") && null(main, "name"));
     assert!(
         main.get("dir").is_none(),
         "this machine's own login names none"
@@ -9746,7 +10412,8 @@ fn the_report_says_what_a_claude_worker_takes_as_a_survey_does() {
         &text,
         &doc,
         format!(
-            "{worker} takes `main`, the row this machine's own login counts as, for a plain start"
+            "{worker} takes main (no address), the row this machine's own login counts as, for a \
+             plain start"
         ),
     );
 
@@ -9756,8 +10423,8 @@ fn the_report_says_what_a_claude_worker_takes_as_a_survey_does() {
         &text,
         &doc,
         format!(
-            "{worker} takes `work-2` for a plain start: rotation moves it off `main`, the row \
-             this machine's own login counts as"
+            "{worker} takes work-2 (no address) for a plain start: rotation moves it off main \
+             (no address), the row this machine's own login counts as"
         ),
     );
 
@@ -9868,8 +10535,8 @@ fn the_report_and_the_survey_say_the_account_a_plain_start_really_takes() {
     assert_eq!(
         line,
         format!(
-            "{worker} takes `work-2`, the row of {UNICORN}, the login this machine's home holds \
-             (not `main`, whose place that is in the roster), for a plain start"
+            "{worker} takes claude {UNICORN}, the row of {UNICORN}, the login this machine's home \
+             holds (not claude {BRONTO}, whose place that is in the roster), for a plain start"
         )
     );
 
@@ -9888,8 +10555,8 @@ fn the_report_and_the_survey_say_the_account_a_plain_start_really_takes() {
     assert_eq!(
         line,
         format!(
-            "{worker} takes `main`, the row of {BRONTO}, the login this machine's home holds, \
-             for a plain start"
+            "{worker} takes claude {BRONTO}, the row of {BRONTO}, the login this machine's home \
+             holds, for a plain start"
         )
     );
 
@@ -9898,7 +10565,8 @@ fn the_report_and_the_survey_say_the_account_a_plain_start_really_takes() {
     assert_eq!(
         line,
         format!(
-            "{worker} takes `main`, the row this machine's own login counts as, for a plain start"
+            "{worker} takes claude {BRONTO}, the row this machine's own login counts as, for a \
+             plain start"
         )
     );
 }
@@ -9953,6 +10621,8 @@ fn a_state_file_of_another_schema_is_refused_by_every_write_and_left_as_it_is() 
     let tmp = tmp_dir("accounts-not-ours");
     let env = env_at(&tmp);
     three_accounts(&tmp, &env);
+    // `use` names an account: `pool-a`'s, by its address.
+    address_rows(&env, &[("pool-a", "pool@x.example")]);
     let store = env.accounts_store();
     store.ensure().expect("the store's directory");
     let newer = r#"{"schema":18446744073709551615,"active":"work-2","pinned":true,"accounts":{}}"#;
@@ -9968,13 +10638,13 @@ fn a_state_file_of_another_schema_is_refused_by_every_write_and_left_as_it_is() 
     let writes: [(AccountsCmd, &dyn AccountsHost); 3] = [
         (
             AccountsCmd::Login {
-                label: "work-2".to_string(),
+                account: "work-2".to_string(),
             },
             &tty,
         ),
         (
             AccountsCmd::Use {
-                label: "work-2".to_string(),
+                account: "pool@x.example".to_string(),
             },
             &FakeHost::new(&never_asked),
         ),
@@ -9998,7 +10668,7 @@ fn a_state_file_of_another_schema_is_refused_by_every_write_and_left_as_it_is() 
     tty.writes_home = true;
     let (code, _, err) = acc(
         AccountsCmd::Login {
-            label: "pool-a".to_string(),
+            account: "pool-a".to_string(),
         },
         &env,
         &tty,
@@ -10032,7 +10702,7 @@ fn a_state_file_of_another_schema_is_refused_by_every_write_and_left_as_it_is() 
     std::fs::write(store.state_file(), &newer[..newer.len() / 2]).expect("write");
     let (code, _, err) = acc_quiet(
         AccountsCmd::Use {
-            label: "work-2".to_string(),
+            account: "pool@x.example".to_string(),
         },
         &env,
     );
@@ -10065,24 +10735,25 @@ fn add_writes_a_symlinked_roster_through_the_link() {
     };
     chmod(&target, 0o644);
 
-    let (code, _, err) = acc_quiet(add("work-2", Class::Preferred), &env);
+    let (work, pool) = (added("work2@x.example"), added("pool@x.example"));
+    let (code, _, err) = acc_quiet(add("work2@x.example", Class::Preferred), &env);
     assert_eq!(code, exit(0), "{err}");
     assert!(is_link(&link), "the link is still a link");
     assert!(!is_link(&target));
     assert_eq!(mode(&target), 0o644, "the target keeps the mode it had");
     chmod(&target, 0o640);
-    let (code, _, err) = acc_quiet(add("pool-a", Class::Pool), &env);
+    let (code, _, err) = acc_quiet(add("pool@x.example", Class::Pool), &env);
     assert_eq!(code, exit(0), "{err}");
     assert_eq!(mode(&target), 0o640);
     assert!(
         std::fs::read_to_string(&target)
             .expect("read")
-            .contains("label = \"pool-a\"")
+            .contains(&format!("label = \"{pool}\""))
     );
     let text = std::fs::read_to_string(&target).expect("read");
     assert!(text.starts_with(hand), "what was there is kept: {text}");
     assert!(
-        text.contains("label = \"work-2\""),
+        text.contains(&format!("label = \"{work}\"")),
         "the target got the row: {text}"
     );
     assert_eq!(
@@ -10092,7 +10763,7 @@ fn add_writes_a_symlinked_roster_through_the_link() {
             .iter()
             .map(|r| r.label.clone())
             .collect::<Vec<_>>(),
-        ["main", "work-2", "pool-a"]
+        ["main".to_owned(), work, pool]
     );
     assert_eq!(
         std::fs::read_dir(&dotfiles).expect("list").count(),
@@ -10104,7 +10775,7 @@ fn add_writes_a_symlinked_roster_through_the_link() {
     let roster = env.accounts_roster().expect("a config dir");
     std::fs::write(&roster, hand).expect("write");
     chmod(&roster, 0o644);
-    let (code, _, err) = acc_quiet(add("work-2", Class::Preferred), &env);
+    let (code, _, err) = acc_quiet(add("work2@x.example", Class::Preferred), &env);
     assert_eq!(code, exit(0), "{err}");
     assert_eq!(mode(&roster), 0o600);
 
@@ -10113,7 +10784,7 @@ fn add_writes_a_symlinked_roster_through_the_link() {
     let link = env.accounts_roster().expect("a config dir");
     std::os::unix::fs::symlink(other.path().join("gone").join("accounts.toml"), &link)
         .expect("symlink");
-    let (code, out, _) = acc_quiet(add("work-2", Class::Preferred), &env);
+    let (code, out, _) = acc_quiet(add("work2@x.example", Class::Preferred), &env);
     assert_eq!(code, exit(1));
     assert!(out.is_empty(), "{out}");
     assert!(is_link(&link), "the link is as it was");
@@ -10133,28 +10804,40 @@ fn add_to_an_inline_roster_says_so_and_prints_the_row_to_add_by_hand() {
     assert_eq!(code, exit(0));
     assert!(out.contains("main"), "the report reads it: {out}");
 
-    let (code, out, err) = acc_quiet(add("work-2", Class::Pool), &env);
+    let (code, out, err) = acc_quiet(add("work2@x.example", Class::Pool), &env);
     assert_eq!(code, exit(1));
     assert!(out.is_empty(), "{out}");
-    let dir = env.accounts_store().login_dir("work-2").expect("a label");
-    let row = accounts::row_inline("work-2", Class::Pool, dir.to_str()).expect("a row");
+    let work = added("work2@x.example");
+    let dir = env.accounts_store().login_dir(&work).expect("a label");
+    // The row to add by hand, its address written as a placeholder, which no refusal prints.
+    let row = accounts::row_inline(&work, Class::Pool, dir.to_str())
+        .and_then(|row| {
+            row.strip_suffix(" }").map(|head| {
+                format!(
+                    "{head}, email = {} }}",
+                    aterm_toml::Value::from(accounts::EMAIL_BY_HAND)
+                )
+            })
+        })
+        .expect("a row");
     assert!(
-        err.trim_end().ends_with(&row),
+        err.trim_end().ends_with(&row) && !err.contains("work2@x.example"),
         "the row, to add by hand: {err}"
     );
     assert_eq!(std::fs::read_to_string(&roster).expect("read"), inline);
     assert!(!dir.exists(), "a refusal makes no login directory");
+    let typed = row.replace(accounts::EMAIL_BY_HAND, "work2@x.example");
 
-    std::fs::write(&roster, inline.replace(" ]", &format!(", {row} ]"))).expect("write");
+    std::fs::write(&roster, inline.replace(" ]", &format!(", {typed} ]"))).expect("write");
     let read = Roster::load(&roster).expect("admits");
     assert_eq!(
-        read.row("work-2").map(|r| (r.class, r.dir.clone())),
+        read.row(&work).map(|r| (r.class, r.dir.clone())),
         Some((Class::Pool, dir.to_str().map(str::to_owned)))
     );
 
     let empty = "account = []\n";
     std::fs::write(&roster, empty).expect("write");
-    let (code, out, err) = acc_quiet(add("work-2", Class::Pool), &env);
+    let (code, out, err) = acc_quiet(add("work2@x.example", Class::Pool), &env);
     assert_eq!(code, exit(1));
     assert!(out.is_empty(), "{out}");
     let own = accounts::row_inline(ACCOUNTS_OWN_LABEL, Class::Preferred, None).expect("a row");
@@ -10164,7 +10847,7 @@ fn add_to_an_inline_roster_says_so_and_prints_the_row_to_add_by_hand() {
     );
     assert_eq!(std::fs::read_to_string(&roster).expect("read"), empty);
     assert!(!dir.exists(), "a refusal makes no login directory");
-    std::fs::write(&roster, format!("account = [ {own}, {row} ]\n")).expect("write");
+    std::fs::write(&roster, format!("account = [ {own}, {typed} ]\n")).expect("write");
     let read = Roster::load(&roster).expect("admits");
     assert_eq!(
         read.rows
@@ -10173,7 +10856,7 @@ fn add_to_an_inline_roster_says_so_and_prints_the_row_to_add_by_hand() {
             .collect::<Vec<_>>(),
         [
             (ACCOUNTS_OWN_LABEL, Class::Preferred, false),
-            ("work-2", Class::Pool, true)
+            (work.as_str(), Class::Pool, true)
         ]
     );
 }
@@ -10198,7 +10881,7 @@ fn a_login_is_recorded_over_a_word_stamped_ahead_of_the_clock() {
     tty.writes_home = true;
     let (code, out, err) = acc(
         AccountsCmd::Login {
-            label: "main".to_string(),
+            account: "main".to_string(),
         },
         &env,
         &tty,
@@ -10212,13 +10895,29 @@ fn a_login_is_recorded_over_a_word_stamped_ahead_of_the_clock() {
         (state.account("main").auth, state.account("main").auth_at),
         (Auth::Ok, Some(env.now))
     );
-    let (code, _, err) = acc_quiet(
-        AccountsCmd::Use {
-            label: "main".to_string(),
-        },
+    // `login` signs in only a row with no address; once `main` holds one (as a sync would give
+    // it), `accounts use` names its account by that address, and the sign-in recorded over the
+    // word stamped ahead of the clock lets the pin be made.
+    address_rows(&env, &[("main", "main@x.example")]);
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = run_accounts_use(
+        (Cli::Claude, &FakeHost::new(&never_asked)),
         &env,
+        Some("main@x.example"),
+        &mut out,
+        &mut err,
     );
-    assert_eq!(code, exit(0), "no longer refused as signed-out: {err}");
+    assert_eq!(
+        code,
+        ExitCode::SUCCESS,
+        "no longer refused as signed-out: {}",
+        String::from_utf8_lossy(&err)
+    );
+    let (state, _) = store.load(env.now).expect("this build's state");
+    assert_eq!(
+        (state.active.as_deref(), state.pinned),
+        (Some("main"), true)
+    );
 }
 
 /// The `auth status --json` runner ([`auth_status_of`]) runs the program it is given, by its
@@ -10426,11 +11125,12 @@ fn the_accounts_report_shows_the_record_of_usage() {
             .to_string()
     };
     assert!(
-        row("main  ").contains("  credits: off (org_level_disabled)  warned: weekly 8% left (")
-            && row("main  ").ends_with("on: -"),
+        row("main (no address)  ")
+            .contains("  credits: off (org_level_disabled)  warned: weekly 8% left (")
+            && row("main (no address)  ").ends_with("on: -"),
         "{out}"
     );
-    assert!(!row("work-2").contains("credits:"), "{out}");
+    assert!(!row("work-2 (no address)").contains("credits:"), "{out}");
 }
 
 #[test]
@@ -11143,6 +11843,16 @@ const STATS_UUID: &str = "0f6c2b8e-1d3a-4c5e-9b7f-2a4d6e8c0b1a";
 
 const STATS_SENTINEL: &str = "S3NT1NEL";
 
+/// The name `accounts stats` gives this Mac's own login (the default home no row holds) where its
+/// login file is [`stats_profile`]: that account's, as the report names it, the address lower-
+/// cased as an account's name is.
+fn stats_own_name() -> Value {
+    Value::from(format!(
+        "claude ana.{}@example.com",
+        STATS_SENTINEL.to_ascii_lowercase()
+    ))
+}
+
 fn stats_profile() -> String {
     let s = STATS_SENTINEL;
     aterm_json::to_string(&aterm_json::json!({
@@ -11175,9 +11885,11 @@ const STATS_DAY: i64 = 86_400;
 /// STATS' `--since` TAKES A SPAN AND REFUSES THE OTHERS. `accounts stats` reads a day unless
 /// named, takes a minute to 90 days in the span grammar `--defer` takes, and refuses zero, under a
 /// minute, past 90 days, a word, another CLI's pool (whose pool keeps no series), and any verb
-/// but `stats` and `history`; `history` takes a day to 400 days, 30 days unless named, and alone
-/// takes `--rows`. Negative control: an unbounded span parser (`parse_span` with its bounds
-/// check removed) admits `--since 0` and `--since 91d`, and the first refusal fails.
+/// but `stats` and `history`; `history` takes a day to 400 days, 30 days unless named, alone
+/// takes `--rows`, and takes one account word, a provider word and address joined into one; two
+/// accounts are refused by their count, never by repeating the words typed. Negative control: an
+/// unbounded span parser (`parse_span` with its bounds check removed) admits `--since 0` and
+/// `--since 91d`, and the first refusal fails.
 #[test]
 fn stats_since_takes_a_span_and_refuses_others() {
     let stats = |line: &str| match parsed(line) {
@@ -11245,13 +11957,25 @@ fn stats_since_takes_a_span_and_refuses_others() {
         }))
     );
     assert_eq!(
-        parsed("accounts history work --since 7d --rows --json"),
+        parsed("accounts history claude ada@x.example --since 7d --rows --json"),
         Ok(Cmd::Accounts(AccountsCmd::History {
-            name: Some("work".into()),
+            name: Some("claude ada@x.example".into()),
             json: true,
             since_s: 7 * 86_400,
             rows: true,
-        }))
+        })),
+        "the provider word and the address after it are one account word"
+    );
+    let two =
+        parsed("accounts history claude bea@y.example claude-cy-z").expect_err("two accounts");
+    assert!(
+        two.starts_with("accounts history takes one account"),
+        "{two}"
+    );
+    assert!(two.ends_with("not 2 words"), "{two}");
+    assert!(
+        !two.contains("bea@y.example") && !two.contains("claude-cy-z"),
+        "a refusal repeats no word typed: {two}"
     );
     assert!(matches!(
         parsed("accounts history --cli codex"),
@@ -11278,6 +12002,12 @@ fn stats_env(tmp: &Tmp, dir: PathBuf, profile: PathBuf) -> Env {
     env
 }
 
+/// `accounts stats` on this Mac's own login, which no row holds, names it by the account its
+/// login file names, as the report does, and prints its profile's plan and nothing else of it.
+/// NEGATIVE CONTROL: with this Mac's own login named by no account (its names taken for a row's
+/// home alone), its JSON reads `label: main`, `ac: null`, `name: null`, and this fails, as do
+/// the four other stats tests of the own login (2026-11-16, a mutation run on SF-07H S7b's
+/// review settle, then restored from HEAD).
 #[test]
 fn accounts_stats_prints_the_profiles_plan_and_nothing_else() {
     let tmp = tmp_dir("stats");
@@ -11295,14 +12025,28 @@ fn accounts_stats_prints_the_profiles_plan_and_nothing_else() {
     );
     assert_eq!(code, format!("{:?}", ExitCode::SUCCESS), "{err}");
     let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
-    assert_eq!(doc["schema"], Value::from(2u64));
+    assert_eq!(
+        doc["schema"],
+        Value::from(crate::harness::account_stats::SCHEMA)
+    );
     assert_eq!(doc["kind"], Value::from("account-stats"));
     assert_eq!(doc["as_of"], Value::from(env.now));
     let account = &doc["accounts"][0];
     let key = super::profile::AccountKey::claude(STATS_UUID).expect("key");
     assert_eq!(account["key"], Value::from(key.to_string()));
     assert_eq!(account["agent"], Value::from("claude"));
-    assert_eq!(account["label"], Value::from("main"));
+    // This Mac's own login, which no row holds, is named as the report names it: by the account
+    // its login file names (its address read for that alone, the address lower-cased as an
+    // account's name is), never by the word its records are kept under here.
+    let address = format!("ana.{}@example.com", STATS_SENTINEL.to_ascii_lowercase());
+    let name = format!("claude {address}");
+    let ac = aterm_db::typed::keys::account_pk("claude", &address).expect("a key");
+    assert_eq!(
+        (account.get("label"), &account["ac"], &account["name"]),
+        (None, &Value::from(ac.as_str()), &Value::from(name.as_str())),
+        "{account}"
+    );
+    assert_eq!(account["slug"], Value::Null, "no lab, no slug: {account}");
     assert_eq!(account["plan"]["word"], Value::from("max"));
     assert_eq!(account["plan"]["tier"], Value::from("5x"));
     assert_eq!(
@@ -11324,7 +12068,9 @@ fn accounts_stats_prints_the_profiles_plan_and_nothing_else() {
         &env,
     );
     assert!(
-        text.contains("main \u{b7} claude \u{b7} Max 5x \u{b7} credits on\n"),
+        text.contains(&format!(
+            "{name} \u{b7} claude \u{b7} Max 5x \u{b7} credits on\n"
+        )),
         "{text}"
     );
     assert!(
@@ -11343,8 +12089,8 @@ fn accounts_stats_prints_the_profiles_plan_and_nothing_else() {
             "the id was printed: {printed}"
         );
         assert!(
-            !printed.contains("example.com"),
-            "the email was printed: {printed}"
+            !printed.replace(&name, "").contains("example.com"),
+            "the email was printed but as the account's name: {printed}"
         );
         assert!(
             !printed.contains("tengu"),
@@ -11353,7 +12099,7 @@ fn accounts_stats_prints_the_profiles_plan_and_nothing_else() {
     }
     assert!(
         !text.contains(&key.to_string()),
-        "text carries labels only; the key is JSON's"
+        "the profile's key is the JSON's alone"
     );
 }
 
@@ -11414,6 +12160,102 @@ fn accounts_stats_names_a_missing_profile_and_labels_another_home_by_key() {
     );
 }
 
+/// A HOME NO ROW HOLDS IS NEVER NAMED AS A ROW ITS WORD IS THE LABEL OF. The default home no row
+/// holds keeps its records under `main`, and a home of no row or key under `home`; where a row
+/// that does not hold the home is labelled with that word, the home is neither keyed nor named as
+/// that row's account (`ac`, `slug`, `name` and `label` all null, and the text marks the word
+/// `(no row)`), and that row's records are not read as the home's. The default home whose login
+/// file names an address is that account's, whatever a row is labelled. NEGATIVE CONTROL: with
+/// `stats_home` taking the row labelled `main` for the default home no row holds (as S7b's
+/// `roster.row(&label)` did), the home is keyed as Bob's account and named `claude
+/// bob@x.example`, and this fails (2026-11-16, a mutation run on SF-07H S7b's review settle,
+/// then restored from HEAD).
+#[test]
+fn accounts_stats_names_no_home_as_the_row_its_word_labels() {
+    let tmp = tmp_dir("stats-word-row");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let bob = aterm_db::typed::keys::account_pk("claude", "bob@x.example").expect("a key");
+    let roster = |label: &str| {
+        let dir = tmp.path().join("logins").join(label);
+        format!(
+            "[[account]]\nlabel = \"{label}\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+             email = \"bob@x.example\"\n",
+            dir.display()
+        )
+    };
+    let stats = |env: &Env| {
+        let (_, out, _) = acc_quiet(
+            AccountsCmd::Stats {
+                json: true,
+                since_s: STATS_DAY,
+            },
+            env,
+        );
+        let (_, text, _) = acc_quiet(
+            AccountsCmd::Stats {
+                json: false,
+                since_s: STATS_DAY,
+            },
+            env,
+        );
+        let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
+        (doc["accounts"][0].clone(), text)
+    };
+    let unnamed = |account: &Value| {
+        (
+            account["ac"].clone(),
+            account["slug"].clone(),
+            account["name"].clone(),
+            account["label"].clone(),
+        )
+    };
+    let none = (Value::Null, Value::Null, Value::Null, Value::Null);
+    let env = stats_env(&tmp, home.join(".claude"), home.join(".claude.json"));
+    std::fs::write(
+        env.accounts_roster().expect("a roster path"),
+        roster("main"),
+    )
+    .expect("roster");
+    // The default home, whose login names nothing: its word is Bob's row's label.
+    let (account, text) = stats(&env);
+    assert_eq!(unnamed(&account), none, "{account}");
+    assert!(
+        text.contains("main (no row) \u{b7} claude \u{b7} plan"),
+        "{text}"
+    );
+    assert!(!text.contains("bob@"), "{text}");
+    // The default home signed in to Ana: Ana's account, not Bob's.
+    std::fs::write(home.join(".claude.json"), stats_profile()).expect("profile");
+    let (account, text) = stats(&env);
+    assert_ne!(account["ac"], Value::from(bob.as_str()), "{account}");
+    assert_eq!(
+        account["name"],
+        Value::from(format!(
+            "claude ana.{}@example.com",
+            STATS_SENTINEL.to_ascii_lowercase()
+        )),
+        "{account}"
+    );
+    assert!(!text.contains("bob@"), "{text}");
+    // Another home of no row and no key: its word, `home`, is Bob's row's label.
+    let other = tmp.path().join("srv-claude-c");
+    std::fs::create_dir_all(&other).expect("dir");
+    let env = stats_env(&tmp, other.clone(), other.join(".claude.json"));
+    std::fs::write(
+        env.accounts_roster().expect("a roster path"),
+        roster("home"),
+    )
+    .expect("roster");
+    let (account, text) = stats(&env);
+    assert_eq!(unnamed(&account), none, "{account}");
+    assert!(
+        text.contains("home (no row) \u{b7} claude \u{b7} plan"),
+        "{text}"
+    );
+    assert!(!text.contains("bob@"), "{text}");
+}
+
 #[test]
 fn accounts_stats_reads_the_profile_claude_code_keeps_for_the_home_it_names() {
     let tmp = tmp_dir("stats-homes");
@@ -11454,7 +12296,11 @@ fn accounts_stats_reads_the_profile_claude_code_keeps_for_the_home_it_names() {
     env.claude_profile = empty;
     let account = stats(&env);
     assert_eq!(account["plan"]["word"], Value::from("max"), "{account}");
-    assert_eq!(account["label"], Value::from("main"));
+    assert_eq!(
+        (account.get("label"), &account["name"]),
+        (None, &stats_own_name()),
+        "this Mac's own login: {account}"
+    );
 
     assert_eq!(
         claude_profile_of(Some(&home), None, Some(&own)),
@@ -11468,9 +12314,10 @@ fn accounts_stats_reads_the_profile_claude_code_keeps_for_the_home_it_names() {
 }
 
 /// `accounts stats` reads the file Claude Code reads for the home ([`profile::effective`]) and
-/// keeps the home's own label: a non-empty `~/.claude/.config.json` is read over a stale
+/// keeps the home's own name: a non-empty `~/.claude/.config.json` is read over a stale
 /// `~/.claude.json` or in its absence, and `CLAUDE_CODE_CUSTOM_OAUTH_URL` reads
-/// `~/.claude-custom-oauth.json`; each is still the default home, `main`.
+/// `~/.claude-custom-oauth.json`; each is still the default home, this Mac's own login, named by
+/// the account its login file names.
 #[cfg(unix)]
 #[test]
 fn accounts_stats_reads_the_file_claude_code_reads_for_the_home() {
@@ -11494,9 +12341,14 @@ fn accounts_stats_reads_the_file_claude_code_reads_for_the_home() {
         );
         let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
         let account = &doc["accounts"][0];
-        (account["label"].clone(), account["plan"]["word"].clone())
+        // The home's name: its account's, else the word it is kept under.
+        let named = account
+            .get("label")
+            .cloned()
+            .unwrap_or_else(|| account["name"].clone());
+        (named, account["plan"]["word"].clone())
     };
-    let main = Value::from("main");
+    let main = stats_own_name();
 
     assert_eq!(stats(&env), (main.clone(), Value::from("max")));
     std::fs::remove_file(home.join(".claude.json")).expect("rm");
@@ -11518,8 +12370,13 @@ fn accounts_stats_reads_the_file_claude_code_reads_for_the_home() {
     assert_eq!(stats(&env), (main, Value::from("pro")));
 }
 
+/// `accounts stats` names the home by the roster row that holds it: a row with no address by its
+/// label marked so (its JSON keeps the `label`), a row with an address by its account's name (its
+/// JSON gives the account's `ac` and `name` and no `label`); this Mac's own login by the account
+/// its login file names; another home no row holds by its own word (`home-<key>`, `home`), which
+/// is no row's label.
 #[test]
-fn accounts_stats_labels_an_enrolled_home_by_its_roster_row() {
+fn accounts_stats_names_an_enrolled_home_by_its_roster_rows_account() {
     let tmp = tmp_dir("stats-roster");
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).expect("home");
@@ -11558,17 +12415,52 @@ fn accounts_stats_labels_an_enrolled_home_by_its_roster_row() {
 
     std::fs::write(&path, roster(&[("work", Some(work.as_path()))])).expect("write");
     assert_eq!(label(&env), Value::from("work"));
-    let (_, text, _) = acc_quiet(
+    let text = |env: &Env| {
+        acc_quiet(
+            AccountsCmd::Stats {
+                json: false,
+                since_s: STATS_DAY,
+            },
+            env,
+        )
+        .1
+    };
+    assert!(
+        text(&env).contains("work (no address) \u{b7} claude \u{b7} Max 5x \u{b7} credits on\n"),
+        "{}",
+        text(&env)
+    );
+    // The same row with an address is named by its account, in the text and the JSON.
+    let addressed = roster(&[("work", Some(work.as_path()))])
+        .replace("[[account]]\n", "[[account]]\nemail = \"work@x.example\"\n");
+    std::fs::write(&path, &addressed).expect("write");
+    let (_, out, _) = acc_quiet(
         AccountsCmd::Stats {
-            json: false,
+            json: true,
             since_s: STATS_DAY,
         },
         &env,
     );
-    assert!(
-        text.contains("work \u{b7} claude \u{b7} Max 5x \u{b7} credits on\n"),
-        "{text}"
+    let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
+    let account = &doc["accounts"][0];
+    assert_eq!(
+        (&account["ac"], &account["name"], account.get("label")),
+        (
+            &Value::from(
+                aterm_db::typed::keys::account_pk("claude", "work@x.example").expect("a key")
+            ),
+            &Value::from("claude work@x.example"),
+            None
+        ),
+        "{account}"
     );
+    assert!(
+        text(&env)
+            .contains("claude work@x.example \u{b7} claude \u{b7} Max 5x \u{b7} credits on\n"),
+        "{}",
+        text(&env)
+    );
+    assert!(!text(&env).contains("work \u{b7}"), "{}", text(&env));
     let slashed = PathBuf::from(format!("{}/", work.display()));
     std::fs::write(&path, roster(&[("work", Some(slashed.as_path()))])).expect("write");
     assert_eq!(label(&env), Value::from("work"), "one home however spelled");
@@ -11594,7 +12486,20 @@ fn accounts_stats_labels_an_enrolled_home_by_its_roster_row() {
     .expect("write");
     assert_eq!(label(&env), Value::from("own"));
     std::fs::write(&path, roster(&[("work", Some(work.as_path()))])).expect("write");
-    assert_eq!(label(&env), Value::from("main"));
+    assert_eq!(
+        label(&env),
+        Value::Null,
+        "this Mac's own login, named by its account"
+    );
+    let (_, out, _) = acc_quiet(
+        AccountsCmd::Stats {
+            json: true,
+            since_s: STATS_DAY,
+        },
+        &env,
+    );
+    let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
+    assert_eq!(doc["accounts"][0]["name"], stats_own_name(), "{doc}");
 }
 
 #[test]
@@ -11838,7 +12743,11 @@ fn accounts_stats_shows_the_accounts_record_on_this_machine() {
     let id = Value::from(kept.trim().to_owned());
     assert_eq!(doc["machine"]["id"], id);
     let account = &doc["accounts"][0];
-    assert_eq!(account["label"], Value::from("main"));
+    assert_eq!(
+        (account.get("label"), &account["name"]),
+        (None, &stats_own_name()),
+        "this Mac's own login: {account}"
+    );
     let five = &account["windows"][0];
     assert_eq!(five["id"], Value::from("five_hour"));
     assert_eq!(five["used_pct_x10"], Value::from(425u64));
@@ -12080,6 +12989,13 @@ fn the_accounts_report_shows_no_figure_of_another_account() {
         assert_eq!(row["condition"], Value::from("unseen"), "{row}");
         assert_eq!(row["auth"], Value::from("unseen"), "{row}");
         assert!(row["walls"].as_object().expect("walls").is_empty(), "{row}");
+        assert!(
+            row["model_walls"]
+                .as_object()
+                .expect("model walls")
+                .is_empty(),
+            "{row}"
+        );
     };
     let observed = |row: &Value| {
         assert_current_quota_aliases(row);
@@ -12123,8 +13039,10 @@ fn the_accounts_report_shows_no_figure_of_another_account() {
         let (out, row, stats, next) = report(&env);
         if !listed {
             assert!(
+                // The account by its name, whose address is its key's: lower case.
                 out.contains(&format!(
-                    "ana.{STATS_SENTINEL}@example.com: nothing read of it by the usage tap yet"
+                    "claude ana.{}@example.com: nothing read of it by the usage tap yet",
+                    STATS_SENTINEL.to_ascii_lowercase()
                 )) && !out.contains("(main)"),
                 "{out}"
             );
@@ -12304,11 +13222,12 @@ fn the_accounts_report_shows_no_figure_of_another_account() {
             let (code, json, err) = acc_quiet(AccountsCmd::Report { json: true }, &env);
             assert_eq!(code, exit(0), "{err}");
             let doc: Value = aterm_json::from_str(json.trim()).expect("report JSON");
+            // The row by its account's name: it has an address.
             let row = doc["accounts"]
                 .as_array()
                 .expect("rows")
                 .iter()
-                .find(|row| row["label"] == Value::from(ACCOUNTS_OWN_LABEL))
+                .find(|row| row["name"] == Value::from("claude invented@example.invalid"))
                 .expect("the row");
             assert_eq!(row["renew_by"], Value::from(ends), "{doc}");
             assert_eq!(
@@ -13415,6 +14334,40 @@ fn token_section() -> String {
     }
 }
 
+/// A row of `label` signing in as `email` (none: a row with no address), to list by hand
+/// ([`listed_by_hand`]).
+fn by_hand(label: &str, email: Option<&str>) -> accounts::Row {
+    accounts::Row {
+        label: label.to_owned(),
+        email: email.map(str::to_owned),
+        ..accounts::Row::default()
+    }
+}
+
+/// [`by_hand`] for Kimi Code, in `region`.
+fn kimi_by_hand(
+    label: &str,
+    email: Option<&str>,
+    region: Option<crate::ai::connector::Region>,
+) -> accounts::Row {
+    accounts::Row {
+        vendor: accounts::Vendor { region, flow: None },
+        ..by_hand(label, email)
+    }
+}
+
+/// Lists `cli`'s roster row `row` under the label it names, as `accounts add` lists the row it
+/// makes ([`accounts_add_admitted`]: its private login directory, this machine's own login first
+/// on a new roster, the fleet files), for a test whose subject is not `add`: `add` labels a row
+/// with its account's reserved slug, and such a test reads its row back by a label of its own,
+/// as an older Mac's roster labels its rows. Returns the roster's rows as written.
+fn listed_by_hand(env: &Env, cli: Cli, row: accounts::Row) -> Vec<accounts::Row> {
+    match accounts_add_admitted(cli, env, &row, &|| true, &mut |_| {}, None) {
+        Ok(added) => added.rows,
+        Err(why) => panic!("{} is listed by hand: {why}", row.label),
+    }
+}
+
 fn run_line(line: &str, env: &Env) -> (String, String, String) {
     let cmd = parsed(line).expect(line);
     let mut out = Vec::new();
@@ -13441,7 +14394,7 @@ fn accounts_list_is_claudes_report_byte_for_byte_and_another_cli_reads_its_own_r
         none.1,
         format!(
             "no accounts listed\nroster: {} (no such file)\nlist one: aterm harness accounts add \
-             <label>\n{}",
+             <account>\n{}",
             config.join("accounts.toml").display(),
             token_section()
         )
@@ -13453,7 +14406,7 @@ fn accounts_list_is_claudes_report_byte_for_byte_and_another_cli_reads_its_own_r
             none.0.as_str(),
             format!(
                 "no accounts listed\nroster: {} (no such file)\nlist one: aterm harness accounts \
-                 add <label> --cli kimi\n",
+                 add <account> --cli kimi\n",
                 config.join("accounts-kimi.toml").display()
             )
             .as_str()
@@ -13517,26 +14470,28 @@ fn another_clis_rows_are_added_listed_and_pinned_in_its_own_roster_and_login_roo
     let mut env = env_at(&tmp);
     env.sock = None;
     let claude_roster = env.accounts_roster().expect("a config dir");
-    let (code, _, err) = run_line("accounts add sol --cli kimi --email sol@example.com", &env);
-    assert_eq!(code, exit(1));
-    assert!(
-        err.contains("row `sol` has an email and no region"),
-        "{err}"
-    );
-    let (code, out, err) = run_line(
-        "accounts add sol --cli kimi --email sol@example.com --region global",
+    // The provider word names the region: `kimicn` is the mainland's, which `--region global`
+    // contradicts; `kimi` is the global one's.
+    let (code, _, err) = run_line(
+        "accounts add kimicn sol@example.com --cli kimi --region global",
         &env,
     );
+    assert_eq!(code, exit(1));
+    assert!(
+        err.contains("is a Kimi account of the mainland-cn region, not --region global"),
+        "{err}"
+    );
+    let (code, out, err) = run_line("accounts add kimi sol@example.com --cli kimi", &env);
     assert_eq!(code, exit(0), "{err}");
-    let dir = ["home", ".aterm", "logins", "kimi", "sol"]
+    let sol = crate::harness::account_names::tests::added_label(Cli::Kimi, "sol@example.com");
+    let dir = ["home", ".aterm", "logins", "kimi", sol.as_str()]
         .iter()
         .fold(tmp.path().to_path_buf(), |dir, name| dir.join(name));
     assert!(
-        out.contains(&format!("login directory: {}", dir.display())),
-        "{out}"
-    );
-    assert!(
-        out.contains("run: aterm harness accounts renew sol --cli kimi"),
+        out.contains(&format!(
+            "run: aterm harness accounts renew {} --cli kimi",
+            crate::harness::account_names::tests::row_name_of(Cli::Kimi, &env, &sol).word
+        )),
         "{out}"
     );
     assert!(dir.is_dir());
@@ -13548,18 +14503,28 @@ fn another_clis_rows_are_added_listed_and_pinned_in_its_own_roster_and_login_roo
     assert!(!claude_roster.exists(), "Claude Code's roster is untouched");
     let (code, out, _) = run_line("accounts list --cli kimi", &env);
     assert_eq!(code, exit(0));
-    assert!(out.contains("sol") && out.contains("not-enrolled"), "{out}");
-    let (code, _, err) = run_line("accounts use sol --cli kimi", &env);
+    assert!(
+        out.contains("kimi sol@example.com") && out.contains("not-enrolled"),
+        "{out}"
+    );
+    let (code, _, err) = run_line("accounts use sol@example.com --cli kimi", &env);
     assert_eq!(code, exit(1), "not signed in yet");
     assert!(
-        err.contains("`aterm harness accounts renew sol --cli kimi`"),
+        err.contains(&format!(
+            "`aterm harness accounts renew {} --cli kimi`",
+            crate::harness::account_names::tests::row_name_of(Cli::Kimi, &env, &sol).word
+        )),
         "the sign-in `add` named: {err}"
     );
     std::fs::create_dir_all(dir.join("credentials")).expect("mkdir");
     std::fs::write(dir.join("credentials/kimi-code.json"), "{}").expect("a stand-in login");
-    let (code, out, err) = run_line("accounts use sol --cli kimi", &env);
+    let (code, out, err) = run_line("accounts use sol@example.com --cli kimi", &env);
     assert_eq!(code, exit(0), "{err}");
-    assert!(out.starts_with("sol: the active account, pinned"), "{out}");
+    let first = out.lines().next().unwrap_or_default();
+    assert!(
+        first.ends_with("sol@example.com: the active account, pinned") && !first.starts_with("sol"),
+        "the account by its name, not its row's label: {out}"
+    );
     assert!(env.state.join("accounts-kimi").join("state.json").is_file());
     // A completed manual turn leaves a lock-free ticket for the next admission
     // to prune. The normal shared admission proves retirement before the snapshot.
@@ -13588,7 +14553,7 @@ fn another_clis_rows_are_added_listed_and_pinned_in_its_own_roster_and_login_roo
     assert_eq!(doc["pinned"].as_bool(), Some(true));
     let mut homeless = env.clone();
     homeless.home = None;
-    let (code, _, err) = run_line("accounts add two --cli grok", &homeless);
+    let (code, _, err) = run_line("accounts add xai two@x.example --cli grok", &homeless);
     assert_eq!(code, exit(1));
     assert!(err.contains("no home directory is known"), "{err}");
 }
@@ -13636,7 +14601,8 @@ fn agy_go(
     source: &dyn super::super::agy_quota_store::Source,
 ) -> (ExitCode, String) {
     let mut out = Vec::new();
-    let code = run_agy(env, what, false, json, source, &mut out);
+    let host = FakeHost::new(&never_asked);
+    let code = run_agy(env, &host, what, false, json, source, &mut out);
     (code, String::from_utf8(out).unwrap())
 }
 
@@ -13882,7 +14848,16 @@ fn a_signed_out_agy_says_so_without_running_it() {
     let (dir, env) = agy_env("agy-signed-out");
     let (source, profile, ran) = person_agy(dir.path(), &[SSH]);
     let mut out = Vec::new();
-    let code = run_agy(&env, &AgyWhat::Quota, false, false, &source, &mut out);
+    let host = FakeHost::new(&never_asked);
+    let code = run_agy(
+        &env,
+        &host,
+        &AgyWhat::Quota,
+        false,
+        false,
+        &source,
+        &mut out,
+    );
     let text = String::from_utf8(out).unwrap();
     assert_eq!(code, ExitCode::FAILURE);
     assert_eq!(
@@ -13895,7 +14870,8 @@ fn a_signed_out_agy_says_so_without_running_it() {
         )
     );
     let mut out = Vec::new();
-    let _ = run_agy(&env, &AgyWhat::Quota, true, true, &source, &mut out);
+    let host = FakeHost::new(&never_asked);
+    let _ = run_agy(&env, &host, &AgyWhat::Quota, true, true, &source, &mut out);
     let json = String::from_utf8(out).unwrap();
     let v: Value = aterm_json::from_str(&json).unwrap();
     assert_eq!(v["reason"].as_str(), Some("signed-out"), "{json}");
@@ -13963,7 +14939,8 @@ fn an_agy_blind_to_the_persons_environment_cannot_say_signed_out_and_still_runs_
         "no file backend, no local answer"
     );
     let mut out = Vec::new();
-    let code = run_agy(&env, &AgyWhat::Quota, true, true, &source, &mut out);
+    let host = FakeHost::new(&never_asked);
+    let code = run_agy(&env, &host, &AgyWhat::Quota, true, true, &source, &mut out);
     let json = String::from_utf8(out).unwrap();
     let v: Value = aterm_json::from_str(&json).unwrap();
     assert_eq!(code, ExitCode::FAILURE, "{json}");
@@ -13983,7 +14960,8 @@ fn the_persons_agy_reads_on_the_backend_it_was_checked_on() {
     std::fs::write(config.join(crate::harness::upgrade_agy::GRANT_FILE), b"{}").unwrap();
     assert!(crate::harness::agy_quota_store::Source::admit(&source, env.now).is_ok());
     let mut out = Vec::new();
-    let code = run_agy(&env, &AgyWhat::Quota, true, true, &source, &mut out);
+    let host = FakeHost::new(&never_asked);
+    let code = run_agy(&env, &host, &AgyWhat::Quota, true, true, &source, &mut out);
     let json = String::from_utf8(out).unwrap();
     assert_eq!(code, ExitCode::SUCCESS, "{json}");
     assert_eq!(std::fs::read_to_string(&ran).unwrap(), SSH.1);
@@ -14270,6 +15248,49 @@ fn versions_reads_the_harness_claims_off_the_roster() {
         ]
     );
     assert!(live_claims_of("").is_empty());
+}
+
+/// A VERIFIED VERSION IS READ AT THE BOUND ITS SOURCE HAS: `supervisor_version=` is what the
+/// claim's image proof read from the build (one word of visible ASCII, up to 128 bytes), not a
+/// claim word, so a long `+meta` version and one with a character no claim word takes are
+/// shown as `status` shows them, and `link` is shown for a development link.
+/// NEGATIVE HALF: a version over that bound, an empty one and one holding a control byte are
+/// not shown; `supervisor_vendor=` keeps the claim word's bound.
+#[test]
+fn versions_shows_a_verified_version_no_claim_word_could_spell() {
+    let long = format!("0.9.0+{}", "m".repeat(94));
+    assert_eq!(long.len(), 100);
+    let over = format!("0.9.0+{}", "m".repeat(123));
+    assert_eq!(over.len(), 129);
+    let row = |n: u32, version: &str, vendor: &str| {
+        format!(
+            "{n} t000000000{n} - live t meta=0 supervisor=grok-alab@424{n} supervisor_proven=1 \
+             supervisor_version={version} supervisor_vendor={vendor} autopilot=-\n"
+        )
+    };
+    let body = [
+        row(1, &long, "1.0.70"),
+        row(2, "1.2.0~rc1:b", "1.0.70"),
+        row(3, "link", "-"),
+        row(4, &over, &long),
+        row(5, "0.9.0%07", "1.0.70~x"),
+    ]
+    .concat();
+    let shown: Vec<(Option<String>, Option<String>)> = live_claims_of(&body)
+        .into_iter()
+        .map(|claim| (claim.version, claim.vendor))
+        .collect();
+    let some = |text: &str| Some(text.to_string());
+    assert_eq!(
+        shown,
+        [
+            (some(&long), some("1.0.70")),
+            (some("1.2.0~rc1:b"), some("1.0.70")),
+            (some("link"), None),
+            (None, None),
+            (None, None),
+        ]
+    );
 }
 
 /// `versions` OVER A FAKE INSTANCE AND A STORE: the installed grok-alab build shows the version
@@ -14784,12 +15805,12 @@ fn accounts_report_reads_rotation_from_parsed_config_and_names_running_sessions(
     env.accounts_store().save(&state).expect("save");
     let (text, doc) = read_both(&env);
     assert!(
-        text.starts_with("active: work-2, 1 of 1 sessions on it\n"),
+        text.starts_with("active: work-2 (no address), 1 of 1 sessions on it\n"),
         "{text}"
     );
-    assert!(text.contains("next: main\n"), "{text}");
+    assert!(text.contains("next: main (no address)\n"), "{text}");
     assert!(
-        text.contains("not next: work-2: the account in use"),
+        text.contains("not next: work-2 (no address): the account in use"),
         "{text}"
     );
     assert_eq!(doc["active"], Value::from("work-2"));
@@ -14812,7 +15833,9 @@ fn accounts_report_reads_rotation_from_parsed_config_and_names_running_sessions(
     .expect("write config");
     let (text, doc) = read_both(&env);
     assert!(
-        text.starts_with("active: main (1), work-2 (1), 2 sessions running\n"),
+        text.starts_with(
+            "active: main (no address) (1), work-2 (no address) (1), 2 sessions running\n"
+        ),
         "{text}"
     );
     assert_eq!(doc["active"], Value::Null);
@@ -14883,7 +15906,7 @@ fn the_native_source_table_separates_machine_keys_from_display_names() {
             },
             held: Vec::new(),
         };
-        let (json, rows) = source_table_rows(Cli::Codex, &fleet, None);
+        let (json, rows) = source_table_rows(Cli::Codex, &fleet, None, None);
         assert_eq!(
             json["accounts"][0]["preferred_machine_keys"],
             aterm_json::json!(["PK_m3"])
@@ -14947,17 +15970,18 @@ fn the_source_tables_default_codex_row_is_here_only_with_its_login_file() {
         ..listed.clone()
     };
     let readiness = |fleet: &CliFleet| {
-        let (_, rows) = source_table_rows(Cli::Codex, fleet, Some(local()));
+        let (_, rows) = source_table_rows(Cli::Codex, fleet, Some(local()), None);
         rows.into_iter()
-            .map(|(label, state, .., readiness)| format!("{label} {state} {readiness}"))
+            .map(|(shown, state, .., readiness)| format!("{shown} {state} {readiness}"))
             .collect::<Vec<_>>()
     };
-    assert_eq!(readiness(&listed), ["main active not-enrolled"]);
-    assert_eq!(readiness(&own), ["main local not-enrolled"]);
+    let owner = "oai owner@example.test";
+    assert_eq!(readiness(&listed), [format!("{owner} active not-enrolled")]);
+    assert_eq!(readiness(&own), [format!("{owner} local not-enrolled")]);
     std::fs::create_dir_all(home.join(".codex")).unwrap();
     std::fs::write(home.join(".codex").join("auth.json"), "{}").unwrap();
-    assert_eq!(readiness(&listed), ["main active unseen"]);
-    assert_eq!(readiness(&own), ["main local unseen"]);
+    assert_eq!(readiness(&listed), [format!("{owner} active unseen")]);
+    assert_eq!(readiness(&own), [format!("{owner} local unseen")]);
 }
 
 #[test]
@@ -15020,15 +16044,189 @@ fn source_table_rows_treats_held_by_rows_as_elsewhere_and_matches_identity_email
         },
         held: Vec::new(),
     };
-    let (_, rows) = source_table_rows(Cli::Codex, &fleet, Some(local));
+    let (_, rows) = source_table_rows(Cli::Codex, &fleet, Some(local), None);
     let summary: Vec<String> = rows
         .into_iter()
-        .map(|(label, state, .., readiness)| format!("{label} {state} {readiness}"))
+        .map(|(shown, state, .., readiness)| format!("{shown} {state} {readiness}"))
         .collect();
     assert_eq!(
         summary,
-        ["codex-m16 active unseen", "codex-other active elsewhere"]
+        [
+            "oai warm@example.test active unseen",
+            "oai other@example.test active elsewhere"
+        ]
     );
+}
+
+/// A SOURCE ROW A ROW HERE HOLDS IS NAMED AS THAT ROW: a Codex row whose sign-in `email` is
+/// not its `identity_email` is keyed by its identity, as `accounts --cli codex` and `accounts
+/// observed` key it, so the table's source row of it (the pool lists the sign-in address, the one
+/// address a source row carries) has that row's key and name, not those of the account the
+/// sign-in address alone would make; a source row no row here holds is named by its address.
+/// NEGATIVE CONTROL: with a source row always named by its address, as S7b named it (the held
+/// row's filter always false), its `ac` is the sign-in address's key and this fails
+/// (2026-11-16, a mutation run on SF-07H S7b's review settle, then restored from HEAD).
+#[test]
+fn a_source_row_a_row_here_holds_is_named_as_that_row() {
+    use crate::harness::accounts_sync::{CliFleet, FleetAccount, FleetRoster};
+    let tmp = tmp_dir("source-table-identity");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    std::fs::write(home.join(".codex/auth.json"), "{}").unwrap();
+    let row = accounts::Row {
+        label: "m8-2".into(),
+        email: Some("login@x.example".into()),
+        identity_email: Some("ident@x.example".into()),
+        ..accounts::Row::default()
+    };
+    let local = LocalSourceTable {
+        records: accounts::AccountRecords {
+            roster: Roster {
+                rows: vec![row.clone()],
+            },
+            ..accounts::AccountRecords::default()
+        },
+        machine: Some("m16".into()),
+        now: 1_790_000_000,
+        error: None,
+        home: Some(home),
+        default_login: None,
+    };
+    let listed = |label: &str, email: &str| FleetAccount {
+        label: label.into(),
+        machines: vec!["m16".into()],
+        class: Class::Preferred,
+        email: email.into(),
+        browser: None,
+        vendor: accounts::Vendor::default(),
+    };
+    let fleet = CliFleet {
+        cli: Cli::Codex,
+        roster: FleetRoster {
+            source: "pool".into(),
+            accounts: vec![
+                listed("m8-2", "login@x.example"),
+                listed("m8-3", "eve@v.example"),
+            ],
+            ..FleetRoster::default()
+        },
+        held: Vec::new(),
+    };
+    let (json, rows) = source_table_rows(Cli::Codex, &fleet, Some(local), None);
+    let (pk, names) =
+        crate::harness::account_names::names_of_row(Cli::Codex, &row, None).expect("a key");
+    assert_eq!(
+        pk,
+        aterm_db::typed::keys::account_pk("codex", "ident@x.example").unwrap(),
+        "the row is keyed by its identity"
+    );
+    let accounts = json["accounts"].as_array().expect("rows");
+    assert_eq!(accounts.len(), 2, "{json}");
+    assert_eq!(accounts[0]["ac"], Value::from(pk.as_str()), "{json}");
+    assert_eq!(
+        accounts[0]["name"],
+        Value::from(names.name.clone()),
+        "{json}"
+    );
+    assert!(accounts[0].get("label").is_none(), "{json}");
+    assert_eq!(
+        accounts[1]["ac"],
+        Value::from(aterm_db::typed::keys::account_pk("codex", "eve@v.example").unwrap()),
+        "a source row no row here holds, by its address: {json}"
+    );
+    assert_eq!(
+        rows[0].0,
+        crate::harness::account_names::shown_row(Cli::Codex, &row, None)
+    );
+    assert_eq!(rows[0].0, "oai ident@x.example");
+    assert_eq!(rows[1].0, "oai eve@v.example");
+}
+
+/// A KIMI CODE SOURCE ROW THAT NAMES NO REGION HAS NO KEY: either region's account may be it (the
+/// two are separate account systems), so a pending row with no region is listed by its label
+/// marked `(no region)` and its JSON has no `ac`, `slug` or `name`, but its `label`, even where
+/// the global account at that address is the lab's and slugged.
+/// Everywhere else no region names the global account (`names_of_login`, as `LeaseKey::for_cli`
+/// maps it), which this does not change.
+/// NEGATIVE CONTROL: with `names_of_listed` naming a Kimi Code address with no region as
+/// `names_of_login` does, the row's `ac`, `slug` and `name` are the global account's and this
+/// fails (2026-11-16, a mutation run on SF-07H S7b's review settle, then restored from HEAD).
+#[test]
+fn a_kimi_source_row_with_no_region_has_no_key() {
+    use crate::harness::accounts_sync::{CliFleet, FleetAccount, FleetRoster};
+    use crate::harness::alab_roster::Lab;
+    let email = "ada@x.example";
+    let global = aterm_db::typed::keys::account_pk("kimi:global", email).unwrap();
+    let lab = Lab {
+        names: [(
+            global.clone(),
+            aterm_file::AccountNames {
+                realm: "kimi:global".into(),
+                slug: "kimi-ada-x".into(),
+                name: Some(format!("kimi {email}")),
+                email: Some(email.into()),
+                login: Some(email.into()),
+                live: true,
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Lab::default()
+    };
+    let pending = |region| FleetAccount {
+        label: "kimi-pending".into(),
+        machines: vec!["m16".into()],
+        class: Class::Preferred,
+        email: email.into(),
+        browser: None,
+        vendor: accounts::Vendor { region, flow: None },
+    };
+    let fleet = |region| CliFleet {
+        cli: Cli::Kimi,
+        roster: FleetRoster {
+            source: "sheet".into(),
+            ..FleetRoster::default()
+        },
+        held: vec![pending(region)],
+    };
+    let (json, rows) = source_table_rows(Cli::Kimi, &fleet(None), None, Some(&lab));
+    let row = &json["accounts"][0];
+    assert_eq!(row["readiness"], Value::from("needs-region"), "{json}");
+    assert_eq!(
+        (row["ac"].clone(), row["slug"].clone(), row["name"].clone()),
+        (Value::Null, Value::Null, Value::Null),
+        "a row of no region has no key: {json}"
+    );
+    assert_eq!(row["label"], Value::from("kimi-pending"), "{json}");
+    assert_eq!(rows[0].0, "kimi-pending (no region)");
+    assert!(
+        crate::harness::account_names::names_of_listed(Cli::Kimi, None, email, Some(&lab))
+            .is_none()
+    );
+    assert_eq!(
+        crate::harness::account_names::names_of_login(Cli::Kimi, None, email, Some(&lab))
+            .map(|(pk, _)| pk),
+        Some(global.clone()),
+        "a login of no region is the global account's, as everywhere else"
+    );
+    // CONTROL: the same row in the global region is the lab's slugged account.
+    let (json, rows) = source_table_rows(
+        Cli::Kimi,
+        &fleet(Some(crate::ai::connector::Region::Global)),
+        None,
+        Some(&lab),
+    );
+    assert_eq!(
+        json["accounts"][0]["ac"],
+        Value::from(global.as_str()),
+        "{json}"
+    );
+    assert_eq!(
+        json["accounts"][0]["slug"],
+        Value::from("kimi-ada-x"),
+        "{json}"
+    );
+    assert_eq!(rows[0].0, format!("kimi {email} (kimi-ada-x)"));
 }
 
 #[test]
@@ -15576,5 +16774,70 @@ fn upgrade_and_versions_take_a_tab_id_of_either_form() {
     assert_eq!(
         read, TABS,
         "each form read; NEGATIVE CONTROL: no malformed one"
+    );
+}
+
+/// A MODEL'S OWN WEEKLY WALL IS ONE CLAUSE ON ITS ROW AND A FIELD OF THE JSON (FL-206): the row's
+/// condition stays the account's (`usable`), and `model_walls` names Fable's bucket with its end.
+/// NEGATIVE CONTROL: the week's wall of all models is the account's own, `limited until`.
+#[test]
+fn a_model_wall_is_a_clause_on_the_row_and_a_field_of_the_json() {
+    let tmp = tmp_dir("accounts-model-wall");
+    let env = env_at(&tmp);
+    three_accounts(&tmp, &env);
+    reported_state(&env);
+    let now = env.now;
+    let reset = now + 3 * 86_400;
+    let wall = |window: &str| {
+        let mut note = None;
+        env.accounts_store()
+            .transact(now, &mut note, |state| {
+                Ok(accounts::note_wall(
+                    state,
+                    "main",
+                    window,
+                    Some(reset),
+                    now - 20,
+                    now,
+                ))
+            })
+            .expect("walled");
+    };
+    wall("seven_day_overage_included");
+    let end = rfc3339_utc(reset + accounts::RESET_GRACE_S);
+    let (code, out, err) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert_eq!(code, exit(0), "{err}");
+    let row = out
+        .lines()
+        .find(|line| line.starts_with("main "))
+        .expect("main's row");
+    assert!(
+        row.contains(&format!("  usable \u{b7} Fable week walled until {end}  ")),
+        "{out}"
+    );
+    let (code, out, err) = acc_quiet(AccountsCmd::Report { json: true }, &env);
+    assert_eq!(code, exit(0), "{err}");
+    let doc: Value = aterm_json::from_str(out.trim()).expect("JSON");
+    let rows = doc.get("accounts").and_then(Value::as_array).expect("rows");
+    let main = &rows[0];
+    assert_eq!(main["condition"], Value::from("usable"), "{main}");
+    assert_eq!(main["limited_until"], Value::Null, "{main}");
+    assert_eq!(
+        main["model_walls"]["seven_day_overage_included_rfc3339"],
+        Value::from(end.clone()),
+        "{main}"
+    );
+
+    wall(accounts::WEEK_LIMIT);
+    let (_, out, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    let row = out
+        .lines()
+        .find(|line| line.starts_with("main "))
+        .expect("main's row");
+    assert!(
+        row.contains(&format!(
+            "  limited until {end} \u{b7} Fable week walled until {end}  "
+        )),
+        "{out}"
     );
 }

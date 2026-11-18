@@ -1472,7 +1472,9 @@ impl Github {
         };
         let canonical = canon::git_request(run);
         let latest = intents.latest(WriteOp::RefUpdateAtomic, crate::github::refs::ATOMIC_KEY)?;
-        if let Some(view) = latest.as_ref().filter(|view| view.open) {
+        if let Some(view) = latest.as_ref()
+            && intents.stops(view)?
+        {
             let id = &view.intent.id;
             return Err(Error::new(
                 Kind::OutcomeUnknown,

@@ -157,6 +157,7 @@ impl Stores {
         let config = lab._home.path().join("aterm.toml");
         let registry = Registry::at(original.clone());
         registry.open().unwrap();
+        super::tests::declare(&original, &crate::att::TRACKER);
         let seed = keys::machine_pk("m7");
         registry
             .write(vec![vec![

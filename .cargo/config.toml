@@ -52,14 +52,6 @@
 [target.'cfg(trust_verify)']
 rustflags = ["-Zthreads=4"]
 
-# Trust's Cargo supports content-based Rust freshness. Recreating an identical
-# checkout must not re-run the compiler's expensive certificate checks just
-# because file timestamps changed. Build-script inputs still use timestamps;
-# the release/publication snapshot cache preserves their identical subtrees.
-# Upstream stable Cargo ignores this unstable table on the cross-build lanes.
-[unstable]
-checksum-freshness = true
-
 # No [build] target-dir: the atpkg shim in released apps resolves a target only from
 # --target-dir or CARGO_TARGET_DIR and refuses a configured one, so no build would start.
 # Check runners choose their own (aterm_toolchain::build_cache::DEFAULT_TARGET).

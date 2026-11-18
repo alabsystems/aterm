@@ -1155,9 +1155,10 @@ fn a_person_only_button_is_pressed_by_no_accessibility_or_control_client() {
 #[cfg(all(a11y_tree, target_os = "macos"))]
 #[test]
 fn this_macs_writes_are_pressed_by_no_accessibility_or_control_client() {
-    use crate::machine_title::page::fixture::{Names, found, named, rename};
+    use crate::machine_title::page::fixture::{Names, found_with_history, named, renamed};
     use crate::native_app::ActionInvocation;
     use crate::native_settings::SettingsRoute;
+    use aterm_agent::machine_name::history::History;
     use aterm_types::machine_name::Class;
     #[derive(Clone, Copy, Debug)]
     enum By {
@@ -1168,13 +1169,18 @@ fn this_macs_writes_are_pressed_by_no_accessibility_or_control_client() {
     }
     let wid = WindowId(0);
     let seeded = named(Class::Seeded, 7, "Heron");
-    // Renamed twice, so Undo Last Rename is drawn available.
-    let renamed = named(Class::Chosen, 7, "Heron");
-    rename(&renamed, Class::Chosen, 8, "Puffin");
+    // Renamed twice, with the History its registry row would hold, so Undo Last Rename is drawn
+    // available.
+    let (renamed, shown) = renamed(&[(7, "Heron"), (8, "Puffin")]);
     let names = Names::authorized(Ok(true));
-    for (key, write, scratch) in [
-        ("name/primary", "name/press/save", &seeded),
-        ("name/press/undo", "name/press/undo", &renamed),
+    for (key, write, scratch, history) in [
+        (
+            "name/primary",
+            "name/press/save",
+            &seeded,
+            History::default(),
+        ),
+        ("name/press/undo", "name/press/undo", &renamed, shown),
     ] {
         for by in [By::Assistive, By::Controller, By::Relayed, By::Person] {
             let mut app = App::headless_for_test();
@@ -1184,7 +1190,10 @@ fn this_macs_writes_are_pressed_by_no_accessibility_or_control_client() {
             }
             assert!(app.open_settings_tab(SettingsRoute::Machine));
             let seq = app.machine_page.reads;
-            app.machine_page_read(seq, found(scratch, &[], &names));
+            app.machine_page_read(
+                seq,
+                found_with_history(scratch, &[], &names, Ok(history.clone())),
+            );
             let (_, view) = app.active_native_view(wid).unwrap();
             let refused = app
                 .act_app(crate::app_control::ActRequest {

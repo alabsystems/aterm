@@ -161,10 +161,11 @@ impl<'a> Repos<'a> {
         self.ok(&cmd.arg("--initial-branch=main").arg(dir));
     }
 
-    /// A clone of `from` at `to`, with no template.
+    /// A clone of `from` at `to`, with no template. Use Git's regular transport so a
+    /// source-local metadata writer cannot race an object-directory copy.
     pub(crate) fn clone_into(&self, from: &Path, to: &Path) {
         self.ok(&git(self.live, &self.who, None)
-            .args(["clone", "--quiet", "--template="])
+            .args(["clone", "--no-local", "--quiet", "--template="])
             .arg(from)
             .arg(to));
     }

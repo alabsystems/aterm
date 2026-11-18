@@ -50,13 +50,13 @@ pub mod retirement;
 
 /// THE TESTS' CALL INTO A PASS between an entry's intent on record and its rename aside (the
 /// leaf's in [`Sweep::take_whole`], a tooling entry's in [`tooling::reclaim`]), with the entry's
-/// path: where a test sets what refuses that rename after the check. Unix test builds alone:
-/// only this crate's Unix tests call it.
-#[cfg(all(test, unix))]
+/// path: where a test sets what refuses that rename after the check, or, on Windows, what a
+/// build does once a shared unit's lock is let go ([`shared_units`]). Test builds alone.
+#[cfg(test)]
 #[path = "build_cache_seams_tests.rs"]
 pub(crate) mod seams;
 
-#[cfg(not(all(test, unix)))]
+#[cfg(not(test))]
 mod seams {
     pub(super) const fn staging(_: &std::path::Path) {}
 }

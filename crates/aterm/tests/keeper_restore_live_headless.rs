@@ -332,6 +332,7 @@ fn a_config_that_says_nothing_starts_the_keeper_and_survives_a_crash() {
     let root = world.0.clone();
     let label = job_label("default");
     let _job = Job::new(&label);
+    let startup = crate::keeper_world::keeper_start();
     let (a, sock) = boot(
         &root,
         "a",
@@ -346,9 +347,19 @@ fn a_config_that_says_nothing_starts_the_keeper_and_survives_a_crash() {
     });
     assert!(
         answered.is_some(),
-        "the keeper the launch started never answered; its status:\n{last}\ninstance log:\n{}",
-        crate::headless_boot::log_tail(&root.join("a.log"))
+        "the keeper the launch started never answered; launched job {label}: {:?}; its status:\n{last}\ninstance log:\n{}\nkeeper log:\n{}",
+        aterm_keeper::job::state(&label),
+        crate::headless_boot::log_tail(&root.join("a.log")),
+        last.split_whitespace()
+            .find_map(|word| word.strip_prefix("socket="))
+            .map(
+                |socket| crate::headless_boot::log_tail(&aterm_keeper::job::log_path(Path::new(
+                    socket
+                )))
+            )
+            .unwrap_or_else(|| "the status did not name its socket".to_owned())
     );
+    drop(startup);
     assert!(
         matches!(
             aterm_keeper::job::state(&label).expect("launchctl"),

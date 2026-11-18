@@ -9,7 +9,7 @@ use super::fixtures::{
 };
 use super::*;
 use crate::events::EventKind;
-use crate::model::{MemSample, Split, TabView, Vitals};
+use crate::model::{MemSample, Membership, ProcState, Split, TabView, Vitals};
 
 fn facts(scene: &Scene) -> Arc<WhyFacts> {
     facts_edited(scene, |_, _| {})
@@ -284,6 +284,107 @@ fn an_unread_listed_coalition_prevents_an_exact_split() {
 }
 
 #[test]
+fn sys_names_memory_member_coverage_is_independent_of_other_coalition_answers() {
+    let scene = Scene {
+        unanswered: 0,
+        ..spotlight_1032()
+    };
+    let full = facts(&scene);
+    assert!(full.split.coverage_complete);
+    let expected = &row(&full, 1092).memory_members;
+    assert!(expected.complete);
+    for missing in 0..2 {
+        let partial = facts_edited(&scene, |_, now| {
+            let coalitions = now.coalitions.as_mut().unwrap();
+            match missing {
+                0 => coalitions.truncated = true,
+                1 => coalitions.rows.retain(|coalition| coalition.id != 1100),
+                _ => unreachable!(),
+            }
+        });
+        assert!(!partial.split.coverage_complete);
+        assert_eq!(
+            &row(&partial, 1092).memory_members,
+            expected,
+            "the current process census and this coalition's active count still agree"
+        );
+    }
+    let cut = facts_edited(&scene, |_, now| now.procs_truncated = true);
+    let members = &row(&cut, 1092).memory_members;
+    assert!(members.truncated);
+    assert!(
+        !members.complete,
+        "a partial process census cannot prove the ranking complete"
+    );
+    assert_eq!(
+        members.top, expected.top,
+        "observed readable rows remain available"
+    );
+}
+
+#[test]
+fn sys_names_absent_process_input_cannot_certify_kept_rows_or_renew_their_observation() {
+    let [base, sweep, now] = sys_names_scene().samples();
+    let procs = now.procs.as_deref().unwrap();
+    let read = now.coalitions.as_ref().unwrap();
+    let first = CoalBase::of(
+        &base,
+        base.coalitions.as_ref().unwrap(),
+        base.procs.as_deref().unwrap(),
+    )
+    .unwrap();
+    let full = CoalBase::of(&now, read, procs).unwrap();
+    assert!(!full.procs_truncated);
+    let mut missing = now.clone();
+    missing.procs = None;
+    let absent = CoalBase::of(&missing, read, procs).unwrap();
+    assert!(
+        absent.procs_truncated,
+        "a separately supplied old slice is not a current census"
+    );
+    let members = vec![Membership::default(); procs.len()];
+    let delegated = vec![false; procs.len()];
+    let split = split(&SplitIn {
+        base: &first,
+        now: &absent,
+        procs,
+        members: &members,
+        delegated: &delegated,
+        self_uid: now.self_uid.unwrap(),
+        tabs: &now.tabs,
+        names: &IdMap::default(),
+        live: &IdMap::default(),
+        listed: read.listed,
+        reap: None,
+    });
+    let unproved = &split
+        .rows
+        .iter()
+        .find(|row| row.id == 4000)
+        .unwrap()
+        .memory_members;
+    assert!(unproved.truncated);
+    assert!(!unproved.complete);
+
+    let mut model = Vitals::new();
+    model.absorb(&base);
+    model.absorb(&sweep);
+    let previous = model.absorb(&now).why.unwrap();
+    missing.machine_only = true;
+    missing.at_ns += 1_000_000_000;
+    missing.at_unix_ms += 1000;
+    let retained = model.absorb(&missing).why.unwrap();
+    assert_eq!(
+        retained.at_ns, previous.at_ns,
+        "the normal no-procs path retains the old observation rather than restamping it"
+    );
+    assert_eq!(
+        row(&retained, 4000).memory_members,
+        row(&previous, 4000).memory_members
+    );
+}
+
+#[test]
 fn a_listed_coalition_that_answers_nothing_is_counted_as_listed() {
     let f = facts(&spotlight_1032());
     assert_eq!(f.split.listed, 9);
@@ -429,6 +530,279 @@ fn delegated_memory_is_read_at_the_split_tick_independently_of_cpu_coverage() {
             unread: 1
         }
     );
+}
+
+fn sys_names_scene() -> Scene {
+    let mut scene = shared_launcher_1032();
+    scene.unanswered = 0;
+    scene
+}
+
+#[test]
+fn sys_names_memory_members_name_the_idle_large_child_instead_of_the_old_lead() {
+    let mut scene = sys_names_scene();
+    let old = scene.procs.iter_mut().find(|p| p.pid == 4001).unwrap();
+    old.name = "old-shell".into();
+    old.footprint = 0;
+    let child = scene.procs.iter_mut().find(|p| p.pid == 4010).unwrap();
+    child.name = "idle-large-child".into();
+    child.mc = 0;
+    child.fast_mc = 0;
+    child.footprint = 8 << 30;
+    scene
+        .procs
+        .iter_mut()
+        .find(|p| p.pid == 4020)
+        .unwrap()
+        .footprint = 0;
+    scene
+        .coalitions
+        .iter_mut()
+        .find(|c| c.id == 4000)
+        .unwrap()
+        .footprint = Some(12 << 30);
+    let f = facts(&scene);
+    let coalition = row(&f, 4000);
+    assert_eq!(coalition.lead.as_ref().unwrap().pid, 4001);
+    assert_eq!(
+        coalition.cpu_mc, 900,
+        "published coalition CPU is unchanged"
+    );
+    let members = &coalition.memory_members;
+    assert!(members.complete);
+    assert_eq!(
+        (members.observed, members.readable, members.unread),
+        (3, 3, 0)
+    );
+    assert_eq!(members.top[0].pid, 4010);
+    assert_eq!(members.top[0].name, "idle-large-child");
+    assert_eq!(members.top[0].footprint, 8 << 30);
+    assert_ne!(Some(members.top[0].footprint), coalition.footprint);
+    assert_eq!(members.top[2].footprint, 0, "readable zero is retained");
+}
+
+#[test]
+fn sys_names_memory_members_cap_three_and_order_ties_independently_of_census_order() {
+    let mut scene = sys_names_scene();
+    for process in scene.procs.iter_mut().filter(|p| p.coalition == 4000) {
+        process.footprint = if process.pid == 4010 {
+            8 << 30
+        } else {
+            1 << 30
+        };
+    }
+    for (pid, footprint) in [(4002, 1 << 30), (4003, 2 << 30)] {
+        scene.procs.push(
+            Proc::new(
+                pid,
+                4001,
+                501,
+                4000,
+                USERSPACE_MS + i64::from(pid),
+                "other-member",
+                0,
+            )
+            .holding(footprint),
+        );
+    }
+    scene
+        .coalitions
+        .iter_mut()
+        .find(|c| c.id == 4000)
+        .unwrap()
+        .started = 5;
+    let first = facts(&scene);
+    let reversed = facts_edited(&scene, |_, now| now.procs.as_mut().unwrap().reverse());
+    let members = &row(&first, 4000).memory_members;
+    assert_eq!(members, &row(&reversed, 4000).memory_members);
+    assert!(members.complete);
+    assert_eq!((members.observed, members.readable), (5, 5));
+    assert_eq!(
+        members.top.iter().map(|m| m.pid).collect::<Vec<_>>(),
+        [4010, 4003, 4001]
+    );
+}
+
+#[test]
+fn sys_names_memory_members_keep_unread_truncated_and_missing_census_explicit() {
+    let scene = sys_names_scene();
+    for defect in 0..5 {
+        let f = facts_edited(&scene, |_, now| match defect {
+            0 => {
+                now.procs
+                    .as_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|p| p.pid == 4001)
+                    .unwrap()
+                    .footprint = None
+            }
+            1 => now.procs_truncated = true,
+            2 => {
+                now.coalitions
+                    .as_mut()
+                    .unwrap()
+                    .rows
+                    .iter_mut()
+                    .find(|c| c.id == 4000)
+                    .unwrap()
+                    .tasks_started += 1
+            }
+            3 => now
+                .procs
+                .as_mut()
+                .unwrap()
+                .retain(|p| p.coalition != Some(4000)),
+            4 => {
+                let coalition = now
+                    .coalitions
+                    .as_mut()
+                    .unwrap()
+                    .rows
+                    .iter_mut()
+                    .find(|c| c.id == 4000)
+                    .unwrap();
+                coalition.tasks_exited = coalition.tasks_started + 1;
+            }
+            _ => unreachable!(),
+        });
+        let members = &row(&f, 4000).memory_members;
+        assert!(!members.complete, "defect {defect}");
+        match defect {
+            0 => {
+                assert_eq!(
+                    (members.readable, members.unread, members.missing),
+                    (2, 1, Some(0))
+                );
+                assert!(members.top.iter().all(|member| member.pid != 4001));
+            }
+            1 => {
+                assert!(members.truncated);
+                assert_eq!(members.readable, 3, "partial still means observed readable");
+            }
+            2 => assert_eq!(members.missing, Some(1)),
+            3 => {
+                assert!(
+                    members.top.is_empty(),
+                    "no member figure is invented as zero"
+                );
+                assert_eq!(
+                    (members.observed, members.readable, members.missing),
+                    (0, 0, Some(3))
+                );
+            }
+            4 => assert_eq!(
+                members.missing, None,
+                "invalid task counters are unavailable"
+            ),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn sys_names_memory_members_exclude_unknown_zombie_and_duplicate_identities() {
+    let scene = sys_names_scene();
+    for state in [ProcState::Unknown, ProcState::Zombie] {
+        let f = facts_edited(&scene, |_, now| {
+            let member = now
+                .procs
+                .as_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|p| p.pid == 4001)
+                .unwrap();
+            member.state = state;
+            member.footprint = Some(u64::MAX);
+            if state == ProcState::Zombie {
+                now.coalitions
+                    .as_mut()
+                    .unwrap()
+                    .rows
+                    .iter_mut()
+                    .find(|c| c.id == 4000)
+                    .unwrap()
+                    .tasks_exited += 1;
+            }
+        });
+        let members = &row(&f, 4000).memory_members;
+        assert_eq!(members.excluded, 1);
+        assert!(members.top.iter().all(|member| member.pid != 4001));
+        assert_eq!(members.complete, state == ProcState::Zombie);
+        assert_eq!(
+            members.missing,
+            Some(u64::from(state == ProcState::Unknown))
+        );
+    }
+    for other_coalition in [4000, 1092] {
+        let f = facts_edited(&scene, |_, now| {
+            let mut duplicate = now
+                .procs
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|p| p.pid == 4001)
+                .unwrap()
+                .clone();
+            duplicate.start = Some(99);
+            duplicate.coalition = Some(other_coalition);
+            duplicate.footprint = Some(u64::MAX);
+            now.procs.as_mut().unwrap().push(duplicate);
+        });
+        let members = &row(&f, 4000).memory_members;
+        assert!(!members.complete);
+        assert_eq!(
+            (
+                members.observed,
+                members.readable,
+                members.ambiguous,
+                members.missing
+            ),
+            (3, 2, 1, Some(1))
+        );
+        assert!(members.top.iter().all(|member| member.pid != 4001));
+        let other = &row(&f, other_coalition).memory_members;
+        assert!(!other.complete);
+        assert_eq!(
+            other.ambiguous, 1,
+            "both conflicting coalition assignments are ambiguous"
+        );
+    }
+}
+
+#[test]
+fn sys_names_memory_members_keep_only_current_generation_and_name_facts() {
+    let scene = sys_names_scene();
+    for unread_identity in [false, true] {
+        let f = facts_edited(&scene, |_, now| {
+            let member = now
+                .procs
+                .as_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|p| p.pid == 4001)
+                .unwrap();
+            member.start = (!unread_identity).then_some(123);
+            member.version = (!unread_identity).then_some(42);
+            member.birth_ms = (!unread_identity).then_some(USERSPACE_MS + 999);
+            member.at_ns = (!unread_identity).then_some(456);
+            member.name = "current-large-member".into();
+            member.footprint = Some(8 << 30);
+        });
+        let members = &row(&f, 4000).memory_members;
+        let member = &members.top[0];
+        assert_eq!(
+            (member.pid, member.name.as_str(), member.footprint),
+            (4001, "current-large-member", 8 << 30)
+        );
+        assert_eq!(member.start, (!unread_identity).then_some(123));
+        assert_eq!(member.version, (!unread_identity).then_some(42));
+        assert_eq!(
+            member.birth_ms,
+            (!unread_identity).then_some(USERSPACE_MS + 999)
+        );
+        assert_eq!(member.at_ns, (!unread_identity).then_some(456));
+    }
 }
 
 #[test]

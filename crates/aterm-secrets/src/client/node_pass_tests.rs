@@ -1422,6 +1422,67 @@ fn ended_runner(exe: &Path) -> aterm_uds::spawnfd::Child {
 
 #[cfg(unix)]
 #[test]
+fn a_completed_identity_does_not_start_a_node_repair_ahead_of_shared_refresh_retry() {
+    use crate::converge::{RefreshObservation, RefreshVersion, RepositoryRequest, RepositoryWork};
+    for identity_complete in [false, true] {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let code = crate::converge::runner_exit_code(1, identity_complete);
+        let failed = converge_program(root.path(), "identity-result", &format!("exit {code}"));
+        let requests = std::cell::RefCell::new(Vec::new());
+        let start = |request| {
+            requests.borrow_mut().push(request);
+            Some(ended_runner(&failed))
+        };
+        let mut converge = NodeConverge::default();
+        converge.due.identity_changed();
+        converge.tend_at(0, [None; 3], &|| true, &start);
+        let RepositoryRequest::Refresh(request) = converge.due.repository_request() else {
+            panic!("startup owes a refresh");
+        };
+        let mut observed = RefreshObservation {
+            version: RefreshVersion {
+                attempt: 1,
+                ..RefreshVersion::default()
+            },
+            pending: Some(request),
+            retry_ms: Some(60_000),
+            ..RefreshObservation::default()
+        };
+        assert_eq!(observed.retry_for(request), Some(60_000));
+        converge.due.observe(observed);
+        converge.tend_at(1, [None; 3], &|| true, &start);
+        assert_eq!(requests.borrow().len(), 1);
+
+        observed.retry_ms = Some(55_000);
+        converge.due.observe(observed);
+        converge.tend_at(5_001, [None; 3], &|| true, &start);
+        assert_eq!(
+            requests.borrow().len(),
+            if identity_complete { 1 } else { 2 }
+        );
+        if identity_complete {
+            observed.retry_ms = Some(0);
+            converge.due.observe(observed);
+            converge.tend_at(60_001, [None; 3], &|| true, &start);
+            assert_eq!(
+                requests.borrow().len(),
+                2,
+                "the unrelated refresh is still owed"
+            );
+            assert_eq!(requests.borrow()[1].work(), RepositoryWork::Refresh);
+            observed.retry_ms = Some(60_000);
+            converge.due.observe(observed);
+            converge.tend_at(60_002, [None; 3], &|| true, &start);
+        } else {
+            assert_eq!(requests.borrow()[1].work(), RepositoryWork::Repair);
+            converge.tend_at(5_002, [None; 3], &|| true, &start);
+        }
+        assert!(converge.runner.is_none());
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn a_standing_row_parks_the_nodes_actual_runner_until_an_input_changes() {
     let root = aterm_tempfile::tempdir().unwrap();
     let standing = converge_program(

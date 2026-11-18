@@ -21,8 +21,8 @@
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 
 use super::login_tests::{Desk, NOW, upkeep_effects};
 use super::*;
@@ -58,15 +58,14 @@ fn env_of(desk: &Desk, now: i64) -> Env {
     )
 }
 
-/// `accounts add <label> [--email <email>]` on `desk`: its exit code, stdout and stderr.
-pub(super) fn add(desk: &Desk, label: &str, email: Option<&str>) -> (ExitCode, String, String) {
+/// `accounts add <account>` on `desk`: its exit code, stdout and stderr.
+pub(super) fn add(desk: &Desk, account: &str) -> (ExitCode, String, String) {
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = run_accounts(
         &AccountsCmd::Add {
-            label: label.to_owned(),
+            account: account.to_owned(),
             class: Class::Preferred,
-            email: email.map(str::to_owned),
-            identity_email: None,
+            email: None,
             browser: None,
         },
         &env_of(desk, NOW),
@@ -134,8 +133,11 @@ fn a_resync_syncs_only_what_changed_and_writes_only_what_differs() {
         Err(format!("no fetch in a test: {source}"))
     };
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
-    let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let (cooldown, rediscovery) = (
+        Watched::new("accounts_sync/sync_cooldown", None),
+        Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
+    );
+    let guard = AutoRenewGuard::default().shared();
     let fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
 
     let first = resync_with(&desk.home, &desk.state, (&desk.roster(), NOW, false), &fx);
@@ -196,7 +198,7 @@ fn a_resync_syncs_only_what_changed_and_writes_only_what_differs() {
 }
 
 /// The rows a resync leaves with no login here are reported, and the automatic ladder leaves
-/// them for a person (`accounts login <label>`): no session here can run on a row with no login
+/// them for a person (`accounts login <account>`): no session here can run on a row with no login
 /// here, and no Mac uses it yet (`DESIGN-alab-one-mesh-2026-11-05.md` §4.15 rule 4), so nothing
 /// is started and nothing is on record, even where a session's record names the row. CONTROL: a
 /// resync that may not sign in (an instance that keeps no fleet accounts of its own) reports the
@@ -228,8 +230,11 @@ fn the_rows_a_resync_leaves_without_a_login_are_reported_and_left_for_a_person()
             counted.fetch_add(1, Ordering::SeqCst);
             Ok(())
         };
-        let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let (cooldown, rediscovery) = (
+            Watched::new("accounts_sync/sync_cooldown", None),
+            Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
+        );
+        let guard = AutoRenewGuard::default().shared();
         let fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
         let done = resync_with(&desk.home, &desk.state, (&desk.roster(), NOW, sign_in), &fx);
         assert_eq!(done.to_sign_in, ["m27-2"], "{done:?}");
@@ -246,8 +251,9 @@ fn the_rows_a_resync_leaves_without_a_login_are_reported_and_left_for_a_person()
 
 /// `accounts add` on a fleet discovery made lists the row in the fleet file too, for this
 /// machine, so the next sync (from init, a window's upkeep or a person's `accounts sync`) keeps
-/// it with its own login directory; the file still says `discovered`. CONTROL: a row with no
-/// email, which a fleet cannot list, is refused and nothing is written.
+/// it, under the account's reserved slug, with its own login directory; the file still says
+/// `discovered`. CONTROL: a word that names no account (a would-be label) is refused and nothing
+/// is written.
 #[cfg(unix)]
 #[test]
 fn a_row_added_beside_a_local_fleet_survives_the_next_sync() {
@@ -257,16 +263,14 @@ fn a_row_added_beside_a_local_fleet_survives_the_next_sync() {
         fs::read(desk.roster()).unwrap(),
         fs::read(desk.fleet_file()).unwrap(),
     );
-    let (code, _, err) = add(&desk, "work", None);
+    let (code, _, err) = add(&desk, "work");
     assert_eq!(code, ExitCode::from(1));
-    assert!(
-        err.contains(&desk.fleet_file().display().to_string()),
-        "{err}"
-    );
+    assert!(err.contains(&aterm_file::no_account("work")), "{err}");
     assert_eq!(fs::read(desk.roster()).unwrap(), roster_was, "CONTROL");
     assert_eq!(fs::read(desk.fleet_file()).unwrap(), fleet_was, "CONTROL");
 
-    let (code, out, err) = add(&desk, "work", Some("work@example.test"));
+    let (code, out, err) = add(&desk, "claude work@example.test");
+    let work = super::super::account_names::tests::added_label(Cli::Claude, "work@example.test");
     assert_eq!(code, ExitCode::SUCCESS, "{err}");
     assert!(
         out.contains(&desk.fleet_file().display().to_string()),
@@ -275,9 +279,9 @@ fn a_row_added_beside_a_local_fleet_survives_the_next_sync() {
     let fleet_text = fs::read_to_string(desk.fleet_file()).unwrap();
     assert_eq!(opt_in_of(&fleet_text), Some(OptIn::Discovered));
     let fleet = FleetRoster::from_toml(&fleet_text, "fleet").unwrap();
-    let listed = fleet.accounts.iter().find(|a| a.label == "work").unwrap();
+    let listed = fleet.accounts.iter().find(|a| a.label == work).unwrap();
     assert_eq!(listed.machines, ["m27"]);
-    let dir = desk.rows().row("work").and_then(|r| r.dir.clone()).unwrap();
+    let dir = desk.rows().row(&work).and_then(|r| r.dir.clone()).unwrap();
 
     sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW + 10).expect("init");
     let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -300,7 +304,7 @@ fn a_row_added_beside_a_local_fleet_survives_the_next_sync() {
         String::from_utf8_lossy(&err)
     );
     let roster = desk.rows();
-    let kept = roster.row("work").expect("the added row survives the sync");
+    let kept = roster.row(&work).expect("the added row survives the sync");
     assert_eq!(kept.email.as_deref(), Some("work@example.test"));
     assert_eq!(kept.dir.as_deref(), Some(dir.as_str()));
     assert_eq!(roster.rows.len(), 3);
@@ -322,7 +326,7 @@ fn a_row_added_under_a_source_this_machine_does_not_write_is_refused_by_name() {
     let vault_path = crate::vault_entry::source_name(FLEET_ROSTER_FILE);
     sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW).expect("vault fleet");
     let roster_was = fs::read(desk.roster()).unwrap();
-    let (code, _, err) = add(&desk, "work", Some("work@example.test"));
+    let (code, _, err) = add(&desk, "claude work@example.test");
     assert_eq!(code, ExitCode::from(1));
     assert!(err.contains(&vault_path), "{err}");
     assert_eq!(fs::read(desk.roster()).unwrap(), roster_was);
@@ -330,7 +334,8 @@ fn a_row_added_under_a_source_this_machine_does_not_write_is_refused_by_name() {
         crate::vault_entry::read_text(&desk.home, FLEET_ROSTER_FILE, 1 << 20).text(),
         Some(vault)
     );
-    assert!(!desk.store().login_dir("work").unwrap().exists());
+    let work = super::super::account_names::tests::added_label(Cli::Claude, "work@example.test");
+    assert!(!desk.store().login_dir(&work).unwrap().exists());
     assert_eq!(
         listed_origin(&desk),
         (Some("vault".to_owned()), Some(vault_path.clone()))
@@ -343,7 +348,7 @@ fn a_row_added_under_a_source_this_machine_does_not_write_is_refused_by_name() {
         format!("[fleet]\nmachine = \"m27\"\naccounts_source = \"{source}\"\n"),
     )
     .unwrap();
-    let (code, _, err) = add(&keyed, "work", Some("work@example.test"));
+    let (code, _, err) = add(&keyed, "claude work@example.test");
     assert_eq!(code, ExitCode::from(1));
     assert!(err.contains(source), "{err}");
     assert!(!keyed.roster().exists());
@@ -418,8 +423,11 @@ fn a_local_accounts_source_is_synced_again_each_time_it_changes() {
     )
     .unwrap();
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
-    let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let (cooldown, rediscovery) = (
+        Watched::new("accounts_sync/sync_cooldown", None),
+        Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
+    );
+    let guard = AutoRenewGuard::default().shared();
     let fx = upkeep_effects(&fetch_source_text, &spawn, &cooldown, &rediscovery, &guard);
     let pass = |now: i64| resync_with(&desk.home, &desk.state, (&desk.roster(), now, false), &fx);
 
@@ -461,12 +469,15 @@ fn the_converge_read_is_due_where_the_resync_syncs_a_missing_roster() {
         Err(format!("no fetch in a test: {source}"))
     };
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
-    let read = Mutex::new(Rediscovery::default());
+    let guard = AutoRenewGuard::default().shared();
+    let read = Watched::new("accounts_sync/rediscovery", Rediscovery::default());
     let probe = |now: i64| read_resync_with(&desk.home, &desk.state, &desk.roster(), now, &read);
     // Each runner is a process of its own: a resync with fresh effects, as the pass's apply.
     let resync = |now: i64| {
-        let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
+        let (cooldown, rediscovery) = (
+            Watched::new("accounts_sync/sync_cooldown", None),
+            Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
+        );
         let fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
         resync_with(&desk.home, &desk.state, (&desk.roster(), now, false), &fx)
     };
@@ -528,7 +539,7 @@ fn a_kimi_only_resync_reaches_current_without_a_claude_roster_or_source() {
             &desk.state,
             &desk.roster(),
             NOW,
-            &Mutex::new(Rediscovery::default()),
+            &Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
         ),
         ResyncRead::Due(_)
     ));
@@ -537,8 +548,11 @@ fn a_kimi_only_resync_reaches_current_without_a_claude_roster_or_source() {
         Err(format!("no fetch in a test: {source}"))
     };
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
-    let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let (cooldown, rediscovery) = (
+        Watched::new("accounts_sync/sync_cooldown", None),
+        Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
+    );
+    let guard = AutoRenewGuard::default().shared();
     let fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
     let synced = resync_with(&desk.home, &desk.state, (&desk.roster(), NOW, false), &fx);
 
@@ -563,7 +577,7 @@ fn a_kimi_only_resync_reaches_current_without_a_claude_roster_or_source() {
             &desk.state,
             &desk.roster(),
             NOW + 2,
-            &Mutex::new(Rediscovery::default()),
+            &Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
         )
     };
     assert_eq!(probe(), ResyncRead::Current);
@@ -608,15 +622,18 @@ fn a_missing_claude_roster_keeps_its_unannotated_local_source_and_its_refusal() 
             &desk.roster(),
             NOW
         ));
-        let read = Mutex::new(Rediscovery::default());
+        let read = Watched::new("accounts_sync/rediscovery", Rediscovery::default());
         let probe = |now| read_resync_with(&desk.home, &desk.state, &desk.roster(), now, &read);
         assert_eq!(probe(NOW), ResyncRead::NoSource);
         let fetch = |_: &Env, source: &str| -> Result<String, String> {
             Err(format!("no fetch in a test: {source}"))
         };
         let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
-        let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let (cooldown, rediscovery) = (
+            Watched::new("accounts_sync/sync_cooldown", None),
+            Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
+        );
+        let guard = AutoRenewGuard::default().shared();
         let fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
         let synced = resync_with(&desk.home, &desk.state, (&desk.roster(), NOW, false), &fx);
         assert!(synced.synced, "{synced:?}");
@@ -655,7 +672,7 @@ fn an_ai_pool_without_claude_accounts_for_this_machine_reaches_current() {
         vec![Cli::Codex]
     );
 
-    let read = Mutex::new(Rediscovery::default());
+    let read = Watched::new("accounts_sync/rediscovery", Rediscovery::default());
     let probe = |now| read_resync_with(&desk.home, &desk.state, &desk.roster(), now, &read);
     let before = probe(NOW);
     assert!(
@@ -666,8 +683,11 @@ fn an_ai_pool_without_claude_accounts_for_this_machine_reaches_current() {
         Err(format!("no fetch in a test: {source}"))
     };
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
-    let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let (cooldown, rediscovery) = (
+        Watched::new("accounts_sync/sync_cooldown", None),
+        Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
+    );
+    let guard = AutoRenewGuard::default().shared();
     let fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
     let synced = resync_with(&desk.home, &desk.state, (&desk.roster(), NOW, false), &fx);
     assert!(

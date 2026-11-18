@@ -477,12 +477,13 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
         return Ok(());
     }
     let commit = snapshot::git_text(repo, &["rev-parse", "HEAD"])?;
-    let take = buildplan::Take::prepare(repo, commit.trim())?;
-    let inputs = if cfg!(target_os = "macos") {
-        Some(crate::build_inputs::current()?)
+    let purpose = if opts.native_only {
+        buildplan::TakePurpose::Native
     } else {
-        None
+        buildplan::TakePurpose::Universal
     };
+    let take = buildplan::Take::prepare_for(repo, commit.trim(), purpose)?;
+    let inputs = take.input_identity();
     let cache = snapshot::CacheRoot::for_repo(repo)?;
     let pilot_cache = cache.path().join(".ubd/pilot");
     let (root, mut rows) = if let Some(resume) = &opts.resume {
@@ -651,11 +652,7 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
             }
         }
     }
-    if let Some(before) = &inputs
-        && crate::build_inputs::current()? != *before
-    {
-        return Err("pilot compiler or SDK inputs changed during the comparison".into());
-    }
+    take.recheck_inputs()?;
     if opts.diagnostic_anatomy() {
         println!(
             "profile-pilot: anatomy recorded; one take does not judge reproducibility; report {}",

@@ -1819,8 +1819,22 @@ fn ai_accounts_claude_probe(env: &aterm_agent::harness::cli::Env) -> aterm_conve
             })
             .count();
         let own_label = bound.row_for_login(None).map(|r| r.label.as_str());
+        // The hint types the row's account word, never its label
+        // (`aterm_agent::harness::account_names::sign_in_word_of`).
+        let lab = aterm_agent::harness::alab_roster::current();
         let next_hint = accounts::renew_next(&bound, &state, &enrolled, own_label, env.now)
-            .map(|label| format!("; next: `aterm harness accounts renew {label}`"))
+            .map(|label| {
+                let word = aterm_agent::harness::account_names::sign_in_word_of(
+                    accounts::Cli::Claude,
+                    &label,
+                    &raw.rows,
+                    lab.as_deref(),
+                );
+                format!(
+                    "; next: `{}`",
+                    aterm_agent::harness::accounts_step::Step::renew(accounts::Cli::Claude, word)
+                )
+            })
             .unwrap_or_default();
         return Probe::Ok {
             now: format!(

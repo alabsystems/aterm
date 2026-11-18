@@ -1394,6 +1394,8 @@ fn claude_token_states(env: &Env) -> BTreeMap<String, String> {
             &view::Places {
                 store: &store,
                 roster: roster.as_deref(),
+                // The state words are keyed by label; no account is named.
+                lab: None,
                 logins: &[],
                 now: env.now,
                 offers: view::OFFERED_HERE,

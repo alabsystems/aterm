@@ -19,6 +19,67 @@ fn captured(os: &str, namespace: Option<&str>) -> ProcessLifetime {
 }
 
 #[test]
+fn observation_matching_preserves_precise_birth_and_pid_without_a_native_probe() {
+    for lifetime in [
+        captured("darwin", None),
+        captured("windows", None),
+        captured("linux", Some("4026531836")),
+    ] {
+        let matches = |pid, birth| {
+            lifetime.matches_observation(&lifetime.scope, lifetime.namespace.as_deref(), pid, birth)
+        };
+        assert!(matches(lifetime.pid(), lifetime.identity.birth));
+        let reused = Birth(lifetime.identity.birth.0 + 1);
+        assert_eq!(
+            lifetime.identity.birth.0 / 1_000_000,
+            reused.0 / 1_000_000,
+            "a rounded start cannot distinguish the generations"
+        );
+        assert!(!matches(lifetime.pid(), reused));
+        assert!(!matches(lifetime.pid() + 1, lifetime.identity.birth));
+        assert!(!matches(u32::MAX, lifetime.identity.birth));
+        assert!(!matches(lifetime.pid(), Birth(0)));
+    }
+}
+
+#[test]
+fn observation_matching_requires_the_recorded_machine_boot_and_namespace() {
+    let lifetime = captured("linux", Some("4026531836"));
+    let matches = |scope: &BootStamp, namespace: Option<&str>| {
+        lifetime.matches_observation(scope, namespace, lifetime.pid(), lifetime.identity.birth)
+    };
+    assert!(matches(&lifetime.scope, Some("4026531836")));
+    assert!(!matches(&lifetime.scope, None));
+    assert!(!matches(&lifetime.scope, Some("4026531837")));
+    for scope in [
+        BootStamp {
+            host: format!("linux:{}", "c".repeat(32)),
+            ..lifetime.scope.clone()
+        },
+        BootStamp {
+            boot: "c".repeat(32),
+            ..lifetime.scope.clone()
+        },
+    ] {
+        assert!(!matches(&scope, Some("4026531836")));
+    }
+
+    let no_namespace = captured("darwin", None);
+    assert!(no_namespace.matches_observation(
+        &no_namespace.scope,
+        None,
+        no_namespace.pid(),
+        no_namespace.identity.birth,
+    ));
+    assert!(!no_namespace.matches_observation(
+        &no_namespace.scope,
+        Some("4026531836"),
+        no_namespace.pid(),
+        no_namespace.identity.birth,
+    ));
+}
+
+#[test]
 fn an_exact_birth_refutes_a_reused_pid_even_within_the_same_second() {
     let lifetime = captured("darwin", None);
     let replacement = Birth(1_234_999);

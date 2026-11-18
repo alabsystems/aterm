@@ -394,6 +394,10 @@ fn list_to_set<'k>(
     Some((parsed, member, longest))
 }
 
+/// One candidate list as `as_members` reads it: its typed value's fields and the members it
+/// holds, by element key.
+type Members = (CellValue, BTreeMap<String, String>);
+
 /// The element registers that restate a list register (`coord`, its old `candidates`) in a
 /// generation that holds its column as a text set (`form`, from [`list_to_set`]): one register
 /// for each member any candidate lists, and for each element `target` holds there that an
@@ -423,7 +427,7 @@ fn as_members(
     };
     // Each candidate's list, by origin: its typed value's fields and the members it holds, by
     // element key; `None` for a revert's bare `null`.
-    let mut lists: Vec<(Digest, Option<(CellValue, BTreeMap<String, String>)>)> = Vec::new();
+    let mut lists: Vec<(Digest, Option<Members>)> = Vec::new();
     let mut universe: BTreeSet<String> = BTreeSet::new();
     for (origin, value) in candidates {
         if value.is_null() {

@@ -82,7 +82,10 @@ fn receipts_of(paths: &Paths, expected: Option<&Config>) -> crate::Result<Observ
         return Ok(Observed::Read(Receipts::default()));
     };
     let recipient = read_identity(paths)?.map(|key| key.recipient().0);
-    let state = load_state(paths)?;
+    let state = read_state(paths)?;
+    // It answers with the receipts, which are no part of the file's standing.
+    note_whole_state(&paths.state_file(), state.as_ref());
+    let state = state.unwrap_or_default();
     Ok(Observed::Read(Receipts {
         materialization: network_observation::project_for(config, recipient, &state),
         http204: http204_observation::project(config, recipient, &state),

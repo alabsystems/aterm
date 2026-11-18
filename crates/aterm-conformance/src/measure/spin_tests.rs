@@ -184,15 +184,26 @@ fn a_rest_take_decides_only_at_rest_and_the_awake_control_only_awake() {
 fn a_takes_footprint_reads_its_median_and_its_share_at_the_floor() {
     let mib = |m: u64| m << 20;
     let footprints = [mib(280), mib(100), mib(110), mib(281), mib(105)];
-    let s = Sampled::of(&footprints, 7).expect("samples");
+    let s = Sampled::of(&footprints, 7, 14).expect("samples");
     assert_eq!(
         (s.samples, s.min, s.max, s.p50, s.at_floor),
         (5, mib(100), mib(281), mib(110), 3)
     );
     assert!((s.floor_share() - 0.6).abs() < 1e-9, "{s:?}");
     assert_eq!(s.cpu_ns, 7);
-    assert_eq!(Sampled::of(&[], 0), None);
+    assert_eq!(Sampled::of(&[], 0, 0), None);
     assert!(s.to_string().contains("footprint_p50_mib=110.0 "), "{s}");
+}
+
+/// A take's CPU rate is its CPU time over the wall time its samples spanned, in ms a second:
+/// 30 ms of CPU over 60 s is 0.5 ms/s; samples that spanned no time read 0.
+#[test]
+fn a_takes_cpu_rate_is_its_cpu_time_over_the_span_its_samples_took() {
+    let s = Sampled::of(&[1 << 20], 30_000_000, 60_000_000_000).expect("one sample");
+    assert!((s.cpu_ms_per_s() - 0.5).abs() < 1e-9, "{s:?}");
+    assert!(s.to_string().contains(" cpu_ms_per_s=0.500"), "{s}");
+    let still = Sampled::of(&[1 << 20], 30_000_000, 0).expect("one sample");
+    assert!(still.cpu_ms_per_s().abs() < f64::EPSILON, "{still:?}");
 }
 
 /// A pet take whose needle fired `fires` times against the frames its window's readings owed
@@ -224,6 +235,7 @@ fn a_rows_head_sets_its_recording_either_way_and_a_rewound_scene_needs_it_on() {
         SpinScene::PetAsleep,
         SpinScene::Resting,
         SpinScene::Hidden,
+        SpinScene::Unattended,
     ] {
         // Every scene the enum has: a new one fails to compile here until it joins the list.
         match scene {
@@ -234,7 +246,8 @@ fn a_rows_head_sets_its_recording_either_way_and_a_rewound_scene_needs_it_on() {
             | SpinScene::Windowed
             | SpinScene::PetAsleep
             | SpinScene::Resting
-            | SpinScene::Hidden => {}
+            | SpinScene::Hidden
+            | SpinScene::Unattended => {}
         }
         for recording in [true, false] {
             let row = SpinRow {

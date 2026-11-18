@@ -10,13 +10,18 @@
 //! unattended sign-in a lift ends, the row a step cannot lift, and the run a sleep interrupts.
 //! Every fixture address is `example.test`.
 
+// Read by the tests a scripted run of the ladder must reach, which run on Unix alone, where
+// aterm links the opener its page is handed to (`cli::opener_link`).
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::ladder_tests::{Bench, attempt_of, hand_roster, runs_signed_out};
 use super::login_tests::{Desk, NOW};
 use super::*;
-use crate::harness::cli::{RenewBrowser, Renewal};
+#[cfg(unix)]
+use crate::harness::cli::RenewBrowser;
+use crate::harness::cli::Renewal;
 use crate::harness::login_adoption::tests::{
     tap_path, write_login_row, write_profile, write_response_across_a_tool_result,
     write_served_turn, write_tap,
@@ -90,7 +95,11 @@ fn upkeep_at(desk: &Desk, bench: &Bench, now: i64) -> Upkept {
     upkeep(
         &desk.home,
         &desk.state,
-        (&desk.roster(), now, UpkeepStep::Both),
+        (
+            &desk.roster(),
+            aterm_uds::trace::Now::at(now),
+            UpkeepStep::Both,
+        ),
         &bench.fx(),
     )
 }
@@ -124,7 +133,8 @@ impl Wrote {
         }
     }
 
-    /// When its last row was written.
+    /// When its last row was written: what the Unix-only in-flight run reports.
+    #[cfg(unix)]
     fn ended(self) -> i64 {
         match self {
             Self::Turn(_, answered) => answered,
@@ -351,8 +361,14 @@ fn login_adopted_the_upkeep_starts_no_sign_in_for_an_account_with_newer_served_e
                 !served,
                 "{what}"
             );
-            assert_eq!(bench.handed().len(), usize::from(!served), "{what}");
-            assert_eq!(attempt_of(&desk, MAIN).is_some(), !served, "{what}");
+            // The control's sign-in is handed its page, and its attempt is on record, on Unix
+            // alone, where aterm links the opener an unattended run's page is handed to
+            // (`cli::opener_link`); off Unix it is refused before its provider runs, and
+            // `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener` holds that.
+            if served || cfg!(unix) {
+                assert_eq!(bench.handed().len(), usize::from(!served), "{what}");
+                assert_eq!(attempt_of(&desk, MAIN).is_some(), !served, "{what}");
+            }
             assert!(
                 signed_out(&desk, MAIN, now),
                 "{what}: the ladder's read hid the row and lifted nothing; the upkeep's step \
@@ -373,11 +389,16 @@ fn login_adopted_the_upkeep_starts_no_sign_in_for_an_account_with_newer_served_e
 /// API time it grew, lifts nothing and cancels nothing, whether its answer is one row or its
 /// response ran a tool while it streamed (the tool's result and a later row of that response
 /// are then both written after the sign-out and the baseline), and neither does no evidence:
-/// the run is counted failed and its work is not cancelled. A run superseded before its provider's
-/// step started gives its spacing back. A sign-in a person started is never marked, so a lift
-/// of its account cancels nothing.
+/// the run is counted failed and its work is not cancelled.
+///
+/// Unix only, where aterm links the opener an unattended run's page is handed to
+/// (`cli::opener_link`): off Unix the run never starts, and
+/// `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener` holds what runs there. A
+/// run superseded before it began and a person's sign-in are held on every platform
+/// ([`login_adopted_a_lift_reaches_no_run_before_it_began_and_no_desk_sign_in`]).
+#[cfg(unix)]
 #[test]
-fn login_adopted_a_lift_supersedes_an_unattended_sign_in_in_flight_but_never_a_desk_one() {
+fn login_adopted_a_lift_supersedes_an_unattended_sign_in_in_flight() {
     for (what, turn, lifts) in [
         (
             "a request served after the sign-out",
@@ -494,7 +515,15 @@ fn login_adopted_a_lift_supersedes_an_unattended_sign_in_in_flight_but_never_a_d
             "{what}: the mark ends with the run's work"
         );
     }
+}
 
+/// A LIFT REACHES NO RUN BEFORE IT BEGAN AND NO SIGN-IN A PERSON STARTED: the ladder's run of a
+/// row superseded before its provider's step started loaded nothing, so its spacing goes back
+/// and no cooldown is left on its row; and a sign-in a person started is never marked, so a
+/// lift of its account cancels nothing. CONTROL: the ladder's own run under the same scope is
+/// superseded, and it alone, and what stops the step still stops the run.
+#[test]
+fn login_adopted_a_lift_reaches_no_run_before_it_began_and_no_desk_sign_in() {
     // Superseded before its provider's step started: nothing loaded, so its spacing goes back
     // and no cooldown is left on its row.
     let desk = desk_seen();
@@ -533,7 +562,7 @@ fn login_adopted_a_lift_supersedes_an_unattended_sign_in_in_flight_but_never_a_d
     );
 
     // A person's sign-in carries no mark, so nothing a lift does reaches it.
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let lifetime = crate::harness::account_work::Lifetime::default();
     let scope = lifetime.enter().unwrap();
     assert!(RunMark::of(&guard, MAIN, false, Some(&scope)).is_none());
@@ -574,7 +603,7 @@ fn login_adopted_a_lift_supersedes_an_unattended_sign_in_in_flight_but_never_a_d
 fn login_adopted_a_sign_in_is_held_only_where_the_lift_landed_and_a_refusal_is_said_once() {
     let now = T + 120;
     let ask = |desk: &Desk, pass: &Pass| {
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         login_live_again(
             (&desk.home, &desk.state, &desk.roster()),
             MAIN,
@@ -613,7 +642,7 @@ fn login_adopted_a_sign_in_is_held_only_where_the_lift_landed_and_a_refusal_is_s
     // No evidence.
     assert!(!ask(&desk_seen(), &Pass::default()));
 
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let said = Mutex::new(Vec::new());
     let settle = |lift: Lift| {
         let pass = Pass::default();
@@ -717,6 +746,11 @@ fn login_adopted_a_row_on_its_own_login_directory_is_left_to_the_ladder_and_said
     let bench = Bench::ending(Renewal::Failed);
     w3_tap(T - 5, 4_000);
     let _ = upkeep_at(&desk, &bench, T + 10);
+    // Its page is handed on Unix alone, where aterm links the opener an unattended run's page
+    // is handed to (`cli::opener_link`); off Unix the ladder's run is refused before it starts
+    // (`an_unattended_run_is_handed_nothing_where_aterm_links_no_opener`), and the row stays
+    // its candidate all the same.
+    #[cfg(unix)]
     assert_eq!(bench.handed().len(), 1, "the ladder signs the row in");
     write_login_row(&desk.home, T + 38);
     write_served_turn(&desk.home, T + 95, T + 97);

@@ -24,6 +24,7 @@ use aterm_vitals::sys::{
 use crate::occupancy_host::Arming;
 use crate::session_store::Store;
 use crate::vitals_host::Msg;
+use crate::vitals_host::memory::{self, ObservedAt};
 
 /// The event ring's size.
 pub(crate) const EVENTS_CAP: usize = 256;
@@ -66,10 +67,14 @@ pub(crate) struct Held {
     pub(crate) unix_ms: u64,
     /// When the machine observation began on the monotonic clock.
     pub(crate) at: Instant,
+    /// The original read boundary, including a clock that continues through suspension.
+    pub(crate) observed_at: ObservedAt,
     /// When the carried job pass observed its input, independent of publication.
     pub(crate) jobs_at: Option<Instant>,
     /// Input observation of the independently assessed leftover view.
     pub(crate) left_at: Option<Instant>,
+    /// Complete source facts paired with this whole reading, independent of CPU warm-up.
+    pub(crate) processes: Option<Arc<crate::vitals_host::memory::Receipt>>,
 }
 
 /// A reply's identity for a later `since=`: what its fingerprints were
@@ -143,10 +148,14 @@ enum Part {
     Whole,
     /// Its split set (`sys why`), carried from its last split tick.
     Split,
+    /// An aterm reply also needs the matching process census's original age.
+    SplitMemory,
     /// Its jobs view (`sys jobs`), carried from the engine's last pass.
     Jobs,
     /// Its independently assessed leftover view.
     Left,
+    /// The complete memory census, with no need for a CPU rate pair.
+    Memory,
 }
 
 /// How the workers pull: at most one pull per `gap`, each waited for at most
@@ -172,6 +181,8 @@ impl Default for Pacing {
 pub(crate) struct Shared {
     state: Mutex<State>,
     landed: Condvar,
+    instant_clock: fn() -> Instant,
+    continuous_ns: fn() -> Option<u64>,
 }
 
 /// The process's one copy.
@@ -186,10 +197,31 @@ pub(crate) static EPOCH: LazyLock<u64> = LazyLock::new(|| {
 
 impl Shared {
     pub(crate) fn new() -> Self {
+        Self::with_clock(if cfg!(test) {
+            || None
+        } else {
+            memory::continuous_now
+        })
+    }
+
+    pub(crate) fn with_clock(continuous_ns: fn() -> Option<u64>) -> Self {
         Self {
             state: Mutex::new(State::default()),
             landed: Condvar::new(),
+            instant_clock: Instant::now,
+            continuous_ns,
         }
+    }
+
+    #[cfg(test)]
+    fn with_clocks(instant_clock: fn() -> Instant, continuous_ns: fn() -> Option<u64>) -> Self {
+        let mut shared = Self::with_clock(continuous_ns);
+        shared.instant_clock = instant_clock;
+        shared
+    }
+
+    fn now(&self) -> ObservedAt {
+        ObservedAt::now(self.instant_clock, self.continuous_ns)
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -293,10 +325,11 @@ impl Shared {
         &self,
         snap: Arc<Snapshot>,
         machine: &Machine,
-        at: Instant,
+        observed_at: ObservedAt,
         jobs_at: Option<Instant>,
         left_at: Option<Instant>,
         jobs_continuous: bool,
+        processes: Option<Arc<crate::vitals_host::memory::Receipt>>,
     ) {
         let mut g = self.lock();
         g.jobs_continuous = jobs_continuous;
@@ -314,12 +347,16 @@ impl Shared {
         g.head_seq = g.head_seq.max(snap.seq);
         if !snap.machine_only || g.held.is_none() {
             let unix_ms = u64::try_from(snap.at_unix_ms).unwrap_or(0);
+            let processes =
+                processes.filter(|receipt| !snap.machine_only && receipt.seq == snap.seq);
             g.held = Some(Held {
                 snap,
                 unix_ms,
-                at,
+                at: observed_at.instant,
+                observed_at,
                 jobs_at,
                 left_at,
+                processes,
             });
         }
         drop(g);
@@ -335,21 +372,59 @@ impl Shared {
         self.lock().head_seq
     }
 
+    /// A forced new reading still needs a bounded age. Zero requests the read rather than
+    /// an impossible zero-duration age; each view retains its ordinary freshness threshold.
+    fn freshness_limit(fresh: Duration, force: bool, view: View) -> Duration {
+        if force && fresh.is_zero() {
+            Duration::from_millis(view.freshness_default_ms())
+        } else {
+            fresh
+        }
+    }
+
     /// A whole snapshot at most `fresh` old, pulling one when needed.
     pub(crate) fn fresh(&self, fresh: Duration, force: bool) -> (Option<Held>, Freshness) {
-        self.fresh_by(fresh, force, Part::Whole, false)
+        self.fresh_by(
+            Self::freshness_limit(fresh, force, View::Overview),
+            force,
+            Part::Whole,
+            false,
+        )
+    }
+
+    /// Memory consumers require one actual process census, rather than a warm CPU pair.
+    pub(crate) fn fresh_memory(&self, fresh: Duration, force: bool) -> Option<Held> {
+        let fresh = Self::freshness_limit(fresh, force, View::Mem);
+        let (held, _) = self.fresh_by(fresh, force, Part::Memory, false);
+        let now = self.now();
+        held.filter(|held| {
+            held.processes
+                .as_ref()
+                .is_some_and(|receipt| receipt.observed_at.within(now, fresh))
+                && held.observed_at.within(now, fresh)
+        })
     }
 
     /// [`Self::fresh`] for a `sys why`, judged by its split set's age while the coalition lane
     /// reads, and when forced by its CPU Stats sample too, which a forced `sys why` prints.
     pub(crate) fn fresh_why(&self, fresh: Duration, force: bool) -> (Option<Held>, Freshness) {
-        self.fresh_by(fresh, force, Part::Split, force)
+        self.fresh_by(
+            Self::freshness_limit(fresh, force, View::Why),
+            force,
+            Part::Split,
+            force,
+        )
     }
 
     /// A leftover assessment of the requested age, independent of the machine snapshot.
     pub(crate) fn fresh_left(&self, fresh: Duration, force: bool) -> (Option<Held>, Freshness) {
         let _armed = crate::vitals_host::JOBS_ARMED.arm();
-        self.fresh_by(fresh, force, Part::Left, false)
+        self.fresh_by(
+            Self::freshness_limit(fresh, force, View::Left),
+            force,
+            Part::Left,
+            false,
+        )
     }
 
     /// The snapshot `q` reads, as fresh as it asks: a `sys why` by its split set, arming `split`
@@ -364,7 +439,9 @@ impl Shared {
         hardware: &Arming,
     ) -> (Option<Held>, Freshness) {
         let fresh_ms = q.fresh_ms.unwrap_or_else(|| q.freshness_default_ms());
-        let fresh = Duration::from_millis(fresh_ms);
+        // `fresh=0` requests a new read; its age is still bounded by this view's ordinary
+        // threshold, rather than treating a newly published, arbitrarily old input as fresh.
+        let fresh = Self::freshness_limit(Duration::from_millis(fresh_ms), fresh_ms == 0, q.view);
         match q.view {
             View::Why => {
                 let force = fresh_ms == 0;
@@ -372,7 +449,11 @@ impl Shared {
                 let _hardware = force.then(|| hardware.arm());
                 self.fresh_why(fresh, force)
             }
-            View::Overview | View::Tab | View::Aterm | View::Global | View::Mem => {
+            View::Aterm => {
+                let _armed = split.arm();
+                self.fresh_by(fresh, fresh_ms == 0, Part::SplitMemory, false)
+            }
+            View::Overview | View::Tab | View::Global | View::Mem => {
                 let _armed = split.arm();
                 self.fresh_by(fresh, fresh_ms == 0, Part::Split, false)
             }
@@ -393,7 +474,7 @@ impl Shared {
         }
     }
 
-    /// The snapshot judged by `part`, at most `fresh` old unless `force`d. With `hardware`, it
+    /// The snapshot judged by `part`, at most `fresh` old and newly pulled when `force`d. With `hardware`, it
     /// also needs a CPU Stats sample, which only a lens, the recorder or a pull that prints it
     /// takes (A2 §6.4): a snapshot without one is never fresh, and a pull for one waits as a cold
     /// pull does, since its pull reads a pair where no sample is warm.
@@ -404,24 +485,20 @@ impl Shared {
         part: Part,
         hardware: bool,
     ) -> (Option<Held>, Freshness) {
-        let split = part == Part::Split;
-        let now = Instant::now();
+        let split = matches!(part, Part::Split | Part::SplitMemory);
+        let began = Instant::now();
+        let now = (self.instant_clock)();
         let mut g = self.lock();
         let have = g.held.clone();
+        if !matches!(part, Part::Jobs | Part::Left) && self.now().continuous_ns.is_none() {
+            return stale(have);
+        }
         let sampled = |h: &Held| !hardware || h.snap.hardware.is_some();
-        let landed = |h: &Held| {
-            match part {
-                Part::Whole => Some(h.at),
-                Part::Split => split_landed(h),
-                Part::Jobs => jobs_landed(h),
-                Part::Left => h.left_at,
-            }
-            .filter(|_| sampled(h))
-        };
+        let landed = |h: &Held| landed_for(h, part).filter(|_| sampled(h));
         if let Some(h) = have.as_ref()
             && !force
-            && landed(h).is_some_and(|t| t.elapsed() <= fresh)
-            && whole(&h.snap)
+            && fresh_age(h, part, landed(h), self.now()).is_some_and(|age| age <= fresh)
+            && whole_for(h, part)
         {
             return (have.clone(), answered(&h.snap));
         }
@@ -429,8 +506,10 @@ impl Shared {
         let old_split = have.as_ref().and_then(|h| split_ns(&h.snap));
         let cold = have.as_ref().is_none_or(|h| {
             !whole(&h.snap)
-                || h.at.elapsed() > crate::vitals_host::COLD_AFTER
-                || (split && split_cold(h))
+                || now
+                    .checked_duration_since(h.at)
+                    .is_none_or(|age| age > crate::vitals_host::COLD_AFTER)
+                || (split && split_cold(h, now))
                 || !sampled(h)
         });
         let pacing = g.pacing;
@@ -452,18 +531,28 @@ impl Shared {
         } else {
             g.last_pull
         };
-        let recent_pull = last_pull.filter(|t| t.elapsed() < pacing.gap);
+        let recent_pull = last_pull.filter(|t| {
+            now.checked_duration_since(*t)
+                .is_some_and(|age| age < pacing.gap)
+        });
         match recent_pull {
             Some(t) => {
                 if let Some(h) = have.as_ref()
                     && landed(h).is_some_and(|l| l >= t)
-                    && whole(&h.snap)
+                    && fresh_age(h, part, landed(h), self.now()).is_some_and(|age| age <= fresh)
+                    && whole_for(h, part)
                 {
                     return (have.clone(), answered(&h.snap));
                 }
             }
             None => {
-                let sent = match g.tx.as_ref().map(|tx| tx.try_send(Msg::Pull)) {
+                let sent = match g.tx.as_ref().map(|tx| {
+                    tx.try_send(if part == Part::Memory {
+                        Msg::MemoryPull
+                    } else {
+                        Msg::Pull
+                    })
+                }) {
                     Some(Ok(()) | Err(TrySendError::Full(_))) => true,
                     Some(Err(TrySendError::Disconnected(_))) => {
                         g.tx = None;
@@ -488,27 +577,26 @@ impl Shared {
         if g.tx.is_none() {
             return stale(have);
         }
-        let deadline = now + if cold { pacing.wait_cold } else { pacing.wait };
+        let deadline = began + if cold { pacing.wait_cold } else { pacing.wait };
         loop {
             if let Some(h) = g.held.as_ref()
                 && Some(h.snap.seq) != old_seq
-                && whole(&h.snap)
+                && whole_for(h, part)
                 && (!split
                     || !h.snap.coal_lane.on()
                     || stalled(&h.snap, "why")
                     || split_ns(&h.snap).is_some_and(|ns| Some(ns) != old_split))
                 && (!matches!(part, Part::Jobs | Part::Left)
                     || stalled(&h.snap, if part == Part::Jobs { "jobs" } else { "left" })
-                    || landed(h).is_some_and(|at| {
-                        if force {
-                            at >= now
-                        } else {
-                            at.elapsed() <= fresh
-                        }
-                    }))
+                    || landed(h).is_some_and(|at| !force || at >= now))
                 && sampled(h)
             {
-                return (Some(h.clone()), answered(&h.snap));
+                return if fresh_age(h, part, landed(h), self.now()).is_some_and(|age| age <= fresh)
+                {
+                    (Some(h.clone()), answered(&h.snap))
+                } else {
+                    stale(Some(h.clone()))
+                };
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() || crate::control::caller_hung_up() {
@@ -616,7 +704,26 @@ impl Shared {
     /// A copy whose pulls are `gap` apart and waited for `wait` (a test's: a long gap makes "within the gap" certain, a long wait is a hang detector, never a latency budget).
     #[cfg(test)]
     pub(crate) fn paced(gap: Duration, wait: Duration) -> Self {
-        let shared = Self::new();
+        Self::paced_with_clock(gap, wait, || Some(0))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn paced_with_clock(
+        gap: Duration,
+        wait: Duration,
+        continuous_ns: fn() -> Option<u64>,
+    ) -> Self {
+        Self::paced_with_clocks(gap, wait, Instant::now, continuous_ns)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn paced_with_clocks(
+        gap: Duration,
+        wait: Duration,
+        instant_clock: fn() -> Instant,
+        continuous_ns: fn() -> Option<u64>,
+    ) -> Self {
+        let shared = Self::with_clocks(instant_clock, continuous_ns);
         shared.lock().pacing = Pacing {
             gap,
             wait,
@@ -629,7 +736,8 @@ impl Shared {
     #[cfg(test)]
     pub(crate) fn publish_for_test(&self, snap: Snapshot, panes: Vec<PaneFact>) {
         self.set_facts(panes);
-        let at = Instant::now();
+        let observed_at = ObservedAt::capture(self.instant_clock, self.continuous_ns);
+        let at = observed_at.instant;
         let jobs_at = snap
             .jobs
             .as_ref()
@@ -638,12 +746,74 @@ impl Shared {
         self.publish(
             Arc::new(snap),
             &Machine::default(),
-            at,
+            observed_at,
             jobs_at,
             left_at,
             true,
+            None,
         );
     }
+}
+
+fn whole_for(held: &Held, part: Part) -> bool {
+    let census = || {
+        !held.snap.machine_only
+            && held
+                .processes
+                .as_ref()
+                .is_some_and(|receipt| receipt.seq == held.snap.seq)
+    };
+    match part {
+        Part::Memory => census(),
+        Part::SplitMemory => whole(&held.snap) && census(),
+        _ => whole(&held.snap),
+    }
+}
+
+fn landed_for(held: &Held, part: Part) -> Option<Instant> {
+    match part {
+        Part::Whole => Some(held.at),
+        Part::Split | Part::SplitMemory => split_landed(held),
+        Part::Jobs => jobs_landed(held),
+        Part::Left => held.left_at,
+        Part::Memory => held
+            .processes
+            .as_ref()
+            .map(|receipt| receipt.observed_at.instant),
+    }
+}
+
+/// Jobs and leftovers keep their own assessment clock, independent of the machine frame.
+/// For memory, the process receipt may precede this frame when the native lane answered an
+/// older ask. Publication, a machine-only read and a newer split cannot renew that census.
+fn fresh_age(
+    held: &Held,
+    part: Part,
+    landed: Option<Instant>,
+    now: ObservedAt,
+) -> Option<Duration> {
+    let landed = landed.or_else(|| {
+        let lane = match part {
+            Part::Split | Part::SplitMemory => "why",
+            Part::Jobs => "jobs",
+            Part::Left => "left",
+            Part::Whole | Part::Memory => return None,
+        };
+        stalled(&held.snap, lane).then_some(held.at)
+    })?;
+    let lane_age = now.instant.checked_duration_since(landed)?;
+    if matches!(part, Part::Jobs | Part::Left) {
+        return Some(lane_age);
+    }
+    let mut age = held.observed_at.age_at(now)?.max(lane_age);
+    if matches!(part, Part::Memory | Part::SplitMemory) {
+        let receipt = held
+            .processes
+            .as_ref()
+            .filter(|receipt| receipt.seq == held.snap.seq)?;
+        age = age.max(receipt.observed_at.age_at(now)?);
+    }
+    Some(age)
 }
 
 /// Whether `snap` is a whole reading with CPU, aterm, and process rates within [`WINDOW_MAX`];
@@ -693,10 +863,13 @@ fn split_ns(snap: &Snapshot) -> Option<u64> {
         .map(|f| f.at_ns)
 }
 
-fn split_cold(h: &Held) -> bool {
+fn split_cold(h: &Held, now: Instant) -> bool {
     use crate::vitals_host::{SPLIT_COLD_MARGIN, SPLIT_WINDOW_MAX};
     h.snap.coal_lane.on()
-        && split_landed(h).is_none_or(|t| t.elapsed() + SPLIT_COLD_MARGIN > SPLIT_WINDOW_MAX)
+        && split_landed(h).is_none_or(|t| {
+            now.checked_duration_since(t)
+                .is_none_or(|age| age + SPLIT_COLD_MARGIN > SPLIT_WINDOW_MAX)
+        })
 }
 
 fn freshness(h: &Held, otherwise: Freshness) -> Freshness {
@@ -788,8 +961,14 @@ fn gather(
     panes: &[PaneFact],
     q: &SysQuery,
     snap: Option<&Snapshot>,
+    processes: Option<&crate::vitals_host::memory::Receipt>,
 ) -> Gathered {
-    let (sids, terms, caller_key): (Vec<(u64, String)>, Vec<PaneTerm>, Option<u64>) = {
+    let (sids, terms, caller_key, sources): (
+        Vec<(u64, String)>,
+        Vec<PaneTerm>,
+        Option<u64>,
+        Vec<(u64, String)>,
+    ) = {
         let g = store.read().unwrap_or_else(PoisonError::into_inner);
         let mut sids = Vec::new();
         let mut terms = Vec::new();
@@ -809,7 +988,24 @@ fn gather(
             .as_deref()
             .and_then(aterm_session::SessionId::parse)
             .and_then(|c| g.by_sid(&c).map(|h| h.local_id));
-        (sids, terms, caller_key)
+        let sources = processes.map_or_else(Vec::new, |receipt| {
+            receipt
+                .panes
+                .iter()
+                .filter_map(|sampled| {
+                    let live = g.by_local(sampled.local)?;
+                    receipt
+                        .nonce_for(sampled.local, &live.sid, live.nonce)
+                        .map(|nonce| {
+                            if !sids.iter().any(|(local, _)| *local == sampled.local) {
+                                sids.push((sampled.local, live.sid.as_str().to_owned()));
+                            }
+                            (sampled.local, nonce)
+                        })
+                })
+                .collect()
+        });
+        (sids, terms, caller_key, sources)
     };
     let sid_of = |k: u64| {
         sids.iter()
@@ -860,15 +1056,30 @@ fn gather(
         fg_pgid: fg_pgid(master),
         request: request.clone(),
     };
-    let tabs: Vec<TabFact> = panes
+    let mut tabs: Vec<TabFact> = panes
         .iter()
         .map(|p| TabFact {
             key: p.key,
             sid: sid_of(p.key),
             window: usize::try_from(p.window).ok(),
             tab: Some(p.tab),
+            sampled_nonce: sources
+                .iter()
+                .find(|(local, _)| *local == p.key)
+                .map(|(_, nonce)| nonce.clone()),
         })
         .collect();
+    // Layout is presentation metadata: a live terminal session can have no visible tab.
+    for (local, nonce) in &sources {
+        if !tabs.iter().any(|fact| fact.key == *local) {
+            tabs.push(TabFact {
+                key: *local,
+                sid: sid_of(*local),
+                sampled_nonce: Some(nonce.clone()),
+                ..TabFact::default()
+            });
+        }
+    }
     let caller_panes = q.caller.as_ref().map(|_| {
         caller_key.map_or_else(Vec::new, |c| {
             panes.iter().find(|p| p.key == c).map_or_else(
@@ -2359,6 +2570,7 @@ pub(crate) fn cmd_sys(
         &panes,
         &q,
         held.as_ref().map(|h| h.snap.as_ref()),
+        held.as_ref().and_then(|h| h.processes.as_deref()),
     );
     if q.effective_scope() == Some(ScopeArg::Request) && g.target.request.is_none() {
         return format!(
@@ -2413,6 +2625,52 @@ fn answer(
     g: &Gathered,
     owner_class: bool,
 ) -> String {
+    let mut state = state;
+    let age_ms = if let Some(held) = held {
+        let now = shared.now();
+        // Independent assessments retain their original Instant-based age contract. A
+        // missing or old memory frame cannot invalidate a newer job or leftover pass.
+        let age = if matches!(q.view, View::Jobs | View::Left) {
+            now.instant.checked_duration_since(held.at)
+        } else {
+            held.observed_at.age_at(now)
+        };
+        let Some(mut age) = age else {
+            return "ERR sys observation clock unavailable\n".to_owned();
+        };
+        let part = match q.view {
+            View::Aterm => {
+                if let Some(receipt) = held.processes.as_ref().filter(|r| r.seq == held.snap.seq) {
+                    let Some(memory_age) = receipt.observed_at.age_at(now) else {
+                        return "ERR sys observation clock unavailable\n".to_owned();
+                    };
+                    age = age.max(memory_age);
+                }
+                Part::SplitMemory
+            }
+            View::Why | View::Overview | View::Tab | View::Global | View::Mem => Part::Split,
+            View::Jobs => Part::Jobs,
+            View::Left => Part::Left,
+            _ => Part::Whole,
+        };
+        let ttl = Duration::from_millis(
+            q.fresh_ms
+                .filter(|ms| *ms > 0)
+                .unwrap_or_else(|| q.freshness_default_ms()),
+        );
+        if matches!(state, Freshness::Fresh | Freshness::Partial)
+            && (!whole_for(held, part)
+                || fresh_age(held, part, landed_for(held, part), now).is_none_or(|age| age > ttl))
+        {
+            state = Freshness::Stale;
+        }
+        let Ok(age_ms) = u64::try_from(age.as_millis()) else {
+            return "ERR sys observation age out of range\n".to_owned();
+        };
+        age_ms
+    } else {
+        0
+    };
     let head = Cursor {
         epoch: *EPOCH,
         seq: held.map_or(0, |h| h.snap.seq).max(shared.head_seq()),
@@ -2439,9 +2697,7 @@ fn answer(
         snap: held.map(|h| h.snap.as_ref()),
         epoch: *EPOCH,
         as_of_unix_ms: held.map_or(0, |h| h.unix_ms),
-        age_ms: held.map_or(0, |h| {
-            u64::try_from(h.at.elapsed().as_millis()).unwrap_or(u64::MAX)
-        }),
+        age_ms,
         state,
         machine,
         target: &g.target,
@@ -2614,6 +2870,14 @@ fn names_slots(wait: &AwaitSys) -> bool {
         .any(|t| t.metric == aterm_vitals::sys::Metric::Slots)
 }
 
+/// Whether `wait` names `spotlight`, whose reading a split by coalition makes: while it waits,
+/// its pulls arm the split set ([`crate::vitals_host::SPLIT_ARMED`]) as `sys why` does.
+fn names_spotlight(wait: &AwaitSys) -> bool {
+    wait.terms
+        .iter()
+        .any(|t| t.metric == aterm_vitals::sys::Metric::Spotlight)
+}
+
 fn await_machine(
     shared: &Shared,
     session: u64,
@@ -2625,6 +2889,7 @@ fn await_machine(
         .checked_add(Duration::from_millis(wait.timeout_ms))
         .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600));
     let _slots = names_slots(wait).then(|| crate::occupancy_host::SLOTS_ARMED.arm());
+    let _split = names_spotlight(wait).then(|| crate::vitals_host::SPLIT_ARMED.arm());
     let mut state = MachineWait::default();
     let mut seen: Option<u64> = None;
     loop {

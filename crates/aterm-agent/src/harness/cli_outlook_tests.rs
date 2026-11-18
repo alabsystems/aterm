@@ -128,7 +128,7 @@ fn stop_ends(outlook: &Value) -> Vec<(String, Option<i64>)> {
 
 /// The card's outlook for `env`'s store, as the window's memo builds it
 /// (`aterm-gui/src/accounts_outlook.rs`): the bound roster, the store's state, the series and
-/// the renewals, the policy's switches.
+/// the renewals, the policy's switches; its rows named as the report names them.
 fn card_outlook(env: &Env) -> outlook::Outlook {
     let store = env.accounts_store();
     let roster =
@@ -152,6 +152,20 @@ fn card_outlook(env: &Env) -> outlook::Outlook {
         offset: |_| 0,
         signing_in: None,
     })
+    .named(crate::harness::account_names::Listing::here(
+        Cli::Claude,
+        &roster.rows,
+    ))
+}
+
+/// The row `label` of `env`'s roster as the report's JSON names it: its account's key, else its
+/// label.
+fn id_of(env: &Env, label: &str) -> String {
+    let roster =
+        accounts::Roster::load(&env.accounts_roster().expect("a roster path")).expect("the roster");
+    crate::harness::account_names::Listing::of(Cli::Claude, &roster.rows, None)
+        .id(label)
+        .to_owned()
 }
 
 /// ACCEPTANCE 3 (and T14's report half): THE REPORT SAYS THE CARD'S NUMBERS. For one seed, the
@@ -198,11 +212,13 @@ fn the_report_says_the_cards_numbers_and_writes_nothing() {
         let label = &row.label;
         let pct = row.figure(card.as_of).words();
         if pct.ends_with("% left") {
-            // The row's own line, then the lines indented under it.
+            // The row's own line, by the account the report names it by, then the lines
+            // indented under it.
+            let shown = format!("{} ", card.names.shown(label));
             let lines: Vec<&str> = text.lines().collect();
             let at = lines
                 .iter()
-                .position(|l| l.split_whitespace().next() == Some(label.as_str()))
+                .position(|l| l.starts_with(&shown))
                 .unwrap_or_else(|| panic!("{label}: its row in\n{text}"));
             let block = std::iter::once(lines[at])
                 .chain(
@@ -222,6 +238,150 @@ fn the_report_says_the_cards_numbers_and_writes_nothing() {
     }
     assert!(figures >= 2, "the card shows figures for me and alt1");
     assert_eq!(before, every_file(tmp.path()), "the reports wrote nothing");
+}
+
+/// THE OUTLOOK NAMES EACH ACCOUNT BY ITS NAME: over the seeded pool with each row given an
+/// address and the carrier (`me`) a plan that names its multiple (Max 20x), so the rows whose plan
+/// was not seen are counted as the carrier's (`Approx::PlanAssumed`), the whole report (the
+/// outlook block, its verdict, chain, lean and approximations, and the outlook's lines under each
+/// row, `counted as Max 20x like <carrier>`) names each row by its account's name (`claude
+/// me@x.example`) and never by its label, and its JSON (the outlook's version, 2; the carrier,
+/// the verdict's row, each link of a chain, the lean, each approximation's account and carrier,
+/// and `not_needed`) by its account's key. CONTROL: the outlook is projected, its chain naming
+/// `me` and the next row, and it counts a row's plan as the carrier's, in its words and its JSON.
+/// NEGATIVE CONTROL: with `row_lines` naming the carrier by its label, the plan-assumed words
+/// naming both rows by label and the approximation's JSON `account` a label, it fails at its
+/// control: `CONTROL: a row's plan is counted as the carrier's, named by its account: …`, the
+/// report reading `plan  ? (not seen; counted as Max 20x like me)` and the approximation `alt1:
+/// plan not seen, counted as Max 20x like me` (2026-11-16, by hand on SF-07H S7a's review
+/// settle, then restored).
+#[test]
+fn the_outlook_names_each_account_by_its_name() {
+    let tmp = tmp_dir("accounts-outlook-names");
+    let env = env_at(&tmp);
+    seeded(&tmp, &env);
+    let labels = ["me", "alt1", "pool1"];
+    let addressed = labels.map(|label| (label, format!("{label}@x.example")));
+    address_rows(
+        &env,
+        &addressed
+            .iter()
+            .map(|(label, email)| (*label, email.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let machine = env.accounts_store().load(env.now).expect("load").0.machine;
+    account_series::note_plan(
+        &env.state,
+        "me",
+        &machine,
+        &account_series::PlanSaid {
+            word: "max".into(),
+            tier: Some("20x".into()),
+            src: "profile".into(),
+        },
+        env.now - H,
+    )
+    .expect("the carrier's plan");
+    let (_, text, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with("outlook (as of "))
+        .unwrap_or_else(|| panic!("an outlook block in\n{text}"));
+    let block = std::iter::once(lines[at])
+        .chain(
+            lines[at + 1..]
+                .iter()
+                .copied()
+                .take_while(|l| l.starts_with(' ')),
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        block.contains("claude me@x.example ") && block.contains("\u{2192}"),
+        "CONTROL: a chain names me: {block}"
+    );
+    assert!(
+        text.contains("like claude me@x.example"),
+        "CONTROL: a row's plan is counted as the carrier's, named by its account: {text}"
+    );
+    // With every account's name taken out, no word of the report is a label.
+    let unnamed = addressed.iter().fold(text.clone(), |text, (_, email)| {
+        text.replace(&format!("claude {email}"), "")
+    });
+    let printed: Vec<&str> = unnamed
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .filter(|word| labels.contains(word))
+        .collect();
+    assert!(
+        printed.is_empty(),
+        "labels {printed:?} in the report:\n{text}"
+    );
+
+    let (_, json, _) = acc_quiet(AccountsCmd::Report { json: true }, &env);
+    let json: Value = aterm_json::from_str(json.trim()).expect("the report is JSON");
+    let outlook = &json["outlook"];
+    assert_eq!(outlook["v"], Value::from(2u64), "{outlook}");
+    let keys: Vec<Value> = labels
+        .iter()
+        .map(|label| Value::from(id_of(&env, label)))
+        .collect();
+    assert!(
+        keys.iter()
+            .all(|key| key.as_str().is_some_and(|key| key.starts_with("ac-"))),
+        "{keys:?}"
+    );
+    assert_eq!(outlook["carrier"], keys[0], "{outlook}");
+    let assumed: Vec<&Value> = outlook["approx"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|approx| approx["kind"] == Value::from("plan-assumed"))
+        .collect();
+    assert!(
+        assumed
+            .iter()
+            .any(|approx| approx["carrier"] == keys[0] && keys[1..].contains(&approx["account"])),
+        "CONTROL: a plan-assumed approximation of another row like the carrier: {outlook}"
+    );
+    let mut named = vec![&outlook["verdict"]["row"]];
+    let mut passes: Vec<&Value> = outlook["passes"].as_array().into_iter().flatten().collect();
+    while let Some(pass) = passes.pop() {
+        named.extend(
+            pass["chain"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|link| &link["account"]),
+        );
+        if let Some(lean) = pass.get("lean").filter(|l| !l.is_null()) {
+            named.push(&lean["row"]);
+            passes.push(&lean["worst"]);
+            passes.push(&lean["best"]);
+        }
+    }
+    for approx in outlook["approx"].as_array().into_iter().flatten() {
+        named.extend([&approx["carrier"], &approx["account"]]);
+    }
+    named.extend(outlook["not_needed"].as_array().into_iter().flatten());
+    let named: Vec<&Value> = named.into_iter().filter(|v| !v.is_null()).collect();
+    assert!(named.len() >= 2, "CONTROL: a chain names rows: {outlook}");
+    for v in named {
+        assert!(
+            keys.contains(v),
+            "{v} names no account by its key: {outlook}"
+        );
+    }
+    for key in outlook["lab"]
+        .as_object()
+        .into_iter()
+        .flat_map(|lab| lab.keys())
+    {
+        assert!(
+            keys.contains(&Value::from(key.clone())),
+            "the lab's bounds of {key}, no account's key: {outlook}"
+        );
+    }
 }
 
 #[test]
@@ -470,7 +630,7 @@ fn the_report_writes_nothing_with_the_journal_on_or_off() {
         "CONTROL: {off_text}"
     );
     assert_eq!(
-        on_json["outlook"]["lab"]["pool1"]["seven_day"]["used_x10"].as_u64(),
+        on_json["outlook"]["lab"][id_of(&env, "pool1").as_str()]["seven_day"]["used_x10"].as_u64(),
         Some(400),
         "the journal's bound is shown: {}",
         on_json["outlook"]

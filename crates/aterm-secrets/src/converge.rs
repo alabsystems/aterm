@@ -49,6 +49,32 @@ pub const UNFINISHED: u8 = 76;
 /// Its starter keeps the work owed without scheduling a retry on the clock.
 pub const STANDING: u8 = 78;
 
+/// Positive identity completion carried independently of an automatic runner's unfinished
+/// whole-pass status. Only the three tagged terminal statuses are part of this protocol.
+const IDENTITY_COMPLETE_BIT: u8 = 0x80;
+
+/// The starter's private result-protocol negotiation, inherited through installed-app handoffs.
+pub const RESULT_PROTOCOL_ENV: &str = "ATERM_CONVERGE_RESULT";
+const IDENTITY_RESULT_PROTOCOL: &str = "identity/1";
+
+/// Whether this process's starter explicitly understands independent identity completion.
+#[must_use]
+pub fn identity_result_requested() -> bool {
+    std::env::var_os(RESULT_PROTOCOL_ENV).is_some_and(|value| value == IDENTITY_RESULT_PROTOCOL)
+}
+
+/// Carry a completed identity beside a failed, unfinished or standing automatic pass. Success
+/// remains exit zero, and a pass that ran no identity carries no positive completion evidence.
+/// The producer uses this only when its starter negotiated [`RESULT_PROTOCOL_ENV`].
+#[must_use]
+pub const fn runner_exit_code(status: u8, identity_complete: bool) -> u8 {
+    if identity_complete && matches!(status, 1 | UNFINISHED | STANDING) {
+        status | IDENTITY_COMPLETE_BIT
+    } else {
+        status
+    }
+}
+
 /// The vault subscriber's `--trigger` word (`aterm_machines::sync::Trigger::Subscriber`).
 pub const SUBSCRIBER: &str = "subscriber";
 
@@ -120,6 +146,7 @@ fn runner_argument(exe: &Path, trigger: &str, argument: &str, value: &str) -> Co
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .env(RESULT_PROTOCOL_ENV, IDENTITY_RESULT_PROTOCOL)
         .setsid(true)
         .leave_background_band(trigger == SUBSCRIBER);
     // The start's note, where its starter gave one ([`noting`]): one variable no program reads
@@ -180,20 +207,63 @@ impl Last {
     /// How `runner` stands now, reaping and taking it once it ended without waiting. A terminal
     /// outcome is delivered once; a failed wait retains custody until a later read can decide.
     pub fn of(runner: &mut Option<Child>) -> Self {
+        RunnerResult::of(runner).last
+    }
+}
+
+/// One owned runner's terminal result. The identity evidence comes from that same child's
+/// exit, never from a shared record another runner could have replaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunnerResult {
+    /// Whole-pass pacing, independent of whether identity completed.
+    pub last: Last,
+    /// The runner positively observed its identity row complete.
+    pub identity_complete: bool,
+}
+
+impl RunnerResult {
+    /// Decode a process exit. A signal, an unknown status and an untagged failure prove no
+    /// identity completion. A tag is accepted only on a defined unfinished runner status.
+    #[must_use]
+    pub fn from_exit_code(code: Option<i32>) -> Self {
+        let tagged = code
+            .and_then(|code| u8::try_from(code).ok())
+            .filter(|code| code & IDENTITY_COMPLETE_BIT != 0)
+            .map(|code| code & !IDENTITY_COMPLETE_BIT)
+            .filter(|status| matches!(*status, 1 | UNFINISHED | STANDING));
+        let status = tagged.map(i32::from).or(code);
+        let last = match status {
+            Some(0) => Last::Ended,
+            Some(code) if code == i32::from(UNFINISHED) => Last::Unfinished,
+            Some(code) if code == i32::from(STANDING) => Last::Standing,
+            _ => Last::Failed,
+        };
+        Self {
+            last,
+            identity_complete: tagged.is_some(),
+        }
+    }
+
+    /// Take one terminal result without waiting. An unsuccessful wait retains the child and
+    /// proves no completion, exactly as a child still running does.
+    pub fn of(runner: &mut Option<Child>) -> Self {
         let Some(child) = runner.as_mut() else {
-            return Self::None;
+            return Self {
+                last: Last::None,
+                identity_complete: false,
+            };
         };
-        let last = match child.try_wait() {
-            Ok(None) | Err(_) => Self::Running,
-            Ok(Some(status)) if status.code() == Some(i32::from(UNFINISHED)) => Self::Unfinished,
-            Ok(Some(status)) if status.code() == Some(i32::from(STANDING)) => Self::Standing,
-            Ok(Some(status)) if status.success() => Self::Ended,
-            Ok(Some(_)) => Self::Failed,
+        let result = match child.try_wait() {
+            Ok(None) | Err(_) => Self {
+                last: Last::Running,
+                identity_complete: false,
+            },
+            Ok(Some(status)) => Self::from_exit_code(status.code()),
         };
-        if last != Self::Running {
+        if result.last != Last::Running {
             runner.take();
         }
-        last
+        result
     }
 }
 
@@ -243,6 +313,14 @@ impl RunnerRetry {
     }
 }
 
+/// One coalesced request, retaining whether an input rather than time alone owes it.
+#[derive(Clone, Copy, Debug)]
+struct Pending {
+    request: RepositoryRequest,
+    /// At least one actual input transition requested this work.
+    input: bool,
+}
+
 /// When the vault's subscriber starts a runner: as it starts, after each pass that applied a
 /// version which moved something a runner reads ([`SyncOutcome::Applied`]'s `moved`: a version
 /// that carried only other Macs' news starts none), after a round that took a pass another
@@ -263,7 +341,7 @@ pub struct Due {
     /// Routes already observed, including a request queued while the lane was held.
     routes: Option<Routes>,
     /// A start came due while the last runner ran (or waited for the lock).
-    pending: Option<RepositoryRequest>,
+    pending: Option<Pending>,
     /// A canonical identity transition is not paced or fulfilled by repository receipts.
     identity_pending: bool,
     /// Whether the one selected child carries identity debt. Its terminal result cannot be
@@ -347,12 +425,38 @@ impl Due {
 
     /// Retain a request while the owned runner or a shared retry still holds the lane.
     pub(crate) fn request(&mut self, request: RepositoryRequest) {
-        self.pending = merge_requests(
-            merge_requests(self.parked_request.take(), self.pending),
-            Some(request),
-        );
+        let parked = self.parked_request.take();
+        self.prepend(parked, true);
+        self.queue(request, true);
         self.identity_pending |= std::mem::take(&mut self.parked_identity);
         self.parked = false;
+    }
+
+    fn queue(&mut self, request: RepositoryRequest, input: bool) {
+        match &mut self.pending {
+            Some(pending) => {
+                pending.request = pending.request.merge(request);
+                pending.input |= input;
+            }
+            None => self.pending = Some(Pending { request, input }),
+        }
+    }
+
+    fn prepend(&mut self, older: Option<RepositoryRequest>, input: bool) {
+        if let Some(older) = older {
+            match &mut self.pending {
+                Some(pending) => {
+                    pending.request = older.merge(pending.request);
+                    pending.input |= input;
+                }
+                None => {
+                    self.pending = Some(Pending {
+                        request: older,
+                        input,
+                    })
+                }
+            }
+        }
     }
 
     /// Note `cause` for the next start's note. It changes no pacing.
@@ -386,6 +490,16 @@ impl Due {
         self.identity_pending = true;
         // A newer canonical intent does not inherit the prior intent's failure backoff.
         self.identity_retry = RunnerRetry::default();
+    }
+
+    /// Retire only the identity carried by the owned child that positively completed it.
+    /// A newer input remains pending, and the child's whole-pass result is reaped separately.
+    pub(crate) fn identity_completed(&mut self) {
+        if self.identity_running {
+            self.identity_running = false;
+            self.identity_retry = RunnerRetry::default();
+            self.parked_identity = false;
+        }
     }
 
     /// Keep custody and capture event boundaries while the LAN prevents a start.
@@ -553,6 +667,10 @@ impl Due {
                 self.parked = true;
                 self.parked_request =
                     merge_requests(self.parked_request, Some(self.repository_request));
+                if self.pending.is_some_and(|pending| !pending.input) && !self.identity_pending {
+                    self.pending = None;
+                    self.causes = self.causes.without(Causes::CLOCK.with(Causes::RECHECK));
+                }
             }
             Last::Ended | Last::Failed | Last::Unfinished => self.parked = false,
             Last::None | Last::Running | Last::Held => {}
@@ -590,8 +708,9 @@ impl Due {
             self.request(request);
         }
         // An input that arrived while the child ran remains work for its successor.
-        if self.pending.is_some() || self.identity_pending {
-            self.pending = merge_requests(self.parked_request.take(), self.pending);
+        if self.pending.is_some_and(|pending| pending.input) || self.identity_pending {
+            let parked = self.parked_request.take();
+            self.prepend(parked, true);
             self.identity_pending |= std::mem::take(&mut self.parked_identity);
             self.parked = false;
         }
@@ -599,26 +718,39 @@ impl Due {
         // can demote it to Repair. A local Repair alone leaves that retry intact.
         if self
             .pending
-            .is_some_and(|request| request.work() == RepositoryWork::Refresh)
+            .is_some_and(|pending| pending.request.work() == RepositoryWork::Refresh)
         {
-            self.pending = merge_requests(self.retry_request.take(), self.pending);
+            let retry = self.retry_request.take();
+            self.prepend(retry, false);
         }
-        let (pending, acknowledged) = self.demote_fulfilled(self.pending);
-        self.pending = pending;
+        let input = self.pending.is_some_and(|pending| pending.input);
+        let (pending, acknowledged) =
+            self.demote_fulfilled(self.pending.map(|pending| pending.request));
+        self.pending = pending.map(|request| Pending { request, input });
         let (retry, retry_acknowledged) = self.demote_fulfilled(self.retry_request);
         if acknowledged || retry_acknowledged {
             self.acknowledged(now_ms);
         }
         self.retry_request = retry;
         self.refresh_due(now_ms, routes);
-        if let Some(RepositoryRequest::Refresh(request)) = self.pending {
+        if let Some(Pending {
+            request: RepositoryRequest::Refresh(request),
+            input,
+        }) = self.pending
+        {
             if self.observed.fulfills(request) {
-                self.pending = Some(RepositoryRequest::Repair);
+                self.pending = Some(Pending {
+                    request: RepositoryRequest::Repair,
+                    input,
+                });
                 self.acknowledged(now_ms);
             } else if let Some(remaining) = self.observed.retry_for(request)
                 && remaining > 0
             {
-                self.retry_request = merge_requests(self.retry_request, self.pending.take());
+                self.retry_request = merge_requests(
+                    self.retry_request,
+                    self.pending.take().map(|pending| pending.request),
+                );
                 self.retry.at = Some(now_ms.saturating_add(remaining));
                 self.retry_cause = Causes::RETRY_WAVE;
                 self.started = Some((now_ms, RECHECK_MS));
@@ -640,7 +772,7 @@ impl Due {
             if self.identity_retry.due(now_ms) {
                 self.because(Causes::RETRY_IDENTITY);
             }
-            self.pending = merge_requests(self.pending, Some(RepositoryRequest::Repair));
+            self.queue(RepositoryRequest::Repair, self.identity_pending);
         }
         if self.pending.is_none() && !self.retry.due(now_ms) {
             return false;
@@ -660,7 +792,7 @@ impl Due {
             self.identity_pending = false;
             self.identity_retry.started();
         }
-        let pending = self.pending.take();
+        let pending = self.pending.take().map(|pending| pending.request);
         // A checkout wake can be repaired now without repeating a failed remote refresh.
         // Only its own deadline, or a new Refresh request, consumes that stronger debt.
         let consume_retry = self.retry.due(now_ms)
@@ -730,7 +862,11 @@ impl Due {
             None
         };
         if let Some(request) = request {
-            self.request(RepositoryRequest::Refresh(request));
+            if moved {
+                self.request(RepositoryRequest::Refresh(request));
+            } else {
+                self.queue(RepositoryRequest::Refresh(request), false);
+            }
         }
     }
 }

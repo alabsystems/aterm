@@ -24,7 +24,10 @@
 //! sweep's `expired`, already settled (item F4's residual: a bridge held that only in memory). A
 //! retry after an answer the same bridge delivered with no deadline standing writes that settle
 //! instead of arming (`Bridge::settle_a_retry_answered_ahead`); a kill between the two arms it,
-//! and the sweep reads the answer back from the bus.
+//! and the sweep reads the answer back from the bus. A settle by this node's `expired` names in its
+//! record's tail what the bridge judged that `expired` to be ([`Verdict`], ATERM-KI-1115-7889: the
+//! ask's verdict, or moot behind its answer), so the next bridge hands no moot one and marks an
+//! answer after a standing one late; a build before it reads the body alone.
 //!
 //! FOR A BUILD BEFORE THE JOURNAL, which reads [`ASKED`] and [`DEADLINES`] and nothing here: a
 //! stop writes the index back as those two files ([`super::StateDir::hand_asks_to_files`]),
@@ -74,12 +77,86 @@ pub(crate) enum Frame {
         off: u64,
         /// Its asker.
         sid: String,
+        /// What this node's `expired` of the ask is, where it published one and judged it
+        /// ([`Verdict`]): written in the record's tail (`expired=<e>`, `moot=<e> by=<a>`), which
+        /// a build before ATERM-KI-1115-7889 skips. `None` for any other settle, and for a
+        /// verdict not judged, which the bridge judges again at its delivery.
+        how: Option<Verdict>,
     },
     /// A stop wrote the index back as the tables a build before the journal reads, as hand-off
     /// `n` ([`super::StateDir::hand_asks_to_files`]).
     Handed(u64),
     /// An open took the tables in as they stood ([`Index::take_in`]).
     Took(Took),
+}
+
+/// WHAT THIS NODE'S `expired` OF AN ASK IS (ATERM-KI-1115-7889), as the bridge judged it once
+/// it was published (`Bridge::answered_below`): the ask's verdict is the first record on its
+/// asker's lane that settles it, so an `expired` above an answer says nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    /// The `expired` at `at` is the verdict: no answer lies below it, and an answer after it is
+    /// late.
+    Expired {
+        /// The `expired`'s offset.
+        at: u64,
+    },
+    /// The `expired` at `at` came after the answer at `by`, which is the verdict: it is never
+    /// handed.
+    Moot {
+        /// The `expired`'s offset.
+        at: u64,
+        /// The answer's.
+        by: u64,
+    },
+    /// The `expired` at `at` whose fence could not be read: judged at its delivery. Never
+    /// journaled ([`Verdict::journaled`]).
+    Unjudged {
+        /// The `expired`'s offset.
+        at: u64,
+    },
+}
+
+impl Verdict {
+    /// The `expired`'s offset.
+    pub(crate) const fn at(self) -> u64 {
+        match self {
+            Self::Expired { at } | Self::Moot { at, .. } | Self::Unjudged { at } => at,
+        }
+    }
+
+    /// This verdict as the journal keeps it: `None` for [`Verdict::Unjudged`], which a later
+    /// bridge judges again.
+    pub(crate) const fn journaled(self) -> Option<Self> {
+        match self {
+            Self::Unjudged { .. } => None,
+            judged => Some(judged),
+        }
+    }
+
+    /// Its tail words (`expired=<e>`, `moot=<e> by=<a>`); none for [`Verdict::Unjudged`].
+    fn words(self) -> String {
+        match self {
+            Self::Expired { at } => format!("expired={at}"),
+            Self::Moot { at, by } => format!("moot={at} by={by}"),
+            Self::Unjudged { .. } => String::new(),
+        }
+    }
+
+    /// The verdict a record's tail names, `None` for a tail this build cannot read.
+    fn of_words(tail: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(tail).ok()?;
+        let mut words = text.split_ascii_whitespace();
+        let first = words.next()?;
+        let verdict = if let Some(at) = first.strip_prefix("expired=") {
+            Self::Expired { at: number(at)? }
+        } else {
+            let at = number(first.strip_prefix("moot=")?)?;
+            let by = number(words.next()?.strip_prefix("by=")?)?;
+            Self::Moot { at, by }
+        };
+        words.next().is_none().then_some(verdict)
+    }
 }
 
 /// The tables as an open took them in: each one's [`digest`], that of no text where there is no
@@ -125,10 +202,10 @@ impl Frame {
         }
     }
 
-    /// Whether its record reads back as itself ([`journal::encode`] refuses one that does not):
-    /// only such a fact enters the index, which every rewrite writes whole.
+    /// Whether its record, body and tail, reads back as itself ([`journal::encode`] refuses one
+    /// that does not): only such a fact enters the index, which every rewrite writes whole.
     pub(crate) fn carried(&self) -> bool {
-        Self::parse(self.body().as_bytes()).as_ref() == Some(self)
+        Self::of_record(self.body().as_bytes(), self.tail().as_bytes()).as_ref() == Some(self)
     }
 
     /// Parse a body back, `None` for anything this build did not write.
@@ -157,6 +234,7 @@ impl Frame {
                 Self::DeadlineGone {
                     off,
                     sid: sid.to_string(),
+                    how: None,
                 }
             }
             "handed" => Self::Handed(number(words.next()?)?),
@@ -178,20 +256,29 @@ impl Record for Frame {
         match self {
             Self::Asked(asked) => format!("asked {}", asked.render()),
             Self::Deadline(deadline) => format!("deadline {}", deadline.render()),
-            Self::DeadlineGone { off, sid } => format!("gone {off} {sid}"),
+            Self::DeadlineGone { off, sid, .. } => format!("gone {off} {sid}"),
             Self::Handed(n) => format!("handed {n}"),
             Self::Took(took) => format!("took {} {}", took.asked, took.deadlines),
         }
     }
 
-    /// None: no fact here has more than its body says.
+    /// A settle's verdict ([`Frame::DeadlineGone`]'s `how`); no other fact has more than its
+    /// body says.
     fn tail(&self) -> String {
-        String::new()
+        match self {
+            Self::DeadlineGone { how: Some(how), .. } => how.words(),
+            _ => String::new(),
+        }
     }
 
-    /// Its body; a tail a later build wrote adds nothing this build reads.
-    fn of_record(body: &[u8], _tail: &[u8]) -> Option<Self> {
-        Self::parse(body)
+    /// Its body, and a settle's verdict where its tail names one; a tail this build cannot read
+    /// adds nothing.
+    fn of_record(body: &[u8], tail: &[u8]) -> Option<Self> {
+        let mut frame = Self::parse(body)?;
+        if let Self::DeadlineGone { how, .. } = &mut frame {
+            *how = Verdict::of_words(tail);
+        }
+        Some(frame)
     }
 }
 
@@ -206,9 +293,10 @@ pub(crate) struct Index {
     /// Each deadline owed a verdict, by the ask's offset: at most [`DEADLINES_KEEP`], the lowest
     /// offsets going first.
     pub(crate) deadlines: BTreeMap<u64, Deadline>,
-    /// Each deadline settled, its asker by the ask's offset ([`Frame::DeadlineGone`]): at most
+    /// Each deadline settled, its asker by the ask's offset, with the verdict of this node's
+    /// `expired` of it where one was judged ([`Frame::DeadlineGone`]): at most
     /// [`DEADLINES_KEEP`], the lowest offsets going first.
-    pub(crate) gone: BTreeMap<u64, String>,
+    pub(crate) gone: BTreeMap<u64, (String, Option<Verdict>)>,
     /// The last hand-off ([`Frame::Handed`]); `None` where no stop handed the index back.
     pub(crate) handed: Option<u64>,
     /// What an open last took from the tables, where no hand-off replaced them since
@@ -239,11 +327,18 @@ impl Replay for Index {
                 }
                 self.noted = true;
             }
-            Frame::DeadlineGone { off, sid } => {
+            Frame::DeadlineGone { off, sid, how } => {
                 if self.deadlines.get(&off).is_some_and(|d| d.sid == sid) {
                     self.deadlines.remove(&off);
                 }
-                self.gone.insert(off, sid);
+                // A settle that names no verdict keeps the one a settle of the same ask named.
+                let how = how.or_else(|| {
+                    self.gone
+                        .get(&off)
+                        .filter(|(asker, _)| *asker == sid)
+                        .and_then(|(_, how)| *how)
+                });
+                self.gone.insert(off, (sid, how));
                 while self.gone.len() > DEADLINES_KEEP {
                     self.gone.pop_first();
                 }
@@ -275,7 +370,16 @@ impl Index {
 
     /// Whether the deadline of `sid`'s ask at `off` is remembered settled.
     pub(crate) fn settled(&self, off: u64, sid: &str) -> bool {
-        self.gone.get(&off).is_some_and(|asker| asker == sid)
+        self.gone.get(&off).is_some_and(|(asker, _)| asker == sid)
+    }
+
+    /// Every verdict of this node's `expired` the settles name, oldest ask first: `(ask, asker,
+    /// verdict)`.
+    pub(crate) fn verdict_rows(&self) -> Vec<(u64, String, Verdict)> {
+        self.gone
+            .iter()
+            .filter_map(|(off, (sid, how))| how.map(|how| (*off, sid.clone(), how)))
+            .collect()
     }
 
     /// Every ask's recipient, oldest offset first.
@@ -295,11 +399,24 @@ impl Index {
     }
 
     /// Keep only what an offset `kept` takes: a log reset's clamp
-    /// ([`super::StateDir::forget_log_offsets`]).
+    /// ([`super::StateDir::forget_log_offsets`]). A settle kept loses its verdict where the
+    /// `expired` it names, or the answer a moot one names, is past the fork
+    /// (ATERM-KI-1115-7889), as the bridge forgets it in memory (`Bridge::forget_log_offsets`):
+    /// restored at the next open, an offset of the old log read as one of the new would mark an
+    /// answer there `late=1`, or name it the answer an `expired` is moot behind.
     pub(crate) fn retain(&mut self, kept: impl Fn(u64) -> bool) {
         self.asked.retain(|off, _| kept(*off));
         self.deadlines.retain(|off, _| kept(*off));
         self.gone.retain(|off, _| kept(*off));
+        for (_, how) in self.gone.values_mut() {
+            let past = how.is_some_and(|verdict| match verdict {
+                Verdict::Moot { at, by } => !kept(at) || !kept(by),
+                Verdict::Expired { at } | Verdict::Unjudged { at } => !kept(at),
+            });
+            if past {
+                *how = None;
+            }
+        }
     }
 
     /// RECONCILE THE INDEX WITH THE TABLES AS AN OPEN FINDS THEM, `None` where there is no file,
@@ -405,10 +522,14 @@ impl Index {
     pub(crate) fn encode(&self) -> io::Result<(Vec<u8>, u64)> {
         let asked = self.asked_rows().into_iter().map(Frame::Asked);
         let deadlines = self.deadlines.values().cloned().map(Frame::Deadline);
-        let gone = self.gone.iter().map(|(off, sid)| Frame::DeadlineGone {
-            off: *off,
-            sid: sid.clone(),
-        });
+        let gone = self
+            .gone
+            .iter()
+            .map(|(off, (sid, how))| Frame::DeadlineGone {
+                off: *off,
+                sid: sid.clone(),
+                how: *how,
+            });
         let rows: Vec<Frame> = asked.chain(deadlines).chain(gone).collect();
         let marks = self
             .handed

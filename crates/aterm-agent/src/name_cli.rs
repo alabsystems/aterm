@@ -35,14 +35,15 @@ aterm name — this machine's name: its NAME (`m8`, or `unnumbered` until it is 
   `nick` sets the
   nickname to <word> (one argument: quote `Blue Heron`) or to a noun drawn again, as a chosen
   nickname, and prints the name as it then stands; `--dry-run` changes no nickname (a first
-  run still makes the name, as any read does). `undo` takes back the last change: the number
-  it replaced, checked as `set` checks one (refused while another machine holds it or its
-  vault gives it to another Mac), and the nickname it replaced; an undo is not undone, and
-  none leaves this machine unnumbered; it refuses, changing nothing, when the name changed
-  after it read it. A real undo publishes as `set` and `nick` do.
-  `history` lists the newest 16 changes, newest first: when, why, the name before and
-  after, who made it, and whether it was undone. `aterm help name` has the page. Unix only
-  for now.
+  run still makes the name, as any read does). `undo` takes back the last rename in this
+  Mac's lab registry row, from any Mac, as a new rename to the values it replaced: the
+  number, checked as `set` checks one (refused while another machine holds it or its vault
+  gives it to another Mac), and the nickname; undoing an undo redoes the rename, and no undo
+  leaves this machine unnumbered; it refuses, changing nothing, when the row changed after
+  it read it. A real undo publishes as `set` and `nick` do.
+  `history` lists every write to this Mac's registry row's number and nickname, newest
+  first: when (UTC), the Mac that wrote it, its kind, and what each cell was and became.
+  It makes no name. `aterm help name` has the page. Unix only for now.
 ";
 
 /// What `aterm name …` asks for, decided without running it so a test can read it.
@@ -60,7 +61,7 @@ enum Mode {
     Nick { to: Nick, dry_run: bool, json: bool },
     /// `undo`: take back the last change, then show the name as `Show` does.
     Undo { dry_run: bool, json: bool },
-    /// `history`: the changes History keeps, newest first.
+    /// `history`: the writes to this Mac's registry row's number and nickname, newest first.
     History { json: bool },
 }
 
@@ -555,22 +556,41 @@ fn policy_after(
     policy_for(current.as_ref().and_then(number))
 }
 
-/// `aterm name undo`: the name is read once, having followed this Mac's registry row
-/// ([`unix::followed`]) as the undo's own base does, and the policy the undone name publishes under is
-/// read from it first (a dry run's too), as `set` and `nick` read theirs: the number it takes
-/// back, which it claims as chosen, or for a nickname undo the chosen number it keeps
-/// ([`crate::machine_name::undo_publishes`]). Then the undo of the newest change that read
-/// showed, and only that one ([`crate::machine_name::undo_last`]'s `seen`), so the policy read
-/// and the change taken back cannot disagree; then, for a real one, its publication.
+/// `aterm name undo`: this Mac's History is read once from its registry row
+/// ([`crate::machine_name::history::read`]) and judged ([`crate::machine_name::history::undo_of`]),
+/// and the policy the undone name publishes under is read from that judgment first (a dry run's
+/// too), as `set` and `nick` read theirs: the number it takes back, which it claims as chosen, or
+/// for a nickname undo the chosen number it keeps ([`crate::machine_name::undo_publishes`]). Then
+/// the undo of the rename that read showed, and only that one ([`crate::machine_name::undo_last`]'s
+/// `seen`), so the policy read and the rename taken back cannot disagree; then, for a real one,
+/// its publication.
 #[cfg(unix)]
 fn undo(dry_run: bool, json: bool) -> ExitCode {
+    use crate::machine_name::history;
     let Some(state) = aterm_types::dirs::state_dir() else {
         eprintln!("aterm name: no state directory: $HOME is not set");
         return ExitCode::from(1);
     };
     let now_ms = aterm_netplace::unix_ms_now();
+    let read_by = std::time::Instant::now() + HISTORY_WAIT;
+    let seen = match history::read(&state, read_by) {
+        Ok(read) => history::undo_of(&read),
+        Err(why) => {
+            eprintln!(
+                "aterm name: this Mac's lab registry row was not read ({why}); no name changed"
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let seen = match seen {
+        Ok(seen) => seen,
+        Err(refused) => {
+            eprintln!("aterm name: {refused}; no name changed");
+            return ExitCode::from(1);
+        }
+    };
     let current = match crate::machine_name::file::read(&state) {
-        Ok(current) => current.map(|name| unix::followed(&state, name, now_ms)),
+        Ok(current) => current.map(|name| unix::followed(&state, name)),
         Err(why) => {
             eprintln!("aterm name: {why}; no name changed");
             return ExitCode::from(1);
@@ -579,7 +599,7 @@ fn undo(dry_run: bool, json: bool) -> ExitCode {
     let policy = policy_for(
         current
             .as_ref()
-            .and_then(crate::machine_name::undo_publishes),
+            .and_then(|name| crate::machine_name::undo_publishes(name, &seen)),
     );
     let policy = match policy {
         Ok(policy) => policy,
@@ -592,7 +612,7 @@ fn undo(dry_run: bool, json: bool) -> ExitCode {
     let ask = unix::UndoAsk {
         kind: caller(session_status().as_deref()),
         dry_run,
-        seen: current.as_ref().and_then(|name| name.history.first()),
+        seen: &seen,
     };
     match unix::undo(
         &state,
@@ -636,31 +656,23 @@ fn undo(_dry_run: bool, _json: bool) -> ExitCode {
     show(false)
 }
 
-/// `aterm name history`: the changes History keeps, made first, as any read does, where no
-/// name is there yet.
+/// How long `aterm name history` and `aterm name undo` give this Mac's registry read.
+#[cfg(unix)]
+const HISTORY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `aterm name history`: every write to this Mac's registry row's number and nickname, newest
+/// first, read from the registry alone ([`crate::machine_name::history::read`]): it makes no
+/// name and follows nothing.
 #[cfg(unix)]
 fn history(json: bool) -> ExitCode {
     let Some(state) = aterm_types::dirs::state_dir() else {
         eprintln!("aterm name: no state directory: $HOME is not set");
         return ExitCode::from(1);
     };
-    match unix::history(
-        &state,
-        json,
-        crate::machine_name::vault_roster_label,
-        aterm_netplace::unix_ms_now(),
-    ) {
-        Ok((text, narrowed)) => {
-            if let Some(was) = narrowed {
-                eprintln!(
-                    "aterm name: {} was open to other users ({was:o}); it is 0700 now",
-                    state.display()
-                );
-            }
-            aterm_uds::stdout::answer_exit("aterm name", &text, 0)
-        }
+    match unix::history(&state, json, std::time::Instant::now() + HISTORY_WAIT) {
+        Ok(text) => aterm_uds::stdout::answer_exit("aterm name", &text, 0),
         Err(why) => {
-            eprintln!("aterm name: {why}");
+            eprintln!("aterm name: this Mac's lab registry row was not read ({why})");
             ExitCode::from(1)
         }
     }
@@ -680,17 +692,15 @@ mod unix {
 
     use aterm_secrets::client::Paths;
 
-    use crate::machine_name::file::{
-        Change, MachineName, NO_HISTORY, by_kind_word, class_word, migration_word, nick_class_word,
-        why_word,
-    };
+    use crate::machine_name::file::{MachineName, class_word, migration_word, nick_class_word};
+    use crate::machine_name::history::{self, Undo};
     use crate::machine_name::{InFleet, Origin, ensure_in_view, follow_registry};
 
     /// `name`, read from `state`, once it has taken the nickname this Mac's own registry row
     /// was given from any Mac ([`follow_registry`]): a follow that fails is journaled and leaves
     /// `name` as it was, so a read never fails on it.
-    pub(super) fn followed(state: &Path, name: MachineName, now_ms: u64) -> MachineName {
-        match follow_registry(state, now_ms) {
+    pub(super) fn followed(state: &Path, name: MachineName) -> MachineName {
+        match follow_registry(state) {
             Ok(moved) => moved.unwrap_or(name),
             Err(why) => {
                 aterm_log::info!("machine name: the lab registry's nickname was not taken ({why})");
@@ -702,11 +712,9 @@ mod unix {
     /// [`followed`], then the number an owner wrote to this Mac's own registry row, published as
     /// `aterm name set` publishes a number ([`crate::machine_name::renumber_from_registry`]), as
     /// a read that shows the name takes both. An undo's own read runs only [`followed`], so the
-    /// undo never renumbers the Mac on its way; the change it takes back, History's newest as
-    /// that read showed it, may be one an earlier read followed from the row
-    /// ([`crate::machine_name::file::Why::Registry`]), which it reverts as it reverts any rename.
+    /// undo never renumbers the Mac on its way.
     fn shown_name(state: &Path, name: MachineName, now_ms: u64) -> MachineName {
-        let name = followed(state, name, now_ms);
+        let name = followed(state, name);
         crate::machine_name::renumber_from_registry(state, super::system_naming(), now_ms)
             .unwrap_or(name)
     }
@@ -811,12 +819,12 @@ mod unix {
     }
 
     /// What `aterm name undo` asks for: the kind of caller that asks, whether it only says
-    /// what would change, and the newest change the command read, the only one it takes back
-    /// (`None` where it read no name).
+    /// what would change, and the undo the command read and judged, the only rename it takes
+    /// back.
     pub(super) struct UndoAsk<'a> {
         pub(super) kind: aterm_net::fleet_member::name_record::ByKind,
         pub(super) dry_run: bool,
-        pub(super) seen: Option<&'a Change>,
+        pub(super) seen: &'a Undo,
     }
 
     /// Choose a number and optional nickname, then report the resulting or previewed name.
@@ -979,38 +987,28 @@ mod unix {
         Ok((if json { shown.json() } else { shown.line() }, notes))
     }
 
-    /// The changes History keeps in `state`'s name, newest first, made first where no file is
-    /// there ([`ensure_in_view`]) and following its registry row's nickname ([`followed`]): one
-    /// line each, or with `json` one array of objects, with the mode `state` was narrowed from
-    /// when it was open to others.
+    /// The writes to this Mac's registry row's number and nickname, newest first, as History
+    /// reads them for the name kept in `state` by `read_by` ([`history::read`]): one line each
+    /// ([`history::History::lines`]), or with `json` one object ([`history::History::json`]).
     ///
     /// # Errors
-    /// As [`report`].
+    /// The registry cannot be read by `read_by`.
     pub(super) fn history(
         state: &Path,
         json: bool,
-        roster: impl FnOnce() -> io::Result<Option<String>>,
-        now_ms: u64,
-    ) -> Result<(String, Option<u32>), String> {
-        let narrowed =
-            aterm_uds::private_file::ensure_private_dir(state).map_err(|e| e.to_string())?;
-        let (name, _) = ensure_in_view(state, roster, now_ms).map_err(|e| e.to_string())?;
-        let name = shown_name(state, name, now_ms);
-        let text = if json {
-            let changes = name.history.iter().map(change_json).collect();
-            let mut text =
-                aterm_json::to_string(&aterm_json::Value::Array(changes)).unwrap_or_default();
+        read_by: std::time::Instant,
+    ) -> Result<String, String> {
+        let read = history::read(state, read_by)?;
+        Ok(if json {
+            let mut text = aterm_json::to_string(&read.json()).unwrap_or_default();
             text.push('\n');
             text
-        } else if name.history.is_empty() {
-            format!("{NO_HISTORY}\n")
         } else {
-            name.history
-                .iter()
-                .map(|change| change.line() + "\n")
+            read.lines(None)
+                .into_iter()
+                .map(|line| line + "\n")
                 .collect()
-        };
-        Ok((text, narrowed))
+        })
     }
 
     /// The next free numbers `aterm name set`'s refusal names beside `num`, which `error`
@@ -1037,54 +1035,6 @@ mod unix {
         )
         .ok()?;
         crate::machine_name::next_free_words(&preview.next_free(num, refused))
-    }
-
-    /// One change as `aterm name history --json` prints it, keys in order.
-    fn change_json(change: &Change) -> aterm_json::Value {
-        use aterm_json::Value;
-        let number = |num: Option<aterm_types::machine_name::Number>| {
-            num.map_or(Value::Null, |num| Value::from(u64::from(num.get())))
-        };
-        let mut object = aterm_json::Map::new();
-        object.insert(
-            "at".to_owned(),
-            Value::String(aterm_types::rfc3339::format_rfc3339(change.at_ms / 1_000)),
-        );
-        object.insert("at_ms".to_owned(), Value::from(change.at_ms));
-        object.insert(
-            "by".to_owned(),
-            change.by.map_or(Value::Null, |by| {
-                let mut by_object = aterm_json::Map::new();
-                by_object.insert(
-                    "kind".to_owned(),
-                    Value::String(by_kind_word(by.kind).to_owned()),
-                );
-                by_object.insert(
-                    "node".to_owned(),
-                    Value::String(aterm_net::fleet_member::name_record::node_word(by.node)),
-                );
-                Value::Object(by_object)
-            }),
-        );
-        object.insert("from".to_owned(), number(change.from));
-        object.insert(
-            "nick_from".to_owned(),
-            change
-                .nick_from
-                .as_ref()
-                .map_or(Value::Null, |nick| Value::String(nick.as_str().to_owned())),
-        );
-        object.insert(
-            "nick_to".to_owned(),
-            Value::String(change.nick_to.as_str().to_owned()),
-        );
-        object.insert("to".to_owned(), number(change.to));
-        object.insert("undone".to_owned(), Value::Bool(change.undone));
-        object.insert(
-            "why".to_owned(),
-            Value::String(why_word(change.why).to_owned()),
-        );
-        Value::Object(object)
     }
 
     /// What `aterm name` says of `name`.

@@ -270,6 +270,15 @@ enum Route {
     Wall,
 }
 
+/// A test drain is acknowledged only after the forwarder empties the kernel queue and tells
+/// the sink every notification it took, including a batch already in flight at the request.
+#[cfg(test)]
+#[derive(Default)]
+struct Settle {
+    requested: AtomicU64,
+    finished: AtomicU64,
+}
+
 /// The watcher, the route of each watch, and the forwarder reading them.
 struct Live {
     watcher: Arc<Watcher>,
@@ -277,16 +286,16 @@ struct Live {
     routes: Arc<Mutex<HashMap<WatchId, Route>>>,
     /// The wall clock's watch whose descriptors the watcher polls ([`Route::Wall`]), which a test
     /// tells ([`InputWatch::wall`]).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     wall: Option<Arc<WallWatch>>,
     /// The watcher polls a wall clock watch that hears each of the Mac's sleeps
     /// ([`InputWatch::hears_wall`]).
     hears_wall: bool,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    /// The forwarder's finished waits ([`Forwarder::waits`]).
+    /// Requests for an acknowledged drain of queued notifications.
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
-    waits: Arc<AtomicU64>,
+    settle: Arc<Settle>,
 }
 
 /// The forwarder's share of [`Live`]: the thread's loop ([`Self::run`]).
@@ -297,9 +306,9 @@ struct Forwarder {
     wall: Option<Arc<WallWatch>>,
     stop: Arc<AtomicBool>,
     sink: Sink,
-    /// Completed waits, incremented after notifying the sink.
+    /// The test thread's drain requests and the last one acknowledged.
     #[cfg(test)]
-    waits: Arc<AtomicU64>,
+    settle: Arc<Settle>,
 }
 
 impl Live {
@@ -312,11 +321,11 @@ impl Live {
         let routes: Arc<Mutex<HashMap<WatchId, Route>>> = Arc::default();
         let wall = Self::poll_wall(&watcher, &routes, open_wall);
         let hears_wall = wall.as_deref().is_some_and(WallWatch::hears_sleep);
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         let held = wall.clone();
         let stop = Arc::new(AtomicBool::new(false));
         #[cfg(test)]
-        let waits = Arc::new(AtomicU64::new(0));
+        let settle = Arc::new(Settle::default());
         let forwarder = Forwarder {
             watcher: Arc::clone(&watcher),
             routes: Arc::clone(&routes),
@@ -324,7 +333,7 @@ impl Live {
             stop: Arc::clone(&stop),
             sink: Arc::clone(sink),
             #[cfg(test)]
-            waits: Arc::clone(&waits),
+            settle: Arc::clone(&settle),
         };
         let thread =
             crate::qos::spawn_lane_thread(THREAD, crate::qos::Role::Responsive, move || {
@@ -333,13 +342,13 @@ impl Live {
         Ok(Live {
             watcher,
             routes,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             wall: held,
             hears_wall,
             stop,
             thread: Some(thread),
             #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
-            waits,
+            settle,
         })
     }
 
@@ -465,30 +474,55 @@ impl Forwarder {
             if self.stop.load(Ordering::Acquire) {
                 return;
             }
-            let told: BTreeSet<Told> = {
-                let routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
-                fired
-                    .iter()
-                    .filter_map(|id| Some((routes.get(id)?, *id)))
-                    .flat_map(|(route, id)| match route {
-                        Route::Looks(paths) => paths.iter().cloned().map(Told::Input).collect(),
-                        Route::Process { pid, started } => vec![Told::Process {
-                            pid: *pid,
-                            started: *started,
-                            exited: self.watcher.is_gone(id),
-                        }],
-                        Route::Wall => self.wall_moved(),
-                    })
-                    .collect()
-            };
-            for told in told {
-                if !(self.sink)(told) {
-                    return;
-                }
+            if !self.tell(&fired) {
+                return;
             }
             #[cfg(test)]
-            self.waits.fetch_add(1, Ordering::Release);
+            {
+                let requested = self.settle.requested.load(Ordering::Acquire);
+                if requested > self.settle.finished.load(Ordering::Acquire) {
+                    loop {
+                        let fired = match self.watcher.wait(Some(std::time::Duration::ZERO)) {
+                            Ok(fired) => fired,
+                            Err(_) => return,
+                        };
+                        if fired.is_empty() {
+                            break;
+                        }
+                        if !self.tell(&fired) {
+                            return;
+                        }
+                    }
+                    self.settle.finished.store(requested, Ordering::Release);
+                }
+            }
         }
+    }
+
+    /// Route and deliver one batch before any drain can acknowledge it.
+    fn tell(&self, fired: &[WatchId]) -> bool {
+        let told: BTreeSet<Told> = {
+            let routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
+            fired
+                .iter()
+                .filter_map(|id| Some((routes.get(id)?, *id)))
+                .flat_map(|(route, id)| match route {
+                    Route::Looks(paths) => paths.iter().cloned().map(Told::Input).collect(),
+                    Route::Process { pid, started } => vec![Told::Process {
+                        pid: *pid,
+                        started: *started,
+                        exited: self.watcher.is_gone(id),
+                    }],
+                    Route::Wall => self.wall_moved(),
+                })
+                .collect()
+        };
+        for told in told {
+            if !(self.sink)(told) {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -713,19 +747,19 @@ impl InputWatch {
     }
 
     /// How many watches are placed: level and process watches.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn placed(&self) -> usize {
         self.places.levels.len() + self.places.processes.len()
     }
 
     /// Watch at most `budget` levels at once.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn set_budget(&mut self, budget: usize) {
         self.budget = budget;
     }
 
     /// Open the wall clock's watch with `wall` from the next start of the watcher on.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn hear_wall_by(&mut self, wall: fn() -> Option<Arc<WallWatch>>) {
         self.wall = wall;
     }
@@ -773,24 +807,24 @@ impl InputWatch {
 
     /// The wall clock's watch the live watch polls, which a test tells by hand
     /// ([`WallWatch::tell`]); `None` while nothing is watched.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn wall(&self) -> Option<&WallWatch> {
         self.live.as_ref()?.wall.as_deref()
     }
 
-    /// Wake the forwarder with nothing changed and wait until that wait finishes: every event
-    /// the kernel queued before the wake has been told by then.
+    /// Request a drain and wait for its acknowledgement: a completion of an older, already
+    /// in-flight wait cannot acknowledge this request. Every queued batch is told first.
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     pub(crate) fn wake_and_settle(&self) {
         let Some(live) = self.live.as_ref() else {
             return;
         };
-        let before = live.waits.load(Ordering::Acquire);
+        let requested = live.settle.requested.fetch_add(1, Ordering::AcqRel) + 1;
         live.watcher.wake().expect("wake the forwarder");
         aterm_spec::wait::until_within(
             aterm_spec::wait::MUST_HAPPEN,
-            "the forwarder finishes the wait it was woken from",
-            || (live.waits.load(Ordering::Acquire) > before).then_some(()),
+            "the forwarder acknowledges the requested queue drain",
+            || (live.settle.finished.load(Ordering::Acquire) >= requested).then_some(()),
         );
     }
 }

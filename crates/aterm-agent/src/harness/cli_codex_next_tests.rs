@@ -98,6 +98,7 @@ impl Pool {
                 },
                 accounts::Row {
                     label: "work".into(),
+                    email: Some("work@example.com".into()),
                     dir: Some(work.display().to_string()),
                     vendor,
                     ..accounts::Row::default()
@@ -201,6 +202,29 @@ impl Pool {
         let text = run(&line);
         let json = aterm_json::from_str(run(&format!("{line} --json")).trim()).expect("JSON");
         (text, json)
+    }
+
+    /// The label of the row the report's JSON names `id` ([`Pool::id`]), else `id` itself.
+    fn label_of_id(&self, id: &str) -> String {
+        let rows = accounts_read_roster_for(self.cli, &self.env, &mut Vec::new())
+            .expect("a roster")
+            .1
+            .rows;
+        let names = crate::harness::account_names::Listing::of(self.cli, &rows, None);
+        rows.iter()
+            .find(|row| names.id(&row.label) == id)
+            .map_or_else(|| id.to_owned(), |row| row.label.clone())
+    }
+
+    /// The row `label` as the report's JSON names it: its account's key, else its label.
+    fn id(&self, label: &str) -> String {
+        let rows = accounts_read_roster_for(self.cli, &self.env, &mut Vec::new())
+            .expect("a roster")
+            .1
+            .rows;
+        crate::harness::account_names::Listing::of(self.cli, &rows, None)
+            .id(label)
+            .to_owned()
     }
 
     /// The pools' seat a launch reads.
@@ -315,15 +339,16 @@ fn next_line(text: &str) -> &str {
         .unwrap_or_else(|| panic!("a next line: {text}"))
 }
 
-/// The text's `not next:` rows, label to reason.
+/// The text's `not next:` rows, each row as the report names it (with no lab, [`Pool::shown`])
+/// to reason.
 fn not_next(text: &str) -> BTreeMap<String, String> {
     text.lines()
         .find_map(|line| line.strip_prefix("not next: "))
         .map(|rows| {
             rows.split("; ")
                 .map(|row| {
-                    let (label, why) = row.split_once(": ").expect("label: why");
-                    (label.to_string(), why.to_string())
+                    let (name, why) = row.split_once(": ").expect("name: why");
+                    (name.to_string(), why.to_string())
                 })
                 .collect()
         })
@@ -341,19 +366,33 @@ fn reason_words(rows: BTreeMap<String, String>) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The JSON's `next.not` rows, label to reason.
+/// The JSON's `next.not` rows, each row as the text names it ([`Pool::shown`], from the JSON's
+/// row of that account: its name, or a row with no address by its label marked so) to reason.
 fn not_next_json(doc: &Value) -> BTreeMap<String, String> {
     doc["next"]["not"]
         .as_array()
         .expect("next.not")
         .iter()
         .map(|row| {
+            let id = row["account"].as_str().expect("account");
             (
-                row["label"].as_str().expect("label").to_string(),
+                shown_in_json(doc, id),
                 row["why"].as_str().expect("why").to_string(),
             )
         })
         .collect()
+}
+
+/// The JSON report `doc`'s row `id` ([`Pool::id`]) as its text names it, with no lab: the name of
+/// the row whose `ac` it is, else (a row with no address) its label marked so.
+fn shown_in_json(doc: &Value, id: &str) -> String {
+    doc["accounts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|row| row["ac"].as_str() == Some(id))
+        .and_then(|row| row["name"].as_str())
+        .map_or_else(|| format!("{id} (no address)"), str::to_owned)
 }
 
 /// ON A CODEX THAT KEEPS NO ROW'S LOGIN ITS OWN, `next:` IS THE ROW ON THIS MACHINE'S OWN LOGIN:
@@ -366,11 +405,22 @@ fn not_next_json(doc: &Value) -> BTreeMap<String, String> {
 fn an_old_codex_reports_the_default_row_next_and_every_row_of_its_own_not_next() {
     let pool = Pool::new("codex-next-old");
     let (text, doc) = pool.report(Some(&pool.old));
-    assert_eq!(next_line(&text), "next: main", "{text}");
+    assert_eq!(
+        next_line(&text),
+        format!("next: {}", pool.shown("main")),
+        "{text}"
+    );
     let not = not_next(&text);
-    assert_eq!(not.keys().collect::<Vec<_>>(), ["work"], "{text}");
-    assert!(not["work"].contains("`aterm pkg update codex`"), "{text}");
-    assert_eq!(doc["next"]["to"], Value::from("main"), "{doc}");
+    assert_eq!(
+        not.keys().cloned().collect::<Vec<_>>(),
+        [pool.shown("work")],
+        "{text}"
+    );
+    assert!(
+        not[&pool.shown("work")].contains("`aterm pkg update codex`"),
+        "{text}"
+    );
+    assert_eq!(doc["next"]["to"], Value::from(pool.id("main")), "{doc}");
     assert_eq!(doc["next"]["wait_until"], Value::Null);
     assert_eq!(not_next_json(&doc), not, "JSON matches text");
     let build = doc["next"]["only_default"]
@@ -387,10 +437,11 @@ fn an_old_codex_reports_the_default_row_next_and_every_row_of_its_own_not_next()
         !text.contains("list another"),
         "another row is no help: {text}"
     );
-    assert!(
-        none.contains("aterm harness accounts use main --cli codex"),
-        "{none}"
+    let pin = format!(
+        "aterm harness accounts use {} --cli codex",
+        pool.word("main")
     );
+    assert!(none.contains(&pin), "{none}");
     assert_eq!(doc["next"]["to"], Value::Null);
     assert_eq!(not_next_json(&doc), not_next(&text), "JSON matches text");
 }
@@ -413,10 +464,13 @@ fn an_old_codex_with_its_default_row_walled_waits_for_that_rows_reset() {
         assert!(next_line(&text).starts_with(&wait), "{work_walled}: {text}");
         let not = not_next(&text);
         assert!(
-            not["main"].starts_with(&format!("limited until {}", rfc3339_utc(until))),
+            not[&pool.shown("main")].starts_with(&format!("limited until {}", rfc3339_utc(until))),
             "{work_walled}: {text}"
         );
-        assert!(not["work"].contains("`aterm pkg update codex`"), "{text}");
+        assert!(
+            not[&pool.shown("work")].contains("`aterm pkg update codex`"),
+            "{text}"
+        );
         assert_eq!(doc["next"]["to"], Value::Null, "{doc}");
         assert_eq!(doc["next"]["wait_until"].as_i64(), Some(until), "{doc}");
         assert_eq!(not_next_json(&doc), not, "JSON matches text");
@@ -441,10 +495,10 @@ fn a_codex_that_keeps_codex_auth_path_reports_plain_rotation() {
         let (text, doc) = pool.report(Some(&pool.new));
         assert_eq!(
             next_line(&text),
-            format!("next: {want}"),
+            format!("next: {}", pool.shown(want)),
             "{walled}: {text}"
         );
-        assert_eq!(doc["next"]["to"], Value::from(want));
+        assert_eq!(doc["next"]["to"], Value::from(pool.id(want)));
         assert!(doc["next"].get("only_default").is_none(), "{doc}");
         assert_eq!(not_next_json(&doc), not_next(&text), "JSON matches text");
         let (plain_text, plain_doc) = pool.report(None);
@@ -559,8 +613,16 @@ fn an_old_codex_report_agrees_with_its_launch_in_every_default_row_condition() {
         );
         match launch {
             Ok(Some(row)) => {
-                assert_eq!(next, format!("next: {row}"), "{case}: {text}");
-                assert_eq!(doc["next"]["to"], Value::from(row), "{case}: {doc}");
+                assert_eq!(
+                    next,
+                    format!("next: {}", pool.shown(&row)),
+                    "{case}: {text}"
+                );
+                assert_eq!(
+                    doc["next"]["to"],
+                    Value::from(pool.id(&row)),
+                    "{case}: {doc}"
+                );
             }
             Ok(None) => panic!("{case}: a launch that takes no row: {text}"),
             Err(refused) => {
@@ -672,8 +734,8 @@ fn off_report_agrees_with_a_launch() {
                 });
                 match &launch {
                     Ok(Some(row)) => {
-                        assert_eq!(next, format!("next: {row}"), "{at}: {text}");
-                        assert_eq!(doc["next"]["to"], Value::from(row.clone()), "{at}: {doc}");
+                        assert_eq!(next, format!("next: {}", pool.shown(row)), "{at}: {text}");
+                        assert_eq!(doc["next"]["to"], Value::from(pool.id(row)), "{at}: {doc}");
                         assert_eq!(doc["next"]["none"], Value::Null, "{at}: {doc}");
                     }
                     Ok(None) => {
@@ -681,7 +743,7 @@ fn off_report_agrees_with_a_launch() {
                         assert_eq!(doc["next"]["to"], Value::Null, "{at}: {doc}");
                         assert_eq!(next, format!("next: none ({none})"), "{at}: {text}");
                         assert!(
-                            none.contains("`main`"),
+                            none.contains(&pool.shown("main")),
                             "{at}: the login it runs on: {none}"
                         );
                     }
@@ -736,7 +798,7 @@ fn off_report_of_claude_code_moves_no_session() {
             "{case}: {text}"
         );
         assert!(
-            none.contains("`main`"),
+            none.contains(&pool.shown("main")),
             "{case}: the login it runs on: {none}"
         );
         let state = pool
@@ -746,7 +808,15 @@ fn off_report_of_claude_code_moves_no_session() {
             .expect("state")
             .0;
         match state.active.as_deref().filter(|_| state.pinned) {
-            Some(pin) => assert!(none.contains(&format!("`{pin}`")), "{case}: {none}"),
+            Some(pin) => {
+                // A pin no row holds is named by its label.
+                let named = if pool.roster().row(pin).is_some() {
+                    pool.shown(pin)
+                } else {
+                    pin.to_owned()
+                };
+                assert!(none.contains(&named), "{case}: {none}");
+            }
             None => assert_eq!(pool.launch_on(None), Ok(None), "{case}: no row taken"),
         }
         assert_eq!(doc["next"]["wait_until"], Value::Null, "{case}: {doc}");
@@ -771,9 +841,9 @@ fn off_report_of_claude_code_moves_no_session() {
 #[test]
 fn rotation_on_reports_as_before() {
     for (cli, program, want) in [
-        (Cli::Claude, None, "next: work"),
-        (Cli::Codex, Some(false), "next: main"),
-        (Cli::Codex, Some(true), "next: main"),
+        (Cli::Claude, None, "work"),
+        (Cli::Codex, Some(false), "main"),
+        (Cli::Codex, Some(true), "main"),
     ] {
         for mode in ["early", "wall"] {
             let pool = Pool::of(cli, "off-control");
@@ -788,6 +858,7 @@ fn rotation_on_reports_as_before() {
             pool.mode(mode);
             let (text, doc) = pool.report(program.as_deref());
             let at = format!("{} under {mode} on {program:?}", cli.id());
+            let want = format!("next: {}", pool.shown(want));
             assert_eq!(next_line(&text), want, "{at}: {text}");
             assert_eq!(off_line(&text), None, "{at}: {text}");
             let mut keys: Vec<&str> = doc["next"]
@@ -1033,7 +1104,7 @@ fn a_keyring_login_takes_no_row_in_any_mode_and_the_report_says_so() {
                     "{at}: {text}"
                 );
                 assert!(
-                    none.contains("OS keyring") && none.contains("`main`"),
+                    none.contains("OS keyring") && none.contains(&pool.shown("main")),
                     "{at}: {none}"
                 );
                 assert_eq!(doc["next"]["to"], Value::Null, "{at}: {doc}");
@@ -1120,7 +1191,7 @@ fn the_report_says_where_a_launch_a_survey_passes_over_would_run() {
     );
     let not = not_next(&text);
     assert!(
-        not.contains_key("main") && not.contains_key("work"),
+        not.contains_key(&refused.shown("main")) && not.contains_key(&refused.shown("work")),
         "{text}"
     );
 }
@@ -1204,8 +1275,16 @@ fn with_no_row_active_next_is_the_row_a_launch_takes() {
                     }
                     other => panic!("{at}: a launch takes a row: {other:?}"),
                 };
-                assert_eq!(next_line(&text), format!("next: {launch}"), "{at}: {text}");
-                assert_eq!(doc["next"]["to"], Value::from(launch), "{at}: {doc}");
+                assert_eq!(
+                    next_line(&text),
+                    format!("next: {}", pool.shown(&launch)),
+                    "{at}: {text}"
+                );
+                assert_eq!(
+                    doc["next"]["to"],
+                    Value::from(pool.id(&launch)),
+                    "{at}: {doc}"
+                );
                 assert!(
                     !text.contains("the account in use"),
                     "{at}: no row is in use: {text}"
@@ -1243,7 +1322,7 @@ fn a_row_that_cannot_serve_is_not_next_for_its_own_condition() {
         let (text, _) = pool.report(program(&pool).as_deref());
         let usable = not_next(&text);
         assert_eq!(
-            usable.get("main").map(String::as_str),
+            usable.get(&pool.shown("main")).map(String::as_str),
             (cli == Cli::Claude).then_some("the account in use"),
             "{}: CONTROL: {text}",
             cli.id()
@@ -1251,7 +1330,12 @@ fn a_row_that_cannot_serve_is_not_next_for_its_own_condition() {
         signed_out(&pool);
         let (text, doc) = pool.report(program(&pool).as_deref());
         let words = reason_words(not_next(&text));
-        assert_eq!(words["main"], "signed-out", "{}: {text}", cli.id());
+        assert_eq!(
+            words[&pool.shown("main")],
+            "signed-out",
+            "{}: {text}",
+            cli.id()
+        );
         assert_eq!(
             reason_words(not_next_json(&doc)),
             words,
@@ -1263,7 +1347,7 @@ fn a_row_that_cannot_serve_is_not_next_for_its_own_condition() {
         let until = pool.wall("main", pool.env.now + 7200);
         let (text, _) = pool.report(program(&pool).as_deref());
         assert_eq!(
-            not_next(&text)["main"],
+            not_next(&text)[&pool.shown("main")],
             format!("limited until {}", rfc3339_utc(until)),
             "{}: {text}",
             cli.id()
@@ -1273,12 +1357,19 @@ fn a_row_that_cannot_serve_is_not_next_for_its_own_condition() {
     let pool = Pool::new("own-condition-active");
     pool.state(|state| state.active = Some("main".to_string()));
     let (text, _) = pool.report(Some(&pool.new));
-    assert_eq!(next_line(&text), "next: main", "CONTROL: {text}");
-    assert!(!not_next(&text).contains_key("main"), "CONTROL: {text}");
+    assert_eq!(
+        next_line(&text),
+        format!("next: {}", pool.shown("main")),
+        "CONTROL: {text}"
+    );
+    assert!(
+        !not_next(&text).contains_key(&pool.shown("main")),
+        "CONTROL: {text}"
+    );
     signed_out(&pool);
     let (text, _) = pool.report(Some(&pool.new));
     assert_eq!(
-        reason_words(not_next(&text))["main"],
+        reason_words(not_next(&text))[&pool.shown("main")],
         "signed-out",
         "{text}"
     );
@@ -1332,7 +1423,7 @@ fn a_row_that_cannot_serve_is_not_next_for_its_own_condition() {
     let (text, doc) = pool.report(None);
     assert_eq!(
         doc["next"]["to"].as_str(),
-        Some("main"),
+        Some(pool.id("main").as_str()),
         "a launch runs on it: {text}"
     );
     assert_eq!(
@@ -1340,7 +1431,7 @@ fn a_row_that_cannot_serve_is_not_next_for_its_own_condition() {
         Some("not-enrolled"),
         "{text}"
     );
-    assert!(!not_next(&text).contains_key("main"), "{text}");
+    assert!(!not_next(&text).contains_key(&pool.shown("main")), "{text}");
     assert!(!text.contains("the account in use"), "{text}");
     assert!(!text.contains("list another"), "{text}");
 }
@@ -1417,8 +1508,12 @@ fn every_codex_judge_reads_the_program_a_launch_runs() {
         sign_ins: std::cell::RefCell::default(),
     };
     let (text, doc) = pool.report_on(&host);
-    assert_eq!(next_line(&text), "next: main", "{text}");
-    assert_eq!(doc["next"]["to"], Value::from("main"), "{doc}");
+    assert_eq!(
+        next_line(&text),
+        format!("next: {}", pool.shown("main")),
+        "{text}"
+    );
+    assert_eq!(doc["next"]["to"], Value::from(pool.id("main")), "{doc}");
     let build = doc["next"]["only_default"]
         .as_str()
         .expect("the build's reason");
@@ -1431,7 +1526,7 @@ fn every_codex_judge_reads_the_program_a_launch_runs() {
     assert_eq!(pool.launch(&launch), Ok(Some("main".to_string())));
     let store = pool.env.accounts_store_for(Cli::Codex).expect("a store");
     for verb in ["renew", "login"] {
-        let line = format!("accounts {verb} main --cli codex");
+        let line = format!("accounts {verb} {} --cli codex", pool.word("main"));
         let Cmd::AccountsOf(of) = parsed(&line).expect(&line) else {
             panic!("{line}: an accounts command")
         };
@@ -1440,7 +1535,7 @@ fn every_codex_judge_reads_the_program_a_launch_runs() {
         let err = String::from_utf8(err).expect("utf-8");
         assert_eq!(code, ExitCode::from(1), "{verb}: {err}");
         let why = crate::harness::codex_alab::AuthPathUnread::Unnamed(launch.clone());
-        let refusal = crate::harness::codex_alab::default_row_staging("main", &why);
+        let refusal = crate::harness::codex_alab::default_row_staging(&pool.shown("main"), &why);
         assert!(err.contains(&refusal), "{verb}: {err}");
         assert!(host.sign_ins.borrow().is_empty(), "{verb}: no sign-in ran");
         let logins = store.load_logins(pool.env.now).expect("logins").0;
@@ -1475,9 +1570,13 @@ fn under_a_pin_a_launch_takes_next_is_the_pinned_row() {
             let until = pool.wall("work", pool.env.now + 7200);
             pool.state(|state| state.active = Some("work".to_string()));
             let (text, _) = pool.report(program.as_deref());
-            assert_eq!(next_line(&text), "next: main", "{at}: CONTROL: {text}");
             assert_eq!(
-                not_next(&text)["work"],
+                next_line(&text),
+                format!("next: {}", pool.shown("main")),
+                "{at}: CONTROL: {text}"
+            );
+            assert_eq!(
+                not_next(&text)[&pool.shown("work")],
                 format!("limited until {}", rfc3339_utc(until)),
                 "{at}: CONTROL: {text}"
             );
@@ -1493,9 +1592,20 @@ fn under_a_pin_a_launch_takes_next_is_the_pinned_row() {
                     Ok(Some("work".to_string())),
                     "{at}: PRECONDITION: a launch takes the pin"
                 );
-                assert_eq!(next_line(&text), "next: work", "{at}: {text}");
-                assert_eq!(doc["next"]["to"], Value::from("work"), "{at}: {doc}");
-                assert!(!not_next(&text).contains_key("work"), "{at}: {text}");
+                assert_eq!(
+                    next_line(&text),
+                    format!("next: {}", pool.shown("work")),
+                    "{at}: {text}"
+                );
+                assert_eq!(
+                    doc["next"]["to"],
+                    Value::from(pool.id("work")),
+                    "{at}: {doc}"
+                );
+                assert!(
+                    !not_next(&text).contains_key(&pool.shown("work")),
+                    "{at}: {text}"
+                );
             } else {
                 assert_eq!(
                     pool.launch_on(program.as_deref()),
@@ -1519,9 +1629,13 @@ fn under_a_pin_a_launch_takes_next_is_the_pinned_row() {
                 "{at}: CONTROL: a launch leaves a pin leased elsewhere"
             );
             let (text, _) = pool.report(program.as_deref());
-            assert_eq!(next_line(&text), "next: main", "{at}: CONTROL: {text}");
             assert_eq!(
-                not_next(&text)["work"],
+                next_line(&text),
+                format!("next: {}", pool.shown("main")),
+                "{at}: CONTROL: {text}"
+            );
+            assert_eq!(
+                not_next(&text)[&pool.shown("work")],
                 format!("leased elsewhere until {}", rfc3339_utc(now + 3600)),
                 "{at}: CONTROL: {text}"
             );
@@ -1582,8 +1696,16 @@ fn with_no_codex_a_launch_can_start_no_row_is_next() {
     std::fs::write(full.join("codex"), "#!/bin/sh\n").expect("a codex on PATH");
     let path = std::env::join_paths([&empty, &full]).expect("a PATH");
     let (text, doc) = pool.report_on(&BareWord(path));
-    assert_eq!(next_line(&text), "next: main", "CONTROL: {text}");
-    assert_eq!(doc["next"]["to"], Value::from("main"), "CONTROL: {doc}");
+    assert_eq!(
+        next_line(&text),
+        format!("next: {}", pool.shown("main")),
+        "CONTROL: {text}"
+    );
+    assert_eq!(
+        doc["next"]["to"],
+        Value::from(pool.id("main")),
+        "CONTROL: {doc}"
+    );
 }
 
 /// ON A CODEX THAT KEEPS NO ROW'S LOGIN ITS OWN, THE ROW ON THIS MACHINE'S OWN LOGIN WITH NO
@@ -1640,12 +1762,13 @@ fn a_default_row_with_no_login_stored_is_not_called_signed_out() {
             .map(|row| row.label.clone()),
             Err(DefaultRow::SignedOut {
                 label: "main".into(),
+                word: Some(pool_word(Cli::Codex, "owner@example.com")),
                 stored
             }),
             "{case}"
         );
         let (text, _) = pool.report(Some(&pool.old));
-        let why = &not_next(&text)["main"];
+        let why = &not_next(&text)[&pool.shown("main")];
         let (said, sign_in) = signed_out_says(stored);
         assert!(why.starts_with(said), "{case}: {text}");
         assert!(why.ends_with(&format!("login {sign_in}")), "{case}: {text}");
@@ -1672,12 +1795,19 @@ fn a_pin_on_a_row_of_its_own_is_refused_for_that_before_its_sign_in() {
     std::fs::remove_file(pool.tmp.path().join("logins/codex/work/auth.json"))
         .expect("work's login");
     let why = auth_path_unread(&pool.old).expect("an old build");
-    let own = only_default_pinned(&why, "work", &DefaultRow::Serves("main".into()));
+    let own = only_default_pinned(
+        &why,
+        "work",
+        &DefaultRow::Serves(
+            "main".into(),
+            Some(pool_word(Cli::Codex, "owner@example.com")),
+        ),
+    );
     let refused = pool.launch(&pool.old).expect_err("a refused launch");
     assert!(refused.starts_with(&own), "{refused}");
     let (text, _) = pool.report(Some(&pool.old));
     assert!(
-        next_line(&text).starts_with("next: none (the pin on `work`"),
+        next_line(&text).starts_with(&format!("next: none (the pin on {}", pool.shown("work"))),
         "{text}"
     );
     pool.mode("off");
@@ -1729,14 +1859,61 @@ impl Pool {
     }
 
     /// `accounts use <form> --cli <cli>` run as `host` answers, which must succeed: what it
-    /// records past its first line.
+    /// records past its first line. A `form` that is not a flag is a row's label, and the line
+    /// names that row's account by its word ([`Pool::word`]).
     fn recorded(&self, form: &str, host: &dyn AccountsHost) -> String {
+        let form = if form.starts_with("--") {
+            form.to_owned()
+        } else {
+            self.word(form)
+        };
         let line = format!("accounts use {form} --cli {}", self.cli.id());
         let (code, out, err) = self.run_on(&line, host);
         assert_eq!(code, ExitCode::SUCCESS, "{line}: {err}");
         let mut lines = out.lines();
         assert!(lines.next().is_some(), "{line}: {out}");
         lines.collect::<Vec<_>>().join("\n")
+    }
+
+    /// The word that names the account of the roster row labelled `label`, as `accounts use`
+    /// takes it.
+    fn word(&self, label: &str) -> String {
+        let roster = self.roster();
+        let row = roster.row(label).expect("the row");
+        crate::harness::account_names::word_of_row(self.cli, row, &roster.rows, None)
+            .expect("a row with an address")
+            .to_string()
+    }
+
+    /// The word a step that signs the roster row labelled `label` in types for it
+    /// ([`crate::harness::account_names::sign_in_word`]): its account's word, else, for a row
+    /// with no address, its label.
+    fn sign_in_word(&self, label: &str) -> String {
+        let roster = self.roster();
+        let row = roster.row(label).expect("the row");
+        crate::harness::account_names::sign_in_word(self.cli, row, &roster.rows, None).to_string()
+    }
+
+    /// The account of the roster row labelled `label` as `accounts use` names it in its lines:
+    /// its name ([`crate::harness::account_names::shown_row`]).
+    fn shown(&self, label: &str) -> String {
+        let roster = self.roster();
+        let row = roster.row(label).expect("the row");
+        crate::harness::account_names::shown_row(self.cli, row, None)
+    }
+
+    /// Whether `said`, a line `accounts use` printed, names the account of the roster row
+    /// labelled `label` by its name ([`Pool::shown`]) and names no row of the pool by its label
+    /// in backticks, as its lines named rows before SF-07H (`` `work` ``). A label here is also
+    /// its row's address's local part (`work@example.com`), so only the backticked form tells a
+    /// label printed from the name.
+    fn names(&self, said: &str, label: &str) -> bool {
+        said.contains(&self.shown(label))
+            && self
+                .roster()
+                .rows
+                .iter()
+                .all(|row| !said.contains(&format!("`{}`", row.label)))
     }
 
     /// The roster as it is written.
@@ -1748,7 +1925,9 @@ impl Pool {
 
     /// The login a launch that takes no row runs on when started plainly, in the report's words.
     fn own(&self) -> String {
-        own_login_words(&self.roster(), None)
+        let roster = self.roster();
+        let names = crate::harness::account_names::Listing::here(self.cli, &roster.rows);
+        own_login_words((&roster, &names), None)
     }
 }
 
@@ -1799,7 +1978,7 @@ fn on_an_old_codex_a_pin_on_a_row_of_its_own_records_the_launchs_refusal() {
             "{mode}: CONTROL: PRECONDITION: with no program known a launch takes the pin"
         );
         assert!(!unknown.contains(refused), "{mode}: CONTROL: {unknown}");
-        assert!(unknown.contains("`work`"), "{mode}: CONTROL: {unknown}");
+        assert!(pool.names(&unknown, "work"), "{mode}: CONTROL: {unknown}");
     }
 }
 
@@ -1819,7 +1998,7 @@ fn on_a_codex_that_keeps_codex_auth_path_a_pin_records_that_a_worker_takes_it() 
             Ok(Some("work".to_string())),
             "{mode}: PRECONDITION: a launch takes the pin"
         );
-        assert!(said.contains("`work`"), "{mode}: {said}");
+        assert!(pool.names(&said, "work"), "{mode}: {said}");
         let old = pool
             .launch(&pool.old)
             .expect_err("PRECONDITION: the old build's launch under the pin is refused");
@@ -1832,7 +2011,7 @@ fn on_a_codex_that_keeps_codex_auth_path_a_pin_records_that_a_worker_takes_it() 
     let path = std::env::join_paths([&empty]).expect("a PATH");
     let said = pool.recorded("work", &BareWord(path));
     assert!(said.contains("`aterm pkg install codex`"), "{said}");
-    assert!(!said.contains("`work`"), "{said}");
+    assert!(!said.contains(&pool.shown("work")), "{said}");
 }
 
 /// WITH CODEX'S LOGIN IN THE OS KEYRING, `accounts use` RECORDS THAT A WORKER TAKES NO ROW, THE
@@ -1902,7 +2081,7 @@ fn for_grok_and_kimi_accounts_use_says_what_a_launch_does() {
                     Ok(Some("work".to_string())),
                     "{at}: PRECONDITION: a launch takes the pin"
                 );
-                assert!(said.contains("`work`"), "{at}: {said}");
+                assert!(pool.names(&said, "work"), "{at}: {said}");
                 assert!(said.contains(cli.connector().product), "{at}: {said}");
             } else {
                 assert_eq!(
@@ -1916,11 +2095,11 @@ fn for_grok_and_kimi_accounts_use_says_what_a_launch_does() {
             let auto = pool.recorded("--auto", &host);
             match pool.launch_on(None) {
                 Ok(Some(row)) => {
-                    assert!(auto.contains(&format!("`{row}`")), "{at}: {auto}");
+                    assert!(pool.names(&auto, &row), "{at}: {auto}");
                 }
                 Ok(None) => {
                     assert!(auto.contains(&pool.own()), "{at}: {auto}");
-                    assert!(!auto.contains("`work`"), "{at}: {auto}");
+                    assert!(!auto.contains(&pool.shown("work")), "{at}: {auto}");
                 }
                 Err(refused) => {
                     assert!(auto.contains(without_no_worker(&refused)), "{at}: {auto}");
@@ -1989,7 +2168,7 @@ fn a_pin_on_a_row_this_mac_may_not_use_records_what_a_launch_does_instead() {
                         Ok(Some("work".to_string())),
                         "{at}: CONTROL: PRECONDITION: a launch takes the pin"
                     );
-                    assert!(control.contains("`work`"), "{at}: CONTROL: {control}");
+                    assert!(pool.names(&control, "work"), "{at}: CONTROL: {control}");
                 } else {
                     assert_eq!(
                         pool.launch_on(program.as_deref()),
@@ -2008,7 +2187,7 @@ fn a_pin_on_a_row_this_mac_may_not_use_records_what_a_launch_does_instead() {
                 match launched {
                     Ok(Some(row)) if row == "work" => assert_eq!(said, control, "{at}"),
                     Ok(Some(row)) => {
-                        assert!(said.contains(&format!("`{row}`")), "{at}: {said}");
+                        assert!(pool.names(&said, &row), "{at}: {said}");
                         assert!(said.contains(&why_not_words(why)), "{at}: {said}");
                     }
                     Err(refused) => {
@@ -2030,22 +2209,22 @@ fn a_pin_on_a_row_this_mac_may_not_use_records_what_a_launch_does_instead() {
 }
 
 /// CONTROL: CLAUDE CODE'S `accounts use` WORDS ARE ITS SUPERVISOR'S, AS BEFORE: the pin, and
-/// `use --auto`'s end of it.
+/// `use --auto`'s end of it, each naming the account by its name.
 #[test]
 fn claude_codes_accounts_use_words_are_its_supervisors() {
     let pool = Pool::of(Cli::Claude, "use-claude");
     let host = CodexProgram(None);
-    let (code, out, err) = pool.run_on("accounts use work", &host);
+    let (code, out, err) = pool.run_on("accounts use work@example.com", &host);
     assert_eq!(code, ExitCode::SUCCESS, "{err}");
     assert_eq!(
         out,
-        format!("work: the active account, pinned\n{ACCOUNTS_USE_RECORDED}\n")
+        format!("claude work@example.com: the active account, pinned\n{ACCOUNTS_USE_RECORDED}\n")
     );
     let (code, out, err) = pool.run_on("accounts use --auto", &host);
     assert_eq!(code, ExitCode::SUCCESS, "{err}");
     assert_eq!(
         out,
-        format!("work: no longer pinned\n{ACCOUNTS_AUTO_RECORDED}\n")
+        format!("claude work@example.com: no longer pinned\n{ACCOUNTS_AUTO_RECORDED}\n")
     );
 }
 
@@ -2130,16 +2309,23 @@ fn next_is_the_row_a_launch_takes_as_accounts_use_says() {
                     .launch_on(program.as_deref())
                     .unwrap_or_else(|why| panic!("{at}: {why}"))
                     .unwrap_or_else(|| panic!("{at}: a launch takes a row"));
-                assert!(auto.contains(&format!("`{launch}`")), "{at}: {auto}");
+                assert!(pool.names(&auto, &launch), "{at}: {auto}");
                 let (text, doc) = pool.report(program.as_deref());
-                assert_eq!(next_line(&text), format!("next: {launch}"), "{at}: {text}");
+                assert_eq!(
+                    next_line(&text),
+                    format!("next: {}", pool.shown(&launch)),
+                    "{at}: {text}"
+                );
                 assert_eq!(
                     doc["next"]["to"],
-                    Value::from(launch.as_str()),
+                    Value::from(pool.id(&launch)),
                     "{at}: {doc}"
                 );
                 assert!(!text.contains("the account in use"), "{at}: {text}");
-                assert!(!not_next(&text).contains_key(&launch), "{at}: {text}");
+                assert!(
+                    !not_next(&text).contains_key(&pool.shown(&launch)),
+                    "{at}: {text}"
+                );
                 assert_eq!(
                     not_next_json(&doc),
                     not_next(&text),
@@ -2190,7 +2376,11 @@ fn a_pin_this_mac_may_not_use_is_not_next_for_what_keeps_it_from_this_mac() {
                         );
                     }
                 }
-                assert_eq!(not_next(&text).get("work"), Some(&why), "{at}: {text}");
+                assert_eq!(
+                    not_next(&text).get(&pool.shown("work")),
+                    Some(&why),
+                    "{at}: {text}"
+                );
                 assert_eq!(
                     not_next_json(&doc),
                     not_next(&text),
@@ -2200,7 +2390,11 @@ fn a_pin_this_mac_may_not_use_is_not_next_for_what_keeps_it_from_this_mac() {
                 match pool.launch_on(program.as_deref()) {
                     Ok(Some(row)) => {
                         assert_ne!(row, "work", "{at}: PRECONDITION: the pin is passed");
-                        assert_eq!(next_line(&text), format!("next: {row}"), "{at}: {text}");
+                        assert_eq!(
+                            next_line(&text),
+                            format!("next: {}", pool.shown(&row)),
+                            "{at}: {text}"
+                        );
                         assert!(said.contains(&why), "{at}: {said}");
                     }
                     other => assert!(
@@ -2235,7 +2429,11 @@ fn a_low_pin_a_launch_takes_is_next_and_not_also_not_next() {
             pool.recorded("work", &host);
             pool.wall("main", pool.env.now + 600);
             let (text, _) = pool.report(program.as_deref());
-            assert_eq!(next_line(&text), "next: work", "{at}: CONTROL: {text}");
+            assert_eq!(
+                next_line(&text),
+                format!("next: {}", pool.shown("work")),
+                "{at}: CONTROL: {text}"
+            );
             let now = pool.env.now;
             pool.state(|state| {
                 accounts::note_sample(
@@ -2256,9 +2454,20 @@ fn a_low_pin_a_launch_takes_is_next_and_not_also_not_next() {
                 "{at}: PRECONDITION: a launch takes the low pin"
             );
             let (text, doc) = pool.report(program.as_deref());
-            assert_eq!(next_line(&text), "next: work", "{at}: {text}");
-            assert_eq!(doc["next"]["to"], Value::from("work"), "{at}: {doc}");
-            assert!(!not_next(&text).contains_key("work"), "{at}: {text}");
+            assert_eq!(
+                next_line(&text),
+                format!("next: {}", pool.shown("work")),
+                "{at}: {text}"
+            );
+            assert_eq!(
+                doc["next"]["to"],
+                Value::from(pool.id("work")),
+                "{at}: {doc}"
+            );
+            assert!(
+                !not_next(&text).contains_key(&pool.shown("work")),
+                "{at}: {text}"
+            );
             assert_eq!(
                 not_next_json(&doc),
                 not_next(&text),
@@ -2296,7 +2505,11 @@ fn under_rotation_off_a_pin_held_for_another_macs_warm_set_is_refused() {
                 "{at}: CONTROL: a launch takes the pin"
             );
             let (text, _) = pool.report(program.as_deref());
-            assert_eq!(next_line(&text), "next: work", "{at}: CONTROL: {text}");
+            assert_eq!(
+                next_line(&text),
+                format!("next: {}", pool.shown("work")),
+                "{at}: CONTROL: {text}"
+            );
             hold(&pool, "work");
             let refused = pool
                 .launch_on(program.as_deref())
@@ -2386,7 +2599,7 @@ fn with_no_grok_or_kimi_a_launch_can_start_use_and_next_say_not_installed() {
         let said = pool.recorded("work", &host);
         assert!(said.contains(&fix), "{at}: {said}");
         assert!(said.contains("not installed"), "{at}: {said}");
-        assert!(!said.contains("`work`"), "{at}: {said}");
+        assert!(!said.contains(&pool.shown("work")), "{at}: {said}");
         let (text, doc) = pool.report_on(&host);
         let none = doc["next"]["none"].as_str().expect("why no row is next");
         assert!(none.contains(&fix), "{at}: {none}");
@@ -2407,10 +2620,14 @@ fn with_no_grok_or_kimi_a_launch_can_start_use_and_next_say_not_installed() {
             "{at}: CONTROL: a launch runs atpkg's managed copy"
         );
         let said = pool.recorded("work", &host);
-        assert!(said.contains("`work`"), "{at}: CONTROL: {said}");
+        assert!(pool.names(&said, "work"), "{at}: CONTROL: {said}");
         assert!(!said.contains(&fix), "{at}: CONTROL: {said}");
         let (text, _) = pool.report_on(&host);
-        assert_eq!(next_line(&text), "next: work", "{at}: CONTROL: {text}");
+        assert_eq!(
+            next_line(&text),
+            format!("next: {}", pool.shown("work")),
+            "{at}: CONTROL: {text}"
+        );
         assert_eq!(
             crate::harness::worker::pooled_launch_program_in(cli, None),
             Path::new(cli.id()),
@@ -2422,8 +2639,9 @@ fn with_no_grok_or_kimi_a_launch_can_start_use_and_next_say_not_installed() {
 /// `accounts use` OF A ROW IT CANNOT PIN NAMES THE STEP THAT ENDS THE REFUSAL, BY ITS KIND: for
 /// Codex (on a build that keeps `CODEX_AUTH_PATH`'s login), Grok Build and Kimi Code CLI, a row
 /// with no login made here (`work`, its login directory emptied) and a row known signed out
-/// (`main`) are each refused with that row's sign-in at a terminal, in the verb `accounts add`
-/// names for it (`Cli::sign_in_verb`), and a label the roster does not list with `accounts add`.
+/// (`main`), each named by its account's word, are each refused with that row's sign-in at a
+/// terminal, in the verb `accounts add` names for it (`Cli::sign_in_verb`), and a word that names
+/// no account as such.
 /// On a Codex build that keeps no row's login its own, the row on this machine's own login is
 /// signed in by Codex's own sign-in (`codex_alab::default_sign_in`), which `accounts login|renew`
 /// refuses there. CONTROL: before `main` is signed out, its pin is recorded.
@@ -2434,7 +2652,8 @@ fn accounts_use_names_the_sign_in_that_ends_its_refusal() {
         let pool = Pool::of(cli, "use-refused");
         let host = CodexProgram((cli == Cli::Codex).then(|| pool.new.clone()));
         let refused = |label: &str, host: &dyn AccountsHost| {
-            let (code, out, err) = pool.run_on(&format!("accounts use {label} --cli {id}"), host);
+            let word = pool.word(label);
+            let (code, out, err) = pool.run_on(&format!("accounts use {word} --cli {id}"), host);
             assert_eq!(code, ExitCode::from(1), "{id}: {label}: {out}{err}");
             err
         };
@@ -2444,15 +2663,17 @@ fn accounts_use_names_the_sign_in_that_ends_its_refusal() {
         std::fs::remove_file(work.join(store)).expect("work's login");
         let err = refused("work", &host);
         let login = format!(
-            "`aterm harness accounts {} work --cli {id}`",
-            cli.sign_in_verb(false)
+            "`aterm harness accounts {} {} --cli {id}`",
+            cli.sign_in_verb(true),
+            pool.sign_in_word("work")
         );
         assert!(err.contains(&login), "{id}: {err}");
         pool.signed_out("main");
         let err = refused("main", &host);
         let renew = format!(
-            "`aterm harness accounts {} main --cli {id}`",
-            cli.sign_in_verb(true)
+            "`aterm harness accounts {} {} --cli {id}`",
+            cli.sign_in_verb(true),
+            pool.sign_in_word("main")
         );
         assert!(err.contains(&renew), "{id}: {err}");
         if cli == Cli::Codex {
@@ -2461,9 +2682,12 @@ fn accounts_use_names_the_sign_in_that_ends_its_refusal() {
             assert!(err.contains(&own), "{id}: {err}");
             assert!(!err.contains(&renew), "{id}: {err}");
         }
-        let err = refused("nobody", &host);
-        let add = format!("`aterm harness accounts add <label> --cli {id}`");
-        assert!(err.contains(&add), "{id}: {err}");
+        let (code, out, err) = pool.run_on(&format!("accounts use nobody --cli {id}"), &host);
+        assert_eq!(code, ExitCode::from(1), "{id}: {out}{err}");
+        assert!(
+            err.contains(&aterm_file::no_account("nobody")),
+            "{id}: {err}"
+        );
     }
 }
 
@@ -2539,9 +2763,13 @@ fn with_no_codex_installed_no_row_is_not_next_for_a_build() {
         path: std::env::join_paths([&dir]).expect("a PATH"),
     };
     let (text, doc) = pool.report_on(&host);
-    assert_eq!(next_line(&text), "next: main", "CONTROL: {text}");
+    assert_eq!(
+        next_line(&text),
+        format!("next: {}", pool.shown("main")),
+        "CONTROL: {text}"
+    );
     assert!(
-        not_next(&text)["work"].contains("this Codex build runs only"),
+        not_next(&text)[&pool.shown("work")].contains("this Codex build runs only"),
         "CONTROL: {text}"
     );
     assert!(
@@ -2564,7 +2792,6 @@ fn the_active_line_says_when_a_launch_takes_another_row() {
             .unwrap_or_else(|| panic!("an active line: {text}"))
             .to_string()
     };
-    let plain = "active: work, 0 of 0 sessions on it";
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
         // A launch takes a Kimi row of its own only where aterm makes its overlay home.
         if !links_here(cli) {
@@ -2572,6 +2799,8 @@ fn the_active_line_says_when_a_launch_takes_another_row() {
         }
         let at = cli.id();
         let pool = Pool::of(cli, "active-line");
+        let plain = format!("active: {}, 0 of 0 sessions on it", pool.shown("work"));
+        let plain = plain.as_str();
         let program = (cli == Cli::Codex).then(|| pool.new.clone());
         pool.state(|state| state.active = Some("work".to_string()));
         assert_eq!(
@@ -2589,10 +2818,14 @@ fn the_active_line_says_when_a_launch_takes_another_row() {
             "{at}"
         );
         let (text, _) = pool.report(program.as_deref());
-        assert_eq!(next_line(&text), "next: main", "{at}: {text}");
+        assert_eq!(
+            next_line(&text),
+            format!("next: {}", pool.shown("main")),
+            "{at}: {text}"
+        );
         let line = header(&text);
         assert!(
-            line.starts_with(plain) && line.contains("takes `main`"),
+            line.starts_with(plain) && line.contains(&format!("takes {},", pool.shown("main"))),
             "{at}: {text}"
         );
 
@@ -2602,7 +2835,7 @@ fn the_active_line_says_when_a_launch_takes_another_row() {
         assert!(next_line(&text).starts_with("next: none"), "{at}: {text}");
         let line = header(&text);
         assert!(
-            line.starts_with(plain) && line != plain && !line.contains("takes `"),
+            line.starts_with(plain) && line != plain && line.contains("does not take it now"),
             "{at}: {text}"
         );
     }
@@ -3114,13 +3347,16 @@ impl Pool {
         let next = &doc["next"];
         let not = next["not"].as_array().expect("next.not");
         let in_use = why_not_words(accounts::WhyNot::Me);
+        // The JSON names each row by its account's key (a row with no address by its label): the
+        // law reads them back to the rows' labels, its own key.
+        let label = |id: &str| self.label_of_id(id);
         LawReport {
-            to: next["to"].as_str().map(str::to_string),
+            to: next["to"].as_str().map(label),
             waits: next["wait_until"].as_i64().is_some(),
             says_none: next.get("none").is_some_and(|none| !none.is_null()),
             not: not
                 .iter()
-                .map(|row| row["label"].as_str().expect("label").to_string())
+                .map(|row| label(row["account"].as_str().expect("account")))
                 .collect(),
             why_in_use: not
                 .iter()
@@ -3131,8 +3367,8 @@ impl Pool {
                     rows.iter()
                         .map(|row| {
                             (
-                                row["from"].as_str().expect("from").to_string(),
-                                row["to"].as_str().expect("to").to_string(),
+                                label(row["from"].as_str().expect("from")),
+                                label(row["to"].as_str().expect("to")),
                             )
                         })
                         .collect()
@@ -3467,7 +3703,7 @@ impl Pool {
         let use_says = use_says.unwrap_or_else(|| {
             use_recorded(
                 (cli, launch),
-                &rotation,
+                (&rotation, None),
                 pinned,
                 (&records.roster, &records.state, &enrolled),
                 now,
@@ -3834,14 +4070,32 @@ fn law_share(build: LawBuild, share: &[LawWorld]) -> (usize, Vec<(String, String
         for label in rows {
             pool.lay(world);
             let (mut out, mut err) = (Vec::new(), Vec::new());
-            let (code, decided) = accounts_use_decided(
-                (pool.cli, &host),
-                &pool.env,
-                Some(label),
-                &mut out,
-                &mut err,
-            );
             let store = pool.env.accounts_store_for(pool.cli).expect("a store");
+            let Some(row) = use_row(pool.cli, &pool.env, label) else {
+                // No word names a row with no address: its label is refused as naming nothing
+                // a pin can hold, and nothing is pinned.
+                let code = run_accounts_use(
+                    (pool.cli, &host),
+                    &pool.env,
+                    Some(label),
+                    &mut out,
+                    &mut err,
+                );
+                let err = String::from_utf8_lossy(&err);
+                let pin_held = store.load(pool.env.now).expect("state").0.pinned;
+                if code == ExitCode::SUCCESS
+                    || pin_held
+                    || !err.contains(&crate::harness::codex_alab::no_pin_words(label))
+                {
+                    say(
+                        "a `use` of a row with no address",
+                        vec![format!("{label}: {code:?}, pinned {pin_held}: {err}")],
+                    );
+                }
+                continue;
+            };
+            let (code, decided) =
+                accounts_use_decided((pool.cli, &host), &pool.env, Some(&row), &mut out, &mut err);
             let pin_held = store.load(pool.env.now).expect("state").0.pinned;
             if code != ExitCode::SUCCESS {
                 if pin_held || decided.is_some() {
@@ -4158,9 +4412,9 @@ impl Pool {
         (plan.is_ok(), String::from_utf8(err).expect("utf-8"))
     }
 
-    /// `accounts use <label>`'s refusal, as `host` answers.
+    /// `accounts use`'s refusal of the account of the row labelled `label`, as `host` answers.
     fn use_refused(&self, label: &str, host: &dyn AccountsHost) -> String {
-        let line = format!("accounts use {label} --cli {}", self.cli.id());
+        let line = format!("accounts use {} --cli {}", self.word(label), self.cli.id());
         let (code, out, err) = self.run_on(&line, host);
         assert_eq!(code, ExitCode::from(1), "{line}: {out}{err}");
         err
@@ -4187,7 +4441,11 @@ fn a_lone_default_row_at_its_wall_waits_as_a_launch_holds_for_it() {
         pool.rows(&[main]);
         let program = (cli == Cli::Codex).then(|| pool.new.clone());
         let (_, free) = pool.report(program.as_deref());
-        assert_eq!(free["next"]["to"].as_str(), Some("main"), "{at}: {free}");
+        assert_eq!(
+            free["next"]["to"].as_str(),
+            Some(pool.id("main").as_str()),
+            "{at}: {free}"
+        );
         assert_eq!(free["next"]["wait_until"], Value::Null, "{at}: {free}");
         assert_eq!(pool.launch_on(program.as_deref()), Ok(None), "{at}");
 
@@ -4201,11 +4459,18 @@ fn a_lone_default_row_at_its_wall_waits_as_a_launch_holds_for_it() {
                 next_line(&text).starts_with("next: wait until"),
                 "{at}: {text}"
             );
-            assert!(not_next_json(&doc).contains_key("main"), "{at}: {doc}");
+            assert!(
+                not_next_json(&doc).contains_key(&pool.shown("main")),
+                "{at}: {doc}"
+            );
             let refused = pool.launch_on(program.as_deref()).expect_err("walled");
             assert!(refused.contains("no usable account"), "{at}: {refused}");
         } else {
-            assert_eq!(next["to"].as_str(), Some("main"), "{at}: {doc}");
+            assert_eq!(
+                next["to"].as_str(),
+                Some(pool.id("main").as_str()),
+                "{at}: {doc}"
+            );
             assert_eq!(next["wait_until"], Value::Null, "{at}: {doc}");
             assert!(
                 next["to_note"]
@@ -4220,7 +4485,7 @@ fn a_lone_default_row_at_its_wall_waits_as_a_launch_holds_for_it() {
         let (_, doc) = pool.report(program.as_deref());
         assert_eq!(
             doc["next"]["to"].as_str(),
-            Some("main"),
+            Some(pool.id("main").as_str()),
             "{at}: CONTROL: {doc}"
         );
         assert_eq!(doc["next"]["to_note"], Value::Null, "{at}: CONTROL: {doc}");
@@ -4239,7 +4504,7 @@ fn a_lone_default_row_at_its_wall_waits_as_a_launch_holds_for_it() {
 fn use_offers_no_sign_in_of_a_row_the_build_never_runs() {
     let pool = Pool::new("use-old-build");
     pool.no_work_login();
-    let login = "accounts login work";
+    let login = &format!("accounts renew {}", pool.sign_in_word("work"));
     let err = pool.use_refused("work", &CodexProgram(Some(pool.old.clone())));
     assert!(!err.contains(login), "{err}");
     assert!(
@@ -4264,7 +4529,11 @@ fn a_row_held_for_another_mac_is_signed_in_by_that_mac() {
         let pool = Pool::of(cli, "use-held");
         let host = CodexProgram((cli == Cli::Codex).then(|| pool.new.clone()));
         pool.no_work_login();
-        let login = format!("accounts {} work", cli.sign_in_verb(false));
+        let login = format!(
+            "accounts {} {}",
+            cli.sign_in_verb(true),
+            pool.sign_in_word("work")
+        );
         let err = pool.use_refused("work", &host);
         assert!(err.contains(&login), "{at}: CONTROL: {err}");
         let (runs, said) = pool.plan("work", &host);
@@ -4281,14 +4550,14 @@ fn a_row_held_for_another_mac_is_signed_in_by_that_mac() {
 }
 
 /// A ROW IN SHARED CUSTODY TAKES A ROOT'S DECISION, WHICH NO SIGN-IN HERE MAKES: `accounts use`
-/// names `accounts shared-renew` and no sign-in. CONTROL: the same row out of custody names its
-/// sign-in.
+/// says so, offering no sign-in, and no `shared-renew` command, which is Claude Code's alone.
+/// CONTROL: the same row out of custody names its sign-in.
 #[test]
 fn use_of_a_row_in_shared_custody_names_its_shared_renewal() {
     let pool = Pool::new("use-shared");
     let host = CodexProgram(Some(pool.new.clone()));
     pool.no_work_login();
-    let login = "accounts login work";
+    let login = &format!("accounts renew {}", pool.sign_in_word("work"));
     let err = pool.use_refused("work", &host);
     assert!(err.contains(login), "CONTROL: {err}");
     let store = pool.env.accounts_store_for(Cli::Codex).expect("a store");
@@ -4323,11 +4592,21 @@ fn use_of_a_row_in_shared_custody_names_its_shared_renewal() {
         })
         .expect("custody");
     let err = pool.use_refused("work", &host);
-    assert!(
-        err.contains("accounts shared-renew work --cli codex"),
-        "{err}"
-    );
+    // `shared-renew` is Claude Code's alone and takes no `--cli`, so a Codex row is offered no
+    // command it would refuse, and no sign-in.
+    assert!(err.contains(&codex_custody_words()), "{err}");
+    assert!(!err.contains("shared-renew work"), "{err}");
     assert!(!err.contains(login), "{err}");
+}
+
+/// What a Codex row in shared custody is told: a root's decision renews it, and `shared-renew`,
+/// the one verb that carries one out, is Claude Code's alone.
+fn codex_custody_words() -> String {
+    format!(
+        "it requires a fresh root-authorized shared renewal, which a sign-in here cannot make and \
+         `aterm harness accounts shared-renew` makes only for a {} row",
+        Cli::Claude.connector().product
+    )
 }
 
 /// UNDER CODEX'S LOGIN IN THE OS KEYRING, `accounts use` SAYS WHAT A SIGN-IN WOULD DO THERE, AS THE
@@ -4339,12 +4618,15 @@ fn use_under_a_keyring_login_offers_no_sign_in_that_would_replace_it() {
     let pool = Pool::new("use-keyring");
     let host = CodexProgram(Some(pool.new.clone()));
     pool.no_work_login();
-    let login = "accounts login work";
+    let login = &format!("accounts renew {}", pool.sign_in_word("work"));
     let err = pool.use_refused("work", &host);
     assert!(err.contains(login), "CONTROL: {err}");
     pool.keyring();
     let err = pool.use_refused("work", &host);
-    assert!(err.contains(&keyring_staging("work", false)), "{err}");
+    assert!(
+        err.contains(&keyring_staging(&pool.shown("work"), false)),
+        "{err}"
+    );
     assert!(!err.contains(login), "{err}");
     let now = pool.env.now;
     pool.state(|state| {
@@ -4352,7 +4634,10 @@ fn use_under_a_keyring_login_offers_no_sign_in_that_would_replace_it() {
     });
     // Hidden keyring credentials cannot inherit a legacy file-independent rejection.
     // The history remains recorded, while the existing unknown-identity launch policy applies.
-    let (code, out, err) = pool.run_on("accounts use main --cli codex", &host);
+    let (code, out, err) = pool.run_on(
+        &format!("accounts use {} --cli codex", pool.word("main")),
+        &host,
+    );
     assert_eq!(code, ExitCode::SUCCESS, "{out}{err}");
     assert_eq!(
         pool.env
@@ -4377,8 +4662,11 @@ fn use_of_a_row_with_a_sign_in_task_names_the_reports_step() {
     pool.no_work_login();
     pool.change_row("work", |row| row.email = Some("work@example.com".into()));
     let err = pool.use_refused("work", &host);
-    assert!(err.contains("accounts renew work"), "CONTROL: {err}");
-    assert!(!err.contains("accounts browser work"), "CONTROL: {err}");
+    assert!(
+        err.contains(&format!("accounts renew {}", pool.sign_in_word("work"))),
+        "CONTROL: {err}"
+    );
+    assert!(!err.contains("accounts browser"), "CONTROL: {err}");
     let store = pool.env.accounts_store_for(Cli::Codex).expect("a store");
     store
         .transact_pool_logins_within(
@@ -4398,7 +4686,14 @@ fn use_of_a_row_with_a_sign_in_task_names_the_reports_step() {
             },
         )
         .expect("a task");
-    let step = accounts::SignInAction::Browser.next_step(Cli::Codex, "work");
+    let roster = pool.roster();
+    let word = crate::harness::account_names::sign_in_word(
+        Cli::Codex,
+        roster.row("work").expect("the row"),
+        &roster.rows,
+        None,
+    );
+    let step = accounts::SignInAction::Browser.next_step(Cli::Codex, &word);
     let err = pool.use_refused("work", &host);
     let tail = step.strip_prefix("Run ").expect("a step");
     assert!(err.contains(tail), "{err}");
@@ -4438,7 +4733,11 @@ fn with_no_program_a_sign_in_and_use_lead_with_the_install() {
         assert!(!runs, "{at}: nothing starts: {said}");
         assert!(said.contains(&install), "{at}: {said}");
         let err = pool.use_refused("work", &missing);
-        let login = format!("accounts {} work", cli.sign_in_verb(false));
+        let login = format!(
+            "accounts {} {}",
+            cli.sign_in_verb(true),
+            pool.sign_in_word("work")
+        );
         let lead = err.find(&install).unwrap_or_else(|| panic!("{at}: {err}"));
         let then = err.find(&login).unwrap_or_else(|| panic!("{at}: {err}"));
         assert!(lead < then, "{at}: {err}");
@@ -4540,13 +4839,17 @@ fn the_report_says_where_a_wall_moves_a_running_session() {
         assert_eq!(
             moves(&doc),
             vec![
-                ("main".to_string(), "work".to_string()),
-                ("work".to_string(), "main".to_string())
+                (pool.id("main"), pool.id("work")),
+                (pool.id("work"), pool.id("main"))
             ],
             "{doc}"
         );
         assert!(
-            text.contains("at a weekly limit: a session on `main` moves to `work`"),
+            text.contains(&format!(
+                "at a weekly limit: a session on {} moves to {}",
+                pool.shown("main"),
+                pool.shown("work")
+            )),
             "{text}"
         );
     } else {
@@ -4556,7 +4859,11 @@ fn the_report_says_where_a_wall_moves_a_running_session() {
             "an unqualified host: {text}"
         );
     }
-    assert_eq!(doc["next"]["to"].as_str(), Some("main"), "{doc}");
+    assert_eq!(
+        doc["next"]["to"].as_str(),
+        Some(pool.id("main").as_str()),
+        "{doc}"
+    );
 
     let (text, doc) = pool.report(Some(&pool.old));
     assert!(
@@ -4589,8 +4896,8 @@ fn the_report_says_where_a_wall_moves_a_running_session() {
         let (_, doc) = pool.report(None);
         let expected = if cli == Cli::Kimi {
             vec![
-                ("main".to_string(), "work".to_string()),
-                ("work".to_string(), "main".to_string()),
+                (pool.id("main"), pool.id("work")),
+                (pool.id("work"), pool.id("main")),
             ]
         } else {
             Vec::new()
@@ -4611,6 +4918,7 @@ fn a_row_with_no_current_login_says_so_in_one_phrase_with_its_own_sign_in() {
         let at = cli.id();
         let pool = Pool::of(cli, "not-next-phrase");
         let program = (cli == Cli::Codex).then(|| pool.new.clone());
+        pool.change_row("work", |row| row.email = None);
         pool.no_work_login();
         pool.signed_out("main");
         let (text, doc) = pool.report(program.as_deref());
@@ -4624,11 +4932,12 @@ fn a_row_with_no_current_login_says_so_in_one_phrase_with_its_own_sign_in() {
             ("main", true, "signed-out"),
             ("work", false, "not-enrolled"),
         ] {
-            let why = &rows[label];
+            let why = &rows[&pool.shown(label)];
             assert!(why.starts_with(word), "{at}: {label}: {why}");
             let verb = cli.sign_in_verb(addressed);
+            let typed = pool.sign_in_word(label);
             assert!(
-                why.contains(&format!("accounts {verb} {label} --cli {at}")),
+                why.contains(&format!("accounts {verb} {typed} --cli {at}")),
                 "{at}: {label}: {why}"
             );
         }
@@ -4697,7 +5006,10 @@ fn a_renewal_with_no_email_names_a_step_that_keeps_the_roster_admitted() {
         account: Some("owner@example.com".into()),
     });
     assert!(
-        err.contains("accounts renew codex-7d229c --cli codex"),
+        err.contains(&format!(
+            "accounts renew {} --cli codex",
+            pool.sign_in_word("codex-7d229c")
+        )),
         "{err}"
     );
     assert!(!err.contains(edit), "{err}");
@@ -4710,6 +5022,8 @@ fn a_renewal_with_no_email_names_a_step_that_keeps_the_roster_admitted() {
         me: Some(test_machine("m16")),
         bound: Default::default(),
         accounts: Vec::new(),
+        names: Default::default(),
+        barred: Default::default(),
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
         #[cfg(unix)]
@@ -4735,7 +5049,8 @@ fn a_renewal_with_no_email_names_a_step_that_keeps_the_roster_admitted() {
     });
     assert!(
         err.contains(&crate::harness::codex_alab::default_row_staging(
-            "main", &why
+            &pool.shown("main"),
+            &why
         )),
         "{err}"
     );
@@ -4803,7 +5118,7 @@ fn a_claude_row_on_the_default_login_is_reported_as_the_doctor_sees_it() {
         let rows = doc["accounts"].as_array().expect("the rows");
         let row = rows
             .iter()
-            .find(|row| row["label"].as_str() == Some("main"))
+            .find(|row| row["ac"].as_str() == Some(pool.id("main").as_str()))
             .expect("main");
         (
             row["condition"].as_str().expect("a condition").to_string(),
@@ -4860,10 +5175,11 @@ fn the_sign_in_aterm_runs_itself_is_said_to_be_aterms() {
         .route(Some(Flow::Browser))
         .expect("the browser route");
     assert!(matches!(browser.drive, Drive::CodexPkce), "PRECONDITION");
-    assert!(sign_in_words(Cli::Codex, "x", browser, &[]).starts_with("aterm's "));
+    let x = crate::harness::account_names::sign_in_word_of(Cli::Codex, "x", &[], None);
+    assert!(sign_in_words(Cli::Codex, &x, browser, &[]).starts_with("aterm's "));
     let device = signin.route(Some(Flow::Device)).expect("the device route");
     assert!(!matches!(device.drive, Drive::CodexPkce), "PRECONDITION");
-    assert!(!sign_in_words(Cli::Codex, "x", device, &[]).starts_with("aterm's "));
+    assert!(!sign_in_words(Cli::Codex, &x, device, &[]).starts_with("aterm's "));
 }
 
 /// `accounts use` AND THE REPORT SAY ONE THING OF A RUNNING SESSION: where its weekly limit moves a
@@ -4917,8 +5233,9 @@ fn use_and_the_report_say_one_thing_of_a_running_session() {
         set(&pool);
         for label in [Some("main"), None] {
             let (mut out, mut err) = (Vec::new(), Vec::new());
+            let row = label.map(|label| use_row(cli, &pool.env, label).expect("an address"));
             let (code, _) =
-                accounts_use_decided((cli, &host), &pool.env, label, &mut out, &mut err);
+                accounts_use_decided((cli, &host), &pool.env, row.as_ref(), &mut out, &mut err);
             let (out, err) = (String::from_utf8_lossy(&out), String::from_utf8_lossy(&err));
             assert_eq!(code, ExitCode::SUCCESS, "{world}: {label:?}: {err}");
             assert_eq!(
@@ -4966,16 +5283,20 @@ fn a_row_nobody_runs_on_waits_only_where_its_sign_in_has_a_route() {
         let pool = Pool::of(cli, "signs-in-by-itself");
         pool.no_work_login();
         pool.change_row("work", |row| row.email = Some("work@example.com".into()));
-        let renew = format!("aterm harness accounts renew work --cli {at}");
+        let renew = format!(
+            "aterm harness accounts renew {} --cli {at}",
+            pool.sign_in_word("work")
+        );
+        let window = format!(
+            "aterm harness accounts browser {} --cli {at}",
+            pool.sign_in_word("work")
+        );
         if cli == Cli::Kimi {
             let no_route = |why: &str| {
                 let (text, _) = pool.report_on(&build.program(&pool));
                 let said = line(&text, "not next:");
                 assert!(!said.contains("waits for"), "{why}: {text}");
-                assert!(
-                    said.contains("aterm harness accounts browser work --cli kimi"),
-                    "{why}: {text}"
-                );
+                assert!(said.contains(&window), "{why}: {text}");
             };
             no_route("nothing on record");
             let store = pool.env.accounts_store_for(cli).unwrap();
@@ -5041,7 +5362,7 @@ fn a_row_nobody_runs_on_waits_only_where_its_sign_in_has_a_route() {
                 !said.contains("waits for"),
                 "{at}: a bot check on record: {text}"
             );
-            assert!(said.contains("accounts browser work"), "{at}: {text}");
+            assert!(said.contains(&window), "{at}: {text}");
             sign_in(now, "auth.vendor.example window done session-kept", false);
             let (text, _) = pool.report_on(&build.program(&pool));
             assert!(
@@ -5104,13 +5425,9 @@ fn claudes_report_says_by_itself_only_where_this_mac_uses_the_row() {
     env.sock = None;
     let home = env.home.clone().expect("a home");
     std::fs::create_dir_all(&home).expect("home");
-    let (code, out, err) = run_line(
-        "accounts adopt-default main --email owner@example.com",
-        &env,
-    );
+    let (code, out, err) = run_line("accounts adopt-default --email owner@example.com", &env);
     assert_eq!(code, exit(0), "{out}{err}");
-    let (code, out, err) = run_line("accounts add work --email work@example.com", &env);
-    assert_eq!(code, exit(0), "{out}{err}");
+    listed_by_hand(&env, Cli::Claude, by_hand("work", Some("work@example.com")));
     let store = env.accounts_store();
     store
         .transact(env.now, &mut None, |state| {
@@ -5127,9 +5444,10 @@ fn claudes_report_says_by_itself_only_where_this_mac_uses_the_row() {
             .to_string()
     };
     let said = not_next(&env);
+    let word = crate::harness::account_names::tests::row_name_of(Cli::Claude, &env, "work").word;
     assert!(!said.contains("by itself"), "no route: {said}");
     assert!(
-        said.contains("aterm harness accounts browser work"),
+        said.contains(&format!("aterm harness accounts browser {word}")),
         "no route: {said}"
     );
     std::fs::create_dir_all(
@@ -5145,10 +5463,10 @@ fn claudes_report_says_by_itself_only_where_this_mac_uses_the_row() {
         "no session on it: {said}"
     );
     assert!(
-        said.contains(
+        said.contains(&format!(
             "no session here runs on it or ran on it within a week, so it waits for `aterm \
-             harness accounts renew work`"
-        ),
+             harness accounts renew {word}`"
+        )),
         "no session on it: {said}"
     );
     store
@@ -5200,7 +5518,8 @@ fn a_login_with_no_terminal_says_the_missing_program_first() {
     let run = |build: LawBuild| {
         let host = build.program(&pool);
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = run_accounts_login_for(Cli::Kimi, &pool.env, &host, "work", &mut out, &mut err);
+        let word = pool.sign_in_word("work");
+        let code = run_accounts_login_for(Cli::Kimi, &pool.env, &host, &word, &mut out, &mut err);
         assert_eq!(code, ExitCode::from(1));
         String::from_utf8_lossy(&err).into_owned()
     };
@@ -5224,19 +5543,16 @@ fn use_refuses_the_claude_row_the_report_calls_not_signed_in() {
     std::fs::create_dir_all(home.join(".claude")).expect("home");
     let profile = home.join(".claude.json");
     env.claude_profile = Some(profile.clone());
-    let (code, out, err) = run_line(
-        "accounts adopt-default main --email owner@example.com",
-        &env,
-    );
+    let (code, out, err) = run_line("accounts adopt-default --email owner@example.com", &env);
     assert_eq!(code, exit(0), "{out}{err}");
-    let (code, out, err) = run_line("accounts use main", &env);
+    let (code, out, err) = run_line("accounts use owner@example.com", &env);
     assert_ne!(code, exit(0), "{out}{err}");
     std::fs::write(
         &profile,
         r#"{"oauthAccount":{"accountUuid":"00000000-0000-4000-8000-000000000001"}}"#,
     )
     .expect("the profile");
-    let (code, out, err) = run_line("accounts use main", &env);
+    let (code, out, err) = run_line("accounts use owner@example.com", &env);
     assert_eq!(code, exit(0), "CONTROL: {out}{err}");
 }
 
@@ -5245,12 +5561,33 @@ fn use_refuses_the_claude_row_the_report_calls_not_signed_in() {
 /// and takes none.
 #[test]
 fn a_stopped_row_names_the_renewal_of_its_own_cli() {
+    // A row a page stopped has an address, so its step names it by the key its address makes in
+    // its CLI's realm (no lab slugs it here), never by its label `work`.
+    let row = accounts::Row {
+        label: "work".to_owned(),
+        email: Some("work@x.example".to_owned()),
+        ..accounts::Row::default()
+    };
     let command = |cli: Cli| -> Vec<String> {
-        let step = stopped_step(cli, "work");
+        let step = stopped_step(
+            cli,
+            vec![crate::harness::account_names::sign_in_word(
+                cli,
+                &row,
+                &[],
+                None,
+            )],
+        );
         let quoted = step.split('`').nth(1).expect("a command");
         quoted.split_whitespace().map(str::to_owned).collect()
     };
-    for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+    let key =
+        |realm: &str| aterm_db::typed::keys::account_pk(realm, "work@x.example").expect("a key");
+    for (cli, realm) in [
+        (Cli::Codex, "codex"),
+        (Cli::Grok, "grok"),
+        (Cli::Kimi, "kimi:global"),
+    ] {
         assert_eq!(
             command(cli),
             [
@@ -5258,7 +5595,7 @@ fn a_stopped_row_names_the_renewal_of_its_own_cli() {
                 "harness",
                 "accounts",
                 "renew",
-                "work",
+                &key(realm),
                 "--cli",
                 cli.id()
             ],
@@ -5268,7 +5605,7 @@ fn a_stopped_row_names_the_renewal_of_its_own_cli() {
     }
     assert_eq!(
         command(Cli::Claude),
-        ["aterm", "harness", "accounts", "renew", "work"]
+        ["aterm", "harness", "accounts", "renew", &key("claude")]
     );
 }
 
@@ -5309,22 +5646,25 @@ impl Pool {
     }
 }
 
-/// THE REPORT NAMES THE ONE STEP A ROW IN SHARED CUSTODY HAS, AS `accounts use` DOES: the
-/// `shared-renew` a root decides, and no sign-in, which `renew` would refuse. CONTROL: out of
-/// custody its `not next:` names the row's sign-in.
+/// THE REPORT SAYS WHAT A ROW IN SHARED CUSTODY TAKES, AS `accounts use` DOES: a renewal a root
+/// decides, and no sign-in, which `renew` would refuse. CONTROL: out of custody its `not next:`
+/// names the row's sign-in.
 #[test]
 fn the_report_names_a_shared_rows_shared_renewal() {
     let pool = Pool::new("report-shared");
     pool.no_work_login();
     pool.change_row("work", |row| row.email = Some("work@example.com".into()));
     let (text, _) = pool.report(Some(&pool.new));
-    let step = "accounts shared-renew work --cli codex";
-    let sign_in = "accounts renew work --cli codex";
-    assert!(not_next(&text)["work"].contains(sign_in), "CONTROL: {text}");
+    let step = codex_custody_words();
+    let sign_in = &format!("accounts renew {} --cli codex", pool.sign_in_word("work"));
+    assert!(
+        not_next(&text)[&pool.shown("work")].contains(sign_in),
+        "CONTROL: {text}"
+    );
     pool.work_in_custody();
     let (text, _) = pool.report(Some(&pool.new));
-    let words = &not_next(&text)["work"];
-    assert!(words.contains(step), "{text}");
+    let words = &not_next(&text)[&pool.shown("work")];
+    assert!(words.contains(&step), "{text}");
     assert!(!words.contains(sign_in), "{text}");
 }
 
@@ -5342,7 +5682,7 @@ fn an_uninstalled_codex_is_named_first_by_use_and_by_the_report() {
     assert!(err.contains(&lead), "{err}");
     assert!(!err.contains(build), "{err}");
     let (_, text, _) = pool.run_on("accounts --cli codex", &gone);
-    let words = &not_next(&text)["work"];
+    let words = &not_next(&text)[&pool.shown("work")];
     assert!(words.contains(&lead), "{text}");
     assert!(!words.contains("by itself"), "{text}");
     let err = pool.use_refused("work", &CodexProgram(Some(pool.old.clone())));
@@ -5435,23 +5775,32 @@ fn the_report_says_a_managed_row_whose_login_names_another_account() {
     law_auth(&work, "work", Some("far@example.com"));
 
     let (text, json) = pool.report(Some(&pool.new));
-    let words = &not_next_json(&json)["work"];
+    let words = &not_next_json(&json)[&pool.shown("work")];
     assert!(
         words.contains("Codex login does not match the expected account")
-            && words.contains("accounts renew work --cli codex"),
+            && words.contains(&format!(
+                "accounts renew {} --cli codex",
+                pool.sign_in_word("work")
+            )),
         "{text}{json}"
     );
-    assert!(text.contains(&format!("not next: work: {words}")), "{text}");
+    assert!(
+        text.contains(&format!("not next: {}: {words}", pool.shown("work"))),
+        "{text}"
+    );
 
     law_auth(&work, "work", Some("work@example.com"));
     let (text, json) = pool.report(Some(&pool.new));
     assert!(
-        !text.contains("work: Codex login does not match the expected account"),
+        !text.contains(&format!(
+            "{}: Codex login does not match the expected account",
+            pool.shown("work")
+        )),
         "CONTROL: {text}"
     );
     assert!(
         !not_next_json(&json)
-            .get("work")
+            .get(&pool.shown("work"))
             .is_some_and(|why| why.contains("does not match the expected account")),
         "CONTROL: {json}"
     );
@@ -5466,24 +5815,35 @@ fn the_report_says_a_row_the_default_login_moved_off() {
     let host = CodexProgram(Some(pool.new.clone()));
     default_login_names(&pool, "owner@example.com");
     let (text, json) = pool.report_on(&host);
-    assert!(!not_next(&text).contains_key("main"), "CONTROL: {text}");
+    assert!(
+        !not_next(&text).contains_key(&pool.shown("main")),
+        "CONTROL: {text}"
+    );
     assert!(!text.contains("the default login names"), "CONTROL: {text}");
 
     default_login_names(&pool, "far@example.com");
     let (text, json_moved) = pool.report_on(&host);
-    let words = "the default login names far@example.com: `aterm harness accounts renew main \
-                 --cli codex` signs this row in again";
+    let words = format!(
+        "the default login names far@example.com: `aterm harness accounts renew {} --cli codex` \
+         signs this row in again",
+        pool.sign_in_word("main")
+    );
+    let words = words.as_str();
     assert_eq!(
-        not_next(&text).get("main").map(String::as_str),
+        not_next(&text).get(&pool.shown("main")).map(String::as_str),
         Some(words),
         "{text}"
     );
-    assert_eq!(next_line(&text), "next: work", "{text}");
+    assert_eq!(
+        next_line(&text),
+        format!("next: {}", pool.shown("work")),
+        "{text}"
+    );
     let row = json_moved["next"]["not"]
         .as_array()
         .expect("not")
         .iter()
-        .find(|row| row["label"] == Value::from("main"))
+        .find(|row| row["account"] == Value::from(pool.id("main")))
         .unwrap_or_else(|| panic!("{json_moved}"));
     assert_eq!(row["why"], Value::from(words));
     assert_ne!(json["next"], json_moved["next"], "CONTROL");
@@ -5495,7 +5855,7 @@ fn the_report_says_a_row_the_default_login_moved_off() {
     }]);
     let (text, _) = pool.report_on(&host);
     assert_eq!(
-        not_next(&text).get("main").map(String::as_str),
+        not_next(&text).get(&pool.shown("main")).map(String::as_str),
         Some(words),
         "a lone row: {text}"
     );
@@ -5503,7 +5863,11 @@ fn the_report_says_a_row_the_default_login_moved_off() {
 
 /// THE REPORT NAMES THE SYNC THAT FOLDS A TWIN ONLY WHERE IT DOES: with a source to read and a twin
 /// that holds nothing it names it, and that sync folds it. With no source to read, or a login of the
-/// twin's own, it says both stay, and the sync it no longer names would have done nothing.
+/// twin's own, it says both stay, and the sync it no longer names would have done nothing. Its JSON
+/// names the twin by its account's key and the row on the default login (no address) by its
+/// label. NEGATIVE CONTROL: with `next.twin.twin` the twin's label, `left: String("twin") right:
+/// String("ac-be93660a8a11fcb5")` (2026-11-16, by hand on SF-07H S7a's review settle, then
+/// restored).
 #[test]
 fn the_report_names_the_sync_that_folds_a_twin_only_where_one_does() {
     let pool = Pool::new("report-twin");
@@ -5533,6 +5897,12 @@ fn the_report_names_the_sync_that_folds_a_twin_only_where_one_does() {
     assert!(line(&text).contains("both stay"), "no source: {text}");
     assert!(!line(&text).contains("accounts sync"), "no source: {text}");
     assert_eq!(json["next"]["twin"]["sync_folds"], Value::from(false));
+    // The JSON names the row on the default login, which has no address, by its label, and the
+    // twin by its account's key, as every reference to a row.
+    assert_eq!(pool.id("main"), "main");
+    assert!(pool.id("twin").starts_with("ac-"), "{}", pool.id("twin"));
+    assert_eq!(json["next"]["twin"]["row"], Value::from(pool.id("main")));
+    assert_eq!(json["next"]["twin"]["twin"], Value::from(pool.id("twin")));
 
     #[cfg(unix)]
     {
@@ -5545,7 +5915,10 @@ fn the_report_names_the_sync_that_folds_a_twin_only_where_one_does() {
         pool.config("[fleet]\nmachine = \"m16\"\n");
         let (text, json) = pool.report_on(&host);
         assert!(
-            line(&text).contains("`aterm harness accounts sync --cli codex` folds `twin`"),
+            line(&text).contains(&format!(
+                "`aterm harness accounts sync --cli codex` folds {}",
+                pool.shown("twin")
+            )),
             "{text}"
         );
         assert_eq!(json["next"]["twin"]["sync_folds"], Value::from(true));
@@ -5571,11 +5944,18 @@ fn accounts_use_cites_the_weekly_limit_line_only_where_the_report_prints_it() {
     let (text, _) = pool.report_on(&host);
     if crate::harness::codex_rotation::QUOTA_ROTATION_QUALIFIED {
         assert!(
-            text.contains("at a weekly limit: a session on `main`"),
+            text.contains(&format!(
+                "at a weekly limit: a session on {}",
+                pool.shown("main")
+            )),
             "CONTROL: {text}"
         );
         let said = pool.recorded("main", &host);
-        assert!(said.contains("but for one on `main`"), "CONTROL: {said}");
+        let main = format!("but for one on {}", pool.shown("main"));
+        assert!(
+            said.contains(&main) && pool.names(&said, "main"),
+            "CONTROL: {said}"
+        );
     }
     pool.rows(&[accounts::Row {
         label: "main".into(),
@@ -5588,4 +5968,27 @@ fn accounts_use_cites_the_weekly_limit_line_only_where_the_report_prints_it() {
     let said = pool.recorded("main", &host);
     assert!(!said.contains("at a weekly limit"), "{said}");
     assert!(!said.contains("but for one on"), "{said}");
+}
+
+/// The word the pin of the account `email` of `cli`'s pool types where no lab names it: its
+/// account key.
+fn pool_word(cli: Cli, email: &str) -> crate::harness::account_names::Word {
+    let row = accounts::Row {
+        label: "any".into(),
+        email: Some(email.to_owned()),
+        vendor: accounts::Vendor {
+            region: (cli == Cli::Kimi).then_some(crate::ai::connector::Region::Global),
+            ..accounts::Vendor::default()
+        },
+        ..accounts::Row::default()
+    };
+    crate::harness::account_names::word_of_row(cli, &row, &[], None).expect("an address")
+}
+
+/// `cli`'s roster row labelled `label` in `env`'s roster, as `accounts use` pins it: none for a
+/// row with no address, which no word names.
+fn use_row(cli: Cli, env: &Env, label: &str) -> Option<UseRow> {
+    let path = env.accounts_roster_for(cli).expect("a roster");
+    let roster = Roster::load_for(cli, &path).expect("the roster");
+    UseRow::of(cli, roster.row(label).expect("the row"))
 }

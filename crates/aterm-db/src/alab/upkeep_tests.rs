@@ -236,7 +236,8 @@ pub(crate) fn machine_row(label: &str) -> Vec<Change> {
 }
 
 /// The idle hour's lab: two Writers whose registry is in its second generation, carrying each
-/// Mac's facts row from a membership epoch that is no longer current. m1 writes both machine
+/// Mac's facts row from a membership epoch that is no longer current, the owner's catalog
+/// declaring `lab/tracker` too, with no entry. m1 writes both machine
 /// rows and its own facts in the first epoch; after a rotation m2 writes its facts in the
 /// second; after another, m1 rolls the registry, which waits for m2 to declare the second
 /// generation and then seals the first. Mac 0 (m1) is the owner the hour passes on.
@@ -248,6 +249,9 @@ fn idle_lab() -> Lab {
     );
     a.open().unwrap();
     a.seed().unwrap();
+    // The lab's tracker is declared on the owner and holds no entry: its logs' files are `live`
+    // and empty, as the hour asks of every file.
+    crate::file::tests::declare(&lab.paths[0], &crate::att::TRACKER);
     a.write(vec![
         machine_row("m1"),
         machine_row("m2"),

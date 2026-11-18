@@ -275,10 +275,40 @@ fn a_child_separates_drift_from_files_it_could_not_read() {
     );
 }
 
-/// The toolchain this host's own drivers find, as `verify` would.
+/// ON WINDOWS A DRIFTED FILE IS NAMED AS GIT NAMES IT: the formatter writes `Diff in
+/// C:\r\src\a.rs:1:` with Windows' separators, and the finding is `src/a.rs`, as every other
+/// finding id and git's own paths are, under the root as given and under its canonical spelling
+/// (`\\?\C:\r`). NEGATIVE CONTROL: the tree path in Windows' own spelling (`src\a.rs`) fails
+/// this, as it failed both real-formatter tests run here with `TRUST_STAGE2_BIN` set.
+#[cfg(windows)]
+#[test]
+fn on_windows_a_drifted_file_is_named_as_git_names_it() {
+    let drift = |output: &str| {
+        read_run(
+            &run_of(false, output),
+            "2024",
+            2,
+            Path::new(r"C:\r"),
+            Some(Path::new(r"\\?\C:\r")),
+        )
+        .drifted
+    };
+    let named = |path: &str| Drift {
+        path: path.into(),
+        edition: "2024".into(),
+    };
+    assert_eq!(
+        drift("Diff in C:\\r\\src\\a.rs:1:\n-x\n+y\nDiff in \\\\?\\C:\\r\\src\\deep\\b.rs:3:\n"),
+        [named("src/a.rs"), named("src/deep/b.rs")]
+    );
+}
+
+/// The toolchain the formatter tests run, from [`host_env`]: on Unix the one this host's own
+/// drivers find, as `verify` would; on Windows the build an explicit `TRUST_STAGE2_BIN` names
+/// alone, which `verify` hands the tests it runs (its `child_env_add`).
 fn real_tools() -> crate::Toolchain {
     let repo = aterm_tempfile::manifest_dir().join("../..");
-    let env = crate::EnvSnapshot::capture();
+    let env = host_env();
     let tools = crate::run_toolchain(&env, &repo);
     if tools.trustfmt.is_none() && env.trust_stage2_bin.is_some() {
         let discovered = crate::EnvSnapshot {
@@ -288,6 +318,53 @@ fn real_tools() -> crate::Toolchain {
         return crate::run_toolchain(&discovered, &repo);
     }
     tools
+}
+
+/// This process's environment, as `verify` captures it.
+#[cfg(not(windows))]
+fn host_env() -> crate::EnvSnapshot {
+    crate::EnvSnapshot::capture()
+}
+
+/// This process's environment with this test binary's scratch root for its home, and no config
+/// or rustup home of its own: on Windows the package store and `aterm.toml` a home names
+/// (`%LOCALAPPDATA%\aterm\pkg`, `%APPDATA%\aterm`) are the person's, which a test binary never
+/// reads, so discovery finds no build there and only an explicit `TRUST_STAGE2_BIN` names a
+/// formatter. No rustup toolchain would either: this tree's `trust.lock` takes its build from the
+/// store alone (`Toolchain::discover_with_store`'s locked arm reads no rustup home). A plain
+/// `cargo test` that is to run the real formatter here sets `TRUST_STAGE2_BIN` itself.
+#[cfg(windows)]
+fn host_env() -> crate::EnvSnapshot {
+    let root = aterm_uds::test_binary::scratch_root().expect("a test binary's scratch root");
+    crate::EnvSnapshot {
+        home: root.join("home"),
+        xdg_config_home: None,
+        rustup_home: None,
+        ..crate::EnvSnapshot::capture()
+    }
+}
+
+/// ON WINDOWS THE REAL TOOLCHAIN IS LOOKED FOR UNDER THIS TEST BINARY'S OWN ROOT: with no
+/// `TRUST_STAGE2_BIN`, the build discovery names for the formatter tests ([`real_tools`]) is the
+/// one in the scratch root's store, whatever `HOME` names, never the person's. NEGATIVE CONTROL:
+/// a [`host_env`] that keeps the captured home, run with `HOME` at a scratch folder, names that
+/// folder's store.
+#[cfg(windows)]
+#[test]
+fn on_windows_the_real_toolchain_is_looked_for_under_the_test_binarys_own_root() {
+    let root = aterm_uds::test_binary::scratch_root().expect("a test binary's scratch root");
+    let repo = aterm_tempfile::manifest_dir().join("../..");
+    let env = crate::EnvSnapshot {
+        trust_stage2_bin: None,
+        ..host_env()
+    };
+    let tools = crate::run_toolchain(&env, &repo);
+    assert!(
+        tools.stage2_dir.starts_with(root),
+        "{} is not under {}",
+        tools.stage2_dir.display(),
+        root.display()
+    );
 }
 
 /// A file the real formatter cannot parse is named by the formatter's own `error:` line, not

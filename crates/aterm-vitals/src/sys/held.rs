@@ -588,10 +588,15 @@ pub(super) fn text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     }
     for (i, (deed, what)) in removals(s).into_iter().enumerate() {
         let n = i + 1;
+        let identity = match deed.by {
+            DeedBy::Aterm => String::new(),
+            DeedBy::Tab(Some(key)) => format!(" {}", view::session_words(ctx, key)),
+            DeedBy::Tab(None) => " sid=unavailable(not_sampled)".to_owned(),
+        };
         lines.push(view::line(
             format!("removed {n}"),
             format!(
-                "removed n={n} age_s={} rows={} bytes={} by={} what={}",
+                "removed n={n} age_s={} rows={} bytes={} by={}{identity} what={}",
                 age_s(ctx, deed.at_unix_ms),
                 deed.n,
                 view::rec(deed.bytes, "not_read"),
@@ -627,6 +632,7 @@ fn row_text(ctx: &Ctx<'_>, h: &Holding, shown: &Shown) -> String {
     );
     if let Some(t) = h.tab {
         out.push_str(&format!(" tab={t}"));
+        out.push_str(&format!(" {}", view::sessions_words(ctx, &h.keys)));
     }
     if let Some(exe) = h.exe.as_deref() {
         out.push_str(&format!(" exe={}", exe_word(exe)));
@@ -703,14 +709,22 @@ pub(super) fn json(ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
                     .into_iter()
                     .enumerate()
                     .map(|(i, (deed, what))| {
-                        Jv::obj([
+                        let mut object = Jv::obj([
                             ("n", Jv::u(i as u64 + 1)),
                             ("age_s", Jv::u(age_s(ctx, deed.at_unix_ms))),
                             ("rows", Jv::u(u64::from(deed.n))),
                             ("bytes", Jv::known_or(deed.bytes, "not_read")),
                             ("by", Jv::s(by_word(&deed.by))),
                             ("what", Jv::s(what.to_owned())),
-                        ])
+                        ]);
+                        match deed.by {
+                            DeedBy::Aterm => {}
+                            DeedBy::Tab(Some(key)) => {
+                                object.set("sid", view::session_json(ctx, key))
+                            }
+                            DeedBy::Tab(None) => object.set("sid", Jv::why("not_sampled")),
+                        }
+                        object
                     })
                     .collect(),
             ),
@@ -727,6 +741,7 @@ fn row_json(ctx: &Ctx<'_>, h: &Holding, shown: &Shown) -> Jv {
     ]);
     if let Some(t) = h.tab {
         o.set("tab", Jv::u(t as u64));
+        view::set_sessions_json(ctx, &h.keys, &mut o);
     }
     if let Some(exe) = h.exe.as_deref() {
         o.set("exe", Jv::s(exe_word(exe)));

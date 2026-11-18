@@ -248,7 +248,9 @@ fn slice_child(
 ) -> Result<(), String> {
     let preparing = Instant::now();
     let preparation_started_ms = crate::cut_timing::epoch_ms();
-    let compilers = full.then(crate::artifact::compilers).transpose()?;
+    let compilers = full
+        .then(|| crate::artifact::compilers(repo, commit))
+        .transpose()?;
     let take = crate::buildplan::Take::prepare(repo, commit)?;
     let plan = crate::buildplan::contention_plan(repo, &take, root, full)?;
     emit_slice_child(aterm_json::json!({
@@ -1287,6 +1289,7 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
                     commit.trim(),
                     &image,
                     &release.join("qualify-freeze.log"),
+                    None,
                     None,
                 )?;
                 crate::release_tools::publish_cutter(&release, &cutter)?;

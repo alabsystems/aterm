@@ -1,10 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-use aterm_agent::machine_name::file;
+use aterm_agent::machine_name::{NameTo, file};
+use aterm_db::file::Renamed;
 use aterm_types::machine_name::Class;
 
-use super::fixture::{Names, found, named, nick, num, publish_all, rename, snapshot};
+use super::fixture::{
+    Names, found, found_with_history, named, nick, num, publish_all, rename, renamed, snapshot,
+};
 use super::*;
 use crate::machine_title::NameUnset;
 
@@ -19,8 +22,12 @@ fn save(rev: u64, number: Option<&str>, nick: Option<&str>) -> MachineRequest {
 /// Each request maps to the write Rename This Mac…'s judges make of it: a nickname alone keeps
 /// the number, a number moves it, an unchanged seeded number is saved as chosen, a pending
 /// chosen one synchronizes, an untouched quiet one writes nothing, New Random Name draws, and
-/// Undo Last Rename takes back the newest change the read showed, its number left to the writer
-/// where the vault's labels were not read. Each mapping has a control a wrong one would fail.
+/// Undo Last Rename writes the Undo the read's offer carries (the row's newest rename, m8 Puffin,
+/// taken back to the m7 Heron it replaced), its number left to the writer where the vault's
+/// labels were not read, and another read's undo is stale. Each mapping has a control a wrong
+/// one would fail.
+/// NEGATIVE CONTROL: with `page_change`'s Undo arm answering the offer's line whatever the offer
+/// carries, the Undo over the renamed read is refused and its `NameChange::Undo` match fails.
 #[test]
 fn page_change_maps_each_request() {
     let present = Names::authorized(Ok(true));
@@ -113,27 +120,56 @@ fn page_change_maps_each_request() {
         );
     }
 
-    // Undo Last Rename takes back the newest change the read showed, by that change.
-    let renamed = named(Class::Chosen, 7, "Heron");
-    rename(&renamed, Class::Chosen, 8, "Puffin");
-    let read = snapshot(1, found(&renamed, &[], &present));
-    let newest = file::read(&renamed.state)
-        .expect("reads")
-        .expect("a name")
-        .history[0]
-        .clone();
+    // Undo Last Rename writes the Undo the read's offer carries: the row's newest rename, by its
+    // operation, the row's name as the read found it (each cell's standing value, label first),
+    // and the values the rename replaced, which the undo writes back.
+    let (renamed, shown) = renamed(&[(7, "Heron"), (8, "Puffin")]);
+    let expected = Undo {
+        op: [2; 32],
+        shown: vec![
+            (Renamed::Label, "m8".to_owned()),
+            (Renamed::Nickname, "Puffin".to_owned()),
+        ],
+        cells: vec![
+            (Renamed::Label, "m7".to_owned()),
+            (Renamed::Nickname, "Heron".to_owned()),
+        ],
+        to: UndoTo::Name(NameTo {
+            num: num(7),
+            nick: Some(nick("Heron")),
+        }),
+    };
+    let read = snapshot(
+        1,
+        found_with_history(&renamed, &[], &present, Ok(shown.clone())),
+    );
+    assert_eq!(read.undo.undo.as_ref(), Some(&expected));
     assert!(matches!(
         page_change(&MachineRequest::Undo { rev: 1 }, &read),
-        PageWrite::Change(NameChange::Undo(seen)) if seen == newest
+        PageWrite::Change(NameChange::Undo(undo)) if undo == expected
     ));
+    assert!(
+        matches!(
+            page_change(&MachineRequest::Undo { rev: 2 }, &read),
+            PageWrite::Refused(why) if why == STALE
+        ),
+        "control: an undo pressed over another read is stale"
+    );
     // A number the vault's labels were not read for is the writer's to check, as Save's is.
-    let unread = snapshot(1, super::fixture::found_unread_labels(&renamed));
+    let unread = snapshot(
+        1,
+        PageFound {
+            history: Ok(shown),
+            ..super::fixture::found_unread_labels(&renamed)
+        },
+    );
     assert!(matches!(
         page_change(&MachineRequest::Undo { rev: 1 }, &unread),
-        PageWrite::Change(NameChange::Undo(seen)) if seen == newest
+        PageWrite::Change(NameChange::Undo(undo)) if undo == expected
     ));
-    let first = snapshot(1, found(&named(Class::Chosen, 7, "Heron"), &[], &present));
-    assert_eq!(first.undo.seen, None, "control: a first number has no undo");
+    let (first, born) = super::fixture::renamed(&[(7, "Heron")]);
+    let first = snapshot(1, found_with_history(&first, &[], &present, Ok(born)));
+    assert_eq!(first.undo.undo, None, "control: a first number has no undo");
     assert!(
         matches!(
             page_change(&MachineRequest::Undo { rev: 1 }, &first),
@@ -143,13 +179,15 @@ fn page_change_maps_each_request() {
     );
 }
 
-/// A write names the read it was pressed over; one the page has since replaced is refused.
-/// NEGATIVE CONTROL: the current read's own write passes.
+/// A write names the read it was pressed over; one the page has since replaced is refused, an
+/// undo over a read that offers one included. The current read's own Save and Undo pass.
+/// NEGATIVE CONTROL: with `page_change` refusing only a rev newer than its read's
+/// (`rev > read.rev`), the writes pressed over read 1 pass and their `STALE` match fails.
 #[test]
 fn a_stale_rev_is_refused() {
     let present = Names::authorized(Ok(true));
-    let seeded = named(Class::Seeded, 7, "Heron");
-    let read = snapshot(2, found(&seeded, &[], &present));
+    let (seeded, shown) = renamed(&[(7, "Heron"), (8, "Puffin")]);
+    let read = snapshot(2, found_with_history(&seeded, &[], &present, Ok(shown)));
     for asked in [
         save(1, None, Some("Kestrel")),
         MachineRequest::Random { rev: 1 },
@@ -166,18 +204,25 @@ fn a_stale_rev_is_refused() {
         page_change(&save(2, None, Some("Kestrel")), &read),
         PageWrite::Change(_)
     ));
+    assert!(matches!(
+        page_change(&MachineRequest::Undo { rev: 2 }, &read),
+        PageWrite::Change(NameChange::Undo(_))
+    ));
 }
 
 /// The page's Save and New Random Name, each resolved against the read the page showed
-/// ([`page_change`]) and set through the name writer's dispatch ([`write_change`]), record a
-/// History entry made by a person on this node: Save as `named`, New Random Name as `drawn`.
-/// The first write mints this Mac's node key, so the read after it names the node in its Node
-/// fact. NEGATIVE CONTROL: the read before any write names no node.
+/// ([`page_change`]) and set through the name writer's dispatch ([`write_change`]), write this
+/// Mac's name as asked: Save claims the seeded number as chosen, and New Random Name draws
+/// another nickname over it, keeping that claim. The first write mints this Mac's node key, so
+/// the read after it names the node in its Node fact. Who wrote each, and when, are this Mac's
+/// registry row's History, which no name file keeps.
+/// NEGATIVE CONTROL: the read before any write names no node; and with `page_change`'s Random
+/// arm answering the held nickname (`NickTo::Word`) in place of a draw, the nickname stays
+/// Heron and the draw's assertion fails.
 #[test]
-fn a_page_write_is_the_persons_on_this_node_in_history() {
+fn a_page_write_is_this_nodes_rename_as_asked() {
     use crate::machine_title::write_change;
-    use aterm_agent::machine_name::file::{self, Why};
-    use aterm_net::fleet_member::name_record::{By, ByKind, node_of};
+    use aterm_net::fleet_member::name_record::node_of;
     use aterm_secrets::client::LabLabels;
     let names = Names::authorized(Ok(true));
     let seeded = named(Class::Seeded, 7, "Heron");
@@ -216,18 +261,15 @@ fn a_page_write_is_the_persons_on_this_node_in_history() {
     let me = aterm_net::fleet_member::read_node_identity(&seeded.state)
         .expect("reads the node key")
         .expect("the page's Save minted this Mac's node key");
-    let by = Some(By {
-        node: node_of(me.node()).expect("a node id"),
-        kind: ByKind::Person,
-    });
     let saved = file::read(&seeded.state).unwrap().expect("a name");
     assert_eq!(
-        (saved.history[0].why, saved.history[0].by),
-        (Why::Named, by)
+        (saved.num, saved.class, saved.nick.as_str()),
+        (Some(num(7)), Class::Chosen, "Heron"),
+        "Save claims the seeded number as chosen"
     );
     let after = snapshot(2, found(&seeded, &[], &names));
     let node = after.snapshot.preview().and_then(|read| read.node());
-    assert_eq!(node, by.map(|by| by.node), "the read names the node minted");
+    assert_eq!(node, node_of(me.node()), "the read names the node minted");
     assert_eq!(Some(node_fact(&after)), node.map(|node| node.to_string()));
 
     write(
@@ -236,13 +278,14 @@ fn a_page_write_is_the_persons_on_this_node_in_history() {
         super::fixture::NOW + 3,
     );
     let drawn = file::read(&seeded.state).unwrap().expect("a name");
-    assert_eq!(
-        (drawn.history[0].why, drawn.history[0].by),
-        (Why::Drawn, by)
+    assert_ne!(
+        drawn.nick, saved.nick,
+        "New Random Name draws another nickname"
     );
     assert_eq!(
-        drawn.history[1], saved.history[0],
-        "the Save's entry stays below it"
+        (drawn.num, drawn.class),
+        (saved.num, saved.class),
+        "the draw keeps the claim"
     );
 }
 
@@ -311,6 +354,7 @@ fn a_failed_read_keeps_the_last_name_shown() {
     let unread = || PageFound {
         snapshot: Snapshot::Unread("the books are locked".to_owned()),
         fleet: None,
+        history: Err("the books are locked".to_owned()),
     };
     assert!(matches!(
         page_read(1, unread(), None, None),
@@ -583,35 +627,57 @@ fn an_authorization_result_goes_back_to_the_surface_that_asked() {
 }
 
 /// The page offers the undo and the next free numbers `aterm name` takes from the same books,
-/// both ways: Undo Last Rename names the title `undo_last`'s dry run over the change it showed
-/// leaves, and a number the vault holds names exactly the next free numbers the read finds, each
-/// of which the set takes, while the set refuses the held number with the line's own refusal.
-/// NEGATIVE CONTROL: the held number is not among those named, and the set refuses it.
+/// both ways: Undo Last Rename names the title the claim it makes leaves, a rename back to what
+/// the row's newest rename replaced (`aterm name set`'s dry run of the offer's `to`, whose claim
+/// `undo_last` makes too; `undo_last`'s own refuses here, where no registry row is this Mac's to
+/// show the rename), and a number the vault holds names exactly the next free numbers the read
+/// finds, each of which the set takes, while the set refuses the held number with the line's
+/// own refusal.
+/// NEGATIVE CONTROL: with `undo_offer` naming the title the read holds (`name.title()`, m8
+/// Puffin) in place of the undo's, the line no longer names m7 Heron and its `contains`
+/// assertion fails; the held number is not among those named, and the set refuses it.
 #[test]
 fn the_page_offers_the_undo_and_free_numbers_aterm_name_takes() {
     use super::fixture::{NOW, labels};
-    use aterm_agent::machine_name::{NameTo, Refused, next_free_words, set_name, undo_last};
+    use aterm_agent::machine_name::{Cause, Refused, next_free_words, set_name, undo_last};
     use aterm_net::fleet_member::name_record::ByKind;
     let present = Names::authorized(Ok(true));
-    let renamed = named(Class::Chosen, 7, "Heron");
-    rename(&renamed, Class::Chosen, 8, "Puffin");
-    let read = snapshot(1, found(&renamed, &[], &present));
-    let seen = read.undo.seen.as_ref().expect("an undo is offered");
-    let undone = undo_last(
+    let (renamed, shown) = renamed(&[(7, "Heron"), (8, "Puffin")]);
+    let read = snapshot(1, found_with_history(&renamed, &[], &present, Ok(shown)));
+    let undo = read.undo.undo.as_ref().expect("an undo is offered");
+    let UndoTo::Name(back) = &undo.to else {
+        panic!("the rename moved the number: {undo:?}");
+    };
+    let undone = set_name(
         &renamed.state,
-        Some(seen),
+        back,
         || Ok(labels(&[])),
         ByKind::Person,
         || Ok(None),
         NOW + 2,
         true,
     )
-    .expect("the undo's dry run");
+    .expect("the rename back's dry run");
+    assert_eq!(undone.name.title(), "m7 Heron");
     assert!(
         read.undo.line.contains(&undone.name.title()),
         "{:?} names {:?}",
         read.undo.line,
         undone.name.title()
+    );
+    let unshown = undo_last(
+        &renamed.state,
+        undo,
+        || Ok(labels(&[])),
+        ByKind::Person,
+        || Ok(None),
+        NOW + 2,
+        true,
+    )
+    .expect_err("no registry row here shows the rename");
+    assert_eq!(
+        Refused::of(&unshown).map(|refused| &refused.cause),
+        Some(&Cause::Unseen)
     );
 
     let scratch = named(Class::Chosen, 7, "Heron");
@@ -660,33 +726,124 @@ fn the_page_offers_the_undo_and_free_numbers_aterm_name_takes() {
     assert_eq!(Refused::of(&held), Some(&refused));
 }
 
-/// History on the page is the name file's History, one `aterm name history` line per change,
-/// newest first. NEGATIVE CONTROL: a failed read that keeps the editor over the name shown
-/// before lists no History and offers no undo, since it read no name.
+/// History on the page is this Mac's registry row's, as `aterm name history` lists it: over a
+/// row of 20 writes, the newest [`PAGE_ROWS`] in [`History::lines`]' words, newest first; a row
+/// with no write says [`NO_HISTORY`] and no row says [`NO_ROW`], in place of rows.
+/// NEGATIVE CONTROL: with `history_rows` listing every write (`History::lines(None)`), the page
+/// lists 20 rows and the first assertion fails; and a failed read that keeps the editor over
+/// the name shown before lists no History and offers no undo, since it read no name.
 #[test]
-fn the_pages_history_is_the_files() {
-    use aterm_agent::machine_name::file::Change;
+fn the_pages_history_is_the_rows() {
+    use super::fixture::{history, renames};
     let present = Names::authorized(Ok(true));
-    let renamed = named(Class::Chosen, 7, "Heron");
-    rename(&renamed, Class::Chosen, 8, "Puffin");
-    let read = snapshot(1, found(&renamed, &[], &present));
-    let kept = file::read(&renamed.state)
-        .expect("reads")
-        .expect("a name")
-        .history;
-    assert_eq!(kept.len(), 3, "the first name, m7 Heron and m8 Puffin");
-    assert_eq!(
-        read.history,
-        Some(kept.iter().map(Change::line).collect::<Vec<_>>())
+    // m7 Heron, m8 Puffin, ... m26 Wren, the newest m25 Kestrel's rename to m26 Wren.
+    let words = ["Heron", "Puffin", "Kestrel", "Wren"];
+    let named_as: Vec<(u32, &str)> = (7..27_u32).zip(words.into_iter().cycle()).collect();
+    let row = renames(&named_as);
+    assert_eq!(row.writes.len(), 20);
+    let scratch = named(Class::Chosen, 26, "Wren");
+    let read = snapshot(
+        1,
+        found_with_history(&scratch, &[], &present, Ok(row.clone())),
     );
+    let Some(PageHistory::Rows(rows)) = &read.history else {
+        panic!("rows: {:?}", read.history);
+    };
+    assert_eq!(rows.len(), PAGE_ROWS);
+    assert_eq!(*rows, row.lines(Some(PAGE_ROWS)));
+    assert_eq!(rows[0], row.writes[0].line());
+    assert!(
+        rows[0].contains("label m25 -> m26") && rows[0].contains("Kestrel -> Wren"),
+        "newest first: {:?}",
+        rows[0]
+    );
+    let oldest = row.writes[PAGE_ROWS].line();
+    assert!(!rows.contains(&oldest), "the page lists only the newest");
+
+    let empty = snapshot(
+        1,
+        found_with_history(&scratch, &[], &present, Ok(history(vec![]))),
+    );
+    assert_eq!(empty.history, Some(PageHistory::Empty(NO_HISTORY)));
+    let none = snapshot(
+        1,
+        found_with_history(&scratch, &[], &present, Ok(History::default())),
+    );
+    assert_eq!(none.history, Some(PageHistory::Empty(NO_ROW)));
 
     let unread = PageFound {
         snapshot: Snapshot::Unread("the books are locked".to_owned()),
         fleet: None,
+        history: Ok(row),
     };
     let PageRead::Read(failed) = page_read(2, unread, None, Some(&read)) else {
         panic!("the editor stays");
     };
     assert_eq!(failed.history, None);
-    assert_eq!(failed.undo.seen, None);
+    assert_eq!(failed.undo.undo, None);
+}
+
+/// A History read that gave up at its bound ([`PAGE_HISTORY_WAIT`]), or failed, leaves the page
+/// offering no undo over a name read that would offer one: LAST CHANGE names why, HISTORY says
+/// History was not read, the host refuses an Undo over that read in the line's words, and the
+/// page's Undo Last Rename press asks nothing of the host.
+/// NEGATIVE CONTROL: the same name read with its History offers the undo and the same press
+/// reaches the host (answered, with no writer in this process, on the page's notice); and with
+/// `undo_offer` judging an unread History as no row (`undo_of(&History::default())`), the line
+/// says NO_ROW, not why, and its first assertion fails.
+#[test]
+fn a_history_read_past_its_bound_offers_no_undo() {
+    use crate::native_app::{ActionInvocation, AppEvent};
+    use crate::native_settings::SettingsRoute;
+    let why = "no answer within 2 s";
+    let present = Names::authorized(Ok(true));
+    let (renamed, shown) = renamed(&[(7, "Heron"), (8, "Puffin")]);
+    let read = snapshot(
+        1,
+        found_with_history(&renamed, &[], &present, Err(why.to_owned())),
+    );
+    assert!(read.undo.line.contains(why), "{:?}", read.undo.line);
+    assert_eq!(read.undo.undo, None);
+    assert_eq!(read.history, Some(PageHistory::Unread(why.to_owned())));
+    assert!(matches!(
+        page_change(&MachineRequest::Undo { rev: 1 }, &read),
+        PageWrite::Refused(line) if line == read.undo.line
+    ));
+    let offered = snapshot(
+        1,
+        found_with_history(&renamed, &[], &present, Ok(shown.clone())),
+    );
+    assert!(
+        offered.undo.undo.is_some(),
+        "control: the read with its History offers it"
+    );
+
+    // The page's own press, over each read.
+    let wid = crate::WindowId(0);
+    let press = |history: Result<History, String>| {
+        let mut app = crate::App::headless_for_test();
+        if let Some(mut window) = app.windows.get_mut(&wid) {
+            window.cols = 160;
+            window.rows = 120;
+        }
+        assert!(app.open_settings_tab(SettingsRoute::Machine));
+        let seq = app.machine_page.reads;
+        app.machine_page_read(seq, found_with_history(&renamed, &[], &present, history));
+        let (_, view) = app.active_native_view(wid).expect("Settings");
+        let _ = app.dispatch_native_view_event(
+            wid,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: crate::native_ui::ActionId::new(format!("name/press/undo@{seq}")),
+                value: None,
+            }),
+        );
+        app.machine_page.state.notice.clone()
+    };
+    assert_eq!(press(Err(why.to_owned())), None, "the press asks nothing");
+    assert_eq!(
+        press(Ok(shown)),
+        Some(format!("Last attempt: {NO_WRITER}")),
+        "control: the undo the read offers reaches the host"
+    );
 }

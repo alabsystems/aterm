@@ -71,6 +71,88 @@ fn aterm_toml_is_read_through_a_link_and_a_dangling_one_is_no_absence() {
     ));
 }
 
+/// An `aterm.toml` reader's answer: the bytes it admitted, `None` for no entry, or its error.
+type ConfigRead = Result<Option<Vec<u8>>, String>;
+
+/// An `aterm.toml` reader, by name.
+type ConfigReader = (&'static str, fn(&std::path::Path) -> ConfigRead);
+
+/// Each `aterm.toml` reader, with a trace scope armed ([`aterm_uds::trace`]), answers as it
+/// does with none and records the path it read: as missing where there is no entry, so a
+/// config made there ends the trace, and by its stamp where there is one, so a rewrite ends it.
+///
+/// NEGATIVE CONTROL (2026-11-14): `aterm_uds::atomic_file::read_regular` without its
+/// `trace::fs::opening` call failed with "read_aterm_config recorded no miss of its path",
+/// left `[]`, right `[(".../aterm.toml", false)]`. Restored.
+#[test]
+fn aterm_toml_readers_record_their_path_and_a_miss() {
+    use aterm_uds::trace::{Moved, Now, Trace, read_as_if_later, scope};
+    let dir = crate::test_scratch_dir("dirs");
+    let path = dir.path().join("aterm.toml");
+    let readers: [ConfigReader; 2] = [
+        ("read_aterm_config", |path| {
+            read_aterm_config(path).map_err(|error| error.to_string())
+        }),
+        ("read_aterm_config_text", |path| {
+            read_aterm_config_text(path)
+                .map(|text| text.map(String::into_bytes))
+                .map_err(|error| error.to_string())
+        }),
+    ];
+    let recorded = |trace: &Trace| {
+        trace
+            .files()
+            .map(|(path, stamp)| (path.to_path_buf(), stamp.is_some()))
+            .collect::<Vec<_>>()
+    };
+    let stands = |trace: &Trace| trace.stands(Now::at(0), std::time::Instant::now());
+    let write = |text: &str| {
+        std::fs::write(&path, text).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    };
+    for (what, read) in readers {
+        let (answer, missed) = scope(|| read(&path));
+        assert_eq!(answer, Ok(None), "{what}");
+        assert_eq!(answer, read(&path), "{what}, with no scope armed");
+        assert_eq!(
+            recorded(&missed),
+            [(path.clone(), false)],
+            "{what} recorded no miss of its path"
+        );
+        assert_eq!(missed.unkept(), None, "{what}: {missed:?}");
+        assert_eq!(stands(&missed), Ok(()), "{what}");
+
+        write("shell = \"fish\"\n");
+        assert_eq!(
+            stands(&missed),
+            Err(Moved::File(path.clone())),
+            "{what}: a config made where none was left the trace standing"
+        );
+        let (answer, found) =
+            read_as_if_later(std::time::Duration::from_secs(60), || scope(|| read(&path)));
+        assert_eq!(answer, Ok(Some(b"shell = \"fish\"\n".to_vec())), "{what}");
+        assert_eq!(
+            recorded(&found),
+            [(path.clone(), true)],
+            "{what} recorded no stamp of its path"
+        );
+        assert_eq!(found.unkept(), None, "{what}: {found:?}");
+        assert_eq!(stands(&found), Ok(()), "{what}");
+
+        write("shell = \"zsh\"\nfont = 12\n");
+        assert_eq!(
+            stands(&found),
+            Err(Moved::File(path.clone())),
+            "{what}: a rewrite left the trace standing"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+}
+
 /// `aterm.toml` passes for this user's file or root's, with no group or other write and no
 /// set-id bit; another user's, or one others may write, is refused, saying why.
 #[test]

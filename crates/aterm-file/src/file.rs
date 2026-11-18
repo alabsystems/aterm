@@ -19,9 +19,15 @@
 //!
 //! A read answers this Mac's own writes too: [`File::read`] lays the intents waiting in the
 //! outbox over the snapshot (`crate::outbox`), and [`File::published`] is the snapshot alone.
+//!
+//! With a trace scope armed on the calling thread (`aterm_uds::trace`), a read records what its
+//! answer came from: each file's stamp, as `aterm_uds::atomic_file::read_regular` records it,
+//! except the status file's, which is recorded by its standing ([`File::state`]): everything it
+//! holds but the count of passes and the pass's time, which every pass moves.
 
 use crate::{
-    Face, Frontier, Kept, Name, Root, Snapshot, State, Status, Why, Word,
+    ACCOUNT_HANDLES, Face, Frontier, Kept, Name, Named, Root, Snapshot, State, Status, Why, Word,
+    many_accounts, no_account, resolve,
     snapshot::{Column, MAX_BYTES, Row},
 };
 use aterm_digest::Sha256;
@@ -140,119 +146,6 @@ impl Read {
     }
 }
 
-/// The handle columns of a file of accounts (`ai/accounts`), in the order a name tries them:
-/// the slug, the name (`claude ada.fb@alpha.example`) and the address.
-pub const ACCOUNT_HANDLES: [&str; 3] = ["slug", "name", "email"];
-
-/// One row as [`resolve`] reads it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Named<'a> {
-    /// Its key.
-    pub pk: &'a str,
-    /// Its lifecycle says live, or says nothing.
-    pub live: bool,
-    /// Its handle cells, in the order a name tries them; an empty cell names nothing.
-    pub handles: Vec<&'a str>,
-}
-
-/// What a word names among the rows [`resolve`] is given, by their places there.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Resolved {
-    One(usize),
-    None,
-    /// Several, in the order given.
-    Many(Vec<usize>),
-}
-
-impl Resolved {
-    /// The places it names: none, one, or each of several.
-    #[must_use]
-    pub fn places(self) -> Vec<usize> {
-        match self {
-            Self::One(place) => vec![place],
-            Self::None => Vec::new(),
-            Self::Many(places) => places,
-        }
-    }
-}
-
-/// The rows `word` names (docs/DESIGN-shared-files-2026-11-11.md §3, §10): the one resolver
-/// every read of a shared file and every account command passes. Exact only: no prefix, no
-/// substring, no folded case and no nearest match. The first of these that names a row answers:
-///
-/// 1. the row whose key is `word`, live or not;
-/// 2. among live rows, then among the others: each handle in turn, every row whose cell is
-///    `word`; then the same with the first `:` of `word` read as a space, so
-///    `oai:ada.fb@alpha.example` names what `oai ada.fb@alpha.example` does.
-///
-/// For accounts that is the slug, the `ac-` key, the provider word and the address in either
-/// spelling, and the address alone, which names every account that signs in as it: one
-/// address signed in to three providers is three accounts, and [`Resolved::Many`].
-#[must_use]
-pub fn resolve(word: &str, rows: &[Named<'_>]) -> Resolved {
-    if word.is_empty() {
-        return Resolved::None;
-    }
-    if let Some(place) = rows.iter().position(|row| row.pk == word) {
-        return Resolved::One(place);
-    }
-    let spaced = word
-        .split_once(':')
-        .map(|(provider, address)| format!("{provider} {address}"));
-    let width = rows.iter().map(|row| row.handles.len()).max().unwrap_or(0);
-    for live in [true, false] {
-        for wanted in std::iter::once(word).chain(spaced.as_deref()) {
-            for handle in 0..width {
-                let found: Vec<usize> = rows
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, row)| {
-                        row.live == live
-                            && row
-                                .handles
-                                .get(handle)
-                                .is_some_and(|cell| !cell.is_empty() && *cell == wanted)
-                    })
-                    .map(|(place, _)| place)
-                    .collect();
-                match found.as_slice() {
-                    [] => {}
-                    [place] => return Resolved::One(*place),
-                    _ => return Resolved::Many(found),
-                }
-            }
-        }
-    }
-    Resolved::None
-}
-
-/// What a word that names no account answers. It lists none: a typo never prints the lab's
-/// addresses.
-#[must_use]
-pub fn no_account(word: &str) -> String {
-    format!(
-        "no account is named `{word}`: name one by its slug, its key, or its provider word and \
-         address"
-    )
-}
-
-/// What a word that names several accounts answers: one line for each, its slug, its name (its
-/// provider word and address) and its key.
-#[must_use]
-pub fn many_accounts<'a>(
-    word: &str,
-    accounts: impl ExactSizeIterator<Item = (&'a str, &'a str, &'a str)>,
-) -> String {
-    let mut why = format!(
-        "`{word}` names {} accounts; name one by its slug:",
-        accounts.len()
-    );
-    for (slug, name, pk) in accounts {
-        why.push_str(&format!("\n  {slug}  {name}  {pk}"));
-    }
-    why
-}
-
 fn read_bounded(path: &Path) -> Result<Option<Vec<u8>>, String> {
     match aterm_uds::atomic_file::read_regular(path, MAX_BYTES) {
         Ok((bytes, _)) => Ok(Some(bytes)),
@@ -263,6 +156,75 @@ fn read_bounded(path: &Path) -> Result<Option<Vec<u8>>, String> {
 
 fn sha_hex(bytes: &[u8]) -> String {
     aterm_codec::hex::encode_lower(&Sha256::digest(bytes))
+}
+
+/// What a read of the status file at `path` answers: `None` where none is there, or where its
+/// bytes are not a status this build reads.
+///
+/// # Errors
+/// The file is there and could not be read: no regular file, past [`MAX_BYTES`], or the open or
+/// the read failed.
+fn state_at(path: &Path) -> std::io::Result<Option<State>> {
+    match aterm_uds::atomic_file::read_regular(path, MAX_BYTES) {
+        Ok((bytes, _)) => Ok(State::decode(&bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The status file at `path`, `None` where none is there, it does not read, or it is no status
+/// this build reads. With a trace scope armed on this thread it records the file's standing
+/// ([`standing_of`], replayed by [`traced_standing`]) and no stamp of it, and where `counted`,
+/// the count of passes as well ([`count_of`], replayed by [`traced_count`]). A read that failed
+/// records the retry `read_regular` records for it, where no stamp decides its error.
+fn read_state(path: &Path, counted: bool) -> Option<State> {
+    use aterm_uds::trace;
+    if !trace::armed() {
+        return state_at(path).ok().flatten();
+    }
+    // The read's own record, made apart so that no stamp of the file joins the armed scope: only
+    // its retry is taken. A raw wall read within it still poisons the armed scope.
+    let (read, apart) = trace::unrecorded(|| trace::scope(|| state_at(path)));
+    if let Some(trace::Unkept::Retry(why)) = apart.unkept() {
+        trace::retry(why);
+    }
+    let state = read.ok().flatten();
+    trace::standing(path, state.as_ref().map(standing_of), traced_standing);
+    if counted {
+        trace::standing(path, Some(count_of(state.as_ref())), traced_count);
+    }
+    state
+}
+
+/// A status's standing: everything it holds but [`State::seq`] and [`State::pass_ms`],
+/// digested. Every pass that writes the status moves those two, and a pass that changed nothing
+/// writes nothing ([`Recorded::Settled`]) or, where another pass's look is outstanding, the
+/// status with only those two moved ([`Recorded::Fenced`], [`File::record`]), which leaves the
+/// standing as it was. No reader of the status but [`File::look`] and [`File::record`] (the
+/// count) and [`crate::Status::json`] (both, and it poisons a scope) answers or decides by them.
+fn standing_of(state: &State) -> [u8; 32] {
+    let rest = State {
+        seq: 0,
+        pass_ms: 0,
+        ..state.clone()
+    };
+    Sha256::digest(rest.encode())
+}
+
+/// The standing of the status file at `path` now ([`standing_of`]), for a trace's replay: `None`
+/// where a read would answer none.
+fn traced_standing(path: &Path) -> Option<[u8; 32]> {
+    state_at(path).ok().flatten().as_ref().map(standing_of)
+}
+
+/// The count of passes a status says, digested: what [`File::look`] answers, 0 with none.
+fn count_of(state: Option<&State>) -> [u8; 32] {
+    Sha256::digest(state.map_or(0, |state| state.seq).to_le_bytes())
+}
+
+/// The count of passes the status file at `path` says now ([`count_of`]), for a trace's replay.
+fn traced_count(path: &Path) -> Option<[u8; 32]> {
+    Some(count_of(state_at(path).ok().flatten().as_ref()))
 }
 
 impl File {
@@ -288,12 +250,26 @@ impl File {
     }
 
     /// The last recorded pass's status file, when one recorded and it reads.
+    ///
+    /// With a trace scope armed on this thread (`aterm_uds::trace`), the read records the file's
+    /// standing and no stamp of it: everything the status holds but [`State::seq`] and
+    /// [`State::pass_ms`], which every pass that writes the status moves. So a pass that changed
+    /// nothing, which writes nothing or, fencing another pass's look, the status with only those
+    /// two moved ([`Self::record`]), leaves a run that read the status standing, while a pass that
+    /// moves its word, its why, its revision or anything else it holds moves it. [`Self::read`],
+    /// [`Self::published`], [`Self::status`] and [`Self::face`] read the status this way;
+    /// [`Self::look`] records the count as well. A read that failed for a reason no stamp
+    /// decides records a retry.
     #[must_use]
     pub fn state(&self) -> Option<State> {
-        read_bounded(&self.root.state(&self.name))
-            .ok()
-            .flatten()
-            .and_then(|bytes| State::decode(&bytes))
+        read_state(&self.root.state(&self.name), false)
+    }
+
+    /// [`Self::state`], read by one that decides by the count of passes too ([`Self::look`],
+    /// [`Self::record`]): with a trace scope armed it records the count beside the standing.
+    #[cfg(any(unix, windows))]
+    fn counted(&self) -> Option<State> {
+        read_state(&self.root.state(&self.name), true)
     }
 
     /// What the snapshot here was projected from.
@@ -492,6 +468,41 @@ impl File {
             .flatten()
     }
 
+    /// The extension the face is written with: the last pass's, else the snapshot's, else a
+    /// table's.
+    #[must_use]
+    pub fn face_ext(&self) -> String {
+        self.state()
+            .map(|state| state.ext)
+            .filter(|ext| !ext.is_empty())
+            .or_else(|| {
+                self.snapshot()
+                    .ok()
+                    .flatten()
+                    .map(|snapshot| snapshot.ext)
+                    .filter(|ext| !ext.is_empty())
+            })
+            .unwrap_or_else(|| crate::snapshot::TABLE_EXT.to_owned())
+    }
+
+    /// Where the face is.
+    #[must_use]
+    pub fn face_path(&self) -> std::path::PathBuf {
+        self.root.face(&self.name, &self.face_ext())
+    }
+
+    /// The face's bytes as they are now; `None` where no face is there.
+    ///
+    /// # Errors
+    /// The face is not a regular file, is larger than any face a pass writes, or cannot be read.
+    pub fn face_bytes(&self) -> Result<Option<Vec<u8>>, String> {
+        match aterm_uds::atomic_file::read_regular(&self.face_path(), crate::MAX_FACE_BYTES) {
+            Ok((bytes, _)) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     /// The face against what a pass wrote there. A face is a pass's own when its bytes are the
     /// ones the status file records, or the rendering of the snapshot beside it: a pass writes
     /// the face before the status that records it, so a pass cut short between the two leaves
@@ -643,6 +654,18 @@ pub enum Recorded {
     Raced,
 }
 
+/// What a restore did ([`File::restore`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Restored {
+    /// The face was rewritten from the snapshot; `kept` is where a person's bytes no commit took
+    /// were kept first.
+    Rewritten { kept: Option<std::path::PathBuf> },
+    /// The face already is the snapshot's.
+    Already,
+    /// No pass has recorded a snapshot here: there is nothing to restore from.
+    Nothing,
+}
+
 #[cfg(any(test, debug_assertions))]
 thread_local! {
     /// The durable writes ([`aterm_uds::atomic_file::write`]) this thread's recordings made: a
@@ -677,7 +700,7 @@ pub fn test_chmods() -> usize {
 mod write {
     use super::{
         BASELINES, File, HISTORY, MAX_BYTES, Opened, Pass, Projected, Projection, Recorded,
-        read_bounded, sha_hex,
+        Restored, read_bounded, sha_hex,
     };
     use crate::{Frontier, Kept, Snapshot, State, Why, Word};
     use aterm_uds::file_lock::LockFile;
@@ -711,23 +734,37 @@ mod write {
     /// Make `dir` and every folder above it that is missing, each the owner's alone (0700),
     /// and set its mode only where it has another: a folder already private is not changed.
     /// The mode compared is the one a chmod sets, a linked folder's own (`set_permissions`
-    /// follows the link, as `metadata` does).
+    /// follows the link, as `metadata` does). With a trace scope armed it records a write
+    /// (`aterm_uds::trace::effect`) where it makes a folder or sets a mode, each of which moves
+    /// what a look at the folder shows; a folder already there and private records nothing.
     fn private_dir(dir: &Path) -> io::Result<()> {
+        use aterm_uds::trace::{Effect, effect};
         #[cfg(unix)]
         {
             use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir)?;
-            if std::fs::metadata(dir)?.permissions().mode() & 0o7777 != 0o700 {
+            let mode = match std::fs::metadata(dir) {
+                Ok(there) if there.is_dir() => there.permissions().mode(),
+                _ => {
+                    effect(Effect::Write);
+                    std::fs::DirBuilder::new()
+                        .recursive(true)
+                        .mode(0o700)
+                        .create(dir)?;
+                    std::fs::metadata(dir)?.permissions().mode()
+                }
+            };
+            if mode & 0o7777 != 0o700 {
+                effect(Effect::Write);
                 #[cfg(any(test, debug_assertions))]
                 super::CHMODS.with(|chmods| chmods.set(chmods.get() + 1));
                 std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
             }
         }
         #[cfg(not(unix))]
-        std::fs::create_dir_all(dir)?;
+        if !std::fs::metadata(dir).is_ok_and(|there| there.is_dir()) {
+            effect(Effect::Write);
+            std::fs::create_dir_all(dir)?;
+        }
         Ok(())
     }
 
@@ -755,7 +792,10 @@ mod write {
 
     impl File {
         /// Make this file's folders, each the owner's alone.
-        pub(crate) fn make_dirs(&self) -> io::Result<()> {
+        ///
+        /// # Errors
+        /// A folder cannot be made or its mode set.
+        pub fn make_dirs(&self) -> io::Result<()> {
             let (root, name) = (&self.root, &self.name);
             private_dir(root.path())?;
             private_dir(&root.face_dir(name))?;
@@ -780,7 +820,8 @@ mod write {
                 "another pass is recording this shared file",
             )?;
             Ok(Look {
-                seq: self.state().map_or(0, |state| state.seq),
+                // Read so a trace records the count beside the status's standing.
+                seq: self.counted().map_or(0, |state| state.seq),
                 lease,
             })
         }
@@ -836,8 +877,10 @@ mod write {
         ///
         /// Each file is written only where its bytes differ from the ones there: the frontier,
         /// the baseline (whose folder is pruned only after one is written), the history and the
-        /// face by their bytes, and the snapshot by its revision and content, so a projection
-        /// of the same content keeps the file and the time it was written. Where the next
+        /// face by their bytes, and the snapshot by its revision, its content and its columns
+        /// (a column's type and nullability, which the content leaves out, included), so a
+        /// projection of the same content and columns keeps the file and the time it was
+        /// written. Where the next
         /// status would equal the one there but for the count of passes and their time, and no
         /// other file was written, the pass let go of its lease and tries the look lock alone:
         /// taken, no other pass's look is outstanding, and it writes nothing
@@ -870,7 +913,8 @@ mod write {
                 "another pass is recording this shared file",
             )?;
             let Look { seq, lease } = look;
-            let before = self.state().unwrap_or_default();
+            // It decides by the count: read so a trace records it ([`File::look`]).
+            let before = self.counted().unwrap_or_default();
             if before.seq != seq {
                 return Ok(Recorded::Raced);
             }
@@ -963,12 +1007,19 @@ mod write {
                         if let Some(baseline) = baseline {
                             wrote |= self.write_baseline(snapshot.rev, &baseline)?;
                         }
-                        // The content here already, at its revision: the file and the time
-                        // it was written stay.
+                        // The content here already, at its revision, its columns stated as
+                        // this pass states them: the file and the time it was written stay. A
+                        // column's type and nullability are no part of the content
+                        // (`Snapshot::content`), so a snapshot an earlier build wrote without
+                        // them is written again here at the same revision. A keyed build
+                        // before this one compares content alone, so it keeps one this build
+                        // wrote; a build before the keyed pass rewrites every pass, without
+                        // the types, and this build states them again at the same revision.
                         let same = held.as_ref().is_some_and(|old| {
                             old.rev == snapshot.rev
                                 && old.ext == snapshot.ext
                                 && old.content() == snapshot.content()
+                                && old.columns == snapshot.columns
                         });
                         if !same {
                             put(&root.snapshot(name), &bytes)?;
@@ -1045,6 +1096,176 @@ mod write {
             })
         }
 
+        /// Rewrite the face from the snapshot here (`aterm file restore`), under the lock a pass
+        /// records under: what a person wrote there and no commit took is kept first as
+        /// `<leaf>.rejected.<ext>` ([`crate::Root::rejected`]), or the next free
+        /// `<leaf>.rejected-<n>.<ext>`, never lost. A snapshot whose face
+        /// is larger than the grid opens leaves no face, as a pass leaves none.
+        ///
+        /// # Errors
+        /// A local file cannot be read or written, the face there is no regular file a face could
+        /// be, or a pass held the lock too long.
+        pub fn restore(&self) -> io::Result<Restored> {
+            let (root, name) = (&self.root, &self.name);
+            let _lock = self.pass_lock()?;
+            let (Some(mut state), Some(snapshot)) = (self.state(), self.snapshot().ok().flatten())
+            else {
+                return Ok(Restored::Nothing);
+            };
+            let path = root.face(name, &snapshot.ext);
+            let text = snapshot.face();
+            let there = match read_bounded(&path) {
+                Ok(there) => there,
+                Err(why) => {
+                    return Err(io::Error::other(format!(
+                        "the face cannot be read ({why}); move it away and restore again"
+                    )));
+                }
+            };
+            let fits = text.len() as u64 <= crate::MAX_FACE_BYTES;
+            if fits && there.as_deref() == Some(text.as_bytes()) {
+                let sha = sha_hex(text.as_bytes());
+                if state.face.as_deref() == Some(&sha) {
+                    return Ok(Restored::Already);
+                }
+                state.face = Some(sha);
+                state.ext.clone_from(&snapshot.ext);
+                put(&root.state(name), &state.encode())?;
+                return Ok(Restored::Already);
+            }
+            let kept = match there {
+                // Bytes a pass or a commit vouches for hold nothing of a person's that is not
+                // in the snapshot or the outbox already.
+                Some(bytes) if state.face.as_deref() != Some(&sha_hex(&bytes)) => {
+                    Some(self.keep_aside(&bytes, &snapshot.ext)?)
+                }
+                _ => None,
+            };
+            if fits {
+                put(&path, text.as_bytes())?;
+                state.face = Some(sha_hex(text.as_bytes()));
+            } else {
+                match std::fs::remove_file(&path) {
+                    Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                    _ => {}
+                }
+                state.face = None;
+            }
+            state.ext.clone_from(&snapshot.ext);
+            put(&root.state(name), &state.encode())?;
+            Ok(Restored::Rewritten { kept })
+        }
+
+        /// Take `bytes` as the face's own once a commit queued every write they ask for, under
+        /// the lock a pass records under: the face then reads `written`, and the next pass that
+        /// writes a new snapshot writes its face over them. Bytes that are no longer the face
+        /// (a later save landed) are not taken: that save's own commit judges them.
+        ///
+        /// # Errors
+        /// The status cannot be written, or a pass held the lock too long.
+        pub fn adopt(&self, bytes: &[u8]) -> io::Result<bool> {
+            let (root, name) = (&self.root, &self.name);
+            let _lock = self.pass_lock()?;
+            let Some(mut state) = self.state() else {
+                return Ok(false);
+            };
+            let ext = if state.ext.is_empty() {
+                crate::snapshot::TABLE_EXT.to_owned()
+            } else {
+                state.ext.clone()
+            };
+            if read_bounded(&root.face(name, &ext))
+                .ok()
+                .flatten()
+                .as_deref()
+                != Some(bytes)
+            {
+                return Ok(false);
+            }
+            state.face = Some(sha_hex(bytes));
+            state.ext = ext;
+            put(&root.state(name), &state.encode())?;
+            Ok(true)
+        }
+
+        /// Keep a person's face bytes a commit refused as `<leaf>.rejected.<ext>` beside the face,
+        /// or as the next `<leaf>.rejected-<n>.<ext>` where an earlier copy is still there.
+        ///
+        /// # Errors
+        /// The file cannot be written.
+        pub fn keep_rejected(&self, bytes: &[u8]) -> io::Result<std::path::PathBuf> {
+            self.make_dirs()?;
+            self.keep_aside(bytes, &self.face_ext())
+        }
+
+        /// The copies of refused face bytes kept beside the face now, each with when it was
+        /// last written.
+        #[must_use]
+        pub fn rejected_kept(&self) -> Vec<(std::path::PathBuf, std::time::SystemTime)> {
+            let prefix = format!("{}.rejected", self.name.leaf());
+            let Ok(entries) = std::fs::read_dir(self.root.face_dir(&self.name)) else {
+                return Vec::new();
+            };
+            let mut kept: Vec<_> = entries
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|f| f.starts_with(&prefix))
+                })
+                .filter_map(|entry| Some((entry.path(), entry.metadata().ok()?.modified().ok()?)))
+                .collect();
+            kept.sort();
+            kept
+        }
+
+        /// Keep `bytes` at the first of `<leaf>.rejected.<ext>`, `<leaf>.rejected-2.<ext>`, …
+        /// that holds them already or is free, so no copy kept earlier is written over.
+        fn keep_aside(&self, bytes: &[u8], ext: &str) -> io::Result<std::path::PathBuf> {
+            for n in 1..=u32::MAX {
+                let path = self.root.rejected_at(&self.name, ext, n);
+                match read_bounded(&path) {
+                    Ok(Some(there)) if there == bytes => return Ok(path),
+                    Ok(None) => {
+                        put(&path, bytes)?;
+                        return Ok(path);
+                    }
+                    _ => {}
+                }
+            }
+            Err(io::Error::other("no free name to keep the face's bytes at"))
+        }
+
+        /// Write where a commit found bad values, `text` one `line:column: why` a line, as
+        /// `<leaf>.problems` beside the face; empty `text` removes the file.
+        ///
+        /// # Errors
+        /// The file cannot be written or removed.
+        pub fn put_problems(&self, text: &str) -> io::Result<std::path::PathBuf> {
+            let path = self.root.problems(&self.name);
+            if text.is_empty() {
+                match std::fs::remove_file(&path) {
+                    Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                    _ => {}
+                }
+            } else {
+                self.make_dirs()?;
+                put(&path, text.as_bytes())?;
+            }
+            Ok(path)
+        }
+
+        /// The lock a pass records under.
+        fn pass_lock(&self) -> io::Result<aterm_uds::file_lock::LockFile> {
+            self.make_dirs()?;
+            aterm_uds::file_lock::LockFile::take(
+                &self.root.lock(&self.name),
+                Instant::now() + LOCK_WAIT,
+                "another pass is recording this shared file",
+            )
+        }
+
         /// Whether no face of `snapshot` is on disk: nothing there at its path, by the
         /// metadata a read of it follows (a link to nothing is missing too).
         fn face_missing(&self, state: &State, snapshot: &Snapshot) -> bool {
@@ -1111,6 +1332,10 @@ pub use write::Look;
 #[cfg(test)]
 #[path = "file_cut_tests.rs"]
 pub(crate) mod cut;
+
+#[cfg(test)]
+#[path = "file_trace_tests.rs"]
+mod trace_tests;
 
 #[cfg(test)]
 #[path = "file_resolve_tests.rs"]

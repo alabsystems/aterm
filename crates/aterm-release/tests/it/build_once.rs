@@ -210,6 +210,50 @@ fn an_entry_without_its_record_is_no_build() {
     );
 }
 
+#[test]
+fn unbound_legacy_complete_records_cannot_enter_the_producer_bound_cache() {
+    let dir = scratch();
+    let store = dir.path().join("artifacts");
+    let mut complete = complete_entry(&store, &identity(7), b"built");
+    let bound_key = complete.key.clone();
+    assert_eq!(
+        artifact::read(&store, &bound_key).unwrap(),
+        Some(complete.clone())
+    );
+    // The old v2 lookup domain for this exact reservation and compiler identity.
+    let legacy_parts = [
+        complete.schema.as_str(),
+        &complete.version,
+        &complete.build.to_string(),
+        &complete.commit,
+        &complete.trustc,
+        &complete.rustc,
+        &complete.inputs,
+        "universal",
+    ]
+    .join("\0")
+        + "\0";
+    let legacy_digest =
+        aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(legacy_parts.as_bytes()));
+    let legacy_key = legacy_digest.as_str();
+    assert_ne!(bound_key, legacy_key);
+    fs::rename(complete.dir(&store), store.join(legacy_key)).unwrap();
+    complete.key = legacy_key.into();
+    fs::write(
+        complete.dir(&store).join(artifact::COMPLETE_FILE),
+        aterm_toml::to_string(&complete).unwrap(),
+    )
+    .unwrap();
+    // Its existing wire schema and valid bundle digest remain unchanged.
+    artifact::prove(&complete, &complete.app(&store)).unwrap();
+    assert!(artifact::read(&store, legacy_key).is_err());
+    fs::create_dir(store.join("identity")).unwrap();
+    for lookup in [legacy_key, bound_key.as_str()] {
+        fs::write(store.join("identity").join(lookup), legacy_key).unwrap();
+        assert!(artifact::read(&store, lookup).is_err());
+    }
+}
+
 /// `artifact::key` changes whenever the version, build number, commit, or compiler hashes change.
 #[test]
 fn the_key_is_what_the_bytes_were_built_as() {

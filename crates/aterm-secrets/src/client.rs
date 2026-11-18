@@ -95,6 +95,7 @@ pub mod service_reading;
 mod steward;
 #[cfg(unix)]
 mod subscriber;
+mod subscriber_gate;
 mod successor;
 mod toml_cache;
 mod vault_memo;
@@ -1243,7 +1244,13 @@ impl StateLock {
         }
         let config = reads.config()?;
         let (vault, store) = records_store_selected(&reads, config)?;
-        let store = records_cache::read(paths, vault, store, &|| reads.identity().ok().flatten())?;
+        let store = records_cache::read(
+            paths,
+            vault,
+            store,
+            &|| reads.identity().ok().flatten(),
+            records_cache::HeadPublication::Allowed,
+        )?;
         if let Some(config) = config {
             retained_history::acknowledge_under(&reads, &store, config)?;
         }
@@ -1491,6 +1498,11 @@ impl StateLock {
             return Ok(None);
         }
         let path = paths.lock_file();
+        // Its presence, owner, mode (on Windows its access list) and links decide the
+        // observation: with a trace scope armed, its stamp is recorded, which holds each of them
+        // (on Windows a digest of its owner and access list, its change time and its names,
+        // `aterm_uds::trace::Meta`) and which a lock taken or let go never moves.
+        aterm_uds::trace::fs::opening(&path);
         #[cfg(unix)]
         if let Some(id) = fsx::file_id(&path)
             && let Some(file) = idle_lock(id)
@@ -1527,6 +1539,7 @@ impl StateLock {
         let path = paths.lock_file();
         #[cfg(test)]
         count_lock_use(LockUse::Opened, &path);
+        aterm_uds::trace::fs::opening(&path);
         fsx::look_afresh();
         #[cfg(unix)]
         let opened = aterm_uds::kept_out(|| {
@@ -1738,14 +1751,22 @@ impl StateLock {
                 Ok(if lock.guards(&path) {
                     StateObservation::Held(lock)
                 } else {
-                    StateObservation::Busy
+                    Self::busy()
                 })
             }
-            Err(std::fs::TryLockError::WouldBlock) => Ok(StateObservation::Busy),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(Self::busy()),
             Err(std::fs::TryLockError::Error(error)) => {
                 Err(Error::new(format!("{}: {error}", path.display())))
             }
         }
+    }
+
+    /// An observation that found a writer holding the lock. With a trace scope armed, a retry is
+    /// recorded: what a writer leaves when it lets the lock go may be no file a stamp shows (one
+    /// that changed nothing), so a run that met it is run again, never kept.
+    fn busy() -> StateObservation {
+        aterm_uds::trace::retry("a writer held the vault's state lock");
+        StateObservation::Busy
     }
 
     fn observe_until(paths: &Paths, deadline: Instant) -> crate::Result<Option<StateLock>> {
@@ -2823,7 +2844,127 @@ fn load_state(paths: &Paths) -> crate::Result<State> {
 
 /// `state.toml`, `None` where there is none.
 fn read_state(paths: &Paths) -> crate::Result<Option<State>> {
-    let Some(table) = read_toml(&paths.state_file(), "state.toml", MAX_STATE)? else {
+    read_state_at(&paths.state_file())
+}
+
+/// `state.toml` at `file`, `None` where there is none. With a trace scope armed on this thread
+/// (`aterm_uds::trace`), the read records the file's standing ([`state_standing`], replayed by
+/// [`traced_state_standing`]) and no stamp of it: what it holds but `heard` and the receipts of
+/// the vault's rounds, which the subscriber rewrites about once a minute while nothing else in it
+/// moves, so a run that read only the rest stands across those rewrites. Its readers that answer
+/// with `heard` or a receipt record the whole state as well ([`note_whole_state`]). A read that
+/// fails records a retry.
+fn read_state_at(file: &Path) -> crate::Result<Option<State>> {
+    if !aterm_uds::trace::armed() {
+        return parse_state_at(file);
+    }
+    #[cfg(test)]
+    if STATE_READ_BY_STAMP.get() {
+        return parse_state_at(file);
+    }
+    let read = aterm_uds::trace::unrecorded(|| parse_state_at(file));
+    match &read {
+        Ok(state) => {
+            aterm_uds::trace::standing(file, state.as_ref().map(standing_of), traced_state_standing)
+        }
+        Err(error) => aterm_uds::trace::retry(format!("{}: {error}", file.display())),
+    }
+    read
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Whether this thread's traced reads of `state.toml` record its stamp, as any read of a file
+    /// through `fsx` does, instead of its standing ([`state_read_by_stamp`]).
+    static STATE_READ_BY_STAMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with this thread's traced reads of `state.toml` recording the file's stamp instead of
+/// its standing ([`read_state_at`]): the negative control of a law that a heard-only save leaves
+/// a traced read standing.
+#[cfg(test)]
+fn state_read_by_stamp<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            STATE_READ_BY_STAMP.set(self.0);
+        }
+    }
+    let _restore = Restore(STATE_READ_BY_STAMP.replace(true));
+    f()
+}
+
+/// The standing of `state.toml` at `file` now ([`state_standing`]), for a trace's replay
+/// ([`read_state_at`]): one `lstat` while the file shows the stamp it was last read under in this
+/// process (`vault_memo::state_look_at`), and a read otherwise; for a file that cannot be read
+/// now, a digest no state has ([`unread_state`]).
+fn traced_state_standing(file: &Path) -> Option<[u8; 32]> {
+    match vault_memo::state_look_at(file, None) {
+        Some(look) => look.standing,
+        None => match parse_state_at(file) {
+            Ok(state) => state.as_ref().map(standing_of),
+            Err(_) => Some(unread_state()),
+        },
+    }
+}
+
+/// The whole of `state.toml` at `file` now ([`whole_of`]), for a trace's replay
+/// ([`note_whole_state`]), as [`traced_state_standing`] takes the standing.
+fn traced_state_whole(file: &Path) -> Option<[u8; 32]> {
+    match vault_memo::state_look_at(file, None) {
+        Some(look) => look.whole,
+        None => match parse_state_at(file) {
+            Ok(state) => state.as_ref().map(whole_of),
+            Err(_) => Some(unread_state()),
+        },
+    }
+}
+
+/// What a replay of a `state.toml` that cannot be read now digests to: the digest of words no
+/// state's text begins with ([`ordinary_state`]), so it equals no recorded standing.
+fn unread_state() -> [u8; 32] {
+    sha256(b"state.toml could not be read")
+}
+
+/// Record, in a trace scope armed on this thread, that a run's answer took `heard` or a receipt
+/// of the vault's rounds from `state`, read from `state.toml` at `file` (`None` where there was
+/// none): the whole state ([`whole_of`]), which those rewrites move, as a standing of the file.
+/// Every reader that answers with one records it: [`status`] (`heard`), the receipts' one read
+/// ([`observe_receipts`]), and `vault_memo::swarm_member_heard_now`; a snapshot's receipt
+/// ([`MaterializationSnapshot::network_materialization`]) poisons the scope.
+fn note_whole_state(file: &Path, state: Option<&State>) {
+    if aterm_uds::trace::armed() {
+        aterm_uds::trace::standing(file, state.map(whole_of), traced_state_whole);
+    }
+}
+
+/// `state.toml`'s standing: what `state` holds but `heard` and the receipts of the vault's
+/// rounds, digested ([`state_standing`]).
+fn standing_of(state: &State) -> [u8; 32] {
+    sha256(ordinary_state(state, false).as_bytes())
+}
+
+/// What `state` holds, all of it, digested: [`standing_of`]'s text with `heard`, and each receipt
+/// of the vault's rounds as [`save_state`] writes it, so a round that moves `heard` or a receipt
+/// moves this.
+fn whole_of(state: &State) -> [u8; 32] {
+    let mut text = ordinary_state(state, true);
+    if let Some(receipt) = &state.network_materialization {
+        receipt.write(&mut text);
+    }
+    if let Some(receipt) = &state.http204_response {
+        receipt.write(&mut text);
+    }
+    if let Some(receipt) = &state.network_refresh {
+        receipt.write(&mut text);
+    }
+    sha256(text.as_bytes())
+}
+
+/// [`read_state_at`]'s read and parse. With a trace scope armed, its read records the file's
+/// stamp, as every read through `fsx` does: [`read_state_at`] makes it unrecorded.
+fn parse_state_at(file: &Path) -> crate::Result<Option<State>> {
+    let Some(table) = read_toml(file, "state.toml", MAX_STATE)? else {
         return Ok(None);
     };
     let int = |key: &str| {
@@ -2917,29 +3058,13 @@ fn read_state(paths: &Paths) -> crate::Result<Option<State>> {
 /// ([`vault_memo::desk_inputs`], aterm-agent's `fleet_log::LocalLog`): of the file's readers,
 /// only [`status`] answers with `heard`, and only the receipts' own projections with a receipt.
 /// The file is read only where it shows another stamp than the one it was last read under in
-/// this process ([`vault_memo::state_standing_in`]): one `lstat` while it stands.
+/// this process ([`vault_memo::state_standing_in`]): one `lstat` while it stands. With a trace
+/// scope armed, this is what a read of the file records of it ([`read_state_at`]).
 ///
 /// # Errors
 /// `state.toml` cannot be read.
 pub fn state_standing(paths: &Paths) -> crate::Result<Option<[u8; 32]>> {
     vault_memo::state_standing_in(paths, None)
-}
-
-/// [`state_standing`], and from the same read of `state.toml` when the vault last heard this Mac
-/// where the state holds it in ([`Stored::In`]), as [`status`]'s [`Membership::In`] gives it
-/// where a vault is configured: what [`vault_memo`]'s memos stamp the file by.
-///
-/// # Errors
-/// `state.toml` cannot be read.
-pub(super) fn state_standing_heard(
-    paths: &Paths,
-) -> crate::Result<Option<([u8; 32], Option<u64>)>> {
-    Ok(read_state(paths)?.map(|state| {
-        (
-            sha256(ordinary_state(&state, false).as_bytes()),
-            (state.membership == Stored::In).then_some(state.heard),
-        )
-    }))
 }
 
 fn save_state(paths: &Paths, state: &State) -> crate::Result<()> {
@@ -3190,7 +3315,14 @@ pub fn status(paths: &Paths) -> crate::Result<Status> {
         let recipient = identity.recipient();
         (recipient, join_code(&recipient))
     });
-    let state = load_state(paths)?;
+    let read = read_state(paths)?;
+    if config.is_some()
+        && let Some(state) = read.as_ref().filter(|state| state.membership == Stored::In)
+    {
+        // It answers with `heard`, which is no part of the file's standing.
+        note_whole_state(&paths.state_file(), Some(state));
+    }
+    let state = read.unwrap_or_default();
     let membership = match (&config, state.membership) {
         (None, _) => Membership::Unconfigured,
         (Some(_), Stored::In) => Membership::In {
@@ -3268,7 +3400,7 @@ pub const CONFLICT_PICK: &str = "aterm secrets set <name> picks it";
 
 /// What picks one value of a conflicted Claude Code token: the token call's write, which deletes
 /// the concurrent values ahead of its own (DESIGN-claude-setup-token §3.5).
-pub const TOKEN_CONFLICT_PICK: &str = "`aterm harness accounts token <label|email> --replace` picks a Claude Code token's, for the account `aterm harness accounts` shows it under";
+pub const TOKEN_CONFLICT_PICK: &str = "`aterm harness accounts token <account> --replace` picks a Claude Code token's, for the account `aterm harness accounts` shows it under";
 
 impl Conflict {
     /// The entries of `conflicts`, in two lists: those [`CONFLICT_PICK`] picks, then the Claude
@@ -3728,7 +3860,12 @@ impl MaterializationSnapshot {
 
     /// Historical evidence from an actual signed URL body whose admitted context matched
     /// this guarded observation. It is not a claim of remote currency or provider sign-in.
-    pub const fn network_materialization(&self) -> Option<VaultNetworkMaterialization> {
+    ///
+    /// A trace scope armed on this thread is poisoned (`aterm_uds::trace::poison`): the receipt
+    /// is no part of `state.toml`'s standing, which is all the snapshot's read recorded of the
+    /// file ([`read_state_at`]), and the snapshot keeps nothing a replay could judge it by.
+    pub fn network_materialization(&self) -> Option<VaultNetworkMaterialization> {
+        aterm_uds::trace::poison("a snapshot's network materialization receipt");
         self.network_materialization
     }
 
@@ -4422,6 +4559,14 @@ pub const fn test_settled_after() -> Duration {
 #[doc(hidden)]
 pub fn test_as_if_later<T>(by: Duration, f: impl FnOnce() -> T) -> T {
     crate::fsx::as_if_later(by, f)
+}
+
+/// Run a test's reads against a fresh cache on this thread, restoring the prior cache even
+/// after a panic. Other threads and the process-wide cache are untouched.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn test_with_cold_records_cache<T>(f: impl FnOnce() -> T) -> T {
+    records_cache::with_cold_cache(f)
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -5353,15 +5498,35 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
 
 /// [`sync`] of a subscriber's pass: a source that fails or holds nothing newer gives way to the
 /// highest verified seq among the vault servers `found` (`docs/DESIGN-fluid-swarm-2026-10-28.md`
-/// F5), the source still its first choice. It keeps in `said` what the source itself said.
+/// F5), the source still its first choice. It keeps in `said` what the source itself said. A
+/// subscriber loop's pass asks those servers as its `gate` says ([`subscriber_gate::Gate`]); with
+/// none, it asks them as every pass did before the gate.
 #[cfg(unix)]
 fn sync_found(
     paths: &Paths,
     wait: Option<Duration>,
     found: Found<'_>,
     said: &std::cell::Cell<SourceSaid>,
+    gate: Option<&subscriber_gate::Gate>,
 ) -> crate::Result<SyncOutcome> {
-    sync_repairing_inner(paths, wait, None, &[], true, Some((found, said)), None)
+    sync_repairing_inner(
+        paths,
+        wait,
+        None,
+        &[],
+        true,
+        Some(Subscribing { found, said, gate }),
+        None,
+    )
+}
+
+/// What a subscriber's pass hands [`sync_repairing_inner`]: the servers its browse found, where
+/// to keep what its source itself said, and its gate, if its loop gates it.
+#[derive(Clone, Copy)]
+struct Subscribing<'a> {
+    found: Found<'a>,
+    said: &'a std::cell::Cell<SourceSaid>,
+    gate: Option<&'a subscriber_gate::Gate>,
 }
 
 /// [`sync`], also probing `candidates` (`DEFAULT_VAULT_URLS` and `_alab-vault._tcp` peers) when the
@@ -5476,7 +5641,13 @@ pub fn load_records(paths: &Paths) -> crate::Result<crate::membership_log::Store
             .get_or_init(|| read_identity(paths).ok().flatten())
             .as_ref()
     };
-    records_cache::read(paths, vault, store, &of)
+    records_cache::read(
+        paths,
+        vault,
+        store,
+        &of,
+        records_cache::HeadPublication::Allowed,
+    )
 }
 
 /// This Mac's membership store as an authority decision reads it: [`load_records`], projected
@@ -5486,6 +5657,8 @@ pub fn load_records(paths: &Paths) -> crate::Result<crate::membership_log::Store
 /// the store read here, admission ([`load_acknowledged_and_ahead`]) included; [`load_records`]
 /// alone serves repair, replication and what this Mac states it holds, which take every record
 /// it holds. With no vault configured the store is [`load_records`]' own.
+/// An authority read reuses authenticated heads but never publishes their derived cache,
+/// including through a later resolve of the returned store.
 ///
 /// # Errors
 /// [`load_records`]' errors; the acknowledged history cannot be read; the store's genesis is
@@ -5536,9 +5709,15 @@ fn acknowledged_read(paths: &Paths, ahead: bool) -> crate::Result<AcknowledgedRe
 fn acknowledged_under(reads: &Reads<'_>, ahead: bool) -> crate::Result<AcknowledgedRecords> {
     let config = reads.config()?;
     let (vault, store) = records_store_selected(reads, config)?;
-    let raw = records_cache::read(reads.paths(), vault, store, &|| {
-        reads.identity().ok().flatten()
-    })?;
+    // Authority readers fence the vault's physical namespace. A derived head may be read
+    // and authenticated, but neither this read nor its later resolves may publish it.
+    let raw = records_cache::read(
+        reads.paths(),
+        vault,
+        store,
+        &|| reads.identity().ok().flatten(),
+        records_cache::HeadPublication::ReadOnly,
+    )?;
     let Some(config) = config else {
         return Ok(AcknowledgedRecords {
             acknowledged: raw,
@@ -5556,16 +5735,20 @@ fn acknowledged_under(reads: &Reads<'_>, ahead: bool) -> crate::Result<Acknowled
     })
 }
 
-/// An envelope-verified replacement is evaluated under its prospective configuration,
-/// before that configuration can replace the currently materialized source on disk.
+/// A configured query, including a prospective replacement and a nested custody read,
+/// evaluates its records without publishing derived data into the authority namespace.
 fn load_records_for(
     reads: &Reads<'_>,
     config: &Config,
 ) -> crate::Result<crate::membership_log::Store> {
     let (vault, store) = records_store_selected(reads, Some(config))?;
-    records_cache::read(reads.paths(), vault, store, &|| {
-        reads.identity().ok().flatten()
-    })
+    records_cache::read(
+        reads.paths(),
+        vault,
+        store,
+        &|| reads.identity().ok().flatten(),
+        records_cache::HeadPublication::ReadOnly,
+    )
 }
 
 /// Verify and merge `records` into `paths.records_file()` under the client state lock, returning
@@ -5815,6 +5998,9 @@ mod record_persistence_tests;
 #[cfg(all(test, unix))]
 #[path = "client/records_append_tests.rs"]
 mod records_append_tests;
+#[cfg(test)]
+#[path = "client/state_trace_tests.rs"]
+mod state_trace_tests;
 #[cfg(test)]
 #[path = "client/state_writes_tests.rs"]
 mod state_writes_tests;
@@ -6094,6 +6280,48 @@ fn sync_records_inner(
     sync_records_until(paths, wait, extra_peers, browsed, None, posts_by).map(|pass| pass.added)
 }
 
+/// Whom one records pass asks ([`records_pass`]).
+#[derive(Clone, Copy)]
+enum Ask<'a> {
+    /// The source and the peers the pass selects: beside the source where nothing waits, and
+    /// after a long poll of it that failed. What each peer answered is kept in `heard` where one
+    /// is given (a sweep's, [`subscriber_gate::Gate::Sweep`]).
+    All(Option<&'a subscriber_gate::Heard>),
+    /// The source alone, on the calling thread ([`subscriber_gate::Gate::SourceFirst`]).
+    Source,
+    /// The peers alone, once the source fell short ([`RecordsPass::source_short`]).
+    Peers,
+}
+
+/// A subscriber pass's records exchange, as its `gate` has it ask: no gate (a pass that is no
+/// subscriber loop's) and a catch-up ask the source and the peers the pass selects beside it, a
+/// sweep the sweep's peers beside it, and a source-first pass its source alone, then the peers
+/// only where the source fell short ([`RecordsPass::source_short`]). Nothing it returns is read:
+/// what it took is in the store.
+fn subscriber_records(
+    paths: &Paths,
+    extra_peers: &[String],
+    browsed: Option<Found<'_>>,
+    posts_by: Option<Instant>,
+    gate: Option<&subscriber_gate::Gate>,
+) {
+    let asking = |ask| records_until(paths, None, extra_peers, browsed, None, posts_by, ask);
+    match gate {
+        None | Some(subscriber_gate::Gate::CatchUp) => {
+            let _ = asking(Ask::All(None));
+        }
+        Some(subscriber_gate::Gate::Sweep(heard)) => {
+            let _ = asking(Ask::All(Some(heard)));
+        }
+        Some(subscriber_gate::Gate::SourceFirst) => {
+            if asking(Ask::Source).is_ok_and(|pass| !pass.source_short) {
+                return;
+            }
+            let _ = asking(Ask::Peers);
+        }
+    }
+}
+
 /// What one records pass did ([`sync_records_until`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RecordsPass {
@@ -6115,6 +6343,13 @@ pub(crate) struct RecordsPass {
     /// ([`transport::ReceivedRecordsAnswer::more`]): the pass is not fresh, and
     /// [`sync_records_until`] asks again.
     pub(crate) more: bool,
+    /// The source fell short of what the peers could add: it failed, it stated no records bound
+    /// where the log crossed (so nothing it sent is taken), or the store could not be offered
+    /// its stream whole (a record it refused or could not read, which the next pull names
+    /// first, [`UNTAKEN`]). A pull that named a memo's heads (`untaken`) is no such shortfall:
+    /// every peer holds what the source could not give. A gated pass asks the peers only after
+    /// this ([`subscriber_gate::Gate::SourceFirst`]).
+    pub(crate) source_short: bool,
 }
 
 impl RecordsPass {
@@ -6261,7 +6496,29 @@ fn sync_records_until(
     deadline: Option<Instant>,
     posts_by: Option<Instant>,
 ) -> crate::Result<RecordsPass> {
-    let mut pass = records_pass(paths, wait, extra_peers, browsed, deadline, posts_by)?;
+    records_until(
+        paths,
+        wait,
+        extra_peers,
+        browsed,
+        deadline,
+        posts_by,
+        Ask::All(None),
+    )
+}
+
+/// [`sync_records_until`], asking as `ask` says: each pull again past what the last took asks
+/// the same servers.
+fn records_until(
+    paths: &Paths,
+    wait: Option<Duration>,
+    extra_peers: &[String],
+    browsed: Option<Found<'_>>,
+    deadline: Option<Instant>,
+    posts_by: Option<Instant>,
+    ask: Ask<'_>,
+) -> crate::Result<RecordsPass> {
+    let mut pass = records_pass(paths, wait, extra_peers, browsed, deadline, posts_by, ask)?;
     // A server answers one reply's causally closed prefix of what this Mac lacks
     // (`Store::missing_within`): while a server said more follow and the store took some, ask
     // again at once, past what it took. A pass that takes nothing, or fails, ends it: what the
@@ -6269,19 +6526,21 @@ fn sync_records_until(
     // have grown the store, so the store's own bound ends the asking, whatever a server says.
     let mut last_added = pass.added;
     while pass.more && last_added > 0 && deadline.is_none_or(|by| Instant::now() < by) {
-        let Ok(next) = records_pass(paths, None, extra_peers, browsed, deadline, posts_by) else {
+        let Ok(next) = records_pass(paths, None, extra_peers, browsed, deadline, posts_by, ask)
+        else {
             break;
         };
         last_added = next.added;
         pass = RecordsPass {
             added: pass.added + next.added,
+            source_short: pass.source_short || next.source_short,
             ..next
         };
     }
     Ok(pass)
 }
 
-/// One records pass of [`sync_records_until`].
+/// One records pass of [`records_until`], asking as `ask` says.
 fn records_pass(
     paths: &Paths,
     wait: Option<Duration>,
@@ -6289,6 +6548,7 @@ fn records_pass(
     browsed: Option<Found<'_>>,
     deadline: Option<Instant>,
     posts_by: Option<Instant>,
+    ask: Ask<'_>,
 ) -> crate::Result<RecordsPass> {
     use crate::membership_log::untaken::{Named, Noted, Sent};
 
@@ -6301,6 +6561,7 @@ fn records_pass(
             untaken: false,
             unstated: false,
             more: false,
+            source_short: false,
         });
     };
     let local_store = load_records(paths)?;
@@ -6423,32 +6684,66 @@ fn records_pass(
             })
             .collect()
     };
-    let (primary, peers, peer_batches) = if wait.is_none() {
-        // Where nothing waits, every peer is asked too, and beside the primary rather than after
-        // it: a primary that does not answer must not spend a bounded pass's whole deadline
-        // (readmit's freshness read) before any peer is asked.
-        let started = pass_counts::starting();
-        std::thread::scope(|scope| {
-            let primary = scope.spawn(|| started.run(fetch_primary));
+    let (primary, peers, peer_batches) = match ask {
+        // A gated pass asks its source first, on this thread, and its peers in a pass of their
+        // own only where the source fell short (`subscriber_records`).
+        Ask::Source => (fetch_primary(), Vec::new(), Vec::new()),
+        Ask::Peers => {
             let peers = collect_peers();
             let peer_batches = fetch_peers(&peers);
-            let primary = primary
-                .join()
-                .unwrap_or_else(|_| Err(Error::new("primary record fetch panicked")));
+            (
+                Err(Error::new("the source was asked first, alone")),
+                peers,
+                peer_batches,
+            )
+        }
+        Ask::All(_) if wait.is_none() => {
+            // Where nothing waits, every peer is asked too, and beside the primary rather than
+            // after it: a primary that does not answer must not spend a bounded pass's whole
+            // deadline (readmit's freshness read) before any peer is asked.
+            let started = pass_counts::starting();
+            std::thread::scope(|scope| {
+                let primary = scope.spawn(|| started.run(fetch_primary));
+                let peers = collect_peers();
+                let peer_batches = fetch_peers(&peers);
+                let primary = primary
+                    .join()
+                    .unwrap_or_else(|_| Err(Error::new("primary record fetch panicked")));
+                (primary, peers, peer_batches)
+            })
+        }
+        Ask::All(_) => {
+            let primary = fetch_primary();
+            // A successful long poll uses only the primary. Leave the next peer batch for a pass
+            // that asks those peers instead of consuming it without a request.
+            let peers = if primary.is_err() {
+                collect_peers()
+            } else {
+                Vec::new()
+            };
+            let peer_batches = fetch_peers(&peers);
             (primary, peers, peer_batches)
-        })
-    } else {
-        let primary = fetch_primary();
-        // A successful long poll uses only the primary. Leave the next peer batch for a pass
-        // that asks those peers instead of consuming it without a request.
-        let peers = if primary.is_err() {
-            collect_peers()
-        } else {
-            Vec::new()
-        };
-        let peer_batches = fetch_peers(&peers);
-        (primary, peers, peer_batches)
+        }
     };
+    if let Ask::All(Some(heard)) = ask {
+        // A peer served this vault's records where it answered a `200` or a `204`, each naming
+        // its boot id; a `404` (it holds no such vault) names none. One that names the source's
+        // own boot id is the source, reached at another name (a holder's own label beside
+        // `alab-secrets` resolves to the holder): what it says is the source's, which a sweep is
+        // not for.
+        let source_boot = primary
+            .as_ref()
+            .ok()
+            .and_then(|answer| answer.boot.as_deref());
+        for (url, _, answered) in &peer_batches {
+            heard.note(
+                url,
+                answered
+                    .as_ref()
+                    .is_ok_and(|peer| peer.boot.is_some() && peer.boot.as_deref() != source_boot),
+            );
+        }
+    }
 
     // A server that states its log crossed and sent records may cross this Mac's
     // ([`crate::crossing`]): then, and once it crossed, a server that stated no bound counts as
@@ -6528,6 +6823,8 @@ fn records_pass(
     let mut any_answered = false;
     let mut primary_err = None;
     let mut primary_refused = false;
+    // Whether the store was offered all the source sent ([`RecordsJudged::whole`]).
+    let mut primary_whole = true;
     // Whether a server that answered sent a prefix that more follow.
     let mut more = false;
     match primary {
@@ -6551,17 +6848,22 @@ fn records_pass(
                 if needs {
                     push_urls.push((primary_url.clone(), boot, bound));
                 }
-            } else if let Some(batch) = offered(primary_url, judge(received)) {
-                verified_batches.push((batch, bound.crossed()));
-                if needs {
-                    push_urls.push((primary_url.clone(), boot, bound));
-                }
             } else {
-                primary_refused = true;
+                let judged = judge(received);
+                primary_whole = judged.whole;
+                if let Some(batch) = offered(primary_url, judged) {
+                    verified_batches.push((batch, bound.crossed()));
+                    if needs {
+                        push_urls.push((primary_url.clone(), boot, bound));
+                    }
+                } else {
+                    primary_refused = true;
+                }
             }
         }
         Err(err) => primary_err = Some(err),
     }
+    let source_short = primary_err.is_some() || primary_refused || !primary_whole;
     for (url, named_heads, res) in peer_batches {
         let Ok(PeerRecords {
             records,
@@ -6824,6 +7126,7 @@ fn records_pass(
         untaken,
         unstated: !stated,
         more,
+        source_short,
     })
 }
 
@@ -7285,8 +7588,14 @@ fn sync_peer_head(
 /// The verified heads every one of `urls` serves `subscriber`, read at once within `total`
 /// (as [`fan_out::envelopes_within`] reads them), each read's lookup and connect within
 /// [`transport::PROBE_CONNECT`]: in `urls`' order, without the peers that served none in time or
-/// served one that does not verify. A mirror of `read_only`'s is not told the subscriber. A
-/// subscriber's pass counts what each peer answered ([`pass_counts`]).
+/// served one that does not verify. With `after`, each is asked only for a vault newer than that
+/// seq ([`transport::get_after_within_as`]), and one that holds none answers with no body. A
+/// mirror of `read_only`'s is not told the subscriber. A subscriber's pass counts what each peer
+/// answered ([`pass_counts`]), and a sweep's keeps in `heard` whether each answered.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a probe's own inputs, each named where the pass decides it"
+)]
 fn probe_peers_for_sync(
     paths: &Paths,
     urls: &[String],
@@ -7295,6 +7604,8 @@ fn probe_peers_for_sync(
     total: Duration,
     subscriber: Option<&str>,
     read_only: &mirrors::ReadOnly,
+    after: Option<u64>,
+    heard: Option<&subscriber_gate::Heard>,
 ) -> Vec<SyncPeerHead> {
     if urls.is_empty() {
         return Vec::new();
@@ -7318,11 +7629,17 @@ fn probe_peers_for_sync(
             if limit > fan_out::ENVELOPES.peek {
                 pass_counts::add(Count::ProbeWholeReads);
             }
-            transport::get_within_as(url, left, connect, subscriber, limit)
+            match after {
+                Some(after) => {
+                    transport::get_after_within_as(url, after, left, connect, subscriber, limit)
+                }
+                None => transport::get_within_as(url, left, connect, subscriber, limit),
+            }
         },
         |url, read| {
-            pass_counts::add(peer_answer(&read));
-            match read {
+            let answer = peer_answer(&read);
+            pass_counts::add(answer);
+            let head = match read {
                 Ok(transport::Pulled::Fetched(fetched)) => {
                     if let Fetched::Body(body) = &fetched {
                         pass_counts::add_n(Count::ProbeBytes, body.len());
@@ -7330,13 +7647,33 @@ fn probe_peers_for_sync(
                     sync_peer_head(url, fetched, attempt, config, pin, held)
                 }
                 Ok(transport::Pulled::Larger) | Err(_) => None,
+            };
+            if let Some(heard) = heard {
+                // It served this vault: a `204` (nothing newer than this Mac's), or a head that
+                // verifies. A `404` (it holds no such vault), a body that does not verify and no
+                // answer are not.
+                heard.note(url, answer == Count::ProbeNoNewer || head.is_some());
             }
+            head
         },
     )
     .into_iter()
     .flatten()
     .flatten()
     .collect()
+}
+
+/// Whether the held vault's file holds the exact version `before` names (its seq and digest), so
+/// a gated probe needs no peer's copy of it ([`subscriber_gate::Gate`]).
+fn holds_exact(paths: &Paths, before: &State) -> bool {
+    chain_cache::held(&paths.cache_file())
+        .ok()
+        .flatten()
+        .is_some_and(|held| {
+            held.envelope().is_ok_and(|envelope| {
+                envelope.seq == before.seq && before.digest == Some(envelope.digest())
+            })
+        })
 }
 
 type HeadLineage = (u64, [u8; 32], Vec<[u8; 32]>);
@@ -7485,13 +7822,14 @@ fn sync_repairing_inner(
     mut repaired: Option<&mut Repaired>,
     extra_peers: &[String],
     allow_mirror: bool,
-    subscribing: Option<(Found<'_>, &std::cell::Cell<SourceSaid>)>,
+    subscribing: Option<Subscribing<'_>>,
     posts_by: Option<Instant>,
 ) -> crate::Result<SyncOutcome> {
     let _pass = PassScope::enter();
     let mut config = configured(paths)?;
     let mut before = load_state(paths)?;
-    let browsed = subscribing.map(|(found, _)| found);
+    let browsed = subscribing.map(|subscribing| subscribing.found);
+    let gate = subscribing.and_then(|subscribing| subscribing.gate);
     let selected = (before.membership == Stored::In
         && !before.failed
         && (source_bound(&config, &before) || log_only_source_bound(&config, &before)))
@@ -7517,8 +7855,8 @@ fn sync_repairing_inner(
             true,
         )?;
         if !matches!(repaired_locally, SyncOutcome::Unchanged { .. }) {
-            if let Some((_, said)) = subscribing {
-                said.set(SourceSaid::Nothing);
+            if let Some(subscribing) = subscribing {
+                subscribing.said.set(SourceSaid::Nothing);
             }
             return Ok(repaired_locally);
         }
@@ -7529,7 +7867,7 @@ fn sync_repairing_inner(
     }
     if matches!(config.source, Source::Url(_)) {
         let _records = pass_counts::within(Phase::Records);
-        let _ = sync_records_inner(paths, None, extra_peers, browsed, posts_by);
+        subscriber_records(paths, extra_peers, browsed, posts_by, gate);
     }
     // Every log member's vault pass, a vault at a path included: its records come from Commons
     // exchanges, which sign nothing, so this is where its wrap gaps close and its re-keys mint.
@@ -7583,29 +7921,46 @@ fn sync_repairing_inner(
             .as_ref()
             .ok()
             .and_then(|fetched| attempt.and_then(|attempt| attempt.received(fetched)));
-        if let Some((_, said)) = subscribing {
-            said.set(SourceSaid::of(primary_result.is_ok(), asked.elapsed()));
+        if let Some(subscribing) = subscribing {
+            subscribing
+                .said
+                .set(SourceSaid::of(primary_result.is_ok(), asked.elapsed()));
         }
         if let Some(request) = &http204_request {
             http204_observation::retain(paths, &config, request, http204.as_ref());
         }
         if waited_on_primary && matches!(primary_result, Ok(Fetched::Body(_))) {
             let _records = pass_counts::within(Phase::Records);
-            let _ = sync_records_inner(paths, None, extra_peers, browsed, posts_by);
+            // The body came from the source: a sweep's peers were asked for records already, so
+            // the records that came with it are the source's to give.
+            let source_first = subscriber_gate::Gate::SourceFirst;
+            let after_body = match gate {
+                Some(subscriber_gate::Gate::Sweep(_)) => Some(&source_first),
+                other => other,
+            };
+            subscriber_records(paths, extra_peers, browsed, posts_by, after_body);
         }
         // The source's body is news only as far as it verifies under the pin (the servers found are
         // read only under one): a body that claims a newer seq and does not verify (anyone on the
         // LAN can answer at the source's name or address) must not keep the servers found unread.
-        let primary_advanced = match (&primary_result, config.signer.as_ref()) {
-            (Ok(Fetched::Body(bytes)), Some(pin)) => {
-                pass_counts::add(Count::FreshPrimary);
-                envelope::verify_for_reader(bytes, &config.name, pin, &config.followed, None)
-                    .is_ok_and(|(envelope, pinned, _)| {
-                        peer_selection::primary_advances(&before, &envelope, pinned)
-                    })
-            }
-            _ => false,
-        };
+        // `primary_verified` is the seq of a body that verified, and `primary_held` whether it
+        // verified as the very version this Mac holds.
+        let (primary_advanced, primary_verified, primary_held) =
+            match (&primary_result, config.signer.as_ref()) {
+                (Ok(Fetched::Body(bytes)), Some(pin)) => {
+                    pass_counts::add(Count::FreshPrimary);
+                    envelope::verify_for_reader(bytes, &config.name, pin, &config.followed, None)
+                        .map_or((false, None, false), |(envelope, pinned, _)| {
+                            (
+                                peer_selection::primary_advances(&before, &envelope, pinned),
+                                Some(envelope.seq),
+                                envelope.seq == before.seq
+                                    && before.digest == Some(envelope.digest()),
+                            )
+                        })
+                }
+                _ => (false, None, false),
+            };
         // Select only when a probe, mirror or recovery needs peers, and reuse the same batch
         // throughout this pass. A primary advancing by itself must not skip a failover batch.
         let peers = std::cell::OnceCell::new();
@@ -7635,13 +7990,50 @@ fn sync_repairing_inner(
                 .flatten()
                 .is_some()
         };
+        // A gated pass whose source answered at its version or with news asks no peer
+        // ([`subscriber_gate::Gate::SourceFirst`]); every other pass asks them where its source
+        // did not advance, and an admin's repair pass always.
+        let probe_due = match gate {
+            Some(subscriber_gate::Gate::SourceFirst) => subscriber_gate::source_fell_short(
+                &primary_result,
+                &before,
+                primary_advanced,
+                primary_verified,
+            ),
+            None | Some(subscriber_gate::Gate::CatchUp | subscriber_gate::Gate::Sweep(_)) => {
+                !primary_advanced
+            }
+        } || (is_local_admin && wait.is_none());
         if let (Source::Url(primary_url), Some(pin)) = (&config.source, config.signer.as_ref())
-            && (!primary_advanced || (is_local_admin && wait.is_none()))
+            && probe_due
         {
             let peers = peer_urls();
             if !peers.is_empty() {
                 let found = {
                     let _probe = pass_counts::within(Phase::Probe);
+                    // A gated pass asks each peer only for a version newer than this Mac's,
+                    // which a peer at this Mac's answers with a `204` and no body, where this Mac
+                    // holds that version's exact bytes (so no peer's copy of them is needed),
+                    // asks its source the same ([`long_poll_after`]), and the source's answer
+                    // leaves no peer's head at that version to take: a source that failed, or
+                    // sent a body that did not verify as this Mac's version, is answered for by
+                    // such a head ([`peer_selection::admits_exact`]), so its peers are read
+                    // whole. An admin reads every peer's whole envelope: its check for heads
+                    // that diverged at one seq needs each head ([`heads_diverged`]).
+                    let probe_after = gate
+                        .filter(|_| !is_local_admin)
+                        .and_then(|_| long_poll_after(&config, &before))
+                        .filter(|_| holds_exact(paths, &before))
+                        .filter(|_| {
+                            !peer_selection::admits_exact(
+                                paths,
+                                &config,
+                                &before,
+                                &primary_result,
+                                primary_held,
+                                true,
+                            )
+                        });
                     probe_peers_for_sync(
                         paths,
                         peers,
@@ -7650,6 +8042,8 @@ fn sync_repairing_inner(
                         servers_within(PROBE_DEADLINE),
                         subscriber.as_deref(),
                         read_only(),
+                        probe_after,
+                        gate.and_then(subscriber_gate::Gate::heard),
                     )
                 };
                 max_peer_seq = found.iter().map(|p| p.seq).max();
@@ -7841,6 +8235,8 @@ fn sync_repairing_inner(
                         servers_within(PROBE_DEADLINE),
                         subscriber.as_deref(),
                         read_only(),
+                        None,
+                        None,
                     )
                     .into_iter()
                     .map(|p| p.seq)
@@ -9768,6 +10164,11 @@ fn subscriber_loop_projecting(
         return Ok(());
     }
     let mut notary = release::NotaryRounds::default();
+    // What each pass asks beside its source ([`subscriber_gate`]): a catch-up first, after the
+    // routes moved, and after a pass that failed or whose source said nothing; a sweep once one is
+    // due; the source first otherwise.
+    let mut sweeps = subscriber_gate::Sweeps::default();
+    let mut moves = subscriber_gate::Moves::default();
     // What this loop counts of its passes, and its thread's time by phase, said in `log` as
     // passes end ([`pass_counts`]).
     let counts = std::sync::Arc::new(pass_counts::PassCounts::default());
@@ -9832,9 +10233,20 @@ fn subscriber_loop_projecting(
         };
         let before = progress();
         let routes = crate::server::route_sources();
+        let moved = moves.before_pass(routes);
         let started = Instant::now();
         let said = std::cell::Cell::new(SourceSaid::AtOnce);
-        let passed = subscriber_pass_saying(paths, &mut repaired, hearing.found, &said);
+        let passed = subscriber_pass_saying(
+            paths,
+            &mut repaired,
+            hearing.found,
+            &said,
+            Some(subscriber_gate::Gating {
+                sweeps: &mut sweeps,
+                moved,
+            }),
+        );
+        moves.after_pass(passed.is_err(), said.get());
         pass_counts::enter(Phase::After);
         for line in counts.pass_ended().into_iter().flatten() {
             log(&line);
@@ -9998,7 +10410,7 @@ fn verdict_due(paths: &Paths) -> bool {
     })
 }
 
-/// [`subscriber_pass_saying`], where what the source said is not wanted.
+/// [`subscriber_pass_saying`], ungated, where what the source said is not wanted.
 #[cfg(test)]
 #[cfg(unix)]
 fn subscriber_pass(
@@ -10011,18 +10423,22 @@ fn subscriber_pass(
         repaired,
         found,
         &std::cell::Cell::new(SourceSaid::AtOnce),
+        None,
     )
 }
 
 /// One subscriber pass: a long-poll of the source (a read every minute of a vault at a path),
 /// which gives way to the vault servers `found` where the source fails or holds nothing newer
-/// ([`sync_found`]). It keeps in `said` what a source at a URL itself said.
+/// ([`sync_found`]). It keeps in `said` what a source at a URL itself said. The loop's pass of a
+/// source at a URL asks those servers as `gating` has it ([`subscriber_gate::gated_pass`]); one
+/// with none asks them as every pass did before the gate.
 #[cfg(unix)]
 fn subscriber_pass_saying(
     paths: &Paths,
     repaired: &mut Repaired,
     found: Found<'_>,
     said: &std::cell::Cell<SourceSaid>,
+    gating: Option<subscriber_gate::Gating<'_>>,
 ) -> crate::Result<(Config, SyncOutcome)> {
     let _pass = pass_counts::within(Phase::Rest);
     pass_counts::add(Count::Passes);
@@ -10031,10 +10447,15 @@ fn subscriber_pass_saying(
     let config = config(paths)?
         .ok_or_else(|| Error::new("no vault configured; waiting for aterm secrets join"))?;
     let before = *repaired;
-    let synced = match config.source {
-        Source::Url(_) => {
+    let synced = match &config.source {
+        Source::Url(primary) => {
             let wait = (!repair_due(paths, repaired)).then_some(LONG_POLL);
-            sync_found(paths, wait, found, said)
+            match gating {
+                Some(gating) => {
+                    subscriber_gate::gated_pass(paths, &config, primary, wait, found, said, gating)
+                }
+                None => sync_found(paths, wait, found, said, None),
+            }
         }
         // Read every minute, not long-polled: the pass itself rules on putting files back.
         Source::Path(_) => sync_repairing(paths, None, Some(&mut *repaired)),

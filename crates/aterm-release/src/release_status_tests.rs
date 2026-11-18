@@ -399,7 +399,7 @@ fn stage_activity_rejects_rebinding_and_bounds_retained_work() {
         "event":"stage-started","stage_index":MAX_OPEN_STAGES,"stage":"extra"})));
 }
 
-/// The build-inputs seal's counting lines (`build_inputs::current`, one per call, in every
+/// The build-inputs seal's counting lines (`build_inputs::current_with_sdk`, one per call, in every
 /// mode it prints) are events of the run, never rejected lines, so a log that holds them
 /// still reads as complete. CONTROL: an event of a name nothing prints is rejected.
 /// NEGATIVE CONTROL: without `inputs` among the known events each is a rejected line.

@@ -13,6 +13,16 @@ fn journal_keyer(realm: &str, email: &str) -> Option<String> {
     }
 }
 
+/// The word a step names `records`' row `label` by, as the view's sign-in step types it.
+fn word(records: &AccountRecords, label: &str) -> aterm_agent::harness::account_names::Word {
+    aterm_agent::harness::account_names::sign_in_word(
+        Cli::Claude,
+        records.roster.row(label).expect("the row"),
+        &records.raw_roster.rows,
+        None,
+    )
+}
+
 fn records() -> AccountRecords {
     let roster = accounts::Roster {
         rows: vec![accounts::Row {
@@ -151,7 +161,7 @@ fn recorded_human_steps_take_precedence_without_exposing_raw_routes() {
                 let view = project(&records, 200_000);
                 assert_eq!(
                     fact(&view, "Next step"),
-                    action.next_step(Cli::Claude, "one")
+                    action.next_step(Cli::Claude, &word(&records, "one"))
                 );
                 assert_eq!(
                     fact(&view, "Sign-in task observed"),
@@ -515,7 +525,7 @@ fn a_row_on_its_vault_token_has_no_recovery_step() {
     let view = project(&records, now_ms);
     assert_eq!(
         fact(&view, "Next step"),
-        SignInAction::Renew.next_step(Cli::Claude, "one"),
+        SignInAction::Renew.next_step(Cli::Claude, &word(&records, "one")),
         "CONTROL: with no reading, the task's step"
     );
     assert!(view.rows[0].facts.iter().all(|(key, _)| key != "Runs on"));
@@ -524,6 +534,7 @@ fn a_row_on_its_vault_token_has_no_recovery_step() {
     records.state.tokens_here = Some(accounts::TokensHere {
         read_at: 150,
         ends: [("one".to_owned(), until)].into(),
+        vouched: false,
     });
     let view = project(&records, now_ms);
     assert!(
@@ -1003,7 +1014,7 @@ fn a_rows_vault_token_and_its_offer_join_the_rows_facts() {
 
     let offer = TokenOffer {
         line: "a vault token would keep one signed in: make one".into(),
-        label: "one".into(),
+        word: "claude-one-x".into(),
         replace: false,
     };
     let mut read = view;

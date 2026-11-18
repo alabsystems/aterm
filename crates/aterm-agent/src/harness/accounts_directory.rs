@@ -237,6 +237,29 @@ impl Store {
                 .collect::<Vec<_>>(),
             now,
         )?;
+        self.check_new_dirs(rows, existing, now, &|row, owner| {
+            format!(
+                "cannot use `{}`: its login directory is retained by `{owner}`; choose an unused label or directory; nothing was written",
+                row.label
+            )
+        })
+    }
+
+    /// The directory half of [`Self::check_new_rows`], for a caller that admits the rows' labels
+    /// itself (`accounts add` and `adopt-default`, whose rows take the records their account's
+    /// reserved slug holds, [`Self::retained_from`]): no new row's directory
+    /// aliases another current or new row's, or another binding's current or historical
+    /// directory. `refused` says why a row is refused, given the label of the row or binding
+    /// that holds its directory.
+    /// # Errors
+    /// As [`Self::check_new_rows`]'s directory refusals, worded by `refused`.
+    pub(in crate::harness) fn check_new_dirs(
+        &self,
+        rows: &[Row],
+        existing: &Roster,
+        now: i64,
+        refused: &dyn Fn(&Row, &str) -> String,
+    ) -> Result<(), String> {
         let (logins, _) = self.load_logins(now)?;
         let default = self.default_home();
         let location = |dir: Option<&str>| {
@@ -258,10 +281,7 @@ impl Store {
                 .iter()
                 .find(|(owner, location)| *owner != row.label && wanted.conflicts(location))
             {
-                return Err(format!(
-                    "cannot use `{}`: its login directory is retained by `{owner}`; choose an unused label or directory; nothing was written",
-                    row.label
-                ));
+                return Err(refused(row, owner));
             }
         }
         Ok(())

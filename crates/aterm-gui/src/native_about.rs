@@ -401,7 +401,7 @@ impl NativeAppModel for AboutApp {
                 !matches!(*key, "tagline" | "author" | "company" | "site" | "version")
             }) {
                 sections.push(wrapped(
-                    &format!("about/provenance/{key}"),
+                    &format!("about/provenance/{}", crate::native_ui::key_word(key)),
                     &format!("{key}: {value}"),
                     width,
                     SemanticRole::Text,

@@ -467,6 +467,8 @@ pub struct Verified {
     pub build: u64,
     /// That build's directory.
     pub build_dir: PathBuf,
+    /// The version the verified manifest names for that build.
+    pub version: String,
 }
 
 /// Verify the record kept beside `program`'s `build`: no index `trust` has seen yanks it; the
@@ -551,6 +553,7 @@ pub fn verify_kept(
         declaration,
         build,
         build_dir,
+        version: pkg.version,
     })
 }
 
@@ -1174,52 +1177,96 @@ pub fn one_leader_per_word(pins: &[(String, Vec<String>)]) -> Result<(), String>
     Ok(())
 }
 
-/// Whether the claimant image `exe` may run as `row`'s harness in `layout`, judged now under
-/// `trust`: a store build the row's images admit has its record verified again here
-/// ([`verify_kept`], the signature and a fresh hash of its tree), so a tree changed, a signer
-/// revoked or a build yanked since the registry was read is refused at this proof.
+/// WHAT AN IMAGE PROOF ADMITTED ([`admits_image`], [`admits_seed_image`]): the store build the
+/// claimant runs from, or a development link's checkout. It is where `status` and `sessions`
+/// read a harness's version from, never the text a claim states.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Admitted {
+    /// A ready, complete store build of the row's package.
+    Build {
+        /// The build's number.
+        build: u64,
+        /// The version that build's manifest names: the verified manifest's where the build's
+        /// record was verified at this proof, else the one recorded when the build was staged
+        /// ([`crate::store::recorded_version`]); `None` where the build records none.
+        version: Option<String>,
+    },
+    /// The checkout of a development link (`aterm pkg link`), which no manifest versions.
+    Checkout,
+}
+
+impl Admitted {
+    /// The word a development link's checkout is shown under where a build shows its version.
+    pub const LINK: &'static str = "link";
+
+    /// The version to show for what was admitted: the build's own, [`Self::LINK`] for a
+    /// checkout, `None` for a build that records no version.
+    #[must_use]
+    pub fn version(&self) -> Option<&str> {
+        match self {
+            Self::Build { version, .. } => version.as_deref(),
+            Self::Checkout => Some(Self::LINK),
+        }
+    }
+}
+
+/// What the claimant image `exe` is admitted as when it may run as `row`'s harness in `layout`,
+/// judged now under `trust`; `None` when it may not. A store build the row's images admit has
+/// its record verified again here ([`verify_kept`], the signature and a fresh hash of its tree),
+/// so a tree changed, a signer revoked or a build yanked since the registry was read is refused
+/// at this proof, and the version returned is the one that verified manifest names.
 #[must_use]
-pub fn admits_image(layout: &crate::store::Layout, row: &Row, exe: &Path, trust: &Trust) -> bool {
-    let Ok(exe) = std::fs::canonicalize(exe) else {
-        return false;
-    };
+pub fn admits_image(
+    layout: &crate::store::Layout,
+    row: &Row,
+    exe: &Path,
+    trust: &Trust,
+) -> Option<Admitted> {
+    let exe = std::fs::canonicalize(exe).ok()?;
     let id = &row.declaration.id;
-    row.images.iter().any(|image| match image {
+    row.images.iter().find_map(|image| match image {
         Image::AnyBuild | Image::Recorded => {
-            store_build_holding(layout, id, &exe).is_some_and(|build| {
-                if has_record(layout, id, build) {
-                    verify_kept(layout, id, build, trust).is_ok()
-                } else {
-                    *image == Image::AnyBuild
-                }
-            })
+            let build = store_build_holding(layout, id, &exe)?;
+            let version = if has_record(layout, id, build) {
+                Some(verify_kept(layout, id, build, trust).ok()?.version)
+            } else if *image == Image::AnyBuild {
+                crate::store::recorded_version(&layout.build_dir(id, build))
+            } else {
+                return None;
+            };
+            Some(Admitted::Build { build, version })
         }
-        Image::Checkout(dir) => {
-            std::fs::canonicalize(dir).is_ok_and(|d| d.parent().is_some() && exe.starts_with(d))
-        }
+        Image::Checkout(dir) => std::fs::canonicalize(dir)
+            .is_ok_and(|d| d.parent().is_some() && exe.starts_with(d))
+            .then_some(Admitted::Checkout),
     })
 }
 
-/// Whether the claimant image `exe` may run as seed id `id`'s CONTRACT 3 claimant in `layout`,
-/// judged now (`docs/HARNESS-CONTRACT.md` §2): inside a ready, complete store build of the
-/// package, or inside the checkout of its `aterm pkg link` development link. This is the rule
+/// What the claimant image `exe` is admitted as when it may run as seed id `id`'s CONTRACT 3
+/// claimant in `layout`, judged now (`docs/HARNESS-CONTRACT.md` §2): a ready, complete store
+/// build of the package (with the version recorded when it was staged), or the checkout of its
+/// `aterm pkg link` development link; `None` when it may not. This is the rule
 /// contract 3 always had, kept whatever row the registry composed for the id (a seed, a link over
 /// it, or a verified record over it), so a harness that speaks only contract 3 keeps its proven
 /// claim from its checkout and from a build older than its first record; a contract 4 claim is
 /// held to its row's images instead ([`admits_image`]). Any id that is not a seed id admits
 /// nothing.
 #[must_use]
-pub fn admits_seed_image(layout: &crate::store::Layout, id: &str, exe: &Path) -> bool {
+pub fn admits_seed_image(layout: &crate::store::Layout, id: &str, exe: &Path) -> Option<Admitted> {
     if !is_seed(id) {
-        return false;
+        return None;
     }
-    let Ok(exe) = std::fs::canonicalize(exe) else {
-        return false;
-    };
-    store_build_holding(layout, id, &exe).is_some()
-        || crate::linkmode::linked_checkout(layout, id)
-            .and_then(|checkout| std::fs::canonicalize(checkout).ok())
-            .is_some_and(|checkout| checkout.parent().is_some() && exe.starts_with(&checkout))
+    let exe = std::fs::canonicalize(exe).ok()?;
+    if let Some(build) = store_build_holding(layout, id, &exe) {
+        return Some(Admitted::Build {
+            build,
+            version: crate::store::recorded_version(&layout.build_dir(id, build)),
+        });
+    }
+    crate::linkmode::linked_checkout(layout, id)
+        .and_then(|checkout| std::fs::canonicalize(checkout).ok())
+        .is_some_and(|checkout| checkout.parent().is_some() && exe.starts_with(&checkout))
+        .then_some(Admitted::Checkout)
 }
 
 /// The build of `store/<package>/<build>/` that holds `exe` (resolved), when it is ready and

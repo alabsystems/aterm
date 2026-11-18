@@ -323,3 +323,54 @@ fn native_admission_conforms_and_catches_charging_a_denied_candidate() {
         }
     }
 }
+
+/// A watched queue (`shared_native`'s preparations) moves its generation only when a pick leaves
+/// it otherwise: a pick that selects nothing and prunes nothing moves nothing, and a selection,
+/// a cooled history pruned and a second home's selection each move it once.
+///
+/// NEGATIVE CONTROL (2026-11-15): `PreparationQueue` hashing nothing (an empty `Hash` impl in place
+/// of the derive) failed with "a selection left the generation", left `0`, right `1`. Restored.
+#[test]
+fn a_watched_queue_moves_only_when_a_pick_selects_or_prunes() {
+    let queue = aterm_uds::trace::Watched::new("schedule-test-queue", PreparationQueue::new());
+    let start = Instant::now();
+    let home = Path::new("/home");
+    let pick = |candidates: &[[u8; 32]], at: u64, home: &Path| {
+        queue
+            .lock()
+            .expect("the queue")
+            .pick(home, candidates, start + Duration::from_secs(at))
+    };
+    assert_eq!(pick(&[], 0, home), None);
+    assert_eq!(
+        queue.generation(),
+        0,
+        "a pick with no candidate moved the generation"
+    );
+    assert_eq!(pick(&[[1; 32]], 0, home), Some([1; 32]));
+    assert_eq!(queue.generation(), 1, "a selection left the generation");
+    assert_eq!(pick(&[[1; 32]], 10, home), None);
+    assert_eq!(
+        queue.generation(),
+        1,
+        "a pick within the cooldown moved the generation"
+    );
+    assert_eq!(pick(&[[1; 32]], 10, Path::new("/other")), Some([1; 32]));
+    assert_eq!(
+        queue.generation(),
+        2,
+        "another home's selection left the generation"
+    );
+    assert_eq!(pick(&[], 120, home), None);
+    assert_eq!(
+        queue.generation(),
+        3,
+        "a cooled history pruned left the generation"
+    );
+    assert_eq!(pick(&[], 130, home), None);
+    assert_eq!(
+        queue.generation(),
+        3,
+        "a pick that pruned nothing moved the generation"
+    );
+}

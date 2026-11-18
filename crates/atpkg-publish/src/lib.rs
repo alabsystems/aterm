@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `atpkg-publish`: packs, signs, and publishes atpkg builds and channel indexes.
+//!
+//! It is Unix's, as the owner-side signer it signs with (`atpkg-keys`) is: on Windows the
+//! library is empty and the bin says so.
+#![cfg(unix)]
 
 pub mod adopt;
 pub mod api;

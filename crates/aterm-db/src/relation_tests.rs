@@ -14,7 +14,7 @@ const NOW: u64 = 1_800_000_000_000;
 /// The fixture's own machine (m12) as `aterm db fleet machines` printed it before the relation
 /// types left the fleet: each column, its TSV cell and its JSON value. A value prints as it is,
 /// an unread cell as `?` (JSON `null`) and a known-empty one as nothing (JSON `null`).
-const M12: [(&str, &str, &str); 46] = [
+const M12: [(&str, &str, &str); 56] = [
     ("machine", "mc-76c301532f85bec9", r#""mc-76c301532f85bec9""#),
     ("label", "m12", r#""m12""#),
     ("number", "12", "12"),
@@ -48,21 +48,31 @@ const M12: [(&str, &str, &str); 46] = [
     ("agents_at", "1799999980000", "1799999980000"),
     ("facts_at", "1799999980000", "1799999980000"),
     ("disk_free_mb", "40000", "40000"),
-    ("cpu_used_x100", "?", "null"),
-    ("cpu_cores", "?", "null"),
-    ("cpu_at", "?", "null"),
-    ("mem_used_mb", "?", "null"),
-    ("mem_total_mb", "262144", "262144"),
-    ("mem_at", "1800000000000", "1800000000000"),
-    ("gpu_used_x100", "?", "null"),
-    ("gpu_cores", "?", "null"),
-    ("gpu_at", "?", "null"),
-    ("disk_used_mb", "?", "null"),
-    ("disk_total_mb", "?", "null"),
-    ("disk_at", "?", "null"),
-    ("net_used_kbps", "?", "null"),
-    ("net_link_kbps", "?", "null"),
-    ("net_at", "?", "null"),
+    ("cpu_used_x100", "0", "0"),
+    ("cpu_cores", "8", "8"),
+    ("cpu_at", "1799999980000", "1799999980000"),
+    ("mem_used_mb", "6553", "6553"),
+    ("mem_total_mb", "16384", "16384"),
+    ("mem_at", "1799999980000", "1799999980000"),
+    ("gpu_used_x100", "0", "0"),
+    ("gpu_cores", "10", "10"),
+    ("gpu_at", "1799999980000", "1799999980000"),
+    ("disk_used_mb", "436000", "436000"),
+    ("disk_total_mb", "476000", "476000"),
+    ("disk_at", "1799999980000", "1799999980000"),
+    ("net_used_kbps", "0", "0"),
+    ("net_link_kbps", "1000000", "1000000"),
+    ("net_at", "1799999980000", "1799999980000"),
+    ("cpu_limit", "false", "false"),
+    ("mem_limit", "false", "false"),
+    ("gpu_limit", "false", "false"),
+    ("disk_limit", "false", "false"),
+    ("load_x100", "0", "0"),
+    ("load_over_x100", "0", "0"),
+    ("look_at", "1799999980000", "1799999980000"),
+    ("update", "current", r#""current""#),
+    ("update_to", "?", "null"),
+    ("old", "false", "false"),
     ("accounts_expected", "2", "2"),
     ("accounts_active", "4", "4"),
 ];
@@ -87,7 +97,8 @@ fn a_fleet_relation_prints_by_the_shared_schema_types() {
     let cells: Vec<Cell> = row.cells();
     let at = |column: &str| schema.position(column).expect("a machines column");
     assert_eq!(cells[at("machine")], Cell::of("mc-76c301532f85bec9"));
-    assert_eq!(cells[at("cpu_used_x100")], Cell::Unread);
+    // Its CPU is idle: a zero its look read, never an unread.
+    assert_eq!(cells[at("cpu_used_x100")], Cell::Value(Value::from(0_u64)));
     assert_eq!(cells[at("host")], Cell::Empty);
 
     // It prints exactly as it did: the same columns, cells and JSON, in the same order.

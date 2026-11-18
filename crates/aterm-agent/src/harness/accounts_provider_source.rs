@@ -2,6 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! Captured provider inputs, shared by planning and writer admission.
+//!
+//! Traced by the accounts keeper: what this file reads of the file system itself, it reads
+//! through `aterm_uds::trace::fs` (census `traced-reads`).
 
 use super::*;
 

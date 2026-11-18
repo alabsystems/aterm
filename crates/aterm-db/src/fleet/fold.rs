@@ -46,11 +46,12 @@ use crate::alab::{
     },
     view::LabView,
 };
-use crate::fleet::read::At;
+use crate::fleet::read::{At, Pair};
 use crate::typed::keys;
 use aterm_codec::hex;
 use aterm_types::machine_name::Number;
 use aterm_types::network_state::{NetworkStateSnapshot, PeerObservation, Reachability};
+use aterm_types::update_standing::{UpdateFact, UpdateStanding};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -503,6 +504,49 @@ fn sighted_facts(
         row.proven = Some(!sighted.unproven);
         row.build = answered.v.build.clone().map(|build| At::new(build, at));
         row.disk_free_mb = answered.v.home_free_mb.map(|free| At::new(free, at));
+        // Its pairs, verdicts and load are its own look's, each side read or not on its own.
+        let look = &answered.v.look;
+        let read = |value: Option<u64>| value.map(|value| At::new(value, at));
+        row.cpu = Pair {
+            used: read(look.cpu_busy_x100),
+            capacity: read(look.cores),
+        };
+        row.mem = Pair {
+            used: read(look.mem_used_mb),
+            capacity: read(look.mem_total_mb),
+        };
+        row.gpu = Pair {
+            used: read(
+                look.gpu_busy_pct
+                    .zip(look.gpu_cores)
+                    .map(|(pct, cores)| pct.saturating_mul(cores)),
+            ),
+            capacity: read(look.gpu_cores),
+        };
+        row.disk = Pair {
+            used: read(
+                look.disk_total_mb
+                    .zip(answered.v.home_free_mb)
+                    .and_then(|(total, free)| total.checked_sub(free)),
+            ),
+            capacity: read(look.disk_total_mb),
+        };
+        row.net = Pair {
+            // A link's rate is each direction's: the busier one is what it uses of it.
+            used: read(
+                look.net_rx_kbps
+                    .zip(look.net_tx_kbps)
+                    .map(|(rx, tx)| rx.max(tx)),
+            ),
+            capacity: read(look.net_link_kbps),
+        };
+        let limits = look.limits;
+        row.limits = [limits.cpu, limits.mem, limits.gpu, limits.disk]
+            .iter()
+            .any(Option::is_some)
+            .then(|| At::new(limits, at));
+        row.load = look.load.map(|load| At::new(load, at));
+        row.update = answered.v.update.clone().map(|update| At::new(update, at));
         row.last_seen_ms = Some(at);
         if now_ms.saturating_sub(at) <= AGENTS_KEEP_MS {
             row.sessions = answered.v.sessions.map(|sessions| At::new(sessions, at));
@@ -524,6 +568,77 @@ fn sighted_facts(
         }
         next.at(newest_ms.saturating_add(REACH_KEEP_MS).saturating_add(1));
     }
+}
+
+/// A build's release numbers, `MAJOR.MINOR.PATCH` with any `+…` after them set aside, compared
+/// as numbers; `None` for a word of any other shape.
+fn release_of(build: &str) -> Option<(u32, u32, u32)> {
+    let numbers = build.split_once('+').map_or(build, |(numbers, _)| numbers);
+    let mut parts = numbers.split('.').map(|part| {
+        Some(part)
+            .filter(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))?
+            .parse::<u32>()
+            .ok()
+    });
+    let release = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some(release)
+}
+
+/// The release most of `builds` run, a tie going to the newer: what a machine behind is behind.
+/// The fold passes the builds of the proven answers young enough to say their machines answer
+/// now; a claim, a journal's build and a silent machine's last answer cast none. `None` where
+/// no build of that shape is among them.
+fn fleet_build<'a>(builds: impl Iterator<Item = &'a str>) -> Option<(u32, u32, u32)> {
+    let mut counts: BTreeMap<(u32, u32, u32), u32> = BTreeMap::new();
+    for release in builds.filter_map(release_of) {
+        let count = counts.entry(release).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(release, count)| (*count, *release))
+        .map(|(release, _)| release)
+}
+
+/// Whether an updater that stands at `standing` moves its machine on by itself: a newer build
+/// installed and waiting for a start, downloaded and not installed yet, offered and not
+/// downloaded yet, or held and tried again. Off, unable, held after a failure, refused, not
+/// installing and failing are not. `None` where that cannot be told: its state unread; up to
+/// date, since a standing is its installed bundle's (`aterm-update`'s `standing`), which an
+/// update may have moved past a window still on the build behind, and as of its last check,
+/// which a release since may have overtaken; and no check made yet.
+const fn installing(standing: UpdateStanding) -> Option<bool> {
+    match standing {
+        UpdateStanding::Installed
+        | UpdateStanding::Downloaded
+        | UpdateStanding::Behind
+        | UpdateStanding::Retrying => Some(true),
+        UpdateStanding::Off
+        | UpdateStanding::Cannot
+        | UpdateStanding::Held
+        | UpdateStanding::Refused
+        | UpdateStanding::NotInstalling
+        | UpdateStanding::Unreadable
+        | UpdateStanding::TooOld
+        | UpdateStanding::Failing
+        | UpdateStanding::CheckFailed => Some(false),
+        UpdateStanding::Current | UpdateStanding::Unchecked | UpdateStanding::Unread => None,
+    }
+}
+
+/// Old and not updating: a machine whose `build` is behind the `fleet`'s release and whose
+/// updater stands where it does not move it on ([`installing`]). A machine not behind is not old,
+/// whatever its standing; one behind whose standing is unread, unsent or a word this build does
+/// not know is unread, never current; and so is one whose build or the fleet's is unread.
+fn old_and_not_updating(
+    build: Option<&str>,
+    fleet: Option<(u32, u32, u32)>,
+    update: Option<&UpdateFact>,
+) -> Option<bool> {
+    if release_of(build?)? >= fleet? {
+        return Some(false);
+    }
+    installing(update?.standing.known()?).map(|installing| !installing)
 }
 
 /// Whether a stated plan's key and an observed one name different plans. A Mac's reading may
@@ -680,11 +795,6 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
             .as_deref()
             .and_then(|v| super::read::word(v, 32));
         row.ram_gb = machine.ram_gb;
-        // The memory pair's capacity is the registry's figure; nothing carries its use yet.
-        row.mem.capacity = machine
-            .ram_gb
-            .zip(inputs.lab.at_ms())
-            .map(|(gb, at)| At::new(gb.saturating_mul(1_024), at));
         row.uuid = uuids
             .get(machine.pk.as_str())
             .map(|uuid| (*uuid).to_owned());
@@ -769,6 +879,31 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
             ))
     });
     machines.extend(strangers);
+    // Old and not updating: judged of each answer young enough to say the machine answers now
+    // (`REACH_KEEP_MS`), its build and its standing that one answer's, never a journal's build or
+    // a sleeping machine's last word.
+    let answering = |machine: &str| {
+        sighted_of
+            .get(machine)
+            .and_then(|sighted| sighted.answered.as_ref().map(|at| (sighted, at)))
+            .filter(|(_, at)| now_ms.saturating_sub(at.at_ms) <= REACH_KEEP_MS)
+    };
+    let fleet = fleet_build(
+        machines
+            .iter()
+            .filter_map(|row| answering(&row.machine))
+            .filter(|(sighted, _)| !sighted.unproven)
+            .filter_map(|(_, answered)| answered.v.build.as_deref()),
+    );
+    for row in &mut machines {
+        row.old = answering(&row.machine).and_then(|(_, answered)| {
+            old_and_not_updating(
+                answered.v.build.as_deref(),
+                fleet,
+                answered.v.update.as_ref(),
+            )
+        });
+    }
 
     // Agents: each listed session of each machine whose answer still speaks for them.
     let accounts_by_name = lab.map(accounts_by_name).unwrap_or_default();
@@ -782,6 +917,8 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
             continue;
         };
         let (how, proven) = (sighted.how, !sighted.unproven);
+        // A time its row gives as an age: the read's time less it.
+        let since = |age: Option<u64>| age.map(|age| answered.at_ms.saturating_sub(age));
         let mut listed: Vec<AgentRow> = answered
             .v
             .agents
@@ -803,9 +940,7 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
                     harness: agent.harness,
                     state: agent.state,
                     state_why: agent.state_why.clone(),
-                    state_since_ms: agent
-                        .state_age_ms
-                        .map(|age| answered.at_ms.saturating_sub(age)),
+                    state_since_ms: since(agent.state_age_ms),
                     task: agent.task,
                     ctx_left_pct: agent.ctx_left_pct,
                     usage_5h_pct: agent.usage_5h_pct,
@@ -813,6 +948,18 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
                     account,
                     model: agent.model.clone(),
                     pinned: agent.pinned,
+                    turn_open: agent.turn.turn_open,
+                    turn_since_ms: since(agent.turn.turn_age_ms),
+                    step_since_ms: since(agent.turn.step_age_ms),
+                    out_at_ms: since(agent.turn.out_age_ms),
+                    out_src: agent.turn.out_src,
+                    jobs: agent.turn.bg,
+                    tools: agent.tools,
+                    need: agent.need,
+                    activity: agent.activity.clone(),
+                    tok_in: agent.tok_in,
+                    tok_out: agent.tok_out,
+                    rate: agent.rate,
                     read_at_ms: answered.at_ms,
                     how,
                     proven,

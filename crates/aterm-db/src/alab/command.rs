@@ -2212,13 +2212,13 @@ fn merge(paths: &Paths, args: &Args) -> Result<Value> {
 
 /// The account row `word` names in `view` (docs/DESIGN-shared-files-2026-11-11.md §3): its slug,
 /// its key, its provider word and address (`oai ada@x.example` or `oai:ada@x.example`), or an
-/// address that names one account, live accounts tried first ([`account_names::one`]). A word
-/// that names none or several says so in the resolver's words. `require_live` (`prefer`) refuses
-/// an account that is not live however it is named; without it (`unprefer`, `retire`, `set`) a
-/// retired account is named for its history.
+/// address that names one account, live accounts tried first (`aterm_file::account::one`). A
+/// word that names none or several says so in the resolver's words. `require_live` (`prefer`)
+/// refuses an account that is not live however it is named; without it (`unprefer`, `retire`,
+/// `set`) a retired account is named for its history.
 pub(super) fn account_row(view: &att::View, word: &str, require_live: bool) -> Result<String> {
     let names = account_names::of(view);
-    let pk = account_names::one(&names, word).map_err(|why| Error::new(&why))?;
+    let pk = aterm_file::account::one(&names, word).map_err(|why| Error::new(&why))?;
     if require_live && !names[pk].live {
         return Err(Error::new(&format!(
             "the account {} is not live: bring it back in `aterm db alab edit accounts` first",

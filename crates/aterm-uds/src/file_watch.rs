@@ -24,7 +24,11 @@
 //! above that one, up to the root, listens only for its own rename, end or
 //! change of mode, one listener per folder however many files' paths run
 //! through it, so a folder of the path renamed (a project folder moved, a
-//! checkout swapped in) or made unsearchable is heard as well. On Windows a
+//! checkout swapped in) or made unsearchable is heard as well. On macOS that
+//! listener is a filter on the one descriptor that every watch's listener on
+//! that folder shares, however many watches' paths run through it (the
+//! process may hold others on the folder: a file's own folder is opened for
+//! that file alone). On Windows a
 //! listener is an open handle on its folder, and no folder above an open
 //! handle can be renamed, moved or sent to the Recycle Bin, so that arm
 //! listens only inside the account's application-data and temporary
@@ -85,11 +89,14 @@ pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
 /// What tells one version of a file from the next: its device and inode
 /// (which a replace by rename changes), length, and modification and change
-/// times.
+/// times. On Windows the device is the volume's serial number, the inode the
+/// file's id (`FILE_ID_INFO`), and the change time `FILE_BASIC_INFO`'s
+/// `ChangeTime`, which a write, a truncation and a change of the file's
+/// attributes, times or access list each move, as Unix's `ctime` is moved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileStamp {
     dev: u64,
-    ino: u64,
+    ino: u128,
     len: u64,
     modified_ns: i128,
     changed_ns: i128,
@@ -102,7 +109,23 @@ impl FileStamp {
     pub fn of(path: &Path) -> Option<Self> {
         std::fs::metadata(path)
             .ok()
-            .map(|meta| Self::from_metadata(&meta))
+            .map(|meta| Self::of_entry(path, &meta, true))
+    }
+
+    /// The stamp of what `path` names, whose metadata `meta` was just read: through a link
+    /// where `follow`, as [`std::fs::metadata`] reads it, else of the link itself. On Windows no
+    /// metadata holds a file's id or its change time, so the stamp is read through a handle on
+    /// it ([`win::stamp`]); where none opens, or its volume keeps no file ids (FAT, exFAT), it
+    /// is `meta`'s length and modification time alone, as it is off Unix and Windows.
+    #[cfg(windows)]
+    fn of_entry(path: &Path, meta: &std::fs::Metadata, follow: bool) -> Self {
+        win::stamp(path, follow).unwrap_or_else(|| Self::from_metadata(meta))
+    }
+
+    /// [`Self::of_entry`] off Windows: `meta`'s.
+    #[cfg(not(windows))]
+    fn of_entry(_path: &Path, meta: &std::fs::Metadata, _follow: bool) -> Self {
+        Self::from_metadata(meta)
     }
 
     fn from_metadata(meta: &std::fs::Metadata) -> Self {
@@ -111,7 +134,7 @@ impl FileStamp {
             use std::os::unix::fs::MetadataExt as _;
             Self {
                 dev: meta.dev(),
-                ino: meta.ino(),
+                ino: u128::from(meta.ino()),
                 len: meta.size(),
                 modified_ns: i128::from(meta.mtime()) * 1_000_000_000
                     + i128::from(meta.mtime_nsec()),
@@ -173,7 +196,7 @@ impl Look {
             Ok(entry) => entry
                 .file_type()
                 .is_symlink()
-                .then(|| FileStamp::from_metadata(&entry)),
+                .then(|| FileStamp::of_entry(path, &entry, false)),
             Err(error) => {
                 return Self {
                     link: None,
@@ -181,8 +204,9 @@ impl Look {
                 };
             }
         };
-        let found = std::fs::metadata(path)
-            .map_or_else(refused, |meta| Found::At(FileStamp::from_metadata(&meta)));
+        let found = std::fs::metadata(path).map_or_else(refused, |meta| {
+            Found::At(FileStamp::of_entry(path, &meta, true))
+        });
         Self { link, found }
     }
 }
@@ -1442,13 +1466,16 @@ mod kqueue {
     //! directory (or the nearest one above it that is there), one on each
     //! folder above that, shared by every file whose path runs through it, a
     //! file system filter that hears every mount and unmount, and a user event
-    //! that wakes the wait.
+    //! that wakes the wait. A folder above is held open once for the listeners
+    //! above of every watch in the process ([`Held`]): every watch whose paths
+    //! run through it puts its own filter on that one descriptor. A key's own
+    //! folder and file are opened for that key alone.
 
     use std::collections::{BTreeMap, BTreeSet};
     use std::io;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, PoisonError, Weak};
     use std::time::Duration;
 
     use super::{FileEvents, Waker, open_for_events, open_link_for_events};
@@ -1496,10 +1523,59 @@ mod kqueue {
         fflags & (VQ_MOUNT | VQ_UNMOUNT) != 0
     }
 
-    /// The listener on one folder above some keys' own folders, which every key whose path runs
-    /// through that folder shares (closing it drops its filter).
-    struct Above {
+    /// A folder (or link) above some watch's keys' own folders, open for its events alone: the
+    /// one descriptor every watch's listener on it shares, however many watches' paths run
+    /// through it; a key whose own folder it is opens another, for that key alone. Each watch
+    /// that listens on it puts a filter of its own on this descriptor in its own kqueue and takes
+    /// that filter off as it lets go ([`KqueueEvents::disarm`]); the descriptor closes as the
+    /// last of them lets go, which drops any filter still on it.
+    struct Held {
         file: std::fs::File,
+        /// Its device and inode, which it is kept by in [`HELD`].
+        id: (u64, u64),
+    }
+
+    /// The folders above that some watch in this process holds open ([`Held`]), by identity
+    /// (device and inode). A watch that comes to listen on one another watch holds takes that
+    /// descriptor rather than keeping the one it opened to read the folder's identity, so the
+    /// listeners above on the folders every watch's path runs through (the home folder and those
+    /// above it) hold one descriptor on each, not one per watch.
+    static HELD: Mutex<BTreeMap<(u64, u64), Weak<Held>>> = Mutex::new(BTreeMap::new());
+
+    impl Held {
+        /// The descriptor every watch's listener on the folder `file` was opened on shares, whose
+        /// identity is `id`: the one a watch already holds open, `file` closed, or else `file`,
+        /// held from now on.
+        fn shared(file: std::fs::File, id: (u64, u64)) -> Arc<Self> {
+            let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(open) = held.get(&id).and_then(Weak::upgrade) {
+                return open;
+            }
+            let open = Arc::new(Self { file, id });
+            held.insert(id, Arc::downgrade(&open));
+            open
+        }
+    }
+
+    impl Drop for Held {
+        /// Forget it in [`HELD`], unless another descriptor on the same folder took its place
+        /// there while it was being let go.
+        fn drop(&mut self) {
+            let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+            if held
+                .get(&self.id)
+                .is_some_and(|open| open.strong_count() == 0)
+            {
+                held.remove(&self.id);
+            }
+        }
+    }
+
+    /// This watch's listener on one folder above some keys' own folders, which every key whose
+    /// path runs through that folder shares: its filter on the descriptor every watch's listener
+    /// there shares ([`Held`]).
+    struct Above {
+        held: Arc<Held>,
         /// What its filter hears.
         fflags: u32,
         keys: BTreeSet<u64>,
@@ -1513,10 +1589,21 @@ mod kqueue {
         /// Which key each open descriptor hears for.
         keys: BTreeMap<RawFd, u64>,
         /// The folders above the keys' own, by identity (device and inode): one listener each,
-        /// however many keys' paths run through it.
+        /// however many keys' paths run through it, on the descriptor every watch's listener
+        /// there shares ([`Held`]).
         above: BTreeMap<(u64, u64), Above>,
         /// Which folder above each of those listeners' descriptors is.
         above_at: BTreeMap<RawFd, (u64, u64)>,
+    }
+
+    impl Drop for KqueueEvents {
+        /// Its filters come off the descriptors above that other watches keep open: its kqueue
+        /// can outlive it, held by its waker ([`FileEvents::waker`]).
+        fn drop(&mut self) {
+            for above in self.above.values() {
+                let _ = change(&self.kq, vnode_delete(above.held.file.as_raw_fd()));
+            }
+        }
     }
 
     impl KqueueEvents {
@@ -1634,8 +1721,11 @@ mod kqueue {
         /// Listen on the folder `path`, or the link itself where `link`, for `fflags` under `key`,
         /// sharing a listener another key already holds on it, widened to `fflags` where it hears
         /// less (it is never narrowed while it lives: a key that needed more and left costs the
-        /// others a look when it fires). Nothing where `path` cannot be opened for events (a
-        /// folder or a link this user cannot read).
+        /// others a look when it fires). The folder or link is opened first, to read its
+        /// identity; a new listener's filter goes on the descriptor another watch's listener
+        /// holds on it, where one does, and the one just opened is closed ([`Held::shared`]).
+        /// Nothing where `path` cannot be opened for events (a folder or a link this user cannot
+        /// read).
         ///
         /// # Errors
         /// [`io::ErrorKind::NotFound`] when the folder or link moved or went as it was listened
@@ -1648,29 +1738,39 @@ mod kqueue {
             link: bool,
             fflags: u32,
         ) -> io::Result<()> {
+            match open_above(path, link)? {
+                Some(file) => self.listen_opened(key, path, file, fflags),
+                None => Ok(()),
+            }
+        }
+
+        /// [`Self::listen_one`] on the folder `path` for a folder above's events, with `between`
+        /// run after the folder is opened and before its listener's filter takes.
+        #[cfg(test)]
+        pub(super) fn listen_one_then(
+            &mut self,
+            key: u64,
+            path: &Path,
+            between: impl FnOnce(),
+        ) -> io::Result<()> {
+            match open_above(path, false)? {
+                Some(file) => {
+                    between();
+                    self.listen_opened(key, path, file, ABOVE_EVENTS)
+                }
+                None => Ok(()),
+            }
+        }
+
+        /// [`Self::listen_one`] on `file`, opened on `path`.
+        fn listen_opened(
+            &mut self,
+            key: u64,
+            path: &Path,
+            file: std::fs::File,
+            fflags: u32,
+        ) -> io::Result<()> {
             use std::os::unix::fs::MetadataExt as _;
-            let opened = if link {
-                open_link_for_events(path)
-            } else {
-                open_for_events(path, true)
-            };
-            let file = match opened {
-                Ok(file) => file,
-                Err(error)
-                    if error.kind() == io::ErrorKind::NotFound
-                        || matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) =>
-                {
-                    return Err(error);
-                }
-                // A link or a file where the lookup passed a folder: it moved as the walk ran.
-                Err(error)
-                    if !link
-                        && matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) =>
-                {
-                    return Err(io::Error::from(io::ErrorKind::NotFound));
-                }
-                Err(_) => return Ok(()),
-            };
             let held = file.metadata()?;
             let id = (held.dev(), held.ino());
             if let Some(shared) = self.above.get_mut(&id) {
@@ -1678,24 +1778,28 @@ mod kqueue {
                     // Adding a filter that is there changes what it hears.
                     change(
                         &self.kq,
-                        vnode_event(shared.file.as_raw_fd(), shared.fflags | fflags),
+                        vnode_event(shared.held.file.as_raw_fd(), shared.fflags | fflags),
                     )?;
                     shared.fflags |= fflags;
                 }
                 shared.keys.insert(key);
                 return Ok(());
             }
-            let fd = file.as_raw_fd();
+            let held = Held::shared(file, id);
+            let fd = held.file.as_raw_fd();
             change(&self.kq, vnode_event(fd, fflags))?;
-            // Moved before the filter took, whose event then never comes.
-            if !still_at(&file, path)? {
-                return Err(io::Error::from(io::ErrorKind::NotFound));
+            // Moved before the filter took, whose event then never comes. The filter comes off
+            // here: another watch may keep the descriptor open.
+            let there = still_at(&held.file, path);
+            if !matches!(there, Ok(true)) {
+                let _ = change(&self.kq, vnode_delete(fd));
+                return there.and(Err(io::Error::from(io::ErrorKind::NotFound)));
             }
             self.above_at.insert(fd, id);
             self.above.insert(
                 id,
                 Above {
-                    file,
+                    held,
                     fflags,
                     keys: BTreeSet::from([key]),
                 },
@@ -1867,6 +1971,28 @@ mod kqueue {
                 .map(|(id, above)| (*id, above.keys.iter().copied().collect()))
                 .collect()
         }
+
+        /// The descriptor each folder above the keys' own is listened on through.
+        #[cfg(test)]
+        pub(super) fn above_descriptors(&self) -> BTreeMap<(u64, u64), RawFd> {
+            self.above
+                .iter()
+                .map(|(id, above)| (*id, above.held.file.as_raw_fd()))
+                .collect()
+        }
+
+        /// How many vnode events this kqueue holds now, taken off it without waiting.
+        #[cfg(test)]
+        pub(super) fn vnode_events_now(&self) -> usize {
+            vnode_events_on(self.kq.as_raw_fd())
+        }
+
+        /// This watch's kqueue, which its waker keeps open after the watch drops
+        /// ([`FileEvents::waker`]).
+        #[cfg(test)]
+        pub(super) fn kqueue_descriptor(&self) -> RawFd {
+            self.kq.as_raw_fd()
+        }
     }
 
     /// The folder [`KqueueEvents::listen_folder`] listened on for a key.
@@ -1958,12 +2084,16 @@ mod kqueue {
             for file in self.armed.remove(&key).unwrap_or_default() {
                 self.keys.remove(&file.as_raw_fd());
             }
-            let above_at = &mut self.above_at;
+            let (kq, above_at) = (&self.kq, &mut self.above_at);
             self.above.retain(|_, above| {
                 above.keys.remove(&key);
                 let shared = !above.keys.is_empty();
                 if !shared {
-                    above_at.remove(&above.file.as_raw_fd());
+                    let fd = above.held.file.as_raw_fd();
+                    above_at.remove(&fd);
+                    // Another watch may keep the descriptor open: this watch's filter comes off
+                    // now, not as it closes.
+                    let _ = change(kq, vnode_delete(fd));
                 }
                 shared
             });
@@ -2036,6 +2166,77 @@ mod kqueue {
             filter: libc::EVFILT_VNODE,
             flags: libc::EV_ADD | libc::EV_CLEAR,
             fflags,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        }
+    }
+
+    /// The folder `path`, or the link itself where `link`, opened for its events
+    /// ([`KqueueEvents::listen_one`]): `None` where it cannot be (a folder or a link this user
+    /// cannot read).
+    ///
+    /// # Errors
+    /// [`io::ErrorKind::NotFound`] when nothing is there, or a link or a file is where the
+    /// folder was; the platform's when descriptors ran out.
+    fn open_above(path: &Path, link: bool) -> io::Result<Option<std::fs::File>> {
+        let opened = if link {
+            open_link_for_events(path)
+        } else {
+            open_for_events(path, true)
+        };
+        match opened {
+            Ok(file) => Ok(Some(file)),
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) =>
+            {
+                Err(error)
+            }
+            // A link or a file where the lookup passed a folder: it moved as the walk ran.
+            Err(error)
+                if !link && matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) =>
+            {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// How many vnode events the kqueue `kq` holds now, taken off it without waiting.
+    #[cfg(test)]
+    pub(super) fn vnode_events_on(kq: RawFd) -> usize {
+        // SAFETY: `kevent` initializes the slots it reports before they are read.
+        let mut events: [libc::kevent; 16] = unsafe { std::mem::zeroed() };
+        let now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: sixteen live event slots and a zero timeout that live for the call, on a
+        // descriptor the caller keeps open for it.
+        let count = unsafe {
+            libc::kevent(
+                kq,
+                std::ptr::null(),
+                0,
+                events.as_mut_ptr(),
+                16,
+                &raw const now,
+            )
+        };
+        events
+            .iter()
+            .take(usize::try_from(count).unwrap_or(0))
+            .filter(|event| event.filter == libc::EVFILT_VNODE)
+            .count()
+    }
+
+    /// The change entry that takes this kqueue's vnode filter off `fd`.
+    fn vnode_delete(fd: RawFd) -> libc::kevent {
+        libc::kevent {
+            ident: libc::uintptr_t::try_from(fd).unwrap_or(0),
+            filter: libc::EVFILT_VNODE,
+            flags: libc::EV_DELETE,
+            fflags: 0,
             data: 0,
             udata: std::ptr::null_mut(),
         }

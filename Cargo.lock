@@ -165,7 +165,7 @@ version = "0.2.2"
 
 [[package]]
 name = "aterm"
-version = "0.206.0"
+version = "0.207.0"
 dependencies = [
  "agh",
  "alab-policy",
@@ -283,6 +283,7 @@ dependencies = [
  "aterm-digest",
  "aterm-dirfd",
  "aterm-durable",
+ "aterm-file",
  "aterm-grapheme",
  "aterm-hash",
  "aterm-http",
@@ -944,6 +945,7 @@ dependencies = [
  "aterm-diskwalk",
  "aterm-durable",
  "aterm-effects",
+ "aterm-file",
  "aterm-gpu",
  "aterm-grapheme",
  "aterm-grid",
@@ -2308,6 +2310,7 @@ dependencies = [
  "aterm-tempfile",
  "aterm-time",
  "aterm-uds",
+ "aterm-vitals",
  "trust-resource-controller",
 ]
 
@@ -2317,6 +2320,7 @@ version = "0.0.0"
 dependencies = [
  "astream-sys",
  "aterm-bench",
+ "aterm-digest",
  "aterm-dirfd",
  "aterm-durable",
  "aterm-path",
@@ -2325,6 +2329,7 @@ dependencies = [
  "aterm-stamp",
  "aterm-sysprobe",
  "aterm-tempfile",
+ "aterm-time",
  "aterm-vitals",
  "libc",
  "trust-exec-policy",
@@ -2865,6 +2870,7 @@ dependencies = [
  "aterm-json",
  "aterm-serde",
  "libc",
+ "trust-exec-policy",
  "trust-sha2",
 ]
 

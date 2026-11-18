@@ -487,3 +487,58 @@ fn a_repeated_outcome_within_a_minute_keeps_the_retained_receipt_and_the_state_f
     retain(&paths, &config, &attempt, Succeeded, 1_500);
     assert_eq!(observed(), (Succeeded, 1_500), "a clock set back");
 }
+
+/// A traced receipts read ([`observe_receipts`]) answers with a receipt, which is no part of
+/// `state.toml`'s standing (`read_state_at`), so it records the whole state as well
+/// (`note_whole_state`): a later refresh of another outcome, which rewrites only the refresh
+/// receipt, moves its trace at the state file's standing, and the run that read the old receipt
+/// is not shown it as standing.
+/// NEGATIVE CONTROL (2026-11-16): with `receipts_of` not calling `note_whole_state`, the trace
+/// stands across the receipt-only rewrite while its answer moved (`a refresh that rewrote only
+/// its receipt moves the read that answered it`: left `Ok(())`, right
+/// `Err(Standing(".../secrets/state.toml"))`).
+#[test]
+fn a_traced_receipts_read_moves_at_a_refresh_that_rewrites_only_its_receipt() {
+    use aterm_uds::trace::{self, Moved, Now};
+    let (_root, paths, config) = fixture();
+    let attempt = failure(&paths, &config);
+    let before = load_state(&paths).unwrap();
+    let (observed, traced) = trace::read_as_if_later(Duration::from_secs(10), || {
+        trace::scope(|| read_refresh(&paths, &config))
+    });
+    assert_eq!(
+        observed.map(VaultNetworkRefresh::completed_at_ms),
+        Some(1_000)
+    );
+    assert_eq!(traced.unkept(), None, "a receipts read may be kept");
+    let stands = || {
+        trace::read_as_if_later(Duration::from_secs(10), || {
+            traced.stands(Now::at_now(), std::time::Instant::now())
+        })
+    };
+    assert_eq!(stands(), Ok(()));
+
+    retain(
+        &paths,
+        &config,
+        &attempt,
+        VaultNetworkRefreshOutcome::Succeeded,
+        2_000,
+    );
+    let after = load_state(&paths).unwrap();
+    assert_eq!(
+        read_refresh(&paths, &config).map(VaultNetworkRefresh::completed_at_ms),
+        Some(2_000),
+        "the refresh receipt moved"
+    );
+    assert_eq!(
+        standing_of(&after),
+        standing_of(&before),
+        "the rewrite moved only the refresh receipt"
+    );
+    assert_eq!(
+        stands(),
+        Err(Moved::Standing(paths.state_file())),
+        "a refresh that rewrote only its receipt moves the read that answered it"
+    );
+}

@@ -59,3 +59,68 @@ fn the_epoch_accessors_read_the_wall_clock() {
     assert!(super::unix_secs().is_some());
     assert!(super::unix_millis().is_some());
 }
+
+/// Each call of `since_epoch`, `unix_secs` or `unix_millis` adds exactly one
+/// to the calling thread's `raw_reads`. The `*_at` conversions of a reading
+/// the caller already holds add nothing. A thread starts at zero, and its
+/// count moves only with its own reads.
+///
+/// Negative controls, each run against this test on 2026-11-14 and then
+/// restored:
+/// - `unix_millis` reading `SystemTime::now()` instead of `wall_now()` failed
+///   "unix_millis is one counted read" (left 1, right 2).
+/// - The count kept in one process-wide `AtomicU64` instead of the
+///   thread-local failed "a fresh thread starts at zero, whatever other
+///   threads read" (left 3, right 0).
+/// - `unix_secs_at` also adding one failed "unix_secs is one counted read"
+///   (left 2, right 1).
+#[test]
+fn raw_reads_counts_each_wall_read_on_the_calling_thread() {
+    let start = super::raw_reads();
+    let moved = || super::raw_reads().wrapping_sub(start);
+
+    let _ = super::unix_secs();
+    assert_eq!(moved(), 1, "unix_secs is one counted read");
+    let _ = super::unix_millis();
+    assert_eq!(moved(), 2, "unix_millis is one counted read");
+    let _ = super::since_epoch();
+    assert_eq!(moved(), 3, "since_epoch is one counted read");
+
+    let held = UNIX_EPOCH
+        .checked_add(Duration::from_secs(1_790_000_000))
+        .expect("post-epoch reading");
+    let _ = super::since_epoch_at(held);
+    let _ = super::unix_secs_at(held);
+    let _ = super::unix_millis_at(held);
+    let _ = super::duration_to_millis_saturating(Duration::from_secs(1));
+    assert_eq!(
+        moved(),
+        3,
+        "converting a reading the caller holds reads no clock"
+    );
+
+    // std on wasm32-unknown-unknown cannot spawn a thread.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        const READS: u64 = 5;
+        let (fresh, own) = std::thread::spawn(|| {
+            let fresh = super::raw_reads();
+            for _ in 0..READS {
+                let _ = super::unix_millis();
+            }
+            (fresh, super::raw_reads())
+        })
+        .join()
+        .expect("the reading thread returns");
+        assert_eq!(
+            fresh, 0,
+            "a fresh thread starts at zero, whatever other threads read"
+        );
+        assert_eq!(own, READS, "a thread counts its own reads");
+        assert_eq!(
+            moved(),
+            3,
+            "another thread's reads leave this thread's count alone"
+        );
+    }
+}

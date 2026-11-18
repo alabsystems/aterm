@@ -223,18 +223,6 @@ fn screen_json(rows: &[String]) -> String {
     )
 }
 
-fn stand_in() -> Command {
-    let mut c = Command::new(std::env::current_exe().expect("exe"));
-    c.arg(PARK[0])
-        .env(PARK_ENV, "1")
-        .env("ATERM_PARENT_SESSION_ID", TAB)
-        .env_remove("HOME")
-        .stdin(aterm_uds::spawnfd::Stdio::null())
-        .stdout(aterm_uds::spawnfd::Stdio::null())
-        .stderr(aterm_uds::spawnfd::Stdio::null());
-    c
-}
-
 fn to_2_1_283() -> Targets {
     Targets {
         managed: Some(Candidate {
@@ -307,7 +295,7 @@ fn visit_at_with(
         dry_run: dry,
         ..drive(&dir)
     };
-    let mut agent = stand_in().spawn().expect("agent");
+    let mut agent = parked_bare().spawn().expect("agent");
     wait_exec(agent.id());
     let sf = register(&opts.home, agent.id(), session);
     let project = opts.home.join(".claude/projects/p");

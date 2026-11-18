@@ -200,6 +200,7 @@ fn an_all_fresh_bundle_releases_the_tree_and_preserves_the_fixture_handoff() {
         carry: Vec::new(),
     };
     let prover = Prover {
+        compiler: None,
         bin: PathBuf::from("/fixture/prover/bin"),
         commit: "22".repeat(20),
         source: "fixture".into(),

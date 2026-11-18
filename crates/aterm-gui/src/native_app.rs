@@ -2128,8 +2128,8 @@ pub(crate) enum MachineRequest {
     /// Authorize Naming: the naming rule only, in a tab of its own.
     #[cfg(target_os = "macos")]
     Authorize { rev: u64 },
-    /// Undo Last Rename: take back the last change the read showed, judged as any rename, and
-    /// only that change (the writer refuses one that is no longer History's newest).
+    /// Undo Last Rename: take back the row's newest rename the read showed, judged as any
+    /// rename, and only that one (the writer refuses where the row no longer shows it).
     #[cfg(target_os = "macos")]
     Undo { rev: u64 },
 }
@@ -2773,6 +2773,15 @@ impl NativeRuntime {
             }
         }
         changed || settled
+    }
+
+    /// The Tables page's model, for a test to read.
+    #[cfg(all(test, unix))]
+    pub(crate) fn tables(&self) -> Option<&crate::native_tables::TablesApp> {
+        self.instances.values().find_map(|app| match app {
+            NativeApp::Tables(tables) => Some(&**tables),
+            _ => None,
+        })
     }
 
     /// The Tables page's model, for a test to wait on its reader.

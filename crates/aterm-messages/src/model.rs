@@ -1801,6 +1801,16 @@ impl Message {
     pub fn is_ask(&self) -> bool {
         matches!(self.hold, Hold::Ask { .. }) || self.actions.iter().any(Intent::is_ask)
     }
+
+    /// For a message a person may take later ([`Self::later`]), how a filing of it keeps a
+    /// re-post quiet ([`LaterAsk::resurface`]); `None` for any other.
+    #[must_use]
+    pub fn resurface(&self) -> Option<crate::need::Resurface> {
+        match &self.need {
+            Need::Later(ask) => Some(ask.resurface()),
+            _ => None,
+        }
+    }
 }
 
 /// An in-place change to a live row.

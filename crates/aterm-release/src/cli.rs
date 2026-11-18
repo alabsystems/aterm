@@ -95,7 +95,7 @@ USAGE
       Detailed front-end/codegen/link timings. One arm (fat1 by default) takes
       one diagnostic take per slice; multiple arms take two in forward/reverse
       order, judging byte identity and running the host instruments afterward.
-      The existing stable compat compiler enables its unstable timing diagnostic
+      The existing stock compat compiler enables its unstable timing diagnostic
       with RUSTC_BOOTSTRAP=1 for this measurement only. Compare sections against
       a regular take separately; product runtime rows use the macOS guest lane.
   targo --unverified ship profile-pilot --inspect RETAINED-TAKE-DIRECTORY
@@ -459,7 +459,8 @@ USAGE
                  [--cut [--source]] [--export] [--wasm32] [--compat]
                            would a release of REV (default HEAD) pass? Read-only;
                            naming sections narrows it to them, none is all three:
-        --compat           the stable x86_64 compile check, without a cut
+        --compat           the stock x86_64 compile check on the release REV's
+                           trust.lock names, without a cut
         --source           with --cut: only commit gates, for source sampling;
                            no bundle-verification outcome is recorded
         --cut              the cut's pre-claim gates that read only the commit

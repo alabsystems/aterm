@@ -316,9 +316,15 @@ pub fn enrich_inventory_with_identity(
                 accounts::SignInAction::Renew => "sign-in at this Mac's terminal needed",
             };
             progress.details.push(format!("{label}: {action}"));
+            let word = super::account_names::sign_in_word_of(
+                accounts::Cli::Claude,
+                label,
+                &raw_roster.rows,
+                super::alab_roster::current().as_deref(),
+            );
             progress
                 .details
-                .push(task.action.next_step(accounts::Cli::Claude, label));
+                .push(task.action.next_step(accounts::Cli::Claude, &word));
         }
         if let Some(attempt) = raw.and_then(|raw| accounts::current_sign_in_attempt(raw, logins)) {
             let outcome = match attempt.outcome {
@@ -359,8 +365,9 @@ pub fn enrich_inventory_with_identity(
             progress.details.push(match why {
                 accounts::WhyNot::Me => continue,
                 accounts::WhyNot::Limited { until } => format!(
-                    "{label}: limited until {}",
-                    super::usage::rfc3339_utc(until)
+                    "{label}: limited until {}{}",
+                    super::usage::rfc3339_utc(until),
+                    accounts::model_walls_clause(state.accounts.get(&label), progress.observed_at)
                 ),
                 accounts::WhyNot::LeasedElsewhere { until } => format!(
                     "{label}: leased elsewhere until {}",

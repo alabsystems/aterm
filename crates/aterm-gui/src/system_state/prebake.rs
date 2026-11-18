@@ -8,8 +8,10 @@
 //! own older one and no other view's, so a live resize that asks at every width bakes the width
 //! it ends on, not each width it passed, and two views (two windows at different widths or
 //! display scales) never drop each other's bakes. One worker bakes what the views want, one image
-//! at a time, the newest request's first; each bake that lands wakes the window, and the view,
-//! which kept drawing the moment it last drew meanwhile, draws it.
+//! at a time, the newest request's first; each bake that lands wakes the window, and the view
+//! draws it. Meanwhile the view draws the moment it last drew where that moment was laid out
+//! after the same words at the same size on the same ground, else the words alone
+//! ([`super::lockup::LockupSpec::paint`]).
 //!
 //! What is kept is what the live views want and last drew, nothing older: each drawing pass
 //! records what it drew ([`Requester::drew`]) and the bakes no view wants or drew go, so a run's
@@ -17,8 +19,9 @@
 //! wants with it, and one whose lockup draws no images (Serious Mode, High Contrast, a pane too
 //! narrow or a window too short for the road) wants and keeps none ([`Requester::none`]). Once no
 //! System State view is on screen (a tab behind another, a window minimised or covered) nothing
-//! is queued and each view keeps only the moment it last drew ([`set_shown`]), so the page that
-//! comes back draws the moment it left at once, until one is again.
+//! is queued and each view keeps only the moment it last drew ([`set_shown`]), until one is
+//! again: the page that comes back with its words, their size and its ground as they were
+//! draws the moment it left at once.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -193,8 +196,9 @@ impl<O: Oven> Baker<O> {
 
     /// Whether any System State view is on screen. Hidden, nothing is queued, a bake under way
     /// is not kept, and each view keeps only the moment it last drew, so the first pass after it
-    /// shows again draws that moment, never the words alone; shown again, what each view last
-    /// asked for and has not kept is queued anew.
+    /// shows again, its words, their size and its ground as they were, draws that moment, not
+    /// the words alone; shown again, what each view last asked for and has not kept is queued
+    /// anew.
     pub(crate) fn set_shown(self: &Arc<Self>, shown: bool) {
         let mut queue = self.queue();
         if queue.hidden != shown {

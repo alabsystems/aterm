@@ -1058,16 +1058,18 @@ fn the_keychain_judge_reads_each_ask_by_the_launch_that_made_it() {
 /// `aterm harness accounts --json` just before R5a's sign-in as lab-b, each row cut to the fields
 /// [`listed`] reads (and `active`): lab-b's login gone since R4, its automatic sign-in failed.
 /// These listings say `login` as the report now does: `signed-out` for a row with no login to
-/// run on here, which the run's own listing said `expired`, `idle` or `ok` of.
-const LISTING_A_DEFAULT: &str = r#"{"accounts":[{"active":true,"auth":"ok","condition":"limited","label":"lab-a","login":"ok","sign_in_attempt":null},{"active":false,"auth":"ok","condition":"not-enrolled","label":"lab-b","login":"signed-out","sign_in_attempt":{"outcome":"no-route","since":1793124278}},{"active":false,"auth":"unseen","condition":"not-enrolled","label":"lab-c","login":"signed-out","sign_in_attempt":{"outcome":"no-route","since":1793123908}}]}"#;
+/// run on here, which the run's own listing said `expired`, `idle` or `ok` of; and they name each
+/// row by its account's key (`ac`, of `EMAIL_A`, `EMAIL_B`, `EMAIL_C`), where the run's own
+/// listing named it by its label.
+const LISTING_A_DEFAULT: &str = r#"{"accounts":[{"active":true,"auth":"ok","condition":"limited","ac":"ac-d9a81cf15810f0fa","login":"ok","sign_in_attempt":null},{"active":false,"auth":"ok","condition":"not-enrolled","ac":"ac-15e8a439470c1cf1","login":"signed-out","sign_in_attempt":{"outcome":"no-route","since":1793124278}},{"active":false,"auth":"unseen","condition":"not-enrolled","ac":"ac-76618b4862a36d91","login":"signed-out","sign_in_attempt":{"outcome":"no-route","since":1793123908}}]}"#;
 
 /// The listing after R5a's turn, which is also the one before R5b's sign-in as lab-a: lab-a
 /// displaced, so signed out with no login here and its automatic sign-in failed (the owner's
 /// `m2-2`).
-const LISTING_B_DEFAULT: &str = r#"{"accounts":[{"active":false,"auth":"ok","condition":"usable","label":"lab-b","login":"ok","sign_in_attempt":null},{"active":true,"auth":"signed-out","condition":"not-enrolled","label":"lab-a","login":"signed-out","sign_in_attempt":{"outcome":"no-route","since":1793124568}},{"active":false,"auth":"unseen","condition":"not-enrolled","label":"lab-c","login":"signed-out","sign_in_attempt":{"outcome":"no-route","since":1793123908}}]}"#;
+const LISTING_B_DEFAULT: &str = r#"{"accounts":[{"active":false,"auth":"ok","condition":"usable","ac":"ac-15e8a439470c1cf1","login":"ok","sign_in_attempt":null},{"active":true,"auth":"signed-out","condition":"not-enrolled","ac":"ac-d9a81cf15810f0fa","login":"signed-out","sign_in_attempt":{"outcome":"no-route","since":1793124568}},{"active":false,"auth":"unseen","condition":"not-enrolled","ac":"ac-76618b4862a36d91","login":"signed-out","sign_in_attempt":{"outcome":"no-route","since":1793123908}}]}"#;
 
 /// The listing after R5b's turn: lab-a usable on the default login again, lab-b displaced.
-const LISTING_A_AGAIN: &str = r#"{"accounts":[{"active":true,"auth":"ok","condition":"usable","label":"lab-a","login":"ok","sign_in_attempt":null},{"active":false,"auth":"signed-out","condition":"not-enrolled","label":"lab-b","login":"signed-out","sign_in_attempt":null},{"active":false,"auth":"unseen","condition":"not-enrolled","label":"lab-c","login":"signed-out","sign_in_attempt":{"outcome":"no-route","since":1793123908}}]}"#;
+const LISTING_A_AGAIN: &str = r#"{"accounts":[{"active":true,"auth":"ok","condition":"usable","ac":"ac-d9a81cf15810f0fa","login":"ok","sign_in_attempt":null},{"active":false,"auth":"signed-out","condition":"not-enrolled","ac":"ac-15e8a439470c1cf1","login":"signed-out","sign_in_attempt":null},{"active":false,"auth":"unseen","condition":"not-enrolled","ac":"ac-76618b4862a36d91","login":"signed-out","sign_in_attempt":{"outcome":"no-route","since":1793123908}}]}"#;
 
 /// rp3's stub log over R5a's, R5b's and R2's P7 turns (their tails cut).
 const STUB_LOG_R5: &str = r#"11:09:28.947 POST /v1/messages -> 200 body=54362B mode=ok kind=main model=claude-opus-5-5 stream=true max_tokens=128000 msgs=14 tools=13 sys=6082c last_user="Write one sentence about anchors, then stop." auth=oat:lab-b sse=4 deltas
@@ -1142,6 +1144,7 @@ fn r5() -> (Ev, Leg, Leg) {
 const R5A: Displacement<'static> = Displacement {
     from: LABEL_A,
     to: LABEL_B,
+    to_email: EMAIL_B,
     auth: AUTH_B,
     prompts: &[P1, P5],
 };
@@ -1149,6 +1152,7 @@ const R5A: Displacement<'static> = Displacement {
 const R5B: Displacement<'static> = Displacement {
     from: LABEL_B,
     to: LABEL_A,
+    to_email: EMAIL_A,
     auth: AUTH_A,
     prompts: &[P1, P6],
 };
@@ -1156,7 +1160,7 @@ const R5B: Displacement<'static> = Displacement {
 #[test]
 fn the_instances_listing_reads_as_each_rows_words() {
     assert_eq!(
-        listed(LISTING_B_DEFAULT, LABEL_A),
+        listed(LISTING_B_DEFAULT, EMAIL_A),
         Some(Listed {
             auth: "signed-out".into(),
             login: "signed-out".into(),
@@ -1165,7 +1169,7 @@ fn the_instances_listing_reads_as_each_rows_words() {
         })
     );
     assert_eq!(
-        listed(LISTING_B_DEFAULT, LABEL_B),
+        listed(LISTING_B_DEFAULT, EMAIL_B),
         Some(Listed {
             auth: "ok".into(),
             login: "ok".into(),
@@ -1174,14 +1178,14 @@ fn the_instances_listing_reads_as_each_rows_words() {
         })
     );
     assert_eq!(
-        listed(LISTING_A_DEFAULT, LABEL_C).map(|r| (r.auth, r.login)),
+        listed(LISTING_A_DEFAULT, EMAIL_C).map(|r| (r.auth, r.login)),
         Some(("unseen".into(), "signed-out".into()))
     );
-    assert_eq!(listed(LISTING_B_DEFAULT, "lab-d"), None);
-    assert_eq!(listed("ERR no such session", LABEL_A), None);
+    assert_eq!(listed(LISTING_B_DEFAULT, "nobody-d@example.test"), None);
+    assert_eq!(listed("ERR no such session", EMAIL_A), None);
     // `--cli all`'s shape nests the rows under `pools`: no `accounts` array at the top.
     assert_eq!(
-        listed(&format!("{{\"pools\":[{LISTING_B_DEFAULT}]}}"), LABEL_A),
+        listed(&format!("{{\"pools\":[{LISTING_B_DEFAULT}]}}"), EMAIL_A),
         None
     );
 }

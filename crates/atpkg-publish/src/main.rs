@@ -3,6 +3,7 @@
 
 //! `atpkg-publish`, the atpkg producer's binary; everything is in the library.
 
+#[cfg(unix)]
 fn main() -> std::process::ExitCode {
     if let Err(error) = agh::git::HelperHost::Subcommand.record() {
         eprintln!("{error}");
@@ -11,9 +12,18 @@ fn main() -> std::process::ExitCode {
     if let Some(code) = aterm_uds::tether::entry() {
         return code;
     }
-    #[cfg(unix)]
     if let Some(exit) = atpkg_publish::harness_local::early_entry() {
         return exit;
     }
     atpkg_publish::cli::main_entry(std::env::args())
+}
+
+/// Off Unix there is no producer: the library is Unix's ([`atpkg_publish`]).
+#[cfg(not(unix))]
+fn main() -> std::process::ExitCode {
+    eprintln!(
+        "atpkg-publish: unsupported on Windows (the owner-side producer signs with atpkg-keys, a \
+         POSIX-only tool)"
+    );
+    std::process::ExitCode::from(2)
 }

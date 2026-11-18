@@ -61,6 +61,7 @@ mod a11y_painted_words_tests;
 mod a11y_tree;
 mod about;
 mod accessibility;
+mod accounts_keeper;
 mod accounts_outlook;
 mod act_barrier;
 #[cfg(test)]
@@ -755,6 +756,7 @@ mod lab_accounts;
 mod lab_deck;
 mod lab_screen;
 mod machine_page;
+mod shared_face;
 #[cfg(all(windows, debug_assertions))]
 pub use jumplist_win::the_shell_keeps_what_a_commit_puts_in_a_test_identitys_jump_list;
 #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
@@ -11157,6 +11159,8 @@ struct App {
     demotions_logged: u32,
     ripening: Vec<exceptions_host::Ripening>,
     host_noted: std::collections::BTreeSet<String>,
+    /// The account lines the harness's look told that stand ([`App::tell_account_line`]).
+    account_lines: std::collections::BTreeMap<String, exceptions_host::AccountLine>,
     entries_refused: std::collections::BTreeMap<String, aterm_messages::exceptions::EntryFault>,
     supervisor_failing: std::collections::BTreeMap<String, exceptions_host::SupervisorFail>,
     resume_standing: std::collections::BTreeMap<
@@ -16232,6 +16236,7 @@ impl App {
             demotions_logged: 0,
             ripening: Vec::new(),
             host_noted: std::collections::BTreeSet::new(),
+            account_lines: std::collections::BTreeMap::new(),
             entries_refused: std::collections::BTreeMap::new(),
             supervisor_failing: std::collections::BTreeMap::new(),
             resume_standing: std::collections::BTreeMap::new(),
@@ -18291,12 +18296,16 @@ impl App {
     /// never start again. A pass that runs without glass is said once.
     fn restore_pass_due_at_park(&mut self, on_glass: bool, now: Instant) -> bool {
         let queued = self.restore_pass_queued();
-        if !queued {
-            self.store
+        if !queued
+            && self
+                .store
                 .read()
                 .unwrap_or_else(|p| p.into_inner())
                 .table()
-                .sessions_settled();
+                .sessions_settled()
+        {
+            // The harness host's accounts' session reconcile waits for it.
+            harness_host::ring();
         }
         let due = restore_pass_due(
             RestorePassSite::Park,
@@ -27344,6 +27353,7 @@ pub enum NetworkRead {
 }
 
 pub use host_quit::install as install_host_quit;
+pub use shared_face::install as install_shared_face_commit;
 
 /// A host-owned worker's nonblocking maintenance. A deadline is returned only
 /// while its next start is owed; a live worker wakes the window when it ends.
@@ -29707,6 +29717,7 @@ pub fn main_entry_with_network(
         demotions_logged: 0,
         ripening: Vec::new(),
         host_noted: std::collections::BTreeSet::new(),
+        account_lines: std::collections::BTreeMap::new(),
         entries_refused: std::collections::BTreeMap::new(),
         supervisor_failing: std::collections::BTreeMap::new(),
         resume_standing: std::collections::BTreeMap::new(),

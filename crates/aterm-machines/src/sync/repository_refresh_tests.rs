@@ -201,3 +201,61 @@ fn the_receipt_of_a_passs_own_checkout_writes_holds_digests_only() {
         Accounted::Own { made: false }
     );
 }
+
+/// Optional cached observations share the actual receipt's byte budget. A large cohort is
+/// reduced without losing a fulfilled refresh, and later generic rows can reduce it further.
+/// An oversized mandatory record preserves the last readable on-disk receipt.
+#[test]
+fn empty_observations_fit_the_record_reader_without_losing_scheduling_progress() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let access = RepositoryPass::open(scratch.path(), 1_000).unwrap();
+    let owner = access.pass.unwrap();
+    let scope = scope(3);
+    let Admission::Refresh(ticket) = owner
+        .admit(
+            RefreshRequest::ensure(Some(scope), access.observed.version),
+            scope,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!("the initial refresh is owed");
+    };
+    owner.finish(ticket, true, 2_000).unwrap();
+    let observed = observe(scratch.path(), 2_000);
+    let subjects: Vec<_> = (0_u64..10_000)
+        .map(|number| {
+            let mut hash = aterm_digest::Sha256::new();
+            hash.update(number.to_le_bytes());
+            let key = CheckoutDigest::new(hash.finalize());
+            (key, key)
+        })
+        .collect();
+    owner.record_empty(scope, subjects.clone()).unwrap();
+    let held = owner.record();
+    let retained = held.repositories.as_ref().unwrap().empty.subjects.len();
+    assert!(
+        retained > 0 && retained < subjects.len(),
+        "only evidence that fits is retained"
+    );
+    assert_eq!(observe(scratch.path(), 2_000), observed);
+    assert!(
+        std::fs::metadata(record_path(scratch.path()))
+            .unwrap()
+            .len()
+            <= super::super::RECORD_BYTES as u64
+    );
+    let mut newer = held;
+    newer.build = "x".repeat(super::super::RECORD_BYTES / 2);
+    owner.record_pass(newer).unwrap();
+    let next = owner.record();
+    assert!(next.repositories.as_ref().unwrap().empty.subjects.len() < retained);
+    assert_eq!(observe(scratch.path(), 2_000), observed);
+    assert!(super::super::read_record(scratch.path()).is_some());
+    let before = std::fs::read(record_path(scratch.path())).unwrap();
+    let mut oversized = next;
+    oversized.build = "x".repeat(super::super::RECORD_BYTES);
+    assert!(owner.record_pass(oversized).is_err());
+    assert_eq!(std::fs::read(record_path(scratch.path())).unwrap(), before);
+    assert_eq!(observe(scratch.path(), 2_000), observed);
+}

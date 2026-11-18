@@ -1101,9 +1101,15 @@ impl App {
             ] {
                 let key = message_reporters::pool_notice_key(cli, cause);
                 match entry {
-                    Some(entry) if speaks => self.except(&entry),
-                    _ if !speaks => self.except_withdraw(&key),
-                    _ => self.except_clear(&key),
+                    Some(entry) if speaks => self.tell_account_line(&entry),
+                    _ if !speaks => {
+                        self.forget_account_line(&key);
+                        self.except_withdraw(&key);
+                    }
+                    _ => {
+                        self.forget_account_line(&key);
+                        self.except_clear(&key);
+                    }
                 }
             }
         }

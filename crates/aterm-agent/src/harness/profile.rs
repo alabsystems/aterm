@@ -2,6 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! Claude Code's profile, read by an allowlist.
+//!
+//! Traced by the accounts keeper: what this file reads of the file system itself, it reads
+//! through `aterm_uds::trace::fs` (census `traced-reads`).
 
 use std::borrow::Borrow;
 use std::fmt;
@@ -9,6 +12,7 @@ use std::io::Read as _;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
+use aterm_uds::trace;
 use serde::Deserialize;
 use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
@@ -481,9 +485,9 @@ pub fn effective(plain: &Path, records: Option<&Path>, custom_oauth: bool) -> Pa
         plain.to_path_buf()
     };
     if let Some(legacy) = records.map(|dir| dir.join(".config.json"))
-        && let Ok(meta) = std::fs::metadata(&legacy)
+        && let Ok(meta) = trace::fs::metadata(&legacy)
         && meta.is_file()
-        && (meta.len() > 0 || (!meta.permissions().readonly() && !plain.exists()))
+        && (meta.len() > 0 || (!meta.permissions().readonly() && !trace::fs::exists(&plain)))
     {
         return legacy;
     }
@@ -495,7 +499,9 @@ pub fn effective(plain: &Path, records: Option<&Path>, custom_oauth: bool) -> Pa
 pub fn default_home_key(user_home: &Path) -> Option<AccountKey> {
     let plain = path_of(user_home, None, None, || None)?;
     let records = user_home.join(".claude");
-    read(&effective(&plain, Some(&records), false)).ok()?.key
+    account_at(&effective(&plain, Some(&records), false))
+        .ok()
+        .flatten()
 }
 
 /// The profile filename selected by a process's own exec environment.
@@ -804,10 +810,10 @@ pub fn default_identity_evidence(
 }
 
 fn evidence_metadata(path: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
-    match std::fs::metadata(path) {
+    match trace::fs::metadata(path) {
         Ok(meta) => Ok(Some(meta)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match std::fs::symlink_metadata(path) {
+            match trace::fs::symlink_metadata(path) {
                 Err(absent) if absent.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(error) => Err(error),
                 Ok(_) => Err(std::io::Error::other("profile entry is unavailable")),
@@ -891,7 +897,7 @@ pub(super) fn profile_in_home(home: &Path) -> PathBuf {
 /// The account the profile of the Claude Code home `home` names, where it names one: `home`'s own
 /// login, which this Mac's keychain may hold with no login file stored.
 pub(super) fn key_in_home(home: &Path) -> Option<AccountKey> {
-    read(&profile_in_home(home)).ok()?.key
+    account_at(&profile_in_home(home)).ok().flatten()
 }
 
 /// The profile [`identity_in_home`] reads under `home`, where it is there but cannot be opened or
@@ -1122,7 +1128,7 @@ pub struct ProfileRead {
 #[must_use]
 pub fn read_facts(path: &Path) -> ProfileRead {
     let facts = read_with(path, decode_facts);
-    let meta = std::fs::metadata(path).ok();
+    let meta = trace::fs::metadata(path).ok();
     ProfileRead {
         facts,
         modified: meta.as_ref().and_then(|meta| meta.modified().ok()),
@@ -1732,7 +1738,7 @@ pub fn muse_login_for(argv: &[String], env: &[String], user_home: &Path) -> Muse
         Ok(None) => MuseLogin::SignedOut { path },
         // `muse logout` may remove the file rather than empty it: a config home Muse Code made
         // that holds no `auth.json` holds no login.
-        Err(NoProfile::Missing) if config.is_dir() => MuseLogin::SignedOut { path },
+        Err(NoProfile::Missing) if trace::fs::is_dir(&config) => MuseLogin::SignedOut { path },
         Err(_) => MuseLogin::Unread,
     }
 }
@@ -1982,7 +1988,7 @@ fn launched_exe_for(
     program: &str,
 ) -> Option<PathBuf> {
     if let Some(first) = argv.first().map(Path::new) {
-        if first.is_absolute() && first.is_file() {
+        if first.is_absolute() && trace::fs::is_file(first) {
             return Some(first.to_path_buf());
         }
         if let Some(path) = non_empty_env_var(env, "PATH")
@@ -1992,14 +1998,14 @@ fn launched_exe_for(
         }
     }
     let user_bin = user_home.join(".local/bin").join(program);
-    if user_bin.is_file() {
+    if trace::fs::is_file(&user_bin) {
         return Some(user_bin);
     }
     if std::env::var_os("HOME").is_some_and(|h| Path::new(&h) == user_home)
         && let Some(layout) = atpkg::store::resolve_configured()
     {
         let managed = layout.agents_dir().join(program);
-        if managed.is_file() {
+        if trace::fs::is_file(&managed) {
             return Some(managed);
         }
     }
@@ -2280,9 +2286,9 @@ where
     if let Some(found) = read_log(&cli_log) {
         return Some((found, cli_log));
     }
-    let mut logs: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(config.join("log"))
+    let mut logs: Vec<(std::time::SystemTime, PathBuf)> = trace::fs::read_dir(config.join("log"))
         .ok()?
-        .flatten()
+        .into_iter()
         .filter_map(|e| {
             let file_name = e.file_name();
             let name = file_name.to_str()?;
@@ -2294,7 +2300,7 @@ where
             {
                 return None;
             }
-            let meta = e.metadata().ok()?;
+            let meta = trace::fs::symlink_metadata(e.path()).ok()?;
             if !meta.is_file() {
                 return None;
             }
@@ -2642,7 +2648,7 @@ pub fn agy_resume_for(
         Some(dir) if dir.is_absolute() => dir,
         _ => default_config.clone()?,
     };
-    let config = std::fs::canonicalize(&config).unwrap_or(config);
+    let config = trace::fs::canonicalize(&config).unwrap_or(config);
     let conversation = agy_active_conversation(argv, &config, files)?;
     let mut relaunch_env = Vec::new();
     if let Some(cfg) = var("AGY_CLI_CONFIG_DIR")
@@ -2675,7 +2681,7 @@ pub fn agy_excerpts_for(
         _ => super::upgrade_agy::config_dir(argv, var("HOME"), user_home)?,
     };
     // The descriptor reader names canonical paths, as the relaunch witness does.
-    let config = std::fs::canonicalize(config).ok()?;
+    let config = trace::fs::canonicalize(config).ok()?;
     let conversation = agy_active_conversation(argv, &config, files)?;
     let history = read_jsonl_tail(&config.join("history.jsonl"), WINDOW);
     let transcript_path = config
@@ -2713,14 +2719,14 @@ pub fn agy_served_at(
         Some(dir) if dir.is_absolute() => dir,
         _ => super::upgrade_agy::config_dir(argv, var("HOME"), user_home)?,
     };
-    let config = std::fs::canonicalize(config).ok()?;
+    let config = trace::fs::canonicalize(config).ok()?;
     let conversation = agy_active_conversation(argv, &config, files)?;
     let transcript = config
         .join("brain")
         .join(&conversation)
         .join(".system_generated/logs/transcript.jsonl");
     // The time first: a row written after it only makes the evidence older than it is.
-    let written = std::fs::metadata(&transcript)
+    let written = trace::fs::metadata(&transcript)
         .ok()?
         .modified()
         .ok()?
@@ -2752,7 +2758,7 @@ fn muse_active_session_lock(
         user_home,
     )?;
     let root = super::upgrade_muse::sessions_root(&data);
-    let root = std::fs::canonicalize(&root).unwrap_or(root);
+    let root = trace::fs::canonicalize(&root).unwrap_or(root);
     let mut held: Option<(String, PathBuf)> = None;
     for lock in files.into_iter().flatten() {
         let Some(session) = super::upgrade_muse::session_of_lock(&root, lock) else {
@@ -2782,9 +2788,8 @@ fn muse_active_session_lock(
     let session = super::upgrade_muse::resumed_ref(argv)
         .filter(|s| super::upgrade_muse::is_session_uuid(s))?;
     let dirs = |p: &Path| -> Vec<PathBuf> {
-        let mut out: Vec<PathBuf> = std::fs::read_dir(p)
+        let mut out: Vec<PathBuf> = trace::fs::read_dir(p)
             .into_iter()
-            .flatten()
             .flatten()
             .filter(crate::harness::entry_is_dir)
             .map(|e| e.path())
@@ -2800,7 +2805,8 @@ fn muse_active_session_lock(
         .map(|d| d.join(&session).join(super::upgrade_muse::LOCK))
         .find(|lock| {
             super::upgrade_muse::session_of_lock(&root, lock).is_some()
-                && (lock.is_file() || lock.with_file_name(super::upgrade_muse::LOG).is_file())
+                && (trace::fs::is_file(lock)
+                    || trace::fs::is_file(lock.with_file_name(super::upgrade_muse::LOG)))
         });
     Some((session, found))
 }
@@ -3691,6 +3697,54 @@ pub fn read(path: &Path) -> Result<Profile, NoProfile> {
     read_with(path, parse)
 }
 
+/// The account the profile at `path` names as signed in: its key exactly as [`read`] finds it
+/// ([`Profile::key`]). With a trace scope armed it records a standing of that key, or of why
+/// there was none (`aterm_uds::trace::standing`), and no stamp of the file: Claude Code rewrites
+/// its profile with its usage, its tips and its projects while the account stays, and a pass
+/// that decides by whom the profile names need not run again for those. A read that failed for
+/// a reason no stamp decides records a retry beside.
+/// # Errors
+/// [`NoProfile`]: why nothing was read, as [`read`] answers it.
+pub fn account_at(path: &Path) -> Result<Option<AccountKey>, NoProfile> {
+    if !trace::armed() {
+        return read_account(path);
+    }
+    let (account, apart) = trace::unrecorded(|| trace::scope(|| read_account(path)));
+    if let Some(trace::Unkept::Retry(why)) = apart.unkept() {
+        trace::retry(why);
+    }
+    trace::standing(path, Some(account_standing(account)), account_now);
+    account
+}
+
+/// [`account_at`]'s read.
+fn read_account(path: &Path) -> Result<Option<AccountKey>, NoProfile> {
+    read(path).map(|profile| profile.key)
+}
+
+/// The digest an [`account_at`] records of what it read: why there was nothing, or the key.
+fn account_standing(read: Result<Option<AccountKey>, NoProfile>) -> [u8; 32] {
+    let mut digest = aterm_digest::Sha256::new();
+    digest.update(b"aterm-agent/profile/account/v1\0");
+    match read {
+        Err(why) => {
+            digest.update([0]);
+            digest.update(why.word().as_bytes());
+        }
+        Ok(None) => digest.update([1, 0]),
+        Ok(Some(key)) => {
+            digest.update([1, 1, key.agent]);
+            digest.update(key.digest);
+        }
+    }
+    digest.finalize()
+}
+
+/// What an [`account_at`] of `path` would record now: its standing's replay.
+fn account_now(path: &Path) -> Option<[u8; 32]> {
+    Some(account_standing(read_account(path)))
+}
+
 /// [`read`]'s file handling, its bytes handed to `parse` before they are zeroed.
 pub(super) fn read_with<T>(
     path: &Path,
@@ -3699,7 +3753,7 @@ pub(super) fn read_with<T>(
     let mut file = match open_nonblocking(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(NoProfile::Missing),
-        Err(_) if std::fs::metadata(path).is_ok_and(|meta| !meta.is_file()) => {
+        Err(_) if trace::fs::metadata(path).is_ok_and(|meta| !meta.is_file()) => {
             return Err(NoProfile::NotAFile);
         }
         Err(_) => return Err(NoProfile::Unreadable),
@@ -3725,7 +3779,10 @@ pub(super) fn read_with<T>(
             Ok(0) => break Ok(filled),
             Ok(n) => filled += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => break Err(NoProfile::Unreadable),
+            Err(e) => {
+                trace::fs::failed(path, &e);
+                break Err(NoProfile::Unreadable);
+            }
         }
     };
     let answer = read.and_then(|n| parse(buf.get(..n).unwrap_or(&[])));
@@ -3747,8 +3804,11 @@ fn wipe(buf: &mut [u8]) {
     std::hint::black_box(&*buf);
 }
 
-/// Open `path` for reading without blocking ([`read`]).
+/// Open `path` for reading without blocking ([`read`]). With a trace scope armed it records the
+/// file's stamp before its open ([`trace::fs::opening`]), and a retry where the open failed for a
+/// reason no stamp decides.
 fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
+    trace::fs::opening(path);
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -3756,7 +3816,9 @@ fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
-    options.open(path)
+    options
+        .open(path)
+        .inspect_err(|error| trace::fs::failed(path, error))
 }
 
 /// Read a profile from its bytes.
@@ -4674,3 +4736,7 @@ mod tests;
 #[cfg(test)]
 #[path = "profile_cold_identity_evidence_tests.rs"]
 mod cold_identity_evidence_tests;
+
+#[cfg(test)]
+#[path = "profile_trace_tests.rs"]
+mod trace_tests;

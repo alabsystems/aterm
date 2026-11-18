@@ -65,7 +65,7 @@ fn a_passthrough_codex_launch_checks_the_known_default_identity() {
             );
             assert!(matches!(
                 super::super::default_row_now(&world.seat(), Cli::Codex).unwrap(),
-                crate::harness::codex_alab::DefaultRow::Serves(label) if label == "main"
+                crate::harness::codex_alab::DefaultRow::Serves(label, _) if label == "main"
             ));
             assert_eq!(std::fs::read(&auth).unwrap(), accepted);
         }

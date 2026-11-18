@@ -12,7 +12,10 @@ use super::instance::{
     Budget, CouldNotRun, Ctl, Instance, Scratch, World, could_not_run, field, recording_line,
     require_recording, uint_field, unanswered,
 };
-use super::starvation::ShapeVerdict;
+use super::starvation::{Disposition, ShapeVerdict};
+
+#[path = "spin_unattended.rs"]
+pub mod unattended;
 
 /// What sits on the instance while it is measured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +69,18 @@ pub enum SpinScene {
     /// reports no `sight=` ([`hidden_unanswered`]), or whose metrics report no
     /// `redraw_hidden_parked`, leaves it unanswered.
     Hidden,
+    /// A bare `/bin/sh` prompt in a window at the shipped motion, rest and effect defaults (its
+    /// head writes no motion, rest or effect line: `motion = "auto"`, the window never rests,
+    /// the rainbow cursor and the cat), in the scratch world every take runs in (its bell silent
+    /// and its automatic lanes off, [`World::prepare`]), raised, then left untouched until its
+    /// attention lapses ([`unattended::ATTENTION`] after the raise, whose focus is a touch),
+    /// measured once `trail status` reads it focused, unattended, on glass and with its pet in
+    /// deep sleep or not drawn ([`unattended::unready`]) and the readings have settled on their
+    /// background cadence ([`unattended::SETTLE`]), as it opens and as it ends, with no window
+    /// event between. Its motion stage and shed are recorded, never required: the Mac's Reduce
+    /// Motion and the load shed may move them. Its decision is [`unattended::decide`]'s: counts,
+    /// never time.
+    Unattended,
 }
 
 impl SpinScene {
@@ -74,7 +89,12 @@ impl SpinScene {
     pub const fn windowed(self) -> bool {
         matches!(
             self,
-            Self::Windowed | Self::PetAsleep | Self::Resting | Self::WindowedRewound | Self::Hidden
+            Self::Windowed
+                | Self::PetAsleep
+                | Self::Resting
+                | Self::WindowedRewound
+                | Self::Hidden
+                | Self::Unattended
         )
     }
 
@@ -117,6 +137,9 @@ impl SpinScene {
             }
             Self::ClaudeShaped | Self::Idle | Self::Rewound => {
                 "# effect settings: the shipped defaults".to_string()
+            }
+            Self::Unattended => {
+                "# motion, rest and effect settings: the shipped defaults".to_string()
             }
         }
     }
@@ -278,7 +301,8 @@ fn rest_unready(scene: SpinScene, line: &str) -> Option<String> {
         | SpinScene::Rewound
         | SpinScene::Windowed
         | SpinScene::WindowedRewound
-        | SpinScene::Hidden => true,
+        | SpinScene::Hidden
+        | SpinScene::Unattended => true,
     };
     (!ready).then(|| format!("resting={}", resting.unwrap_or("?")))
 }
@@ -323,14 +347,18 @@ pub struct Sampled {
     pub max: u64,
     /// The samples within [`FLOOR_BAND`] of the least.
     pub at_floor: usize,
-    /// The CPU time the instance took in the window, ns.
+    /// The CPU time the instance took between the first sample and the last, ns.
     pub cpu_ns: u64,
+    /// The wall time `cpu_ns` was taken in: from just after the first sample to just after the
+    /// last, ns.
+    pub span_ns: u64,
 }
 
 impl Sampled {
-    /// The summary of `footprints` (`None` for none), with the window's CPU time.
+    /// The summary of `footprints` (`None` for none), with the CPU time the instance took
+    /// (`cpu_ns`) in the wall time the samples spanned (`span_ns`).
     #[must_use]
-    pub fn of(footprints: &[u64], cpu_ns: u64) -> Option<Self> {
+    pub fn of(footprints: &[u64], cpu_ns: u64, span_ns: u64) -> Option<Self> {
         let mut sorted = footprints.to_vec();
         sorted.sort_unstable();
         let min = *sorted.first()?;
@@ -345,7 +373,23 @@ impl Sampled {
                 .filter(|&&f| f <= min.saturating_add(FLOOR_BAND))
                 .count(),
             cpu_ns,
+            span_ns,
         })
+    }
+
+    /// The instance's CPU time per second of wall time over the samples, ms: [`Self::cpu_ns`]
+    /// over [`Self::span_ns`]; 0 for samples that spanned no time. A report, never a bound.
+    #[must_use]
+    pub fn cpu_ms_per_s(&self) -> f64 {
+        if self.span_ns == 0 {
+            return 0.0;
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a CPU rate for reading, from counts far under 2^52"
+        )]
+        let rate = self.cpu_ns as f64 * 1e3 / self.span_ns as f64;
+        rate
     }
 
     /// The share of the samples at the floor ([`Self::at_floor`]), 0 to 1.
@@ -373,13 +417,14 @@ impl std::fmt::Display for Sampled {
         write!(
             f,
             "samples={} footprint_p50_mib={:.1} footprint_min_mib={:.1} footprint_max_mib={:.1} \
-             floor_share={:.2} cpu_ns={}",
+             floor_share={:.2} cpu_ns={} cpu_ms_per_s={:.3}",
             self.samples,
             mib(self.p50),
             mib(self.min),
             mib(self.max),
             self.floor_share(),
-            self.cpu_ns
+            self.cpu_ns,
+            self.cpu_ms_per_s()
         )
     }
 }
@@ -389,6 +434,7 @@ impl std::fmt::Display for Sampled {
 fn sample(pid: u32, window: Duration) -> Result<Option<Sampled>, CouldNotRun> {
     let start = std::time::Instant::now();
     let first = super::usage(pid)?;
+    let first_at = std::time::Instant::now();
     let mut footprints = vec![first.footprint];
     let mut last = first;
     loop {
@@ -400,9 +446,11 @@ fn sample(pid: u32, window: Duration) -> Result<Option<Sampled>, CouldNotRun> {
         last = super::usage(pid)?;
         footprints.push(last.footprint);
     }
+    let span = u64::try_from(first_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
     Ok(Sampled::of(
         &footprints,
         last.cpu_ns.saturating_sub(first.cpu_ns),
+        span,
     ))
 }
 
@@ -422,7 +470,8 @@ pub const MAX_OS_EVENTS: u64 = 30;
 /// when it can: more than [`MAX_OS_EVENTS`] for a windowed scene, and any for a pet scene, whose
 /// pet answers each (a focus lost and regained, two events, fades it back in over 0.30 s, about
 /// 18 cursor-effect frames at a 16.7 ms effect interval; a pointer over its pane heats its gaze; a
-/// resize can move its seat) and whose window each but a focus leaving wakes from rest.
+/// resize can move its seat) and whose window each but a focus leaving wakes from rest. An
+/// unattended take never asks: [`unattended::decide`] refuses it at any event first.
 fn os_events_unidle(scene: SpinScene, input: u64) -> Option<&'static str> {
     if scene.pet() {
         (input > 0).then_some("its pet may answer any of them")
@@ -476,7 +525,13 @@ pub struct SpinReport {
     pub os_event_kinds: Option<String>,
     /// The status reasons at the end of the window.
     pub reasons: Option<String>,
-    pub verdict: ShapeVerdict,
+    /// The row's verdict: [`judge`]'s, a pass or a fail, for every scene but the unattended
+    /// one, whose [`unattended::decide`] may also leave it undecided
+    /// ([`Disposition::Unproved`]).
+    pub verdict: Disposition,
+    /// An unattended take's decision: its counts, bounds and edges, and why it failed or was
+    /// left undecided.
+    pub unattended: Option<unattended::UnattendedDecision>,
     /// The session's replay checks at the end ([`super::instance::replay_checks`]).
     pub checks: String,
 }
@@ -493,7 +548,7 @@ impl std::fmt::Display for SpinReport {
              wait_cancelled_wakes={:?} turns={:?} \
              wakes_by_variant={:?} fires_by_owner={:?} os_events={:?} os_event_kinds={:?} \
              pet_open={:?} pet={:?} backend={:?} \
-             reasons={:?} max_frames={:?} hidden_parked={:?} min_hidden_parked={:?} {} \
+             reasons={:?} max_frames={:?} hidden_parked={:?} min_hidden_parked={:?} {}{} \
              verdict={:?} {}",
             self.row.scene,
             self.row.recording,
@@ -529,6 +584,9 @@ impl std::fmt::Display for SpinReport {
             self.row.min_hidden_parked,
             self.sampled
                 .map_or_else(|| "sampled=none".to_string(), |s| s.to_string()),
+            self.unattended
+                .as_ref()
+                .map_or_else(String::new, |d| format!(" {d}")),
             self.verdict,
             self.checks
         )
@@ -742,21 +800,101 @@ fn await_pet_ready(
 }
 
 /// Raise the sole test session's native window and wait for its focus: a pet scene's readiness
-/// wait starts from it, and the hidden scene minimises the front window. Sending a PTY focus
-/// report would not establish this OS precondition.
-fn prepare_pet_focus(ctl: &Ctl) -> Result<(), CouldNotRun> {
+/// wait starts from it, the unattended scene's attention lapses from it, and the hidden scene
+/// minimises the front window. Sending a PTY focus report would not establish this OS
+/// precondition.
+fn prepare_focus(ctl: &Ctl) -> Result<(), CouldNotRun> {
     let sessions = ctl.call(&["ls"]);
     if !sessions.ok() {
-        return could_not_run("cannot list the pet measurement's session");
+        return could_not_run("cannot list the measurement's session");
     }
-    let sid = sole_session(&sessions.stdout).ok_or_else(|| {
-        CouldNotRun::Refused("the pet measurement needs exactly one session".into())
-    })?;
+    let sid = sole_session(&sessions.stdout)
+        .ok_or_else(|| CouldNotRun::Refused("the measurement needs exactly one session".into()))?;
     ctl.ok(&["raise", sid])?;
-    ctl.await_event("the pet measurement's native window to gain focus", || {
+    ctl.await_event("the measurement's native window to gain focus", || {
         let reply = ctl.call(&["trail", "status"]);
         (reply.ok() && field(&reply.stdout, "focused") == Some("true")).then_some(())
     })
+}
+
+/// The unattended take's whole-run limit: the ordinary take's [`BUDGET_SECS`], with its
+/// attention lapse, its readiness wait's guard ([`UNATTENDED_GUARD`]), its settle
+/// ([`unattended::SETTLE`]) and its longer `window` added.
+fn unattended_budget_secs(window: Duration) -> u64 {
+    BUDGET_SECS
+        .saturating_add(unattended::ATTENTION.as_secs())
+        .saturating_add(UNATTENDED_GUARD.as_secs())
+        .saturating_add(unattended::SETTLE.as_secs())
+        .saturating_add(window.as_secs())
+}
+
+/// How long the unattended take waits for its window's state on an instance that keeps working
+/// without it: `aterm_spec::wait::WORKING_GUARD`'s length (aterm-spec is no library dependency
+/// of this crate), a guard on a subject that works forever, not a latency budget. The take's
+/// budget holds it ([`unattended_budget_secs`]), so a launch and settle that a loaded Mac
+/// stretches leave the wait the rest of it.
+const UNATTENDED_GUARD: Duration = Duration::from_secs(15 * 60);
+
+/// How often the unattended take reads `trail status` while it waits for its window's state: each
+/// read starts a `ctl` process, and the state it waits for comes at a lapse and a pet's deep sleep,
+/// seconds apart, so a read a second is plenty.
+const UNATTENDED_POLL: Duration = Duration::from_secs(1);
+
+/// Wait, from the raise that touched the window last (`focused_at`), until its attention has
+/// lapsed ([`unattended::ATTENTION`]) without a read, then read `trail status` until it reads
+/// the unattended scene's state ([`unattended::unready`]), for as long as the instance (`pid`)
+/// works ([`Budget::await_while_working`]): the wait is refused once the instance made no CPU or
+/// I/O progress for a `MUST_HAPPEN`. Each read costs the instance the CPU of its answer, and its
+/// readings run on their own, so an instance that still answers or reads is read as working, and
+/// what ends the wait on one that keeps working without the state is the take's budget, which
+/// holds [`UNATTENDED_GUARD`] for it. A build whose reply lacks the scene's fields leaves the
+/// take unanswered ([`unattended::unanswered`]).
+fn await_unattended(
+    ctl: &Ctl,
+    pid: u32,
+    focused_at: std::time::Instant,
+) -> Result<(), CouldNotRun> {
+    let first = ctl.call(&["trail", "status"]);
+    if let Some(why) = first
+        .ok()
+        .then(|| unattended::unanswered(&first.stdout))
+        .flatten()
+    {
+        return unanswered(why);
+    }
+    std::thread::sleep(unattended::ATTENTION.saturating_sub(focused_at.elapsed()));
+    let mut last = String::new();
+    ctl.budget()
+        .await_while_working(
+            pid,
+            "the window's unattended state",
+            UNATTENDED_POLL,
+            || {
+                let reply = ctl.call(&["trail", "status"]);
+                if !reply.ok() {
+                    last = format!("{} {}", reply.stdout.trim(), reply.stderr.trim());
+                    return None;
+                }
+                last = unattended::fields(&reply.stdout);
+                unattended::unready(&reply.stdout).is_none().then_some(())
+            },
+        )
+        .map_err(|error| error.map(|why| format!("{why}; last trail state: {last}")))
+}
+
+/// The unattended take's `trail status` reply as its window `edge` (opened, ended), refused where
+/// the request failed; its fields are [`unattended::decide`]'s to judge.
+fn unattended_trail(ctl: &Ctl, edge: &str) -> Result<String, CouldNotRun> {
+    let trail = ctl.call(&["trail", "status"]);
+    if trail.ok() {
+        Ok(trail.stdout)
+    } else {
+        could_not_run(format!(
+            "the unattended window gave no trail status as its window {edge} ({} {})",
+            trail.stdout.trim(),
+            trail.stderr.trim()
+        ))
+    }
 }
 
 /// Whether a windowed Rewound take's window reads [`FOCUSED`] as its measured window `edge`
@@ -807,7 +945,9 @@ fn pet_fields(line: &str) -> String {
 /// deeply sleeping pet at full motion ([`PET_READY`]), resting as its scene needs
 /// ([`rest_unready`]), as it opened or as it ended, or its footprint could not be read, or a
 /// windowed Rewound scene's window did not end focused ([`FOCUSED`]) or was not drawn by the GPU
-/// renderer.
+/// renderer, or the unattended scene's window did not come to its state while the instance worked
+/// ([`Budget::await_while_working`]) or [`unattended::decide`] refused its take or left it
+/// unanswered.
 pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
     row.validate()?;
     let _one = super::take(false);
@@ -821,6 +961,8 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
     super::instance::first_exec(&rig.fake_tui)?;
     let budget = Budget::from_now(if row.scene.pet() {
         PET_BUDGET_SECS
+    } else if row.scene == SpinScene::Unattended {
+        unattended_budget_secs(row.window)
     } else {
         BUDGET_SECS
     });
@@ -838,12 +980,27 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
     };
     let ctl = &inst.ctl;
     phases.end("launch");
-    if row.scene.pet() || row.scene == SpinScene::Hidden || row.scene == SpinScene::WindowedRewound
+    if row.scene.pet()
+        || matches!(
+            row.scene,
+            SpinScene::Hidden | SpinScene::WindowedRewound | SpinScene::Unattended
+        )
     {
-        prepare_pet_focus(ctl)?;
+        prepare_focus(ctl)?;
     }
+    let focused_at = std::time::Instant::now();
     ctl.ok(&["await", "idle", SETTLE_QUIET_MS, "timeout=60000"])?;
     require_recording(ctl, row.recording)?;
+    if row.scene == SpinScene::Unattended {
+        await_unattended(ctl, inst.pid(), focused_at)?;
+        eprintln!(
+            "measure spin: {:?} readiness_seconds={:.3}",
+            row.scene,
+            focused_at.elapsed().as_secs_f64()
+        );
+        // The readings' change to their background cadence, before the window opens.
+        std::thread::sleep(unattended::SETTLE);
+    }
     if row.scene.pet() {
         let started = std::time::Instant::now();
         await_pet_ready(ctl.budget(), row.scene, || {
@@ -903,6 +1060,21 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
     } else {
         None
     };
+    // The unattended window's state as its window opens: one that lost it since the wait would
+    // only be refused at the end ([`unattended::decide`]), so it is refused here.
+    let unattended_open = if row.scene == SpinScene::Unattended {
+        let trail = unattended_trail(ctl, "opened")?;
+        if let Some(off) = unattended::unready(&trail) {
+            return could_not_run(format!(
+                "the unattended window read {off} as its window opened ({})",
+                unattended::fields(&trail)
+            ));
+        }
+        Some(trail)
+    } else {
+        None
+    };
+    let opened_at = std::time::Instant::now();
     let opened = ctl.ok(&["metrics"])?;
     if row.scene == SpinScene::Hidden {
         hidden_take(ctl, "opened")?;
@@ -953,6 +1125,24 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         }
     }
     let metrics = ctl.ok(&["metrics"])?;
+    let at_most = opened_at.elapsed();
+    let unattended = match &unattended_open {
+        Some(opened_trail) => {
+            let ended_trail = unattended_trail(ctl, "ended")?;
+            Some(unattended::decide(
+                row,
+                &unattended::UnattendedReadings {
+                    at_least: row.window,
+                    at_most,
+                    opened: &opened,
+                    ended: &metrics,
+                    opened_trail,
+                    ended_trail: &ended_trail,
+                },
+            )?)
+        }
+        None => None,
+    };
     let pet = if row.scene.pet() {
         Some(pet_take(ctl, row.scene, "ended")?)
     } else {
@@ -1065,18 +1255,25 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         os_events,
         os_event_kinds,
         reasons,
-        verdict: judge(
-            row,
-            Counts {
-                arms,
-                timer_wakes,
-                owner_fires: &fired,
-                needle,
-                wakes,
-                frames,
-                hidden_parked,
+        verdict: unattended.as_ref().map_or_else(
+            || match judge(
+                row,
+                Counts {
+                    arms,
+                    timer_wakes,
+                    owner_fires: &fired,
+                    needle,
+                    wakes,
+                    frames,
+                    hidden_parked,
+                },
+            ) {
+                ShapeVerdict::Pass => Disposition::Pass,
+                ShapeVerdict::Fail => Disposition::Fail,
             },
+            |decision| decision.verdict,
         ),
+        unattended,
         owner_fires: fired,
         needle,
         hidden_parked,

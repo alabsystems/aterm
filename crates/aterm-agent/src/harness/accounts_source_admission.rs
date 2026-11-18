@@ -2,6 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! The source observation retained by an automatic account sync.
+//!
+//! Traced by the accounts keeper: what this file reads of the file system itself, it reads
+//! through `aterm_uds::trace::fs` (census `traced-reads`).
 
 use super::*;
 use crate::harness::alab_roster::{ReceiptGuard, SourceCapture};

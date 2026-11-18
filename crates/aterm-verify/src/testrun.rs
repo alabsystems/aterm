@@ -774,7 +774,7 @@ pub struct Ran {
     /// How it ended, with what its tree used ([`Run::usage`]).
     pub run: Run,
     /// Whether its turn came and its runner was asked to start it: `false` for one the run's
-    /// first red, its spent ceiling or the release's pool left unstarted, which used no CPU.
+    /// first red or the release's pool left unstarted, which used no CPU.
     pub started: bool,
     /// Its width and charge.
     pub planned: Planned,
@@ -805,9 +805,8 @@ impl Ran {
 /// Run every binary of `plan` at its width, starting each as [`Dispatcher`] admits it: in the
 /// plan's order, once its charge fits in what the running binaries leave of the plan's share and
 /// its peak in what they leave of `memory`, with the running binaries using `live()` cores at
-/// their last reads. Once `stop()` (the run's wall-clock ceiling is spent, or its run-wide halt is
-/// armed) it halts and starts nothing more; `completed` is handed a local halt that takes the
-/// same lock as admission, so a decisive red can close dispatch before it writes its event. A
+/// their last reads. Once `stop()` holds it halts and starts nothing more. `completed` is handed
+/// a local halt that takes the same lock as admission, so a decisive red can close dispatch before it writes its event. A
 /// binary `run_one` answers `None` for did not start (the run stopped as its turn came) is answered
 /// as one the halt left. Each worker books
 /// its children into the calling stage's memory meter ([`crate::memory::current`]), hands them
@@ -2156,7 +2155,7 @@ fn emit(ctx: &crate::Ctx, event: &str) {
 /// A finished binary's outcome (ok, NOT RUN when its machine or the run's end kept it from
 /// running, else FAIL, the proven red that ends a halted run), its `test-binary-finished` event,
 /// and the sample of it its history keeps ([`crate::test_history`]) when its run measured what it
-/// takes ([`measured`]; `started`: the run left it time to start): its outcome, its waits, its
+/// takes ([`measured`]; `started`: the dispatcher admitted it): its outcome, its waits, its
 /// tree's usage (`null` where unread), the test threads it ran at (`width`) and the cores of the
 /// share it was charged (`charge`, [`crate::test_plan`]), and the tests libtest said it runs.
 fn binary_event(
@@ -2398,13 +2397,13 @@ fn stopped_detail(stopped: &crate::libtest_json::Stopped, log: &str) -> String {
 }
 
 /// Whether a binary's run measured what it takes, so its history keeps a sample of it: it was
-/// `started` (the run's ceiling left it time: [`not_started`]), nothing outside it ended it (no
+/// `started`, nothing outside it ended it (no
 /// [`Run::spawn_error`]: a spawn refused, an interrupt that came before it started, a stuck
 /// holder it waited behind, a wait for it that failed, or an end unrun at macOS's program check,
 /// `exec::start`: a program its syspolicyd stranded, or at its ceiling a leader not yet started or
 /// a member held past a first exec's bound) and no interrupt was ending the run as it ended
 /// ([`crate::exec::ending`]), which cuts a binary short at a point that says nothing of it. A
-/// binary the run's ceiling ended keeps its sample, a lower bound of what it takes, unless verify
+/// binary its own work ceiling ended keeps its sample, a lower bound of what it takes, unless verify
 /// ended it unrun there; one that never started would keep a wall of about 0 ms, and push a
 /// measured sample out of its row. A binary verify stopped at its first red case
 /// ([`Run::stopped_at`]) is deliberately not measured: its caller keeps an outcome-only schema-1
@@ -2656,30 +2655,6 @@ pub fn overruns(bins: &[Binary], ran: &[Option<Ran>]) -> String {
         "  test binaries over their charge (charged what they used next run): {}",
         over.join(", ")
     )
-}
-
-/// A binary the test run's ceiling left no time to start.
-#[must_use]
-pub fn not_started(b: &Binary, limit: Duration) -> Run {
-    Run {
-        case_observations: None,
-        stopped_at: None,
-        hung: None,
-        ok: false,
-        output: format!(
-            "{}\n{} — not started: the test run's {:.1}s wall-clock ceiling was spent before \
-             this binary's turn\n\x20 test binary: {}\n\x20 Counted as a FAIL: it never ran.\n\
-             \x20 Raise the ceiling with --timeout <seconds>, or remove it with \
-             --timeout off.\n",
-            b.header,
-            crate::findings::CEILING_KILL,
-            limit.as_secs_f64(),
-            b.spec
-        ),
-        code: None,
-        spawn_error: None,
-        usage: None,
-    }
 }
 
 /// A failed recording pass diagnostic. Preserve a bare binary panic location
@@ -3803,11 +3778,9 @@ fn run_planned_observed(
     };
     let meter = crate::memory::current();
     let live = || meter.as_ref().and_then(|m| m.live_rate()).unwrap_or(0.0);
-    let ceiling = ctx.exec_env().child_ceiling;
     progress.enter(Phase::Dispatch);
     let started = Instant::now();
-    let spent = || ceiling.is_some_and(|limit| started.elapsed() >= limit);
-    let stop = || spent() || ctx.halted().is_some();
+    let stop = || ctx.halted().is_some();
     let dispatch_samples = Mutex::new(Vec::with_capacity(bins.len()));
     // Hear one binary's end: classify its red before event I/O can hold up the local stop, emit
     // its FAIL before the halt's NOT RUN events, arm that run-wide halt, and keep its sample.
@@ -3839,16 +3812,9 @@ fn run_planned_observed(
             if ctx.halted().is_some() {
                 return None;
             }
-            let mut env = ctx.exec_env();
-            if let Some(limit) = ceiling {
-                let left = limit.saturating_sub(started.elapsed());
-                if left.is_zero() {
-                    return None;
-                }
-                env.child_ceiling = Some(left);
-            }
+            // Each admitted binary starts its own work clock inside exec::run_test.
             let cmd = final_binary_cmd(ctx, b, planned.width, planned.charge, checkers, watch);
-            let mut run = exec::run_test(&cmd, env, local_halt);
+            let mut run = exec::run_test(&cmd, ctx.exec_env(), local_halt);
             if cmd.test_cases.as_ref().is_some_and(|w| w.json) {
                 // The raw events were the child's log; every reader takes libtest's report.
                 run.output = crate::libtest_json::render(&run.output, run.stopped_at.as_ref());
@@ -3859,9 +3825,7 @@ fn run_planned_observed(
     );
     let total = started.elapsed();
     progress.enter(Phase::Reporting);
-    // Keep cancellation separate from expiry: a configured ceiling is no evidence it was
-    // spent. An unstarted binary keeps the first red's words, or the interrupt's; only an
-    // actually spent ceiling is a timeout. Each is heard as the rest were, without a sample.
+    // A halt accounts for its queued binaries. An unexplained omission is a gate defect.
     let ran: Vec<Option<Ran>> = bins
         .iter()
         .zip(ran)
@@ -3873,8 +3837,8 @@ fn run_planned_observed(
             let stopped = ctx.halted().or_else(|| {
                 exec::ending().then_some("the run was interrupted before this child started")
             });
-            let run = match (stopped, ceiling.filter(|limit| total >= *limit)) {
-                (Some(words), _) => Run {
+            let run = match stopped {
+                Some(words) => Run {
                     case_observations: None,
                     ok: false,
                     output: String::new(),
@@ -3882,8 +3846,7 @@ fn run_planned_observed(
                     spawn_error: Some(words.to_owned()),
                     ..Run::default()
                 },
-                (None, Some(limit)) => not_started(b, limit),
-                (None, None) => never_run(),
+                None => never_run(),
             };
             let planned = plan.order.iter().find(|p| p.index == index).copied()?;
             let left = Ran {
@@ -4122,7 +4085,7 @@ impl BinaryCpu {
     }
 }
 
-/// A binary the dispatch never started though no ceiling halted it: a defect of this gate, and
+/// A binary the dispatcher omitted without a halt: a defect of this gate, and
 /// a FAIL, never a pass.
 fn never_run() -> Run {
     Run {

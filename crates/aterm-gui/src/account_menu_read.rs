@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use aterm_agent::harness::account_card::{self, AccountCard, History, HistoryIn};
 use aterm_agent::harness::account_history::{self, HistoryWho};
 use aterm_agent::harness::profile::AccountKey;
-use aterm_agent::harness::{accounts, ai_pool, alab_seen, claims, footer::FactsOwner};
+use aterm_agent::harness::{accounts, ai_pool, alab_roster, alab_seen, claims, footer::FactsOwner};
 
 use crate::autopilot_menu::MenuOwner;
 use crate::claude_lights::Fact;
@@ -607,9 +607,12 @@ fn card_of(
     };
     let machines = machines_of(key.home.as_deref(), memo, now);
     let journal = alab_seen::journal();
+    // The lab as the process holds it, which slugs the account's word (`AccountCard::word`).
+    let lab = alab_roster::current();
     let card = account_card::build(&account_card::Inputs {
         cli: key.cli,
         roster,
+        lab: lab.as_deref(),
         state,
         enrolled,
         signing_in: pool.and_then(|read| read.signing_in.as_deref()),
@@ -855,6 +858,7 @@ impl AccountRead {
         account_card::build(&account_card::Inputs {
             cli: accounts::Cli::Claude,
             roster: &accounts::Roster::default(),
+            lab: None,
             state: &accounts::State::default(),
             enrolled: &std::collections::BTreeSet::new(),
             signing_in: None,

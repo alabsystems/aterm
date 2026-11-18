@@ -3,6 +3,8 @@
 
 //! One bounded peer plan across configured URLs and unresolved LAN names.
 
+#[cfg(unix)]
+use super::subscriber_gate::{SWEEP_PEERS, Sweeps};
 use super::*;
 #[cfg(unix)]
 use crate::discover::Watch;
@@ -212,6 +214,46 @@ impl<'a> PeerDiscovery<'a> {
         )
     }
 
+    /// The peers a sweep at `now` asks of `config`'s vault beside `primary`
+    /// ([`super::subscriber_gate::Gate::Sweep`]): of what [`Self::select`] chooses among (the
+    /// compiled-in addresses, the policy's servers, the mirrors and the names the browse heard),
+    /// at most [`SWEEP_PEERS`] whose turn `sweeps` gives ([`Sweeps::choose`]), each name among
+    /// them resolved once, never a name of the source's own; and how many it chose. The pass asks
+    /// these same peers for its records and for its envelope ([`Self::selected`]), so a sweep
+    /// resolves no name twice.
+    #[cfg(unix)]
+    pub(super) fn sweep(
+        &self,
+        paths: &Paths,
+        config: &Config,
+        primary: &str,
+        sweeps: &mut Sweeps,
+        now: Instant,
+    ) -> (usize, Vec<String>) {
+        let _peers = pass_counts::within(Phase::Peers);
+        let started = Instant::now();
+        let mut known = policy_peer_urls(paths, config);
+        known.extend(config.mirrors.iter().cloned());
+        let budget = self.budget();
+        let defaults = if !cfg!(test) && alab_vault(config) {
+            crate::ALAB_DEFAULT_URLS
+        } else {
+            &[]
+        };
+        let pool = self.pool(config, budget);
+        sweep_of(
+            &config.name,
+            primary,
+            defaults,
+            &known,
+            pool,
+            sweeps,
+            now,
+            budget.saturating_sub(started.elapsed()),
+            crate::discover::resolve_all,
+        )
+    }
+
     /// Every queue becomes the first candidate in turn, including across fresh readers.
     /// Keep the configured source and a still-authorized cached listing available outside
     /// the rotating batch for fallback and idle long-polling.
@@ -278,6 +320,73 @@ enum Target {
     Known(String),
     Ready(DiscoveredVault),
     Name(String),
+}
+
+// A sweep is the Unix subscriber loop's ([`PeerDiscovery::sweep`]).
+#[cfg(unix)]
+impl Target {
+    /// What a sweep knows this target by ([`Sweeps::choose`]): a URL's endpoint
+    /// ([`transport::describe`]), or a name the browse heard, which is not resolved before it is
+    /// chosen.
+    fn key(&self) -> String {
+        match self {
+            Self::Known(url) => transport::describe(url).to_ascii_lowercase(),
+            Self::Ready(item) => transport::describe(&item.url).to_ascii_lowercase(),
+            Self::Name(name) => format!("instance {}", name.trim().to_ascii_lowercase()),
+        }
+    }
+
+    /// Whether this is the name the source at `primary` registers itself under: its host is the
+    /// name's `<name>.local`, as a vault server registers its label, so a sweep asking it would
+    /// ask the source. A collision rename of the holder's name (`alab-secrets (2)`) is another
+    /// island's holder, the one a sweep is for, and the address any other name resolves to is
+    /// dropped where it is the source's ([`Plan::finish`]).
+    fn names_source(&self, primary: &str) -> bool {
+        let Self::Name(name) = self else {
+            return false;
+        };
+        aterm_http::Uri::parse(primary).is_some_and(|uri| {
+            uri.host()
+                .trim_end_matches('.')
+                .to_ascii_lowercase()
+                .strip_suffix(".local")
+                .is_some_and(|stem| name.trim().eq_ignore_ascii_case(stem))
+        })
+    }
+}
+
+/// [`PeerDiscovery::sweep`] of `pool` and the `defaults` and `policy` URLs, its names resolved by
+/// `resolve` within `budget`: how many targets it chose, and their URLs.
+#[cfg(unix)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the sweep's own inputs and its resolver seam, each named"
+)]
+fn sweep_of(
+    vault: &str,
+    primary: &str,
+    defaults: &[&str],
+    policy: &[String],
+    pool: Pool,
+    sweeps: &mut Sweeps,
+    now: Instant,
+    budget: Duration,
+    resolve: impl FnOnce(&[String], Duration) -> Vec<DiscoveredVault>,
+) -> (usize, Vec<String>) {
+    let (preferred, targets) = Plan::targets(vault, primary, defaults, policy, &[], pool);
+    let keyed: Vec<(String, Target)> = preferred
+        .into_iter()
+        .map(Target::Known)
+        .chain(targets)
+        .filter(|target| !target.names_source(primary))
+        .map(|target| (target.key(), target))
+        .collect();
+    let chosen = sweeps.choose(keyed, now, SWEEP_PEERS);
+    let asked = chosen.len();
+    (
+        asked,
+        Plan::of(Vec::new(), chosen).finish(vault, primary, budget, resolve),
+    )
 }
 
 struct Plan {
@@ -394,6 +503,22 @@ impl Plan {
         pool: Pool,
         from: Cursor<'_>,
     ) -> Self {
+        let (preferred, targets) = Self::targets(vault, primary, defaults, policy, explicit, pool);
+        let limit = MAX_CANDIDATES - preferred.len();
+        Self::of(preferred, from.select(targets, limit))
+    }
+
+    /// The valid, distinct `defaults` (at most [`MAX_CANDIDATES`]), and the rest a plan chooses
+    /// among: the `policy` and `explicit` URLs, then `pool`, its names in a stable order. None
+    /// names `primary`'s endpoint.
+    fn targets(
+        vault: &str,
+        primary: &str,
+        defaults: &[&str],
+        policy: &[String],
+        explicit: &[String],
+        pool: Pool,
+    ) -> (Vec<String>, Vec<Target>) {
         let mut seen = BTreeSet::new();
         let mut take = |raw: &str| {
             let clean = normalized(raw, vault, primary)?;
@@ -421,7 +546,11 @@ impl Plan {
                 targets.extend(names.into_iter().map(Target::Name));
             }
         }
-        let selected = from.select(targets, MAX_CANDIDATES - preferred.len());
+        (preferred, targets)
+    }
+
+    /// The plan of `preferred` URLs and the `selected` targets.
+    fn of(mut preferred: Vec<String>, selected: Vec<Target>) -> Self {
         let mut ready = Vec::new();
         let mut names = Vec::new();
         for target in selected {

@@ -5,6 +5,18 @@
 //! Owner-only private file and directory operations backed by `astream_sys` checks on Unix, and
 //! on Windows by a protected access list of the token user and SYSTEM alone, given at creation
 //! ([`crate::acl`]; the Windows arm's own rules head `private_file_win.rs`).
+//!
+//! With a trace scope armed on the calling thread ([`crate::trace`]), each read of a file here
+//! records, before its open, the stamp of the name as itself (a link there is never followed,
+//! as the open follows none; `crate::trace::fs::opening_itself`) or that nothing is there, and
+//! its directory's verdict as a standing ([`crate::trace::standing`]): the directory's kind,
+//! owner, mode and access list (on Windows its kind, owner and access list), which a read
+//! decides by, and not its times, which every file written beside it moves. The stamp holds
+//! what the file is refused or admitted by: on Unix its owner, mode and link count and the
+//! inode-change time an access list's change moves; on Windows its owner and access list (a
+//! digest of them), its change time and its names ([`crate::trace::Meta`]). A lookup, open or
+//! read that fails for a reason neither decides records a retry. Both arms record alike: the
+//! recording is in the readers they share ([`open_in`], `dir_is_read`).
 
 use std::fmt;
 use std::io::{self, Read};
@@ -26,7 +38,7 @@ use crate::secret::Secret;
 #[path = "private_file_win.rs"]
 mod win;
 #[cfg(windows)]
-use win::{DirIs, Opening, check_dir_verdict, dir_is, open_in};
+use win::{DirIs, Opening, check_dir_verdict, dir_is, open_in as open_at};
 #[cfg(windows)]
 pub use win::{check_owned_dir, create_private_dir, ensure_private_dir, judge_private_dir};
 
@@ -211,8 +223,9 @@ pub fn read_private_with_metadata(
 /// How old a file's last change must be, by its own times, before [`KeptParse`] pins a parse
 /// to it: two in-place writes inside one tick of a filesystem's clock leave one stamp, and the
 /// coarsest clock a private file's volume keeps ticks every two seconds (FAT's modification
-/// time). A file younger than this is read again at every call.
-pub const SETTLE: Duration = Duration::from_secs(2);
+/// time). A file younger than this is read again at every call. It is the trace's settle rule,
+/// [`crate::trace::SETTLED`].
+pub const SETTLE: Duration = crate::trace::SETTLED;
 
 /// What a read of a file's open descriptor says of it without its bytes: which file it is, how
 /// long, and when it was last written and last changed. A `write`, a truncation and a change
@@ -461,12 +474,11 @@ fn read_capped_with_len(
         .read_to_end(&mut bytes)
     {
         crate::secret::scrub(&mut bytes);
+        read_failed(name, &e);
         return Err(PrivateFileError::Io(e));
     }
     #[cfg(any(test, debug_assertions))]
     tally::add(name, bytes.len());
-    #[cfg(not(any(test, debug_assertions)))]
-    let _ = name;
     if bytes.len() > max {
         crate::secret::scrub(&mut bytes);
         return Err(PrivateFileError::Malformed(
@@ -474,6 +486,13 @@ fn read_capped_with_len(
         ));
     }
     Ok(bytes)
+}
+
+/// Record, in a trace scope armed on this thread, that a read of the file `name`, opened and
+/// stamped, failed with `error` after its open: a retry where no stamp decides it
+/// ([`crate::trace::fs::failed`]).
+fn read_failed(name: &str, error: &io::Error) {
+    crate::trace::fs::failed(Path::new(name), error);
 }
 
 const ONE_COMPONENT: &str = "a private file's name is one path component";
@@ -542,6 +561,24 @@ enum DirIs {
 
 #[cfg(unix)]
 impl DirIs {
+    /// This verdict as a trace's standing of its directory ([`dir_standing`]): a tag for the
+    /// verdict, and an open directory's mode bits, which decide [`Opening::Owned`]'s reads.
+    fn standing(self) -> [u8; 32] {
+        let (tag, mode) = match self {
+            Self::Missing => (1, 0),
+            Self::Private => (2, 0),
+            Self::Open(mode) => (3, mode),
+            Self::Symlink => (4, 0),
+            Self::NotDir => (5, 0),
+            Self::Others => (6, 0),
+            Self::Acl => (7, 0),
+        };
+        let mut digest = [0; 32];
+        digest[0] = tag;
+        digest[1..5].copy_from_slice(&mode.to_le_bytes());
+        digest
+    }
+
     /// astream-sys's owner-only verdict on a directory, in this module's words: the one
     /// mapping both of [`dir_is`]'s routes take.
     fn of(verdict: Result<(), astream_sys::NotPrivate>) -> Self {
@@ -553,6 +590,27 @@ impl DirIs {
             Err(NotPrivate::Owner(_)) => Self::Others,
             Err(NotPrivate::Acl) => Self::Acl,
         }
+    }
+}
+
+#[cfg(windows)]
+impl DirIs {
+    /// This verdict as a trace's standing of its directory ([`dir_standing`]): a tag for the
+    /// verdict, and for a folder of the user's whose access list is not private the clause it
+    /// breaks, which [`check_dir_verdict`]'s refusal names.
+    fn standing(self) -> [u8; 32] {
+        let (tag, why) = match self {
+            Self::Missing => (1, ""),
+            Self::Private => (2, ""),
+            Self::Open(why) => (3, why),
+            Self::Reparse => (4, ""),
+            Self::NotDir => (5, ""),
+            Self::Others => (6, ""),
+        };
+        let mut digest = aterm_digest::Sha256::new();
+        digest.update([tag]);
+        digest.update(why.as_bytes());
+        digest.finalize()
     }
 }
 
@@ -580,6 +638,27 @@ fn dir_is(dir: &Path) -> io::Result<DirIs> {
     #[cfg(any(test, debug_assertions))]
     tally::opened(dir);
     dir_is_opened(dir)
+}
+
+/// A trace's standing of the directory `dir` a read judged ([`DirIs::standing`] of its
+/// [`dir_is`] now): `None` where it could not be judged.
+fn dir_standing(dir: &Path) -> Option<[u8; 32]> {
+    dir_is(dir).ok().map(DirIs::standing)
+}
+
+/// [`dir_is`] for a read of a file in `dir`: with a trace scope armed on this thread, the
+/// verdict is recorded as a standing of `dir` ([`dir_standing`]), and a judgement that failed
+/// as a retry where no stamp decides it.
+fn dir_is_read(dir: &Path) -> io::Result<DirIs> {
+    let judged = dir_is(dir);
+    if crate::trace::armed() {
+        let value = judged.as_ref().ok().copied().map(DirIs::standing);
+        crate::trace::standing(dir, value, dir_standing);
+        if let Err(error) = &judged {
+            crate::trace::fs::failed(dir, error);
+        }
+    }
+    judged
 }
 
 /// [`dir_is`] over `dir` opened (`open_nonblocking`, refusing a link at its last component)
@@ -632,7 +711,7 @@ impl<'a> JudgedDir<'a> {
     pub fn judge(dir: &'a Path) -> Result<Self, PrivateFileError> {
         Ok(Self {
             dir,
-            judged: dir_is(dir).map_err(PrivateFileError::Io)?,
+            judged: dir_is_read(dir).map_err(PrivateFileError::Io)?,
         })
     }
 
@@ -641,7 +720,7 @@ impl<'a> JudgedDir<'a> {
     /// # Errors
     /// As [`check_private_dir`].
     pub fn private(dir: &'a Path) -> io::Result<Self> {
-        let judged = dir_is(dir)?;
+        let judged = dir_is_read(dir)?;
         check_dir_verdict(dir, judged)?;
         Ok(Self { dir, judged })
     }
@@ -710,7 +789,9 @@ impl<'a> JudgedDir<'a> {
     pub fn read_head(&self, name: &str, len: usize) -> Result<Vec<u8>, PrivateFileError> {
         let (mut file, _meta) = self.open(name)?;
         let mut head = vec![0; len];
-        let read = read_full(&mut file, &mut head).map_err(PrivateFileError::Io)?;
+        let read = read_full(&mut file, &mut head)
+            .inspect_err(|error| read_failed(name, error))
+            .map_err(PrivateFileError::Io)?;
         head.truncate(read);
         #[cfg(any(test, debug_assertions))]
         tally::add(name, read);
@@ -734,11 +815,14 @@ pub fn open_private(
     open_judged(dir, name, Opening::Read).map(|(file, meta, _loose)| (file, meta))
 }
 
-/// `name` directly in `dir`, under `dir`'s verdict from [`dir_is`] (taken from the
-/// directory's attributes where they decide it, so the directory is opened only where they
-/// cannot), the file opened as `how` says and judged on its open descriptor (astream-sys's
-/// owner-only rule, never a second `stat` by path), with whether a group or other read bit
-/// was set on the file or its directory (only [`Opening::Owned`] lets one through).
+/// `name` directly in `dir`, under `dir`'s verdict (a read-write opening's from [`dir_is`], any
+/// other's from `dir_is_read`, which records it in a trace scope armed on this thread): on Unix
+/// taken from the directory's attributes where they decide it, so the directory is opened only
+/// where they cannot; on Windows from the folder opened as itself. The file is opened as `how`
+/// says and judged on its open descriptor, never by a second `stat` by path (on Unix by
+/// astream-sys's owner-only rule, on Windows by the arm's, `acl::owner_only`), and the answer
+/// says whether a group or other read bit was set on the file or its directory: only Unix's
+/// `Opening::Owned` lets one through, and on Windows, which has no such bit, it is `false`.
 fn open_judged(
     dir: &Path,
     name: &str,
@@ -747,14 +831,46 @@ fn open_judged(
     if !one_component(name) {
         return Err(PrivateFileError::Malformed(ONE_COMPONENT));
     }
-    let judged = dir_is(dir).map_err(PrivateFileError::Io)?;
+    let judged = if how == Opening::ReadWrite {
+        dir_is(dir)
+    } else {
+        dir_is_read(dir)
+    }
+    .map_err(PrivateFileError::Io)?;
     open_in(dir, judged, name, how)
 }
 
 /// [`open_judged`] once `name` is known to be one component and `dir` has been judged:
-/// the file looked up, opened and judged under `judged`, `dir`'s verdict.
-#[cfg(unix)]
+/// the file looked up, opened and judged under `judged`, `dir`'s verdict. In a trace scope
+/// armed on this thread, a read opening records the name's own stamp, or that nothing is there,
+/// before anything else here looks at it (`trace::fs::opening_itself`: a link there is never
+/// followed, as the open never follows one, and on Windows the look is made with this thread's
+/// cloud placeholders exposed, as the arm's own looks are), and a lookup, open or judgement that
+/// failed records a retry where no stamp decides it; with none armed, nothing more is made or
+/// looked at. The lookup, open and judgement are each arm's own (`open_at`: Unix's below, the
+/// Windows arm's `open_in`), so the Windows arm's looks at the name are made after its stamp is
+/// recorded too.
 fn open_in(
+    dir: &Path,
+    judged: DirIs,
+    name: &str,
+    how: Opening,
+) -> Result<(std::fs::File, std::fs::Metadata, bool), PrivateFileError> {
+    if how != Opening::ReadWrite && crate::trace::armed() {
+        crate::trace::fs::opening_itself(&dir.join(name));
+    }
+    open_at(dir, judged, name, how).inspect_err(|error| {
+        if let PrivateFileError::Io(error) = error
+            && crate::trace::armed()
+        {
+            crate::trace::fs::failed(&dir.join(name), error);
+        }
+    })
+}
+
+/// [`open_in`]'s lookup, open and judgement, with nothing recorded.
+#[cfg(unix)]
+fn open_at(
     dir: &Path,
     judged: DirIs,
     name: &str,
@@ -991,6 +1107,7 @@ fn read_capped_into(
         Ok(len) => len,
         Err(e) => {
             crate::secret::scrub(&mut buf[..cap]);
+            read_failed(name, &e);
             return Err(PrivateFileError::Io(e));
         }
     };
@@ -1003,7 +1120,10 @@ fn read_capped_into(
             Ok(_) => Some(PrivateFileError::Malformed(
                 "longer than such a file can be",
             )),
-            Err(e) => Some(PrivateFileError::Io(e)),
+            Err(e) => {
+                read_failed(name, &e);
+                Some(PrivateFileError::Io(e))
+            }
         };
         if let Some(refused) = refused {
             crate::secret::scrub(&mut buf[..cap]);
@@ -1012,8 +1132,6 @@ fn read_capped_into(
     }
     #[cfg(any(test, debug_assertions))]
     tally::add(name, len);
-    #[cfg(not(any(test, debug_assertions)))]
-    let _ = name;
     Ok(len)
 }
 

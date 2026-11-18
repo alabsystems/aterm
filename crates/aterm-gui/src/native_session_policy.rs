@@ -35,7 +35,7 @@ pub(crate) struct ProofRead {
 
 impl ProofRead {
     /// The proof read of a registry and its generation, taken together.
-    fn of(
+    pub(crate) fn of(
         read: (
             std::sync::Arc<aterm_agent::harness::registry::Registry>,
             u64,
@@ -48,6 +48,23 @@ impl ProofRead {
             registry: Some(registry),
         }
     }
+}
+
+/// Where an image proof reads the claimant's executable and the store its build is in: the
+/// kernel and this user's configured atpkg prefix ([`Self::LIVE`]), or a test's own.
+pub(crate) struct ImageReads<'a> {
+    /// The executable file process `pid` runs.
+    pub(crate) exe: &'a dyn Fn(u32) -> Option<std::path::PathBuf>,
+    /// The store, asked only where the image is judged in full.
+    pub(crate) layout: &'a dyn Fn() -> Option<atpkg::store::Layout>,
+}
+
+impl ImageReads<'_> {
+    /// The kernel's read of a pid's executable and this user's configured atpkg prefix.
+    pub(crate) const LIVE: Self = Self {
+        exe: &|pid| i32::try_from(pid).ok().and_then(aterm_uds::sudo::exe_path),
+        layout: &atpkg::store::resolve_configured,
+    };
 }
 
 #[derive(Default)]
@@ -293,36 +310,34 @@ impl SessionPolicy {
         ProofRead::of(registry::snapshot_at().unwrap_or_else(registry::current_at))
     }
 
-    /// Whether the CLAIMANT RUNS AS ITS ROW'S HARNESS under its contract's image rule, judged under
-    /// `read` ([`crate::harness_claim::image_by`], this user's configured atpkg prefix). With
+    /// What the CLAIMANT IS ADMITTED AS when it runs as its row's harness (`None`: it does not),
+    /// with the version read there, under its contract's image rule, judged under
+    /// `read` ([`crate::harness_claim::image_by`]) on the executable and the store `reads`
+    /// gives ([`ImageReads::LIVE`]: the kernel's, and this user's configured atpkg prefix). With
     /// `reuse` (a standing claim's re-proof) the verdict this session's claimant last passed stands
     /// while its key holds ([`crate::harness_claim::ImageKey`]: the same holder, contract and
     /// kernel start, the same executable file, the same registry generation), so no signature is
     /// verified, no tree hashed and no setting read again; without it (a claim being made) the
     /// image is judged in full. Either way a pass is kept for the next re-proof
     /// ([`crate::harness_claim::KeptImage`]; HX-05's review, finding 1). A fixture's captured
-    /// images judge, and nothing is kept.
+    /// images judge, nothing is kept and no version is read.
     pub(crate) fn claimant_image(
         &self,
         read: &ProofRead,
         claimant: crate::harness_claim::Claimant<'_>,
         reuse: bool,
-    ) -> bool {
+        reads: &ImageReads<'_>,
+    ) -> Option<crate::harness_claim::Passed> {
         let Some(registry) = read.registry.as_deref() else {
-            return self.actor_image(claimant.row, claimant.contract, claimant.pid);
+            return self
+                .actor_image(claimant.row, claimant.contract, claimant.pid)
+                .then(crate::harness_claim::Passed::default);
         };
-        let Some(exe) = i32::try_from(claimant.pid)
-            .ok()
-            .and_then(aterm_uds::sudo::exe_path)
-        else {
-            return false;
-        };
+        let exe = (reads.exe)(claimant.pid)?;
         let key = crate::harness_claim::ImageKey::of(&claimant, &exe, read.generation);
         let (row, contract) = (claimant.row, claimant.contract);
         self.kept_image.passes(key, reuse, || {
-            let Some(layout) = atpkg::store::resolve_configured() else {
-                return false;
-            };
+            let layout = (reads.layout)()?;
             crate::harness_claim::image_by(registry, &layout, row, contract, &exe)
         })
     }
@@ -479,7 +494,7 @@ impl SessionPolicy {
             use std::os::unix::ffi::OsStrExt;
             let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&target.path));
             atpkg::store::resolve_configured()
-                .is_some_and(|layout| crate::harness_claim::image_in(&layout, row, path))
+                .is_some_and(|layout| crate::harness_claim::image_in(&layout, row, path).is_some())
         }
         #[cfg(not(unix))]
         false

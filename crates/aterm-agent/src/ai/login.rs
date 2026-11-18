@@ -237,11 +237,11 @@ fn claude(h: &Host<'_>, f: &Facts, out: &mut dyn Write) -> Done {
         .accounts
         .as_ref()
         .is_some_and(|a| a.renews || a.next_sign_in.is_some());
-    let label = f
-        .accounts
-        .as_ref()
-        .and_then(|a| a.next_sign_in.clone().or_else(|| Some(a.label.clone())))
-        .unwrap_or_else(|| OWN_LABEL.to_string());
+    // The word the renewal names the row by: the row's own, where the roster lists it
+    // ([`super::facts::ClaudeAccounts::sign_in_word`]), else (a row adopted below) the account
+    // the address given makes. A row to renew that the roster does not list has none, and its
+    // label would name nothing `renew` takes, so nothing runs.
+    let mut word = f.accounts.as_ref().and_then(|a| a.sign_in_word.clone());
     let env: Vec<(String, String)> = h.vars.to_vec();
     if !renews && let Some(marker) = agent_marker(h.var) {
         return Done::Refused(format!(
@@ -265,14 +265,9 @@ fn claude(h: &Host<'_>, f: &Facts, out: &mut dyn Write) -> Done {
         if !email.contains('@') || email.chars().any(char::is_whitespace) {
             return Done::Refused("that is not an email address".to_string());
         }
-        let args = as_args(&[
-            "harness",
-            "accounts",
-            "adopt-default",
-            &label,
-            "--email",
-            &email,
-        ]);
+        // The default login is listed as the account the address names: no label is chosen,
+        // since the row takes that account's reserved slug.
+        let args = as_args(&["harness", "accounts", "adopt-default", "--email", &email]);
         match h.runner.terminal(h.aterm, &args, &env, None) {
             Ok(0) => {}
             Ok(code) => {
@@ -282,16 +277,28 @@ fn claude(h: &Host<'_>, f: &Facts, out: &mut dyn Write) -> Done {
             }
             Err(why) => return Done::Failed(why),
         }
+        let lab = crate::harness::alab_roster::current();
+        match crate::harness::account_names::word_of_login(Cli::Claude, &email, lab.as_deref()) {
+            Some(adopted) => word = Some(adopted),
+            None => return Done::Refused("that is not an email address".to_string()),
+        }
     }
     if renews && let Some(why) = unattended_refusal(h, f) {
         return Done::Refused(why);
     }
-    let args = as_args(&["harness", "accounts", "renew", &label]);
+    let Some(word) = word else {
+        return Done::Refused(format!(
+            "accounts.toml no longer lists the row to renew, so nothing was run: `{}` lists its \
+             rows",
+            Step::Report(Cli::Claude)
+        ));
+    };
+    let args = as_args(&["harness", "accounts", "renew", word.as_str()]);
     match renew_run(h, &args, &env, out) {
         Ok(0) => Done::SignedIn(None),
         Ok(code) => Done::Failed(format!(
             "`{}` exited {code}",
-            Step::Renew(Cli::Claude, label.clone())
+            Step::renew(Cli::Claude, word)
         )),
         Err(why) => Done::Failed(why),
     }
@@ -389,7 +396,7 @@ fn renew_run(
 pub fn pool_target(
     cli: crate::harness::accounts::Cli,
     pool: &super::facts::CliAccounts,
-) -> Result<(&str, &'static str), String> {
+) -> Result<super::facts::SignInTarget<'_>, String> {
     let id = cli.id();
     let roster = pool.roster.display();
     if let Some(why) = &pool.refused {
@@ -462,7 +469,7 @@ pub fn pool_target(
         return Err(format!(
             "`{label}` is the row with no current login, and it has no email, so aterm does not \
              sign it in: `{}` does, at a terminal; no other row of this pool needs a sign-in",
-            Step::Login(cli, label.clone())
+            Step::Login(cli, pool.word(cli, label))
         ));
     }
     Err(if pool.emails > 0 {
@@ -473,17 +480,12 @@ pub fn pool_target(
         )
     } else if cli.renews_headlessly() {
         format!(
-            "{roster} lists no email: run `{}` (kimi also `--region <r>`)",
-            Step::Add {
-                cli,
-                email: Some("<e>".to_owned()),
-            }
+            "{roster} lists no email: list the account by its provider word and address: run \
+             `{}`",
+            Step::Add(cli)
         )
     } else {
-        format!(
-            "{roster} lists no row: run `{}`",
-            Step::Add { cli, email: None }
-        )
+        format!("{roster} lists no row: run `{}`", Step::Add(cli))
     })
 }
 
@@ -505,7 +507,8 @@ fn moved_step_words(label: &str, step: &Step) -> String {
 
 /// A CLI with its own accounts pool signs in through it, for the pool's next row (a row with an
 /// email, or for Grok Build's any row, [`super::facts::CliAccounts::next`]): `aterm harness
-/// accounts <verb> <label> --cli <id>`, the verb that signs the CLI's row in
+/// accounts <verb> <account> --cli <id>`, the row named by the word its sign-in takes
+/// ([`super::facts::SignInTarget::word`]), in the verb that signs the CLI's row in
 /// ([`crate::harness::accounts::Cli::sign_in_verb`]). That is `renew`, a fresh login in its own
 /// staging home, its page pinned and approved headlessly and its account checked before any
 /// session uses it, else `login`, the same sign-in on this terminal for the person to approve
@@ -523,8 +526,8 @@ pub fn pool_sign_in(
     out: &mut dyn Write,
 ) -> Done {
     let id = cli.id();
-    let (label, verb) = match pool_target(cli, pool) {
-        Ok(target) => target,
+    let (word, verb) = match pool_target(cli, pool) {
+        Ok(target) => (target.word, target.verb),
         Err(why) => return Done::Refused(why),
     };
     if verb != "renew"
@@ -532,7 +535,7 @@ pub fn pool_sign_in(
     {
         return Done::Refused(format!(
             "{marker} is set: `{}` is a person's approval at this Mac, not an agent's",
-            Step::sign_in(cli, label, verb == "renew")
+            Step::sign_in(cli, word, verb == "renew")
         ));
     }
     if verb == "renew"
@@ -540,7 +543,7 @@ pub fn pool_sign_in(
     {
         return Done::Refused(why);
     }
-    let args = as_args(&["harness", "accounts", verb, label, "--cli", id]);
+    let args = as_args(&["harness", "accounts", verb, word.as_str(), "--cli", id]);
     let env: Vec<(String, String)> = h.vars.to_vec();
     let ran = if verb == "renew" {
         renew_run(h, &args, &env, out)
@@ -551,7 +554,7 @@ pub fn pool_sign_in(
         Ok(0) => Done::SignedIn(None),
         Ok(code) => Done::Failed(format!(
             "`{}` exited {code}",
-            Step::sign_in(cli, label, verb == "renew")
+            Step::sign_in(cli, word, verb == "renew")
         )),
         Err(why) => Done::Failed(why),
     }

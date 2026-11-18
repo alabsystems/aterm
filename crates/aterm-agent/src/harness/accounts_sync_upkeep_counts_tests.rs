@@ -7,11 +7,15 @@
 //! synthetic.
 
 use super::*;
-use crate::harness::accounts_upkeep_counts::{UpkeepCounts, counts, counts_here};
+use crate::harness::accounts_upkeep_counts::{UpkeepCounts, counts, counts_here, store_locks_here};
 use crate::harness::alab_roster::{
     Lab, LabAccount, ReceiptGuard, SourceGuard, SourceSnapshot, TestSourceOverride, test_machine,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+#[cfg(unix)]
+#[path = "accounts_sync_upkeep_fixpoint_tests.rs"]
+mod fixpoint;
 
 /// A receipt guard that counts how often it is asked, and admits every save unless told to
 /// refuse.
@@ -103,12 +107,17 @@ fn no_fetch(_: &Env, _: &str) -> Result<String, String> {
 
 /// One pass of the window's upkeep over `bed`, keeping what it remembers between passes in
 /// `rediscovery` as a window does.
-fn upkeep_pass(bed: &Bed, rediscovery: &Mutex<Rediscovery>, step: UpkeepStep) {
+fn upkeep_pass(bed: &Bed, rediscovery: &Watched<Rediscovery>, step: UpkeepStep) {
     with_logged_effects(
         (&|_work| Ok(()), &no_fetch),
         (rediscovery, std::sync::Arc::new(|_: &str| {})),
         |fx| {
-            let _ = upkeep(&bed.home, &bed.state, (&claude_roster(bed), NOW, step), fx);
+            let _ = upkeep(
+                &bed.home,
+                &bed.state,
+                (&claude_roster(bed), trace::Now::at(NOW), step),
+                fx,
+            );
         },
     );
 }
@@ -121,7 +130,7 @@ struct Scripted {
     asked: Arc<AtomicUsize>,
     refuses: Arc<AtomicBool>,
     source: TestSourceOverride,
-    rediscovery: Mutex<Rediscovery>,
+    rediscovery: Watched<Rediscovery>,
 }
 
 impl Scripted {
@@ -141,7 +150,7 @@ impl Scripted {
             asked,
             refuses,
             source,
-            rediscovery: Mutex::new(Rediscovery::default()),
+            rediscovery: Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
         }
     }
 
@@ -213,10 +222,10 @@ impl Scripted {
 ///   roster's publication with the lab's guard, which admits the row each adds (2); and
 ///   Claude Code's and Codex's pools each retire the source the lab replaces, a publication
 ///   the guard admits (2);
-/// - a second pass over the same inputs, which changes nothing: `[1, 2, 2, 0]`, `asked` 0.
-///   The quiet rule holds Codex's sync back (its last one took nothing for the same inputs),
-///   so two pools sync; Grok and Kimi still reach their publication with the guard and
-///   neither plan asks it; no file under the scratch root moves;
+/// - a second pass over the same inputs, which changes nothing: `[1, 3, 2, 0]`, `asked` 0.
+///   Off the keeper's thread nothing holds a sync back, so the three pools sync again; Codex's
+///   stops before any publication as before, Grok and Kimi still reach their publication with
+///   the guard and neither plan asks it; no file under the scratch root moves;
 /// - a pool sync a person asks for through the verb, unchanged: `[0, 0, 0, 1]`, `asked` 1:
 ///   no pass, no upkeep sync, one admission;
 /// - a pass that only renews (`UpkeepStep::Renew`): `[1, 0, 0, 0]`: a pass, and no sync;
@@ -231,8 +240,6 @@ impl Scripted {
 ///   adds rows` fails, left `([1, 3, 2, 0], 4)`, right `([1, 3, 2, 4], 4)`;
 /// - `count`'s add to the process's counts removed: the first pass fails, `the process's
 ///   counts moved by [0, 0, 0, 0], this thread's by [1, 3, 2, 4]`;
-/// - the `Event::PoolSync` increment moved above the quiet rule's test in `upkeep_pools`:
-///   `an unchanged pass` fails, left `([1, 3, 2, 0], 0)`, right `([1, 2, 2, 0], 0)`;
 /// - the `Event::Pass` increment moved below `upkeep`'s off-switch returns: `a pass the off
 ///   switch ends` fails, left `([0, 0, 0, 0], 0)`, right `([1, 0, 0, 0], 0)`.
 #[test]
@@ -261,7 +268,7 @@ fn a_scripted_upkeep_moves_each_count_by_what_it_did() {
     }
 
     let before = script.tree();
-    assert_eq!(script.pass(), ([1, 2, 2, 0], 0), "an unchanged pass");
+    assert_eq!(script.pass(), ([1, 3, 2, 0], 0), "an unchanged pass");
     assert_eq!(script.tree(), before, "an unchanged pass writes nothing");
 
     assert_eq!(
@@ -290,7 +297,7 @@ fn a_scripted_upkeep_moves_each_count_by_what_it_did() {
             upkeep_pools(
                 &bed.home,
                 &bed.state,
-                (&claude_roster(bed), NOW, UpkeepStep::Sync),
+                (&claude_roster(bed), trace::Now::at(NOW), UpkeepStep::Sync),
                 fx,
             );
         });
@@ -306,8 +313,8 @@ fn a_scripted_upkeep_moves_each_count_by_what_it_did() {
 /// - the first pass: `[1, 3, 0, 0]`: Codex, Grok and Kimi sync; Kimi reaches its roster's
 ///   publication, which adds this machine's row with no guard to ask; Codex and Grok keep no
 ///   roster and have no source;
-/// - the second pass: `[1, 1, 0, 0]`: Kimi alone syncs (the quiet rule holds Codex's and
-///   Grok's back), reaches its publication again, and changes nothing.
+/// - the second pass: `[1, 3, 0, 0]`: off the keeper's thread nothing holds a sync back, so
+///   the three sync again; Kimi reaches its publication again and changes nothing.
 ///
 /// NEGATIVE CONTROL (2026-11-13): with `&& guard.is_some()` removed from the
 /// `Event::PoolSyncGuarded` increment in `sync_cli_in_env`, `the first pass` fails: left
@@ -316,7 +323,7 @@ fn a_scripted_upkeep_moves_each_count_by_what_it_did() {
 #[test]
 fn an_upkeep_sync_from_a_fleet_file_is_counted_without_a_guard() {
     let bed = accounts_bed("upkeep-unguarded", false);
-    let rediscovery = Mutex::new(Rediscovery::default());
+    let rediscovery = Watched::new("accounts_sync/rediscovery", Rediscovery::default());
     let pass = || moved(|| upkeep_pass(&bed, &rediscovery, UpkeepStep::Sync));
     assert_eq!(pass(), [1, 3, 0, 0], "the first pass");
     assert!(
@@ -324,7 +331,7 @@ fn an_upkeep_sync_from_a_fleet_file_is_counted_without_a_guard() {
         "Kimi's sync reached its publication and added this machine's row"
     );
     let before = Bed::tree(bed._dir.path());
-    assert_eq!(pass(), [1, 1, 0, 0], "the second pass");
+    assert_eq!(pass(), [1, 3, 0, 0], "the second pass");
     assert_eq!(
         Bed::tree(bed._dir.path()),
         before,
@@ -335,9 +342,9 @@ fn an_upkeep_sync_from_a_fleet_file_is_counted_without_a_guard() {
 /// AN UPKEEP SYNC WHOSE PLAN CHANGES NOTHING ASKS NO ADMISSION; EVERY OTHER SYNC ASKS AS IT
 /// DID. After the first pass of [`Scripted`] has added the lab's rows, by
 /// `[passes, pool_syncs, pool_syncs_guarded, receipt_admissions]` and the
-/// times the guard was asked (Codex's sync is held back by the quiet rule in every pass after
-/// the first, so two pools sync):
-/// - an upkeep pass that changes nothing: `[1, 2, 2, 0]`, asked 0, no file moved: no
+/// times the guard was asked (off the keeper's thread every pass syncs the three pools, and
+/// Codex's stops before any publication, the lab listing no row of its):
+/// - an upkeep pass that changes nothing: `[1, 3, 2, 0]`, asked 0, no file moved: no
 ///   receipt admission. That is not every strict read of the registry a sync can cause in a
 ///   window: its capture and each validation refresh the lab view, which reads the registry's
 ///   mail metadata strictly where its held lab does not stand
@@ -348,19 +355,20 @@ fn an_upkeep_sync_from_a_fleet_file_is_counted_without_a_guard() {
 ///   and the verb exits 0;
 /// - the same unchanged syncs as init runs them (`sync_cli_accounts_with`): `[0, 0, 0, 2]`,
 ///   asked 2;
-/// - an upkeep pass after the lab prefers a second Kimi account here: `[1, 2, 2, 1]`,
+/// - an upkeep pass after the lab prefers a second Kimi account here: `[1, 3, 2, 1]`,
 ///   asked 1 (Kimi's plan adds the row; Grok's changes nothing), and the row is added;
 /// - an upkeep pass after that row's login directory was removed, the roster's bytes equal:
-///   `[1, 2, 2, 1]`, asked 1, and the directory is made again: the receipt owns it;
-/// - with the guard refusing: an unchanged upkeep pass is `[1, 2, 2, 0]`, asked 0 and
+///   `[1, 3, 2, 1]`, asked 1, and the directory is made again: the receipt owns it;
+/// - with the guard refusing: an unchanged upkeep pass is `[1, 3, 2, 0]`, asked 0 and
 ///   moves no file; a person's unchanged sync through the verb is asked 1 and fails with the
 ///   guard's refusal on stderr; an upkeep pass whose plan would add a third Kimi row is
 ///   asked 1 and adds nothing.
 ///
-/// NEGATIVE CONTROLS (2026-11-13), each applied alone:
+/// NEGATIVE CONTROLS (2026-11-16, run again against these counts), each applied alone, the file
+/// touched after its restore:
 /// - the admission restored for the upkeep (`SyncCaller::admits` answering `EveryPlan` for
-///   `Upkeep`): `an unchanged upkeep pass` fails, left `([1, 2, 2, 2], 2)`, right
-///   `([1, 2, 2, 0], 0)`;
+///   `Upkeep`): `an unchanged upkeep pass` fails, left `([1, 3, 2, 2], 2)`, right
+///   `([1, 3, 2, 0], 0)`;
 /// - the admission dropped for a person's unchanged sync (`Changes` for `Person`):
 ///   `Kimi: a person's unchanged sync` fails, left `([0, 0, 0, 0], 0)`, right
 ///   `([0, 0, 0, 1], 1)`;
@@ -379,7 +387,7 @@ fn an_unchanged_upkeep_sync_asks_no_admission_and_every_other_sync_asks_as_it_di
     assert_eq!(script.pass(), ([1, 3, 2, 4], 4), "the first pass");
 
     let before = script.tree();
-    assert_eq!(script.pass(), ([1, 2, 2, 0], 0), "an unchanged upkeep pass");
+    assert_eq!(script.pass(), ([1, 3, 2, 0], 0), "an unchanged upkeep pass");
     assert_eq!(script.tree(), before, "an unchanged pass writes nothing");
 
     for cli in [Cli::Kimi, Cli::Grok] {
@@ -407,7 +415,7 @@ fn an_unchanged_upkeep_sync_asks_no_admission_and_every_other_sync_asks_as_it_di
         ))));
     assert_eq!(
         script.pass(),
-        ([1, 2, 2, 1], 1),
+        ([1, 3, 2, 1], 1),
         "an upkeep pass that adds one row"
     );
     assert!(
@@ -424,7 +432,7 @@ fn an_unchanged_upkeep_sync_asks_no_admission_and_every_other_sync_asks_as_it_di
     fs::remove_dir(&directory).unwrap();
     assert_eq!(
         script.pass(),
-        ([1, 2, 2, 1], 1),
+        ([1, 3, 2, 1], 1),
         "an upkeep pass that makes a missing login directory"
     );
     assert!(directory.is_dir(), "the receipt made the directory again");
@@ -434,7 +442,7 @@ fn an_unchanged_upkeep_sync_asks_no_admission_and_every_other_sync_asks_as_it_di
     let before = script.tree();
     assert_eq!(
         script.pass(),
-        ([1, 2, 2, 0], 0),
+        ([1, 3, 2, 0], 0),
         "an unchanged upkeep pass under a guard that refuses"
     );
     let refused = script.counted(|| {
@@ -458,7 +466,7 @@ fn an_unchanged_upkeep_sync_asks_no_admission_and_every_other_sync_asks_as_it_di
         ]))));
     assert_eq!(
         script.pass(),
-        ([1, 2, 2, 1], 1),
+        ([1, 3, 2, 1], 1),
         "an upkeep pass whose changed plan the guard refuses"
     );
     assert!(
@@ -472,4 +480,85 @@ fn an_unchanged_upkeep_sync_asks_no_admission_and_every_other_sync_asks_as_it_di
         before,
         "refused and unchanged syncs write nothing"
     );
+}
+
+/// UNDER TODAY'S WAKE, A KEEPER'S PASSES OVER NOTHING MOVED SKIP EVERY DUTY AND SYNC NO POOL
+/// (L1-memo, accounts upkeep on a cause, commit 10c). Over [`Scripted`] on the keeper's thread
+/// (`trace::keeper`), every read judged settled as of a minute past the clock, with whole passes
+/// (`UpkeepStep::Both`, what the window's upkeep thread makes at each wake): the first adds the
+/// lab's rows and counts, by `[passes, pool_syncs, pool_syncs_guarded, receipt_admissions]` with
+/// the times the guard was asked, what a syncing pass counts
+/// (`a_scripted_upkeep_moves_each_count_by_what_it_did`): `([1, 3, 2, 4], 4)`; a second
+/// confirms what it wrote, keeping each duty's verdict. The ten after them, with nothing moved:
+/// - count `([10, 0, 0, 0], 0)`: no pool syncs and no receipt is admitted;
+/// - by `[runs, skips, kept, poisoned]`, `[0, 10 × d, 0, 0]`, where `d` is how many duties the
+///   confirming pass entered: every duty is skipped;
+/// - take no account store's writer lock and move no file.
+///
+/// Then a Kimi roster written again with the same bytes moves the traces that read it: the next
+/// pass syncs Kimi's pool alone (`pool_syncs` 1) and still writes nothing.
+///
+/// NEGATIVE CONTROLS (2026-11-16), each failing `ten whole passes over nothing moved`, left
+/// `([10, 20, 20, 0], 0)`, right `([10, 0, 0, 0], 0)`: Kimi's and Grok's pools synced and were
+/// guarded at each of the ten passes:
+/// - the memo off (`accounts_upkeep_memo::standing` taking its kept verdict as
+///   `memo.take(duty)).filter(|_| false)`, so none stands);
+/// - a store that keeps no `machine` file drawing its id at each load (`mint_machine()` in
+///   place of `self.unkept_machine()` in `Store::state_as_stored`).
+///
+/// Each restored, the file touched.
+#[test]
+fn ten_whole_passes_over_nothing_moved_skip_every_duty_and_sync_no_pool() {
+    let script = Scripted::new("upkeep-memo-rest");
+    let duties = |c: UpkeepCounts| [c.duty_runs, c.duty_skips, c.duty_kept, c.duty_poisoned];
+    let whole = || {
+        let before = duties(counts_here());
+        let counted = script.pass_of(UpkeepStep::Both);
+        let after = duties(counts_here());
+        let moved: [u64; 4] = std::array::from_fn(|i| after[i] - before[i]);
+        (counted, moved)
+    };
+    trace::keeper(|| {
+        trace::read_as_if_later(Duration::from_secs(60), || {
+            let (counted, _) = whole();
+            assert_eq!(counted, ([1, 3, 2, 4], 4), "the first whole pass");
+            let (_, [runs, skips, ..]) = whole();
+            let entered = runs + skips;
+            assert!(entered > 0, "the confirming pass entered no duty");
+
+            let tree = script.tree();
+            let locks = store_locks_here();
+            let before = duties(counts_here());
+            let counted = script.counted(|| {
+                for _ in 0..10 {
+                    upkeep_pass(&script.bed, &script.rediscovery, UpkeepStep::Both);
+                }
+            });
+            let after = duties(counts_here());
+            let moved: [u64; 4] = std::array::from_fn(|i| after[i] - before[i]);
+            assert_eq!(
+                counted,
+                ([10, 0, 0, 0], 0),
+                "ten whole passes over nothing moved"
+            );
+            assert_eq!(
+                moved,
+                [0, 10 * entered, 0, 0],
+                "ten whole passes over nothing moved: [runs, skips, kept, poisoned]"
+            );
+            assert_eq!(store_locks_here() - locks, 0, "no store lock is taken");
+            assert_eq!(script.tree(), tree, "no file moves");
+
+            let kimi = script.bed.roster(Cli::Kimi);
+            let bytes = fs::read(&kimi).unwrap();
+            fs::write(&kimi, &bytes).unwrap();
+            let tree = script.tree();
+            let counted = script.pass_of(UpkeepStep::Both);
+            assert_eq!(
+                counted.0[1], 1,
+                "a rewritten Kimi roster syncs Kimi alone: {counted:?}"
+            );
+            assert_eq!(script.tree(), tree, "the sync it runs writes nothing");
+        });
+    });
 }

@@ -36,7 +36,9 @@ use crate::native_tables::{
     AsOf, Author, AuthorKind, ColumnKind, Group, Observed, Schema, Sheet, SheetColumn, SheetRow,
     Shown, Since, Written, WrittenCell,
 };
-use crate::native_tables::{Snapshot, Staged, Wrote};
+use crate::native_tables::{Asked, Opened, Paged, Snapshot, Staged, Wrote};
+#[cfg(unix)]
+use crate::native_tables::{Logged, LoggedCell, OpenedCell, Valued};
 
 /// The compiled table a sheet was read from, which a new row's key is derived by.
 #[cfg(unix)]
@@ -442,7 +444,11 @@ pub(crate) fn read(
     let mut projections = BTreeMap::new();
     for shown in listed.iter().filter(|shown| !shown.owned) {
         let collection = compiled.collection(shown.name).map_err(|e| e.to_string())?;
-        projections.insert(shown.name, (collection, view.project(collection)));
+        let (projection, settled) = view.project_settled(collection);
+        projections.insert(
+            shown.name,
+            (collection, projection, std::sync::Arc::new(settled)),
+        );
     }
     let mut sheets = Vec::with_capacity(listed.len());
     let mut whole = true;
@@ -486,7 +492,7 @@ pub(crate) fn read(
 /// ([`aterm_db::typed::ClaimRule::Label`]): its value as written, not the claim it reads as.
 #[cfg(unix)]
 fn written_label(projections: &Projections, to: &str, pk: &str) -> Option<String> {
-    let (collection, projection) = projections.get(to)?;
+    let (collection, projection, _) = projections.get(to)?;
     let column = collection
         .columns
         .iter()
@@ -635,9 +641,16 @@ struct Read<'a> {
     cells: &'a std::sync::Arc<aterm_db::typed::cell::Cells>,
 }
 
-/// The cells collections' projections, by name.
+/// The cells collections' projections, by name, each with how its claimed columns settled.
 #[cfg(unix)]
-type Projections = BTreeMap<&'static str, (&'static Collection, aterm_db::typed::cell::Projection)>;
+type Projections = BTreeMap<
+    &'static str,
+    (
+        &'static Collection,
+        aterm_db::typed::cell::Projection,
+        std::sync::Arc<aterm_db::typed::claim::Settlements>,
+    ),
+>;
 
 #[cfg(unix)]
 impl Read<'_> {
@@ -893,7 +906,7 @@ impl Read<'_> {
         projections: &Projections,
     ) -> Result<(Sheet, bool), String> {
         let name = shown.name;
-        let (collection, projection) = &projections[name];
+        let (collection, projection, settled) = &projections[name];
         let collection: &'static Collection = collection;
         // A phone's number is ordinary data a generation builds up to 0.200.0 read holds sealed:
         // it shows as it is, opened with nothing recorded, and stays read-only. Where the open
@@ -948,7 +961,7 @@ impl Read<'_> {
         // LINKED ROWS: how many live rows of another cells collection name each row.
         let mut linked: Vec<(String, BTreeMap<String, usize>)> = Vec::new();
         for other in self.listed.iter().filter(|other| !other.owned) {
-            let (other_collection, other_projection) = &projections[other.name];
+            let (other_collection, other_projection, _) = &projections[other.name];
             for column in other_collection.columns {
                 if target(&column.ty) != Some(name) || !column.live_at(other_collection.version) {
                     continue;
@@ -1212,6 +1225,7 @@ impl Read<'_> {
                 compiled: self.compiled,
                 collection,
                 cells: self.cells.clone(),
+                settled: settled.clone(),
             }),
             life,
             referrers,
@@ -1432,6 +1446,11 @@ pub(crate) struct Reading {
     /// Each new row's key as the save would derive it from its cells now, by the key the page
     /// gives it ([`crate::native_tables::rows::NEW`]): where nothing refuses the grid.
     pub(crate) keys: std::collections::BTreeMap<String, String>,
+    /// The record of one Write of the grid that carries each cell it writes, by row key (a new
+    /// row's as [`Self::keys`] has it) and column, as the save appends them where the Write lands
+    /// on the read ([`aterm_db::att::Compiled::appended`]): a cell it leaves out writes nothing.
+    /// `None` where the grid is refused, or the save's own rules would refuse the Write.
+    pub(crate) records: Option<std::collections::BTreeMap<(String, String), usize>>,
 }
 
 /// What the save would refuse of `staged` (by row and column) on `sheet`, by row and column with
@@ -1459,19 +1478,43 @@ pub(crate) fn refusals(sheet: &Sheet, staged: &BTreeMap<(String, String), String
         &born,
     ) {
         // A key made at random as the row is written (a phone's) is not this one.
-        Ok(_) if aterm_db::alab::registry::born_at_random(schema.collection.name) => Reading {
-            refused: BTreeMap::new(),
-            keys: BTreeMap::new(),
-        },
+        Ok(_) if aterm_db::alab::registry::born_at_random(schema.collection.name) => {
+            Reading::default()
+        }
         Ok(plan) => Reading {
             refused: BTreeMap::new(),
+            records: carried(schema, &plan),
             keys: keys.into_iter().zip(plan.born).collect(),
         },
         Err(problems) => Reading {
             refused: placed(&sheet.base, &keys, problems).into_iter().collect(),
-            keys: BTreeMap::new(),
+            ..Reading::default()
         },
     }
+}
+
+/// The record of one Write of `plan` that carries each cell it writes, by row key and column:
+/// the records the save appends where it lands on the read `schema` holds
+/// ([`aterm_db::att::Compiled::appended`]); `None` where the save's rules refuse it or a row
+/// passes a record's limits.
+#[cfg(unix)]
+fn carried(schema: &Schema, plan: &grid::Plan) -> Option<BTreeMap<(String, String), usize>> {
+    let records = schema
+        .compiled
+        .appended(schema.collection, plan, &schema.cells)
+        .ok()??;
+    let mut out = BTreeMap::new();
+    for (record, changes) in records.iter().enumerate() {
+        for change in changes {
+            if change.collection != schema.collection.name {
+                continue;
+            }
+            if let Ok(key) = aterm_db::typed::cell::CellKey::parse(&change.key) {
+                out.insert((key.pk.to_owned(), key.col.to_owned()), record);
+            }
+        }
+    }
+    Some(out)
 }
 
 /// No registry is read here, so nothing is staged to check.
@@ -1538,6 +1581,371 @@ pub(crate) fn write(paths: &Paths, staged: Vec<Staged>) -> Result<Wrote, String>
     Ok(wrote)
 }
 
+/// The kind History's page names for `kind`, as `aterm-db` decides it.
+#[cfg(unix)]
+const fn author_kind(kind: aterm_db::att::EntryKind) -> AuthorKind {
+    match kind {
+        aterm_db::att::EntryKind::Aterm => AuthorKind::Aterm,
+        aterm_db::att::EntryKind::Import => AuthorKind::Import,
+        aterm_db::att::EntryKind::Explicit => AuthorKind::Explicit,
+    }
+}
+
+/// A column's words, as the drawer and the pane say a field: `Location`, `Ram gb`.
+#[cfg(unix)]
+fn column_words(name: &str) -> String {
+    crate::native_tables::sentence(&label_of(name))
+}
+
+/// What one stored change of `table` says in History: the row it wrote, its column where it is
+/// a typed cell, and what changed in words, the value as the grid shows it (a secret reference
+/// as its store entry's name, never a value: [`shown_value`]). An owned or log row's write is
+/// one whole-row change.
+#[cfg(unix)]
+fn change_words(table: &Table, change: &aterm_db::database::Change) -> LoggedCell {
+    use aterm_db::typed::cell::{CellKey, CellValue};
+    let whole = || LoggedCell {
+        collection: change.collection.clone(),
+        pk: change.key.clone(),
+        column: None,
+        words: "whole row".to_owned(),
+    };
+    let Some(collection) = table.collection(&change.collection) else {
+        return whole();
+    };
+    if collection.kind != Kind::Cells {
+        return whole();
+    }
+    let Ok(key) = CellKey::parse(&change.key) else {
+        return whole();
+    };
+    let words = column_words(key.col);
+    let value = change
+        .value
+        .as_ref()
+        .and_then(|value| CellValue::decode(value).ok());
+    let now = match (collection.column(key.col), &value, key.elem) {
+        (_, Some(cell), Some(elem)) if cell.x.as_bool() == Some(true) => format!("+ {elem}"),
+        (_, Some(_), Some(elem)) => format!("\u{2212} {elem}"),
+        (Some(schema), Some(cell), None) => set_words(&schema.ty, &cell.x)
+            .unwrap_or_else(|| shown_value(collection.name, schema, key.pk, Some(&cell.x))),
+        // A column this build does not compile: what it holds is not said.
+        (None, Some(_), None) => "a value this build cannot read".to_owned(),
+        (_, None, _) => String::new(),
+    };
+    let now = if now.is_empty() {
+        "empty".to_owned()
+    } else {
+        now
+    };
+    LoggedCell {
+        collection: change.collection.clone(),
+        pk: key.pk.to_owned(),
+        column: Some(key.col.to_owned()),
+        words: format!("{words} \u{2192} {now}"),
+    }
+}
+
+/// One record of `table`'s history as History lists it.
+#[cfg(unix)]
+fn logged(table: &Table, entry: &aterm_db::att::Entry) -> Logged {
+    let (label, id) = named(&entry.mac);
+    Logged {
+        operation: entry.operation,
+        by: Author {
+            kind: author_kind(entry.kind),
+            label,
+            id,
+            at_ms: entry.authored_ms,
+            hlc: (entry.hlc.ms, entry.hlc.counter),
+        },
+        machine: entry.mac.row().map(str::to_owned),
+        inert: entry.inert.is_some(),
+        cells: entry
+            .changes
+            .iter()
+            .map(|change| change_words(table, change))
+            .collect(),
+    }
+}
+
+/// What History's reader keeps between its reads ([`history`]): the registry's ordered history at
+/// one revision, so a page at that revision reads no record again. One revision of one table,
+/// replaced when the registry moves; the reader holds it for as long as it reads.
+#[cfg(unix)]
+pub(crate) type Kept = aterm_db::att::Kept;
+
+/// Where the registry is not kept, History reads nothing to keep.
+#[cfg(not(unix))]
+#[derive(Debug, Default)]
+pub(crate) struct Kept;
+
+/// One page of History ([`crate::native_tables::Asked`]): the registry's records newest first,
+/// at least `asked.limit` of those its filters keep where so many are left, read a page at a time
+/// (`aterm_db::att::Handle::history_page`, newest first). The table and kind filters are the
+/// store's; where a machine or Find is asked, the records the store serves are judged here,
+/// until the page is full or [`crate::native_tables::SCAN`] records were looked at: the next
+/// page then goes on from the last record looked at. Where `asked.through` names a record, the
+/// page holds every record the filters keep from the newest through it, whatever the bounds, so a
+/// read again keeps every line that showed: the store's pages are read on until it is passed. A
+/// store page that finds the registry moved starts from the newest record again, and the page
+/// says so. Every store page is cut from `kept`, the registry's ordered history at the revision
+/// it holds, where the registry is still at that revision: Read older, a filter changed and each
+/// store page after the first then read no record again
+/// (`aterm_db::att::Handle::history_page_kept`).
+///
+/// # Errors
+/// As [`read`].
+#[cfg(unix)]
+pub(crate) fn history(paths: &Paths, asked: &Asked, kept: &mut Kept) -> Result<Paged, String> {
+    use crate::native_tables::{SCAN, place_words, words_of};
+    use aterm_db::att::history::{Ask, Cursor, Filter, Revision};
+    use aterm_db::att::{Handle, Hlc, REGISTRY};
+    let handle = Handle::at(paths.clone(), &REGISTRY);
+    let table = handle.compiled().table;
+    let tables = history_tables(table);
+    let title = |name: &str| {
+        tables.iter().find(|(each, _)| each == name).map_or_else(
+            || crate::native_tables::sentence(name),
+            |(_, title)| title.clone(),
+        )
+    };
+    let row = |collection: &str, pk: &str| {
+        asked
+            .names
+            .get(&(collection.to_owned(), pk.to_owned()))
+            .cloned()
+            .unwrap_or_else(|| pk.to_owned())
+    };
+    let judges = asked.filter.reads();
+    let cursor = |(ms, counter, operation): (u64, u64, [u8; 32])| Cursor {
+        hlc: Hlc { ms, counter },
+        operation,
+    };
+    let through = asked.through.map(cursor);
+    let mut ask = Ask {
+        filter: Filter {
+            collection: asked.filter.table.clone(),
+            kind: asked.filter.kind.map(|kind| match kind {
+                AuthorKind::Aterm => aterm_db::att::EntryKind::Aterm,
+                AuthorKind::Import => aterm_db::att::EntryKind::Import,
+                AuthorKind::Explicit => aterm_db::att::EntryKind::Explicit,
+            }),
+            ..Filter::default()
+        },
+        after: asked.before.map(cursor),
+        // Judged here, a store page is as long as the bound, so one read most often answers.
+        limit: if judges { SCAN } else { asked.limit.max(1) },
+        revision: asked.revision.map(Revision),
+        newest_first: true,
+    };
+    let mut records = Vec::new();
+    let mut looked = 0;
+    let mut moved = false;
+    loop {
+        let page = handle
+            .history_page_kept(&ask, kept)
+            .map_err(|e| e.to_string())?;
+        if page.moved {
+            // Asked at an older revision, or moved between two store pages of this read: the
+            // store starts from the newest record, and what this read kept goes.
+            moved = true;
+            records.clear();
+            looked = 0;
+        }
+        let last = page.entries.len().saturating_sub(1);
+        let mut stopped = None;
+        for (at, entry) in page.entries.iter().enumerate() {
+            looked += 1;
+            let record = logged(table, entry);
+            let keeps = !judges || {
+                let (place, changed) = place_words(&record, title, row);
+                asked
+                    .filter
+                    .keeps(&record, &words_of(&record, &place, &changed))
+            };
+            if keeps {
+                records.push(record);
+            }
+            let passed = through.is_none_or(|through| entry.cursor() <= through);
+            if passed && (records.len() >= asked.limit || (judges && looked >= SCAN)) {
+                stopped = Some((at, entry.cursor()));
+                break;
+            }
+        }
+        if stopped.is_some() || page.next.is_none() {
+            let next = match stopped {
+                Some((at, _)) if at == last && page.next.is_none() => None,
+                Some((_, cursor)) => Some(cursor),
+                None => None,
+            };
+            return Ok(Paged {
+                records,
+                next: next.map(|next| (next.hlc.ms, next.hlc.counter, next.operation)),
+                revision: page.revision.0,
+                moved,
+                tables,
+            });
+        }
+        // The store's page ended short of the bounds, or of the record asked through.
+        ask.after = page.next;
+        ask.revision = Some(page.revision);
+    }
+}
+
+/// Every collection of `table` History can list records of, by name and title: the rail's
+/// ([`listed`]) in its order, then every other (a log, a carried face such as `archived`) in the
+/// table's order, by its face's title where it has one, else its name in words.
+#[cfg(unix)]
+pub(crate) fn history_tables(table: &Table) -> Vec<(String, String)> {
+    let listed = listed(table);
+    let mut tables: Vec<(String, String)> = listed
+        .iter()
+        .map(|listed| (listed.name.to_owned(), listed.title.to_owned()))
+        .collect();
+    tables.extend(
+        table
+            .collections
+            .iter()
+            .filter(|collection| !listed.iter().any(|l| l.name == collection.name))
+            .map(|collection| {
+                let title = table.faced(collection.name).map_or_else(
+                    || crate::native_tables::sentence(collection.name),
+                    |faced| faced.title.to_owned(),
+                );
+                (collection.name.to_owned(), title)
+            }),
+    );
+    tables
+}
+
+/// What record `operation` of the registry wrote, opened for History: each cell with what it
+/// wrote, what that replaced, the writes beside it it had not seen and what has written there
+/// since (`aterm_db::att::Handle::wrote_named`), each value as the grid shows it and each writer
+/// by its machine's name.
+///
+/// # Errors
+/// As [`read`]; or this machine holds no such eligible record.
+#[cfg(unix)]
+pub(crate) fn record(paths: &Paths, operation: [u8; 32]) -> Result<Opened, String> {
+    use aterm_db::att::{Handle, REGISTRY};
+    let handle = Handle::at(paths.clone(), &REGISTRY);
+    let table = handle.compiled().table;
+    let (wrote, macs) = handle.wrote_named(operation).map_err(|e| e.to_string())?;
+    let cells = wrote
+        .iter()
+        .map(|cell| {
+            let place = change_words(
+                table,
+                &aterm_db::database::Change {
+                    collection: cell.collection.clone(),
+                    key: cell.key.clone(),
+                    value: None,
+                },
+            );
+            // What an owned or log row's write replaced, where it replaced one row: what it
+            // wrote says which fields it changed.
+            let over = match cell.replaced.as_slice() {
+                [one] if !one.withheld => one.value.as_ref(),
+                _ => None,
+            };
+            let whole = place.column.is_none();
+            let words = |held: &aterm_db::att::Held, over: Option<&aterm_json::Value>| -> String {
+                if held.withheld {
+                    return "a secret, not shown".to_owned();
+                }
+                let Some(value) = &held.value else {
+                    return "nothing".to_owned();
+                };
+                if whole {
+                    return whole_row_words(value, over);
+                }
+                change_words(
+                    table,
+                    &aterm_db::database::Change {
+                        collection: cell.collection.clone(),
+                        key: cell.key.clone(),
+                        value: Some(value.clone()),
+                    },
+                )
+                .words
+                .rsplit_once(" \u{2192} ")
+                .map_or_else(|| "the whole row".to_owned(), |(_, now)| now.to_owned())
+            };
+            let valued = |held: &[aterm_db::att::Held]| -> Vec<Valued> {
+                held.iter()
+                    .map(|held| {
+                        // As every line names a writer: its machine row's name, else its id's start.
+                        let (label, id) = named(&macs.name(&held.actor, held.machine.as_ref()));
+                        Valued {
+                            by: label.unwrap_or(id),
+                            words: words(held, None),
+                        }
+                    })
+                    .collect()
+            };
+            OpenedCell {
+                collection: cell.collection.clone(),
+                pk: place.pk.clone(),
+                what: place
+                    .column
+                    .as_deref()
+                    .map_or_else(|| "Whole row".to_owned(), column_words),
+                column: place.column,
+                now: cell
+                    .wrote
+                    .iter()
+                    .map(|held| words(held, over))
+                    .collect::<Vec<_>>()
+                    .join(" / "),
+                was: valued(&cell.replaced),
+                unseen: valued(&cell.unseen),
+                since: valued(&cell.since),
+            }
+        })
+        .collect();
+    Ok(Opened { cells })
+}
+
+/// What an owned or log row's whole value says in History, opened: `a row of 3 fields`; written
+/// over `over`, the one row it replaced, the fields whose values differ, in words
+/// (`Location, Ram gb changed`), the counter that orders a Mac's own statements left out. Never a
+/// value: a field may hold a secret.
+#[cfg(unix)]
+pub(crate) fn whole_row_words(
+    value: &aterm_json::Value,
+    over: Option<&aterm_json::Value>,
+) -> String {
+    fn fields(value: &aterm_json::Value) -> Option<BTreeMap<&String, &aterm_json::Value>> {
+        value.as_object().map(|map| {
+            map.iter()
+                .filter(|(name, _)| name.as_str() != COUNTER)
+                .collect()
+        })
+    }
+    let Some(now) = fields(value) else {
+        return "a row".to_owned();
+    };
+    let Some(was) = over.and_then(fields) else {
+        return match now.len() {
+            1 => "a row of 1 field".to_owned(),
+            n => format!("a row of {n} fields"),
+        };
+    };
+    let names: std::collections::BTreeSet<&String> =
+        now.keys().chain(was.keys()).copied().collect();
+    let changed: Vec<String> = names
+        .into_iter()
+        .filter(|name| now.get(name) != was.get(name))
+        .map(|name| column_words(name))
+        .collect();
+    if changed.is_empty() {
+        "no field changed".to_owned()
+    } else {
+        format!("{} changed", changed.join(", "))
+    }
+}
+
 /// Where a Mac's registry is: the secrets client's paths, which only macOS and Linux have.
 #[cfg(unix)]
 pub(crate) type Paths = aterm_secrets::client::Paths;
@@ -1575,6 +1983,14 @@ pub(crate) struct Mark {
     revision: aterm_db::att::Revision,
 }
 
+#[cfg(unix)]
+impl Mark {
+    /// The registry's revision this mark is of, as History's pages name theirs.
+    pub(crate) const fn digest(&self) -> [u8; 32] {
+        self.revision.0
+    }
+}
+
 /// [`Mark`] of the registry at `paths`.
 ///
 /// # Errors
@@ -1593,6 +2009,13 @@ pub(crate) fn mark(paths: &Paths) -> Result<Mark, String> {
 pub(crate) enum Mark {}
 
 #[cfg(not(unix))]
+impl Mark {
+    pub(crate) const fn digest(&self) -> [u8; 32] {
+        match *self {}
+    }
+}
+
+#[cfg(not(unix))]
 pub(crate) fn mark(_: &Paths) -> Result<Mark, String> {
     Err("the registry is kept on macOS and Linux".into())
 }
@@ -1604,6 +2027,16 @@ pub(crate) fn read(_: &Paths, _: Option<[u8; 32]>, _: bool) -> Result<(Snapshot,
 
 #[cfg(not(unix))]
 pub(crate) fn write(_: &Paths, _: Vec<Staged>) -> Result<Wrote, String> {
+    Err("the registry is kept on macOS and Linux".into())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn history(_: &Paths, _: &Asked, _: &mut Kept) -> Result<Paged, String> {
+    Err("the registry is kept on macOS and Linux".into())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn record(_: &Paths, _: [u8; 32]) -> Result<Opened, String> {
     Err("the registry is kept on macOS and Linux".into())
 }
 

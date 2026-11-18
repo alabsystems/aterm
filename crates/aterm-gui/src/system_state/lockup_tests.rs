@@ -5,7 +5,7 @@ use super::*;
 
 fn spec(px: f32, scale: f32, done: u32, total: u32) -> LockupSpec {
     LockupSpec {
-        kitty: true,
+        road: true,
         px,
         scale,
         alab: true,
@@ -43,7 +43,7 @@ fn lockup_values_round_trip() {
     for value in [
         spec(22.0, 2.0, 11, 16),
         LockupSpec {
-            kitty: false,
+            road: false,
             alab: false,
             dark: !dark(),
             pose: CatPose::Loaf,
@@ -76,7 +76,7 @@ fn lockup_values_round_trip() {
         }
     }
     // Unreadable numbers fall back; a count past the total is the total.
-    let read = LockupSpec::parse(Some("kitty,NaN,0,1,1,20,16,99"));
+    let read = LockupSpec::parse(Some("road,NaN,0,1,1,20,16,99"));
     assert_eq!(
         (read.px, read.scale, read.done, read.total),
         (22.0, 2.0, 16, 16)
@@ -219,10 +219,13 @@ fn the_images_sit_on_whole_device_pixels_and_match_what_is_baked_ahead() {
     }
 }
 
-/// A new moment never waits on a bake: the last moment's road and cat stay until the new ones
-/// are kept. NEGATIVE CONTROL: once they are, the new moment draws.
+/// A new step of the run never waits on a bake: the road and the cat painted last, laid out
+/// after the same words at the same size, stay until the step's own are kept, and images baked
+/// for the other ground never stand in (new words or a new size are
+/// `new_words_or_a_new_size_paint_the_words_alone_until_their_road_lands`). NEGATIVE CONTROL:
+/// once the step's own are kept, they draw.
 #[test]
-fn a_new_moment_waits_for_its_bakes_and_the_last_one_stays_meanwhile() {
+fn a_new_step_waits_for_its_bakes_and_the_last_one_stays_meanwhile() {
     let width = 300.0;
     let last = LockupSpec {
         pose: CatPose::Walk,
@@ -257,11 +260,60 @@ fn a_new_moment_waits_for_its_bakes_and_the_last_one_stays_meanwhile() {
     assert_eq!(other.paint(width, Some(last)).images, None);
 }
 
-/// A LIVE RESIZE AND A NEW DISPLAY NEVER BAKE WHERE THEY PAINT (§4.5): a lockup grown wider, or
-/// on a display of another scale, whose own images are not baked yet paints the road and the
-/// cat it painted last, one to one as they were baked, clipped to the node; rasterizing that
-/// frame keeps nothing new and leaves the new size unbaked. NEGATIVE CONTROL: the held road
-/// draws (its pixels show over the ground), and once the new size's images are kept they draw.
+/// THE HELD ROAD STARTS WHERE THESE WORDS END (§4.5): while a moment's images bake, the road and
+/// the cat painted last stand in for them only where they were laid out after the same words at
+/// the same size. A moment whose words grew (`aterm` became `aterm · ALab` mid-run, as the
+/// Secrets row came into place) or are set a size up (a resize past a size step) paints its
+/// words alone until its own images land: the last road starts where the old words ended, inside
+/// the new ones. NEGATIVE CONTROL: the next step of the same words at the same size holds the
+/// last road and cat.
+#[test]
+fn new_words_or_a_new_size_paint_the_words_alone_until_their_road_lands() {
+    let width = 852.0;
+    let laid = |alab, px| LockupSpec {
+        alab,
+        ..spec(px, 2.0, 5, 16)
+    };
+    let step = |spec: LockupSpec| LockupSpec { done: 6, ..spec };
+    let before = laid(false, 16.0);
+    let last = baked_paint(before, width).images.expect("baked");
+    let next = step(before);
+    assert!(
+        !next.wanted(width).ready(),
+        "the next step is not baked yet"
+    );
+    assert_eq!(
+        next.paint(width, Some(last)).images,
+        Some(last),
+        "control: the same words at the same size hold the last road"
+    );
+    for now in [step(laid(true, 16.0)), step(laid(false, 22.0))] {
+        assert!(!now.wanted(width).ready(), "{now:?}: not baked yet");
+        assert!(
+            last.spec.road_x() < now.words_end(),
+            "{now:?}: the last road starts at {}, inside these words, which end at {}",
+            last.spec.road_x(),
+            now.words_end()
+        );
+        let paint = now.paint(width, Some(last));
+        assert_eq!(paint.images, None, "{now:?}: the words alone");
+        assert!(paint.pending, "{now:?}: while its own images bake");
+        let own = baked_paint(now, width).images;
+        assert_eq!(
+            now.paint(width, Some(last)).images,
+            own,
+            "{now:?}: its own images draw once kept"
+        );
+    }
+}
+
+/// A LIVE RESIZE AND A NEW DISPLAY NEVER BAKE WHERE THEY PAINT (§4.5): a lockup grown wider or
+/// narrower at the same words' size, or on a display of another scale, whose own images are not
+/// baked yet paints the road and the cat it painted last, one to one as they were baked, clipped
+/// to the node; painting that frame keeps nothing new and leaves the new size unbaked (that the
+/// raster draws an image not kept as nothing, and bakes none, is `tray_raster`'s
+/// `an_image_not_kept_draws_nothing_and_bakes_nothing`). NEGATIVE CONTROL: the held road draws
+/// (its pixels show over the ground), and once the new size's images are kept they draw.
 #[test]
 fn a_width_or_scale_change_paints_the_last_images_and_never_bakes() {
     let before = spec(22.0, 2.0, 5, 16);
@@ -278,6 +330,7 @@ fn a_width_or_scale_change_paints_the_last_images_and_never_bakes() {
         let (spec_now, width_now) = now;
         let wanted = spec_now.wanted(width_now);
         assert!(!wanted.ready(), "{now:?}: the new size is not baked yet");
+        let kept = crate::widget::images_kept_bytes();
         let paint = spec_now.paint(width_now, Some(last));
         assert_eq!(
             paint.images,
@@ -304,7 +357,6 @@ fn a_width_or_scale_change_paints_the_last_images_and_never_bakes() {
             prim,
             DrawPrim::ClipPush { x, y, w, h } if (*x, *y, *w, *h) == (rect.x, rect.y, rect.width, rect.height)
         )));
-        let kept = crate::widget::images_kept_bytes();
         let ground = [0x10, 0x12, 0x18, 0xFF];
         let scale = spec_now.scale;
         let (w, h) = (
@@ -323,7 +375,7 @@ fn a_width_or_scale_change_paints_the_last_images_and_never_bakes() {
         assert_eq!(
             crate::widget::images_kept_bytes(),
             kept,
-            "{now:?}: the raster kept nothing new"
+            "{now:?}: painting the frame kept nothing new"
         );
         assert!(!wanted.ready(), "{now:?}: and baked nothing");
         let painted = |pixels: &[u8]| {
@@ -346,7 +398,7 @@ fn a_width_or_scale_change_paints_the_last_images_and_never_bakes() {
 }
 
 /// A COLD FIRST FRAME DRAWS THE WORDS ALONE (§4.5): with nothing baked, the lockup paints its
-/// chevron and words and no image, and the raster bakes nothing.
+/// chevron and words and no image, and painting it keeps nothing.
 #[test]
 fn a_cold_first_frame_draws_the_words_and_no_image() {
     let cold = spec(22.0, 2.0, 0, 16);
@@ -365,8 +417,11 @@ fn a_cold_first_frame_draws_the_words_and_no_image() {
             .iter()
             .any(|prim| matches!(prim, DrawPrim::Text { .. }))
     );
-    let _ = crate::tray_raster::rasterize_tray_pixels(&prims, 100, 100, 2.0, [0, 0, 0, 255]);
-    assert_eq!(crate::widget::images_kept_bytes(), 0);
+    assert_eq!(
+        crate::widget::images_kept_bytes(),
+        0,
+        "painting it kept nothing"
+    );
 }
 
 /// THE WORDS KEEP THEIR HIERARCHY (§4.5): `aterm` in the brand face's strong weight (SF Mono
@@ -461,7 +516,7 @@ fn aterm_is_bold_and_alab_and_the_separator_quieter() {
 fn the_words_alone_show_one_progress_and_a_full_track_at_done() {
     let width = 852.0;
     let text = |done| LockupSpec {
-        kitty: false,
+        road: false,
         ..spec(22.0, 2.0, done, 16)
     };
     let carets: Vec<f32> = [0, 8, 16].map(|done| text(done).caret_x()).to_vec();

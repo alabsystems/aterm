@@ -1006,7 +1006,7 @@ fn a_harness_led_claude_tab_is_observed() {
     let vendor = build("claude", 1_000_002_000_001_000_304, "claude");
     let row = contract::row_named("claude-code-alab").expect("rostered");
     assert!(
-        crate::harness_claim::image_in(&layout, row, &harness),
+        crate::harness_claim::image_in(&layout, row, &harness).is_some(),
         "the claim's image rule takes the harness's store build"
     );
     assert_eq!(

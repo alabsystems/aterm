@@ -1290,7 +1290,6 @@ fn job_marks(snap: &Snapshot) -> Vec<JobSaid> {
         .findings
         .zombies
         .iter()
-        .filter(|z| z.tab.is_some())
         .map(|z| u64::from(z.count))
         .sum();
     [

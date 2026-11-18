@@ -1046,8 +1046,15 @@ fn a_live_tree_client_keeps_the_eventual_ceiling_while_its_fifo_widens() {
     let implicit = client.attach_cargo(&mut cargo, &timed_out).unwrap();
     assert_eq!(
         cargo.get_args().collect::<Vec<_>>(),
-        ["-j", "14"],
+        ["--config", "build.jobs=14"],
         "NEGATIVE CONTROL: a live Cargo must not snapshot the initial one-token allocation"
+    );
+    assert_eq!(
+        cargo
+            .get_envs()
+            .find(|(name, _)| *name == "CARGO_BUILD_JOBS")
+            .and_then(|(_, value)| value),
+        Some(std::ffi::OsStr::new("14")),
     );
     std::thread::scope(|scope| {
         let workers: Vec<_> = (0..13)

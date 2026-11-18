@@ -795,6 +795,14 @@ pub(crate) fn exited(h: BorrowedHandle<'_>) -> bool {
     unsafe { WaitForSingleObject(h.as_raw_handle(), 0) == WAIT_OBJECT_0 }
 }
 
+/// Positive liveness of a retained process handle opened with [`SYNCHRONIZE`]. An exited
+/// process or a failed wait supplies no live observation.
+pub(crate) fn process_live(h: BorrowedHandle<'_>) -> bool {
+    const WAIT_TIMEOUT: u32 = 258;
+    // SAFETY: `h` is a live process handle for the borrow; a zero wait does not block.
+    unsafe { WaitForSingleObject(h.as_raw_handle(), 0) == WAIT_TIMEOUT }
+}
+
 /// `FILETIME` (`minwindef.h`): two 32-bit halves of a 64-bit 100-ns count, 4-byte aligned.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -838,7 +846,7 @@ pub(crate) fn process_path(pid: u32) -> Option<PathBuf> {
 }
 
 /// `h`'s creation, kernel and user `FILETIME` counts (`GetProcessTimes`), or `None`.
-fn process_times(h: BorrowedHandle<'_>) -> Option<(u64, u64, u64)> {
+pub(crate) fn process_times(h: BorrowedHandle<'_>) -> Option<(u64, u64, u64)> {
     let (mut creation, mut exit, mut kernel, mut user) = (
         FileTime::default(),
         FileTime::default(),

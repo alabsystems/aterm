@@ -12,7 +12,7 @@ use crate::snapshot::{
     verify_crate_cache,
 };
 
-fn scratch() -> aterm_tempfile::TempDir {
+pub(crate) fn scratch() -> aterm_tempfile::TempDir {
     aterm_tempfile::Builder::new()
         .prefix("aterm-snapshot-")
         .suffix(".noindex")
@@ -20,7 +20,7 @@ fn scratch() -> aterm_tempfile::TempDir {
         .unwrap()
 }
 
-fn git(dir: &Path, args: &[&str]) -> String {
+pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
     let out = crate::ledger::testing::git()
         .arg("-C")
         .arg(dir)
@@ -56,17 +56,17 @@ fn git(dir: &Path, args: &[&str]) -> String {
 
 const ARCHIVE: &[u8] = b"the itoa 1.0.0 archive\n";
 
-fn checksum() -> String {
+pub(crate) fn checksum() -> String {
     aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(ARCHIVE))
 }
 
 const OTHER: &str = "4e07408562bedb8b60ce05c1decfe3ad16b72230967de01f640b7e4729b49fce";
 
-fn held(root: PathBuf) -> CacheHold {
+pub(crate) fn held(root: PathBuf) -> CacheHold {
     CacheRoot::at(root).unwrap().hold().unwrap()
 }
 
-fn fixture(root: &Path) -> (PathBuf, String) {
+pub(crate) fn fixture(root: &Path) -> (PathBuf, String) {
     let template = template();
     let here = root.to_str().unwrap().as_bytes();
     for (rel, entry) in &template.entries {
@@ -186,7 +186,7 @@ fn moved(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
     out
 }
 
-fn stub_targo(root: &Path, crates: &str) -> PathBuf {
+pub(crate) fn stub_targo(root: &Path, crates: &str) -> PathBuf {
     let bin = root.join("toolchain/bin");
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::write(bin.join("crates"), crates).unwrap();

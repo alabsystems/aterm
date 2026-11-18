@@ -91,6 +91,9 @@ fn spec_xref_closure() {
     std::hint::black_box(
         aterm_agent::harness::accounts_sync::account_alias_admission_environment as fn(),
     );
+    std::hint::black_box(
+        aterm_agent::harness::accounts_upkeep_memo::account_upkeep_verdict_environment as fn(),
+    );
     #[cfg(unix)]
     std::hint::black_box(aterm_db::replica::db_repair_policy_environment as fn());
     #[cfg(unix)]
@@ -485,6 +488,7 @@ fn spec_xref_closure() {
         "AccountPublicationOutbox",
         "AccountFleetCommit",
         "AccountProviderCommit",
+        "AccountUpkeepVerdict",
     ] {
         assert!(
             report

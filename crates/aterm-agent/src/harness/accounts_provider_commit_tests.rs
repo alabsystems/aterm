@@ -7,8 +7,19 @@ use super::*;
 use crate::harness::alab_roster::{SourceSnapshot, TestSourceOverride};
 use aterm_spec::interp::State;
 
+/// A pool syncing by default whose provider receipt was cut short before its roster was written
+/// is recovered by the window's next upkeep of the pools, which writes the row the receipt held.
+/// The upkeep made again, with nothing left to do, records the receipt's path in its trace: a
+/// receipt left pending after a kept verdict moves that verdict's trace, so the keeper's memo
+/// runs the sync again rather than replay an answer from before it.
+///
+/// NEGATIVE CONTROL (2026-11-16), the one mutation of its mutant build that reached this test:
+/// `Store::receipt` reading the receipt under `trace::unrecorded` failed `the sync's trace
+/// records its receipt`. Restored, the file touched. (A mutant whose read report owed no
+/// recovery, `sync_needs_recovery` read as `false` there, did not fail: the sync it found due by
+/// its missing roster recovers the receipt itself.)
 #[test]
-fn pending_default_provider_receipt_bypasses_an_identical_input_hold() {
+fn a_pending_default_provider_receipt_is_recovered_by_the_upkeep() {
     let _source = TestSourceOverride::new(SourceSnapshot::Absent);
     let bed = Bed::new("default-recovery-hold");
     bed.secret(
@@ -22,14 +33,9 @@ fn pending_default_provider_receipt_bypasses_an_identical_input_hold() {
     assert!(interrupted.is_err());
     assert!(store.sync_needs_recovery());
     assert!(!bed.roster(Cli::Codex).exists());
-    let inputs = cli_sync_inputs(Cli::Codex, &bed.home, &bed.state, &bed.aterm_toml());
-    let rediscovery = std::sync::Mutex::new(Rediscovery {
-        default_held: BTreeMap::from([(Cli::Codex, (inputs, Instant::now()))]),
-        ..Rediscovery::default()
-    });
-    assert!(default_sync_holds(&rediscovery, Cli::Codex, &inputs));
-    let cooldown = std::sync::Mutex::new(None);
-    let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+    let rediscovery = Watched::new("accounts_sync/rediscovery", Rediscovery::default());
+    let cooldown = Watched::new("accounts_sync/sync_cooldown", None);
+    let guard = AutoRenewGuard::default().shared();
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
     let fx = super::super::login_tests::upkeep_effects(
         &read_named,
@@ -41,11 +47,33 @@ fn pending_default_provider_receipt_bypasses_an_identical_input_hold() {
     upkeep_pools(
         &bed.home,
         &bed.state,
-        (&bed.roster(Cli::Claude), NOW, UpkeepStep::Sync),
+        (
+            &bed.roster(Cli::Claude),
+            trace::Now::at(NOW),
+            UpkeepStep::Sync,
+        ),
         &fx,
     );
     assert!(!store.sync_needs_recovery());
     assert!(bed.rows(Cli::Codex).iter().any(|row| row.label == "new"));
+
+    let receipt = store.dir.join("sync-commit.json");
+    let ((), looked) = trace::scope(|| {
+        upkeep_pools(
+            &bed.home,
+            &bed.state,
+            (
+                &bed.roster(Cli::Claude),
+                trace::Now::at(NOW),
+                UpkeepStep::Sync,
+            ),
+            &fx,
+        );
+    });
+    assert!(
+        looked.files().any(|(path, _)| path == receipt),
+        "the sync's trace records its receipt: {looked:?}"
+    );
 }
 
 pub(crate) fn transition(state: &State, action: &str) -> State {

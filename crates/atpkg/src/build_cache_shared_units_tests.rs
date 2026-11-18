@@ -12,9 +12,28 @@ fn file(path: &Path) {
 
 /// Set `path`'s access and modification times to `at`.
 fn stamp(path: &Path, at: SystemTime) {
-    let file = std::fs::File::open(path).unwrap();
+    let file = open_to_stamp(path);
     file.set_times(std::fs::FileTimes::new().set_accessed(at).set_modified(at))
         .unwrap();
+}
+
+/// `path`, a file or a folder, opened so its times can be set: any open on Unix.
+#[cfg(unix)]
+fn open_to_stamp(path: &Path) -> std::fs::File {
+    std::fs::File::open(path).unwrap()
+}
+
+/// `path`, a file or a folder, opened so its times can be set: Windows sets them only through a
+/// handle that may write attributes, and opens a folder only with backup semantics.
+#[cfg(windows)]
+fn open_to_stamp(path: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .unwrap()
 }
 
 /// Every file and folder of `dir` last touched at `at`.
@@ -39,13 +58,17 @@ fn unit(path: &Path, at: SystemTime) -> PathBuf {
     path.to_path_buf()
 }
 
+/// Each path of `went` under `root`, its parts joined by `/` whatever the host's separator.
 fn names(went: &[(PathBuf, Unused)], root: &Path) -> Vec<String> {
     went.iter()
         .map(|(path, _)| {
-            path.strip_prefix(root)
+            let parts: Vec<_> = path
+                .strip_prefix(root)
                 .unwrap()
-                .to_string_lossy()
-                .into_owned()
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect();
+            parts.join("/")
         })
         .collect()
 }
@@ -279,6 +302,84 @@ fn a_shared_unit_whose_lock_a_build_holds_stays() {
     assert!(!held.exists());
 }
 
+/// ON WINDOWS A BUILD BETWEEN THE LOCK AND THE RENAME KEEPS ITS UNIT: Windows renames no folder
+/// holding an open file, so a pass lets go of a month-unused unit's lock, its intent on record,
+/// just before its rename aside. A build that takes the lock then (shared, as a reading build
+/// does) and holds it keeps the unit, its rename refused; one that takes it, reads the unit's
+/// fingerprint and lets go keeps it too, its read seen at the stage and the unit put back. Each
+/// intent closes with nothing gone. NEGATIVE CONTROL: a build that takes the lock and lets go
+/// without reading leaves the unit to go.
+#[cfg(windows)]
+#[test]
+fn on_windows_a_build_between_the_lock_and_the_rename_keeps_its_unit() {
+    use super::super::Refusal;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    for build in ["holds", "reads", "lets go"] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let (home, root) = home_and_store(dir.path());
+        let now = SystemTime::now();
+        let old = unit(&root.join("build/serde/0123abcd"), now - RECLAIM_IDLE - DAY);
+        let holding: Rc<RefCell<Option<crate::lock::Flock>>> = Rc::default();
+        let held = Rc::clone(&holding);
+        super::super::seams::on_staging(move |unit| {
+            // The pass let its lock go: a build takes it, shared.
+            let lock = reading(unit);
+            match build {
+                "holds" => *held.borrow_mut() = Some(lock),
+                "reads" => {
+                    std::fs::read(unit.join("fingerprint/lib-dep.json")).unwrap();
+                    drop(lock);
+                }
+                _ => drop(lock),
+            }
+        });
+        let went = reclaim(&home, now, &mut |_, _| true);
+        super::super::seams::clear();
+        drop(holding.borrow_mut().take());
+        assert_eq!(names(&went, &root), ["build/serde/0123abcd"], "{build}");
+        let why = &went[0].1;
+        match build {
+            "holds" => assert!(
+                matches!(
+                    why,
+                    Unused::Refused {
+                        by: Refusal::Rename(_)
+                    }
+                ),
+                "{build}: {why:?}"
+            ),
+            "reads" => assert!(
+                matches!(
+                    why,
+                    Unused::Refused {
+                        by: Refusal::Stopped
+                    }
+                ),
+                "{build}: {why:?}"
+            ),
+            _ => assert!(
+                matches!(why, Unused::SharedUnits { units: 1, .. }),
+                "{build}: {why:?}"
+            ),
+        }
+        let stays = build != "lets go";
+        assert_eq!(
+            old.join("fingerprint/lib-dep.json").is_file(),
+            stays,
+            "{build}"
+        );
+        assert_eq!(old.join(LOCK).is_file(), stays, "{build}");
+        let stages: Vec<_> = std::fs::read_dir(root.join("build/serde"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .filter(|name| name != "0123abcd")
+            .collect();
+        assert!(stages.is_empty(), "{build}: no stage is left: {stages:?}");
+    }
+}
+
 /// THE STORE IS LISTED WITH ITS BYTES: `aterm pkg machine cache` (`plan_home`) lists the store
 /// of a home's `.cargo` as one candidate whose paths are the units a pass takes, so its line
 /// carries their bytes on disk; the shared build cache and the tooling cache stay listed beside
@@ -317,18 +418,18 @@ fn the_shared_store_is_listed_with_its_bytes() {
 /// Trust's `homedir` does. NEGATIVE CONTROL: with no variable set the home's `.cargo` holds it.
 #[test]
 fn the_shared_stores_root_is_the_cargo_homes() {
-    let home = Path::new("/Users//someone");
-    let cwd = Path::new("/work/repo");
+    let (home, cwd) = (native("/Users//someone"), native("/work/repo"));
+    let (home, cwd) = (home.as_path(), cwd.as_path());
     let with = |vars: &[(&str, &str)]| {
         let vars: Vec<(String, OsString)> = vars
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), OsString::from(v)))
+            .map(|(k, v)| ((*k).to_owned(), native(v).into_os_string()))
             .collect();
         root_with(home, Some(cwd), &move |name| {
             vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
         })
     };
-    let store = |base: &str| Path::new(base).join("trust/native-dependencies-v1");
+    let store = |base: &str| native(base).join("trust/native-dependencies-v1");
     assert_eq!(with(&[]), store("/Users//someone/.cargo"));
     assert_eq!(
         with(&[("CARGO_HOME", "/opt/cargo"), ("TARGO_HOME", "/opt/targo")]),
@@ -345,14 +446,24 @@ fn the_shared_stores_root_is_the_cargo_homes() {
     );
     // This process's own home is read by its environment; another home is read at its own
     // `.cargo`, whatever this process's environment names.
-    let env = |name: &str| (name == "CARGO_HOME").then(|| OsString::from("/opt/cargo"));
+    let env = |name: &str| (name == "CARGO_HOME").then(|| native("/opt/cargo").into_os_string());
     assert_eq!(root_for(home, Some(home), &env), store("/opt/cargo"));
     assert_eq!(
-        root_for(home, Some(Path::new("/Users//other")), &env),
+        root_for(home, Some(native("/Users//other").as_path()), &env),
         store("/Users//someone/.cargo")
     );
     assert_eq!(root_for(home, None, &env), store("/Users//someone/.cargo"));
     assert_eq!(super::root(home), store("/Users//someone/.cargo"));
+}
+
+/// `unix`, a fixture's path, as this platform spells it: an absolute one on a drive on Windows
+/// (`C:\opt\cargo`), where `/opt/cargo` names no drive and so takes the working directory's.
+fn native(unix: &str) -> PathBuf {
+    if cfg!(windows) && unix.starts_with('/') {
+        PathBuf::from(format!("C:{}", unix.replace('/', "\\")))
+    } else {
+        PathBuf::from(unix)
+    }
 }
 
 /// A STORE A BUILD NOTED IS READ AND EVICTED by the passes that run without the build's

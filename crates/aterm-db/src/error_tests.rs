@@ -4,6 +4,35 @@
 use super::*;
 
 #[test]
+fn capacity_is_a_typed_refusal_and_not_a_failure_word() {
+    use aterm_types::network_state::RepairCause;
+    let words = "table operation capacity exhausted; conflict space is reserved";
+    assert!(!Error::new(words).is_capacity_exhausted());
+    assert!(
+        !Error::new(words)
+            .context("credential requests")
+            .is_capacity_exhausted()
+    );
+    assert!(Error::capacity(words).is_capacity_exhausted());
+    assert_eq!(Error::capacity(words).repair_cause(), RepairCause::Quota);
+    assert!(
+        Error::capacity(words)
+            .context("credential requests")
+            .is_capacity_exhausted()
+    );
+    assert!(!Error::repair(words, RepairCause::Quota).is_capacity_exhausted());
+    assert!(
+        !Error::from(aterm_secrets::Error::of_kind(
+            aterm_secrets::ErrorKind::MembershipCapacity,
+            words,
+        ))
+        .is_capacity_exhausted()
+    );
+    assert!(!Error::busy().is_capacity_exhausted());
+    assert!(!Error::repair(words, RepairCause::NotReady).is_capacity_exhausted());
+}
+
+#[test]
 fn a_held_control_journal_remains_contention_after_database_admission() {
     let lab = table::tests::Lab::new(&[aterm_secrets::commons::roster::Role::Writer]);
     let bootstrap = lab.bootstrap(0);

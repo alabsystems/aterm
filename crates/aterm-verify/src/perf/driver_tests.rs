@@ -264,6 +264,15 @@ fn nested_build_reuses_artifacts_across_launcher_metadata() {
             .env("CARGO_BUILD_BUILD_DIR", root.join("build.noindex"))
             .env("CARGO_MANIFEST_DIR", root.join(launcher))
             .env("OUT_DIR", root.join(launcher).join("out"));
+        // Both launcher environments use the same Apple linker. Searching the
+        // live package store for cc also observes unrelated signed index updates.
+        #[cfg(target_os = "macos")]
+        {
+            let host = atpkg::cli::current_triple()
+                .to_ascii_uppercase()
+                .replace('-', "_");
+            cmd.env(format!("CARGO_TARGET_{host}_LINKER"), "/usr/bin/cc");
+        }
         let output = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
             &mut cmd,
             aterm_spec::wait::MUST_HAPPEN,

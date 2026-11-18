@@ -29,6 +29,8 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+pub(super) use crate::membership_log::head::Publication as HeadPublication;
+
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 /// The most files an entry is known by ([`Entry::stamps`]). Kept to one, a read of each of two
 /// such files took the entry from the other and read its whole file again at every Commons check
@@ -49,22 +51,71 @@ const MAX_BYTES: usize = Store::MAX_FOOTPRINT + MAX_INPUT_BYTES;
 /// first is; a file that moved under every one of them fails the read as it did before.
 const MOVED_READS: usize = 3;
 
-/// The entries every reader and the records writer of this process share.
+/// The entries ordinary readers and the records writer of this process share.
 static CACHE: Cache = Cache::new();
+
+#[cfg(any(test, debug_assertions))]
+std::thread_local! {
+    static TEST_CACHE: std::cell::RefCell<Option<std::sync::Arc<Cache>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn with_cache<T>(ask: impl FnOnce(&Cache) -> T) -> T {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(cache) = TEST_CACHE.with(|slot| slot.borrow().clone()) {
+        return ask(&cache);
+    }
+    ask(&CACHE)
+}
+
+#[cfg(any(test, debug_assertions))]
+pub(super) fn with_cold_cache<T>(ask: impl FnOnce() -> T) -> T {
+    struct Restore(Option<std::sync::Arc<Cache>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_CACHE.with(|slot| {
+                slot.replace(self.0.take());
+            });
+        }
+    }
+    let _restore =
+        Restore(TEST_CACHE.with(|slot| slot.replace(Some(std::sync::Arc::new(Cache::new())))));
+    ask()
+}
 
 /// This Mac's identity, as a read takes it from its caller: asked only where a read of the file
 /// looks for the vault's head or writes one, and where the caller holds no identity, `None`.
 pub(super) type IdentityOf<'i> = &'i dyn Fn() -> Option<&'i Identity>;
 
+#[derive(Clone, Copy)]
+struct Query<'i> {
+    identity: IdentityOf<'i>,
+    publication: HeadPublication,
+}
+
 /// The store of the records file at `paths`, read under `vault` and `store`'s context; `identity`
-/// is this Mac's, which the vault's head is sealed under ([`head`]).
+/// is this Mac's, which the vault's head is sealed under ([`head`]). `publication` controls
+/// filesystem cache writes by this query and its later resolves, not cache authentication
+/// or the publishing capability retained by the cache's own store.
 pub(super) fn read<'i>(
     paths: &Paths,
     vault: String,
     store: Store,
     identity: IdentityOf<'i>,
+    publication: HeadPublication,
 ) -> crate::Result<Store> {
-    CACHE.read_moving(paths, vault, store, identity, |_| {})
+    with_cache(|cache| {
+        cache.read_moving(
+            paths,
+            vault,
+            store,
+            Query {
+                identity,
+                publication,
+            },
+            |_| {},
+        )
+    })
 }
 
 /// How many complete records the records file `stamp` names holds, where it holds exactly those
@@ -75,7 +126,7 @@ pub(super) fn read<'i>(
 /// this build refused, none waiting on a parent, no frame twice. `None` for any other file,
 /// and for one no read of this process stamped.
 pub(super) fn held_on_file(stamp: fsx::FileStamp, store: &Store) -> Option<usize> {
-    CACHE.held_on_file(stamp, store)
+    with_cache(|cache| cache.held_on_file(stamp, store))
 }
 
 struct Cache {
@@ -143,7 +194,16 @@ impl Cache {
                 .get_or_init(|| super::read_identity(paths).ok().flatten())
                 .as_ref()
         };
-        self.read_moving(paths, vault, store, &of, |_| {})
+        self.read_moving(
+            paths,
+            vault,
+            store,
+            Query {
+                identity: &of,
+                publication: HeadPublication::Allowed,
+            },
+            |_| {},
+        )
     }
 
     /// [`Self::read_noting`], started again while the file moves under it ([`MOVED_READS`]);
@@ -153,7 +213,7 @@ impl Cache {
         paths: &Paths,
         vault: String,
         store: Store,
-        identity: IdentityOf<'i>,
+        query: Query<'i>,
         after_observation: impl Fn(usize),
     ) -> crate::Result<Store> {
         // The first try takes the caller's own name and store, as one read does (an entry
@@ -168,7 +228,7 @@ impl Cache {
                 paths,
                 vault,
                 store,
-                identity,
+                query,
                 || after_observation(attempt),
                 &mut opened,
             );
@@ -198,7 +258,17 @@ impl Cache {
                 .get_or_init(|| super::read_identity(paths).ok().flatten())
                 .as_ref()
         };
-        self.read_noting(paths, vault, store, &of, after_observation, &mut None)
+        self.read_noting(
+            paths,
+            vault,
+            store,
+            Query {
+                identity: &of,
+                publication: HeadPublication::Allowed,
+            },
+            after_observation,
+            &mut None,
+        )
     }
 
     /// One read, which leaves in `opened` the data file it opened and the stamp it opened it
@@ -208,7 +278,7 @@ impl Cache {
         paths: &Paths,
         vault: String,
         store: Store,
-        identity: IdentityOf<'i>,
+        query: Query<'i>,
         after_observation: impl FnOnce(),
         opened: &mut Option<(std::path::PathBuf, fsx::FileStamp)>,
     ) -> crate::Result<Store> {
@@ -216,7 +286,7 @@ impl Cache {
         let began = fsx::read_began();
         let Some(mut reader) = fsx::open_owned_reader(selected.path())? else {
             selected.confirm()?;
-            return Ok(store);
+            return Ok(query.publication.snapshot(store));
         };
         let stamp = reader.stamp();
         *opened = Some((selected.path().to_path_buf(), stamp));
@@ -241,14 +311,14 @@ impl Cache {
             after_observation();
             reader.check_unchanged()?;
             selected.confirm()?;
-            return Ok(entry.store.clone());
+            return Ok(query.publication.snapshot(entry.store.clone()));
         }
         // The vault's head, where one names this file as it is under this Mac's identity and
         // this read's context: the records without the bodies nothing reads, and without
         // verifying again what this Mac verified before it wrote the head.
         let context = head::context(&store, &vault);
         let head_path = crate::records_storage::head_path(&paths.records_file())?;
-        let identity = identity();
+        let identity = (query.identity)();
         if std::fs::symlink_metadata(&head_path).is_ok()
             && let Some(identity) = identity
             && let Some((read, digest)) = head::open(
@@ -258,13 +328,14 @@ impl Cache {
                 context,
                 identity,
                 store.clone(),
+                query.publication,
             )
         {
             after_observation();
             reader.check_unchanged()?;
             selected.confirm()?;
             self.keep(vault, keys, network, budgets, digest, stamp, None, &read);
-            return Ok(read);
+            return Ok(query.publication.snapshot(read));
         }
         #[cfg(test)]
         self.observations
@@ -285,7 +356,7 @@ impl Cache {
             reader.check_unchanged()?;
             selected.confirm()?;
             entry.known_by(stamp);
-            return Ok(entry.store.clone());
+            return Ok(query.publication.snapshot(entry.store.clone()));
         }
         #[cfg(test)]
         self.hashes
@@ -301,7 +372,7 @@ impl Cache {
             reader.check_unchanged()?;
             selected.confirm()?;
             entry.known_by(stamp);
-            return Ok(entry.store.clone());
+            return Ok(query.publication.snapshot(entry.store.clone()));
         }
         let (mut store, bytes) = match observed {
             Observed::Small(bytes) => (store.recovering(bytes.as_slice()), Some(bytes)),
@@ -336,7 +407,7 @@ impl Cache {
             ));
         }
         self.keep(vault, keys, network, budgets, digest, stamp, bytes, &store);
-        Ok(store)
+        Ok(query.publication.snapshot(store))
     }
 
     /// Keep `store`, read from the file `stamp` names whose SHA-256 is `digest` (its bytes too,

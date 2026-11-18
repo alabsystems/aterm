@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Settings ▸ This Mac's reads over scratch state, for its tests: a name file claimed one way,
-//! the read the page's writer would make of it, and macOS's names and naming permission from a
-//! stub, so no test reads or sets this Mac's own.
+//! the read the page's writer would make of it, this Mac's History as its lab registry row would
+//! hold it, built by hand, and macOS's names and naming permission from a stub, so no test reads
+//! or sets this Mac's own, or reads a registry.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -12,7 +13,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aterm_agent::machine_name::file::MachineName;
+use aterm_agent::machine_name::history::{History, NameCell, NameWrite};
 use aterm_agent::machine_name::{InFleet, NameTo, file, publish, rename_preview, set_name};
+use aterm_db::att::EntryKind;
+use aterm_db::file::Renamed;
 use aterm_net::fleet_member::name_record::{ByKind, FLOOR_MS};
 use aterm_secrets::client::{LabLabels, LabelHold};
 use aterm_types::machine_name::{Class, GeneratedNames, Nickname, Number};
@@ -184,6 +188,9 @@ fn found_with(
     PageFound {
         snapshot: Snapshot::named(preview, status),
         fleet: Some(InFleet::Out),
+        // What `history::read` answers for a name kept in a scratch folder: no registry row is
+        // its, so it has no History.
+        history: Ok(History::default()),
     }
 }
 
@@ -196,6 +203,19 @@ pub(crate) fn found(scratch: &Scratch, held: &[u32], names: &Names) -> PageFound
         || Ok(lab),
         |name| NamingStatus::read(&scratch.state, &scratch.config, name, names),
     )
+}
+
+/// [`found`] with `history` as the page's History read answered it.
+pub(crate) fn found_with_history(
+    scratch: &Scratch,
+    held: &[u32],
+    names: &Names,
+    history: Result<History, String>,
+) -> PageFound {
+    PageFound {
+        history,
+        ..found(scratch, held, names)
+    }
 }
 
 /// A read of `scratch`, the vault holding `held` for other Macs, as the page's own reader makes
@@ -234,6 +254,97 @@ pub(crate) fn held_by_older_build(scratch: &Scratch, n: u32) {
         + "\n";
     aterm_uds::private_file::write_private(&scratch.state, PEERS_FILE, line.as_bytes())
         .expect("their claim");
+}
+
+/// The key of this Mac's lab registry row in a hand-built History.
+pub(crate) const ROW: &str = "mc-0123456789abcdef";
+
+/// The Mac each hand-built write names as its writer.
+pub(crate) const WRITER: &str = "m8";
+
+/// What one write left in `cell`: `value`, standing or not, over the values it `replaced`.
+pub(crate) fn cell(cell: Renamed, value: &str, stands: bool, replaced: &[&str]) -> NameCell {
+    NameCell {
+        cell,
+        value: Some(value.to_owned()),
+        stands,
+        replaced: replaced
+            .iter()
+            .map(|value| Some((*value).to_owned()))
+            .collect(),
+        unseen: Vec::new(),
+    }
+}
+
+/// Write `op` (its digest every byte `op`) of `kind` by Mac `mac`, authored `op` seconds after
+/// [`NOW`], leaving `cells`.
+pub(crate) fn write(op: u8, mac: &str, kind: EntryKind, cells: Vec<NameCell>) -> NameWrite {
+    NameWrite {
+        op: [op; 32],
+        at_ms: NOW + u64::from(op) * 1_000,
+        mac: mac.to_owned(),
+        kind,
+        reverts: None,
+        carried: false,
+        cells,
+    }
+}
+
+/// This Mac's row ([`ROW`]) holding `writes`, newest first, with nothing of its on the way.
+pub(crate) fn history(writes: Vec<NameWrite>) -> History {
+    History {
+        row: Some(ROW.to_owned()),
+        pending: Vec::new(),
+        writes,
+    }
+}
+
+/// The History this Mac's row holds after `names` (number and nickname, oldest first), each a
+/// person's rename at [`WRITER`] and so an explicit write: the first writes both cells, each
+/// later one the cells it changed over what it replaced, and a cell's newest write alone stands.
+pub(crate) fn renames(names: &[(u32, &str)]) -> History {
+    let mut writes: Vec<NameWrite> = Vec::new();
+    let mut last: [Option<String>; 2] = [None, None];
+    for (at, (n, word)) in names.iter().enumerate() {
+        let op = u8::try_from(at + 1).expect("at most 255 renames");
+        let mut cells = Vec::new();
+        for (slot, (column, value)) in [
+            (Renamed::Label, format!("m{n}")),
+            (Renamed::Nickname, (*word).to_owned()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if last[slot].as_ref() == Some(&value) {
+                continue;
+            }
+            for older in &mut writes {
+                for written in &mut older.cells {
+                    if written.cell == column {
+                        written.stands = false;
+                    }
+                }
+            }
+            let replaced: Vec<&str> = last[slot].iter().map(String::as_str).collect();
+            cells.push(cell(column, &value, true, &replaced));
+            last[slot] = Some(value);
+        }
+        writes.push(write(op, WRITER, EntryKind::Explicit, cells));
+    }
+    writes.reverse();
+    history(writes)
+}
+
+/// A scratch name renamed through `names` (number and nickname, oldest first), each chosen as a
+/// person's rename makes it, and the History its registry row would hold after them
+/// ([`renames`]).
+pub(crate) fn renamed(names: &[(u32, &str)]) -> (Scratch, History) {
+    let (first, rest) = names.split_first().expect("at least one name");
+    let scratch = named(Class::Chosen, first.0, first.1);
+    for (n, word) in rest {
+        rename(&scratch, Class::Chosen, *n, word);
+    }
+    (scratch, renames(names))
 }
 
 /// `found` as read `rev` shows it.

@@ -17,18 +17,25 @@ use std::path::Path;
 /// This acquires no file lock and imposes no byte limit. A caller that streams or parses the
 /// file retains its own size, freshness and locking policy.
 ///
+/// With a trace scope armed on the calling thread ([`crate::trace`]) it records `path`'s stamp
+/// before the open, which decides a missing path and one that is a link or no regular file;
+/// an open or a look that fails otherwise records a retry where no stamp decides it
+/// ([`crate::trace::fs::failed`]). What the caller then reads from the file is decided by that
+/// stamp too.
+///
 /// # Errors
 /// The path, open or metadata error, or [`io::ErrorKind::InvalidData`] when the final component
 /// is a link, reparse point or anything other than a regular file. Other than Unix and Windows,
-/// this returns [`io::ErrorKind::Unsupported`] before examining `path`.
+/// this returns [`io::ErrorKind::Unsupported`] before examining `path`, and records nothing.
 pub fn open(path: &Path) -> io::Result<(File, Metadata)> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
-        open_unix(path)
-    }
-    #[cfg(windows)]
-    {
-        open_after_check(path, || {})
+        crate::trace::fs::opening(path);
+        #[cfg(unix)]
+        let opened = open_unix(path);
+        #[cfg(windows)]
+        let opened = open_after_check(path, || {});
+        opened.inspect_err(|error| crate::trace::fs::failed(path, error))
     }
     #[cfg(not(any(unix, windows)))]
     {

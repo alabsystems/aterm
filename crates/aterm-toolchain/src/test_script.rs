@@ -5,8 +5,9 @@
 
 use std::path::Path;
 
-/// Make `path` an executable script holding `body` (mode 0755), or rewrite it in place, so
-/// every hard link to it reads the new body.
+/// Make `path` an executable script (mode 0755), or rewrite it in place, so every hard link
+/// reads the new body. A leading `/bin/sh` shebang names the retained signed interpreter on
+/// Apple hosts; every byte after that line is kept.
 ///
 /// On Unix a child process writes it. Linux refuses to exec a file anything holds open for
 /// writing (`ETXTBSY`), and a child another test thread forks while this process holds `path`
@@ -22,6 +23,12 @@ pub(crate) fn script(path: &Path, body: &str) {
     {
         use std::io::{Seek as _, Write as _};
         use std::os::unix::fs::PermissionsExt as _;
+        let shell = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+        let cat = aterm_uds::deadline::stand_in(Path::new("/bin/cat"));
+        let rewritten = body
+            .strip_prefix("#!/bin/sh\n")
+            .map(|rest| format!("#!{}\n{rest}", shell.display()));
+        let body = rewritten.as_deref().unwrap_or(body);
         let mut staged = {
             let scratch = aterm_tempfile::tempdir().expect("a scratch folder for the body");
             let at = scratch.path().join("body");
@@ -38,12 +45,16 @@ pub(crate) fn script(path: &Path, body: &str) {
             .write_all(body.as_bytes())
             .and_then(|()| staged.rewind())
             .expect("the script's bytes");
-        let mut sh = aterm_uds::spawnfd::command("/bin/sh");
-        sh.args(["-c", "exec cat >\"$1\"", "sh"]).arg(path);
-        let wrote = aterm_uds::deadline::output_within_from(
+        let mut sh = aterm_uds::spawnfd::command(shell);
+        sh.args(["-c", "exec \"$1\" >\"$2\"", "sh"])
+            .arg(cat)
+            .arg(path);
+        let wrote = aterm_uds::deadline::output_from_while_process_progressing_complete_with_limit(
             &mut sh,
             staged.into(),
             aterm_spec::wait::MUST_HAPPEN,
+            "writing the stand-in driver's script",
+            4096,
         )
         .unwrap_or_else(|e| panic!("write {}: {e:?}", path.display()));
         assert!(
@@ -64,20 +75,42 @@ pub(crate) fn script(path: &Path, body: &str) {
 #[cfg(unix)]
 #[test]
 fn a_body_past_a_pipes_capacity_is_written_whole() {
+    const STAGE: &str = "ATERM_TOOLCHAIN_LARGE_SCRIPT_WRITER";
+    const NAME: &str = "test_script::a_body_past_a_pipes_capacity_is_written_whole";
+    const RECEIPT: &str = "SCRIPT_BODY_WRITTEN";
+    if std::env::var(STAGE).as_deref() != Ok("1") {
+        let mut command =
+            aterm_uds::spawnfd::command(std::env::current_exe().expect("this test binary"));
+        command
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(STAGE, "1");
+        let output = aterm_uds::deadline::output_while_process_progressing_complete_with_limit(
+            &mut command,
+            aterm_spec::wait::MUST_HAPPEN,
+            "the large-script writer's isolated process",
+            4096,
+        )
+        .expect("the isolated writer makes progress or its hang detector ends it");
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == RECEIPT),
+            "{output:?}"
+        );
+        return;
+    }
     let scratch = aterm_tempfile::tempdir().unwrap();
     let path = scratch.path().join("long");
     let body = format!(
         "#!/bin/sh\n{}exit 0\n",
         "# a line of padding\n".repeat(50_000)
     );
-    let (wrote, written) = std::sync::mpsc::channel();
-    let (at, text) = (path.clone(), body.clone());
-    std::thread::spawn(move || {
-        script(&at, &text);
-        let _ = wrote.send(());
-    });
-    written
-        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-        .expect("the script written within the hang detector");
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+    script(&path, &body);
+    let actual = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        actual.split_once('\n').expect("interpreter line").1,
+        body.split_once('\n').expect("interpreter line").1
+    );
+    println!("\n{RECEIPT}");
 }

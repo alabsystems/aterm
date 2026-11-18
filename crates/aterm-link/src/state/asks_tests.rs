@@ -40,6 +40,7 @@ fn every_record_round_trips_and_a_rewrite_holds_the_same_index() {
         Frame::DeadlineGone {
             off: 7,
             sid: "s-a".to_string(),
+            how: None,
         },
         Frame::Handed(4),
         Frame::Took(Took {
@@ -68,7 +69,7 @@ fn every_record_round_trips_and_a_rewrite_holds_the_same_index() {
             },
         )]
         .into(),
-        gone: [(7, "s-a".to_string())].into(),
+        gone: [(7, ("s-a".to_string(), None))].into(),
         handed: Some(4),
         took: Some(Took {
             asked: 11,
@@ -110,6 +111,7 @@ fn a_rewrite_keeps_whether_anything_was_noted_since_the_last_hand_off() {
         Frame::DeadlineGone {
             off: 4,
             sid: "s-a".to_string(),
+            how: None,
         },
     ] {
         let mut noted = index.clone();
@@ -137,6 +139,7 @@ fn a_record_its_body_cannot_carry_is_refused() {
         Frame::DeadlineGone {
             off: 1,
             sid: String::new(),
+            how: None,
         },
     ] {
         let refused = journal::encode(0, &frame).expect_err("refused");
@@ -161,6 +164,7 @@ fn the_index_trims_to_the_caps_on_replay() {
         frames.push(Frame::DeadlineGone {
             off: off + 100_000,
             sid: "s-a".to_string(),
+            how: None,
         });
     }
     let index = read(&journal(&frames)).index;
@@ -185,11 +189,13 @@ fn a_settle_takes_out_only_its_askers_deadline_and_is_remembered() {
     index.apply(Frame::DeadlineGone {
         off: 5,
         sid: "s-b".to_string(),
+        how: None,
     });
     assert!(index.deadlines.contains_key(&5), "another asker's settle");
     index.apply(Frame::DeadlineGone {
         off: 5,
         sid: "s-a".to_string(),
+        how: None,
     });
     assert!(index.deadlines.is_empty());
     assert!(index.settled(5, "s-a") && !index.settled(5, "s-b"));
@@ -226,6 +232,7 @@ fn handed_index() -> Index {
     index.apply(Frame::DeadlineGone {
         off: 4,
         sid: "s-a".to_string(),
+        how: None,
     });
     index.apply(Frame::Handed(2));
     index
@@ -311,6 +318,7 @@ fn a_table_of_an_older_build_after_a_hand_off_replaces_the_journals_word() {
     control.apply(Frame::DeadlineGone {
         off: 6,
         sid: "s-a".to_string(),
+        how: None,
     });
     let theirs = table(&[
         Deadline {
@@ -357,11 +365,13 @@ fn a_table_is_taken_in_once_and_its_settle_never_ages_out() {
     index.apply(Frame::DeadlineGone {
         off: 3,
         sid: "s-a".to_string(),
+        how: None,
     });
     for off in 0..=DEADLINES_KEEP as u64 {
         index.apply(Frame::DeadlineGone {
             off: 1_000 + off,
             sid: "s-a".to_string(),
+            how: None,
         });
     }
     assert!(!index.settled(3, "s-a"), "the settle aged out");
@@ -391,6 +401,7 @@ fn damaged_records_take_back_what_a_table_holds_of_them() {
     salvaged.apply(Frame::DeadlineGone {
         off: 5,
         sid: "s-a".to_string(),
+        how: None,
     });
     salvaged.apply(Frame::Handed(2));
     let rows = [deadline(3, "s-a"), deadline(4, "s-a"), deadline(5, "s-a")];
@@ -413,4 +424,51 @@ fn damaged_records_take_back_what_a_table_holds_of_them() {
         !index.take_in(None, Some(&text), false),
         "a rewritten journal holds what it took"
     );
+}
+
+/// **A SETTLE'S VERDICT RIDES IN ITS TAIL** (ATERM-KI-1115-7889): `moot=<e> by=<a>` and
+/// `expired=<e>` read back as written; the body alone, as a build before it wrote it, and a
+/// tail this build cannot read, read as a settle with no verdict, the same settle.
+#[test]
+fn a_settles_verdict_rides_in_its_tail_and_a_bare_body_still_parses() {
+    let gone = |how| Frame::DeadlineGone {
+        off: 5,
+        sid: "s-a".to_string(),
+        how,
+    };
+    for how in [
+        Some(Verdict::Moot { at: 9, by: 7 }),
+        Some(Verdict::Expired { at: 9 }),
+        None,
+    ] {
+        let frame = gone(how);
+        assert!(frame.carried(), "{frame:?}");
+        let read = read(&journal(&[frame.clone()]));
+        assert_eq!(
+            read.index.verdict_rows(),
+            how.map(|how| (5, "s-a".to_string(), how))
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        assert!(read.index.settled(5, "s-a"));
+    }
+    assert_eq!(
+        gone(None).body(),
+        gone(Some(Verdict::Expired { at: 9 })).body()
+    );
+    for tail in [
+        &b""[..],
+        b"moot=9",
+        b"moot=9 by=x",
+        b"expired=9 later=1",
+        b"\xff",
+    ] {
+        assert_eq!(
+            Frame::of_record(b"gone 5 s-a", tail),
+            Some(gone(None)),
+            "{:?}",
+            String::from_utf8_lossy(tail)
+        );
+    }
+    assert!(!gone(Some(Verdict::Unjudged { at: 9 })).carried());
 }

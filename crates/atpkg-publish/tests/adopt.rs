@@ -37,6 +37,11 @@ const ATTRIBUTES: &str =
 
 fn exe(path: &Path, text: &str) {
     use std::os::unix::fs::PermissionsExt as _;
+    let shell = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+    let rewritten = text
+        .strip_prefix("#!/bin/sh\n")
+        .map(|rest| format!("#!{}\n{rest}", shell.display()));
+    let text = rewritten.as_deref().unwrap_or(text);
     put(path, text);
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 }
@@ -413,6 +418,25 @@ fn a_build_with_the_bases_compiler_skips_the_key_and_commits_the_lock() {
             && message.contains("stock: 1.98.0 (moved from 1.97.1)"),
         "the commit says the key was skipped and the stock moved: {message}"
     );
+}
+
+#[test]
+fn a_failed_identity_probe_is_not_a_successful_reply_without_a_hash() {
+    let f = Fixture::new("adopt-probe-error");
+    f.repo(&[]);
+    let failed = format!("#!/bin/sh\necho 'commit-hash: {COMMIT_A}'\nexit 7\n");
+    for (build, reply, exit) in [
+        (500, failed.as_str(), 3),
+        (501, "#!/bin/sh\necho 'commit-hash: unknown'\n", 1),
+    ] {
+        f.build(build, COMMIT_A, COMMIT_A);
+        exe(&f.trustc(build), reply);
+        let error = adopt::adopt(&f.inputs(build, plain_path())).expect_err("no compiler identity");
+        assert_eq!(error.exit_code(), exit, "{error}");
+        assert!(!f.worktree(build).exists(), "no worktree before identity");
+        assert!(!has_branch(&f.repo, &format!("adopt/trust-{build}")));
+        assert!(f.log().is_empty(), "no key step before identity");
+    }
 }
 
 #[test]

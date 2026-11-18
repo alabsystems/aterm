@@ -232,6 +232,22 @@ fn index(root: &Path) -> Result<Vec<IndexEntry>, String> {
         .collect()
 }
 
+/// Whether `top`, the folder `git rev-parse --show-toplevel` names, is `dir`, the submodule's
+/// folder under the canonical root.
+#[cfg(not(windows))]
+fn answers_for(top: &str, dir: &Path) -> bool {
+    Path::new(top) == dir
+}
+
+/// Whether `top`, the folder `git rev-parse --show-toplevel` names, is `dir`, the submodule's
+/// folder under the canonical root. Git for Windows spells a folder with `/` and a drive
+/// (`C:/Users/…`), never as canonicalization does (`\\?\C:\Users\…`), so `top` is read at its own
+/// canonical path: one folder is one spelling there whatever its case or short names.
+#[cfg(windows)]
+fn answers_for(top: &str, dir: &Path) -> bool {
+    std::fs::canonicalize(top).is_ok_and(|top| top == dir)
+}
+
 fn checkout(root: &Path) -> Checkout {
     let dir = root.join(SUBMODULE);
     if !dir.is_dir() {
@@ -241,7 +257,7 @@ fn checkout(root: &Path) -> Checkout {
         Ok(out) => String::from_utf8_lossy(&out).trim().to_owned(),
         Err(e) => return Checkout::Uninitialised(e),
     };
-    if Path::new(&top) != dir {
+    if !answers_for(&top, &dir) {
         return Checkout::Uninitialised(format!(
             "git inside it answers for the repository at {top}"
         ));

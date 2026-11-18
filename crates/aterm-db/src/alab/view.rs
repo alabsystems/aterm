@@ -15,14 +15,14 @@
 #[cfg(unix)]
 use super::journal::place::{Places, Why};
 use super::{
-    account_names::{self, Found, Names},
-    mail,
+    account_names, mail,
     registry::{self, ACCOUNT, ADDRESS, AddressIndex, MACHINE, PREFERENCE},
 };
 use crate::typed::{
     cell::{self, Cells, Projection},
     owned::OwnedRead,
 };
+use aterm_file::{AccountNames, account::Found};
 use aterm_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -193,7 +193,7 @@ pub struct LabView {
     pub accounts: BTreeMap<String, Account>,
     /// Each account's slug and name, by key ([`account_names`]): how a surface shows it and
     /// what a command names it by.
-    pub names: BTreeMap<String, Names>,
+    pub names: BTreeMap<String, AccountNames>,
     /// Live preferences on live machines, by machine key then rank.
     pub preferences: Vec<Preference>,
     /// Every Mac's `account-obs` rows: which accounts its login files name, and when it last
@@ -307,7 +307,7 @@ impl LabView {
     pub(crate) fn read_projected(
         cells: &Cells,
         machines: &Projection,
-        names: BTreeMap<String, Names>,
+        names: BTreeMap<String, AccountNames>,
         facts: &OwnedRead,
         obs: &OwnedRead,
         me_uuid: Option<&str>,
@@ -514,18 +514,13 @@ impl LabView {
                 (pk, account)
             })
             .collect();
-        let names: BTreeMap<String, Names> = accounts
+        let names: BTreeMap<String, AccountNames> = accounts
             .rows()
             .iter()
             .map(|row| {
-                let names = Names {
-                    slug: row.cell("slug").to_owned(),
-                    name: shown(row, "name"),
-                    email: shown(row, "email"),
-                    login: shown(row, "login_email"),
-                    live: row.live,
-                };
-                (row.pk.clone(), names)
+                let names = AccountNames::of_row(row);
+                let realm = account_names::realm(Some(&names.realm));
+                (row.pk.clone(), AccountNames { realm, ..names })
             })
             .collect();
         let mut preferences: Vec<Preference> = links
@@ -565,11 +560,11 @@ impl LabView {
         self.names.get(pk)?.name.as_deref()
     }
 
-    /// The accounts `word` names ([`account_names::named`]): its slug, its key, its provider word
-    /// and address (`oai ada@x.example` or `oai:ada@x.example`), or an address, live accounts
-    /// tried first. A roster label and a legacy label name none.
+    /// The accounts `word` names (`aterm_file::account::named`): its slug, its key, its provider
+    /// word and address (`oai ada@x.example` or `oai:ada@x.example`), or an address, live
+    /// accounts tried first. A roster label and a legacy label name none.
     pub fn account_named(&self, word: &str) -> Found<'_> {
-        account_names::named(&self.names, word)
+        aterm_file::account::named(&self.names, word)
     }
 
     /// The label of machine `pk`.

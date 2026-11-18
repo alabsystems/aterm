@@ -122,18 +122,6 @@ fn a_bound_registry_name_precedes_legacy_books_and_roster_without_making_a_local
         (Class::Seeded, IMPLIED_SINCE, 0)
     );
     assert_eq!(name.migration, None);
-    assert_eq!(name.by, None);
-    assert_eq!(
-        whats(&name),
-        [(
-            Why::First,
-            None,
-            Some(num(86)),
-            None,
-            "MissBunny".to_owned()
-        )],
-        "the first name, by no one"
-    );
     assert!(name.was.is_empty());
     assert_eq!(file::read(root.path()).expect("reads"), Some(name));
 }
@@ -231,8 +219,8 @@ fn seen(name: &MachineName) -> Option<Option<&str>> {
 
 /// The name kept in `root` once a read has followed this Mac's row while it holds the chosen
 /// nickname `row` (`None`: none chosen).
-fn follow(root: &aterm_tempfile::TempDir, row: Option<&str>, at: u64) -> MachineName {
-    registry::with_row(row, || follow_registry(root.path(), at)).expect("follows the row");
+fn follow(root: &aterm_tempfile::TempDir, row: Option<&str>) -> MachineName {
+    registry::with_row(row, || follow_registry(root.path())).expect("follows the row");
     file::read(root.path())
         .expect("reads")
         .expect("a kept name")
@@ -252,12 +240,12 @@ fn renick(root: &aterm_tempfile::TempDir, word: &str, row: Option<&str>, at: u64
 fn an_owner_write_of_the_row_nickname_renames_this_mac() {
     let root = state();
     let mirror = mirrored(&root);
-    let name = follow(&root, Some("Heron"), NOW + 1);
+    let name = follow(&root, Some("Heron"));
     assert_eq!(name.title(), "m86 Heron");
     assert_eq!(
-        (name.nick_class, name.rev, name.by),
-        (NickClass::Chosen, mirror.rev + 1, None),
-        "a chosen nickname, by no author here: the registry keeps who wrote it"
+        (name.nick_class, name.rev),
+        (NickClass::Chosen, mirror.rev + 1),
+        "a chosen nickname: the registry keeps who wrote it"
     );
     assert_eq!(
         (name.num, name.class, name.since, name.act),
@@ -266,20 +254,7 @@ fn an_owner_write_of_the_row_nickname_renames_this_mac() {
     );
     assert_eq!(seen(&name), Some(Some("Heron")));
     assert_eq!(
-        whats(&name),
-        [
-            (
-                Why::Registry,
-                Some(num(86)),
-                Some(num(86)),
-                Some("MissBunny".to_owned()),
-                "Heron".to_owned()
-            ),
-            whats(&mirror)[0].clone()
-        ]
-    );
-    assert_eq!(
-        registry::with_row(Some("Heron"), || follow_registry(root.path(), NOW + 2)).expect("reads"),
+        registry::with_row(Some("Heron"), || follow_registry(root.path())).expect("reads"),
         None,
         "a row read again changes nothing"
     );
@@ -294,12 +269,8 @@ fn a_mac_whose_row_held_no_chosen_nickname_follows_the_first_one_written() {
         let (drawn, _) = ensure_from(root.path(), || registry_name(86, row), unread, never, NOW)
             .expect("a first name");
         assert_eq!(seen(&drawn), Some(None), "{row:?}");
-        assert_eq!(follow(&root, None, NOW + 1), drawn, "{row:?}");
-        assert_eq!(
-            follow(&root, Some("Heron"), NOW + 2).title(),
-            "m86 Heron",
-            "{row:?}"
-        );
+        assert_eq!(follow(&root, None), drawn, "{row:?}");
+        assert_eq!(follow(&root, Some("Heron")).title(), "m86 Heron", "{row:?}");
     }
 }
 
@@ -309,19 +280,19 @@ fn a_rename_whose_row_write_is_on_its_way_is_not_undone() {
     mirrored(&root);
     let renamed = renick(&root, "Bunny", Some("MissBunny"), NOW + 1);
     assert_eq!(
-        follow(&root, Some("MissBunny"), NOW + 2),
+        follow(&root, Some("MissBunny")),
         renamed,
         "the row still holds the nickname the rename replaced"
     );
-    let written = follow(&root, Some("Bunny"), NOW + 3);
+    let written = follow(&root, Some("Bunny"));
     assert_eq!(
-        (written.title(), written.rev, written.history.len()),
-        ("m86 Bunny".to_owned(), renamed.rev, renamed.history.len()),
-        "the rename's own row write changes no name and records nothing"
+        (written.title(), written.rev),
+        ("m86 Bunny".to_owned(), renamed.rev),
+        "the rename's own row write changes no name"
     );
     assert_eq!(seen(&written), Some(Some("Bunny")));
     assert_eq!(
-        follow(&root, Some("Heron"), NOW + 4).title(),
+        follow(&root, Some("Heron")).title(),
         "m86 Heron",
         "a later write from another Mac is followed"
     );
@@ -336,8 +307,8 @@ fn an_earlier_own_write_does_not_undo_a_newer_rename() {
     renick(&root, "Otter", Some("MissBunny"), NOW + 1);
     let newer = renick(&root, "Zebra", Some("Otter"), NOW + 2);
     assert_eq!(seen(&newer), Some(Some("Otter")));
-    assert_eq!(follow(&root, Some("Otter"), NOW + 3), newer);
-    assert_eq!(follow(&root, Some("Zebra"), NOW + 4).title(), "m86 Zebra");
+    assert_eq!(follow(&root, Some("Otter")), newer);
+    assert_eq!(follow(&root, Some("Zebra")).title(), "m86 Zebra");
 }
 
 /// An edit that leaves the nickname (a number alone) starts from the nickname the row was given
@@ -364,14 +335,6 @@ fn a_number_rename_keeps_a_row_nickname_no_read_followed_yet() {
     .expect("a number rename")
     .name;
     assert_eq!(renamed.title(), "m87 Heron");
-    assert_eq!(
-        whats(&renamed)
-            .iter()
-            .map(|what| what.0)
-            .take(2)
-            .collect::<Vec<_>>(),
-        [Why::Named, Why::Registry]
-    );
 }
 
 /// A rename to the nickname the row was given, which no read followed yet, asks for nothing the
@@ -387,42 +350,50 @@ fn a_rename_to_the_row_nickname_no_read_followed_changes_nothing_it_asked() {
     .expect("a rename here");
     assert!(!set.changed, "the request changed nothing");
     assert_eq!(set.name.title(), "m86 Heron");
-    assert_eq!(whats(&set.name)[0].0, Why::Registry);
     assert_eq!(file::read(root.path()).expect("reads"), Some(set.name));
 }
 
-/// An undo whose read followed the row takes back the newest change that read showed, though an
-/// owner write no earlier read followed was waiting in the row; one whose read did not follow is
-/// refused, as any undo of a name changed after its read is.
+/// An undo starts from the name as this Mac's row leaves it: an owner's nickname written to the
+/// row from another Mac, which no read here followed yet, is the row's newest rename, and its
+/// undo gives back the nickname it replaced; an undo of the rename before it, read before that
+/// write reached this Mac's registry, is refused as unseen, History giving another undo now.
+/// NEGATIVE CONTROL: with `edit_name` starting from the file rather than `row_followed`, the
+/// undo's base is `Bunny`, the nickname undo changes nothing, and `changed` is false.
 #[test]
 fn an_undo_read_through_the_follow_takes_back_what_it_showed() {
     let root = state();
     mirrored(&root);
-    let unfollowed = renick(&root, "Bunny", Some("MissBunny"), NOW + 1);
-    let undo = |seen: Option<&Change>, at| {
+    renick(&root, "Bunny", Some("MissBunny"), NOW + 1);
+    let ours = owner_write(2, &[(Renamed::Nickname, Some("MissBunny"), "Bunny")]);
+    let theirs = owner_write(3, &[(Renamed::Nickname, Some("Bunny"), "Heron")]);
+    let mut replaced = ours.clone();
+    replaced.cells[0].stands = false;
+    let now = row(vec![theirs, replaced]);
+    let undo = |seen: &history::Undo, at| {
         registry::with_row(Some("Heron"), || {
-            undo_last(
-                root.path(),
-                seen,
-                no_labels,
-                ByKind::Person,
-                unread,
-                at,
-                false,
-            )
+            history::with_history(Ok(now.clone()), || {
+                undo_last(
+                    root.path(),
+                    seen,
+                    no_labels,
+                    ByKind::Person,
+                    unread,
+                    at,
+                    false,
+                )
+            })
         })
     };
-    let why = undo(unfollowed.history.first(), NOW + 2).expect_err("a stale read");
+    let stale = undo_over(vec![ours]).expect("the rename here");
+    let why = undo(&stale, NOW + 2).expect_err("a stale read");
     assert_eq!(
         Refused::of(&why).map(|refused| &refused.cause),
         Some(&Cause::Unseen)
     );
-    let read = registry::with_row(Some("Heron"), || follow_registry(root.path(), NOW + 3))
-        .expect("follows")
-        .expect("the row moved");
-    let undone = undo(read.history.first(), NOW + 4).expect("an undo").name;
-    assert_eq!(undone.title(), "m86 Bunny", "the row's change taken back");
-    assert_eq!(whats(&undone)[0].0, Why::Undone);
+    let fresh = history::undo_of(&now).expect("the other Mac's rename");
+    let undone = undo(&fresh, NOW + 4).expect("an undo");
+    assert!(undone.changed, "the row's Heron taken back");
+    assert_eq!(undone.name.title(), "m86 Bunny");
 }
 
 /// A row holding this Mac's own nickname, a drawn noun included, renames nothing and leaves a
@@ -443,15 +414,10 @@ fn a_row_holding_this_macs_own_nickname_renames_nothing() {
             Ok(())
         })
         .expect("a row seen before");
-        let name = follow(&root, Some(drawn.nick.as_str()), NOW + 1);
+        let name = follow(&root, Some(drawn.nick.as_str()));
         assert_eq!(
-            (name.title(), name.nick_class, name.rev, name.history.len()),
-            (
-                drawn.title(),
-                NickClass::Auto,
-                drawn.rev,
-                drawn.history.len()
-            ),
+            (name.title(), name.nick_class, name.rev),
+            (drawn.title(), NickClass::Auto, drawn.rev),
             "{before:?}"
         );
         assert_eq!(seen(&name), Some(Some(drawn.nick.as_str())), "{before:?}");
@@ -472,18 +438,17 @@ fn a_name_that_never_looked_follows_a_chosen_row_only_once_it_moves() {
         kept.nick_class = class;
         file::read_or_create(root.path(), || Ok(kept.clone()))
             .expect("a name an earlier build made");
-        let looked = follow(&root, Some("MissBunny"), NOW + 1);
+        let looked = follow(&root, Some("MissBunny"));
         assert_eq!(
             (looked.title(), seen(&looked)),
             (first.to_owned(), Some(Some("MissBunny")))
         );
-        let name = follow(&root, Some("Heron"), NOW + 2);
+        let name = follow(&root, Some("Heron"));
         assert_eq!(
             name.title(),
             "unnumbered Heron",
             "the nickname only, never the number"
         );
-        assert_eq!(whats(&name)[0].0, Why::Registry);
     }
 }
 
@@ -493,17 +458,11 @@ fn a_name_that_never_looked_follows_a_chosen_row_only_once_it_moves() {
 fn a_row_with_no_chosen_nickname_renames_nothing() {
     let root = state();
     let mirror = mirrored(&root);
-    let emptied = follow(&root, None, NOW + 1);
-    assert_eq!(
-        (emptied.title(), emptied.rev, emptied.history.len()),
-        (mirror.title(), mirror.rev, mirror.history.len())
-    );
+    let emptied = follow(&root, None);
+    assert_eq!((emptied.title(), emptied.rev), (mirror.title(), mirror.rev));
     assert_eq!(seen(&emptied), Some(None));
     renick(&root, "Otter", None, NOW + 2);
-    assert_eq!(
-        follow(&root, Some("MissBunny"), NOW + 3).title(),
-        "m86 MissBunny"
-    );
+    assert_eq!(follow(&root, Some("MissBunny")).title(), "m86 MissBunny");
 }
 
 /// No row of this Mac's (no lab, a name kept elsewhere) leaves the file as it is.
@@ -511,7 +470,7 @@ fn a_row_with_no_chosen_nickname_renames_nothing() {
 fn no_row_of_this_macs_leaves_the_file_as_it_is() {
     let root = state();
     let mirror = mirrored(&root);
-    assert_eq!(follow_registry(root.path(), NOW + 1).expect("reads"), None);
+    assert_eq!(follow_registry(root.path()).expect("reads"), None);
     assert_eq!(file::read(root.path()).expect("reads"), Some(mirror));
 }
 
@@ -615,14 +574,19 @@ fn queued_id(queued: Option<&registry::Queued>) -> Option<&str> {
     queued.map(|write| write.id.as_str())
 }
 
-/// The cells of one write to the row, as the door seam records them.
+/// One write to the row, as the door seam records it: its cells, then that a person asked.
 fn cells(cells: &[&str]) -> Vec<Vec<String>> {
-    vec![cells.iter().map(|cell| (*cell).to_owned()).collect()]
+    vec![
+        cells
+            .iter()
+            .map(|cell| (*cell).to_owned())
+            .chain(["by=person".to_owned()])
+            .collect(),
+    ]
 }
 
 /// The registry row's number is the Mac's: an owner's number other than the chosen one renumbers
-/// it as chosen, by no author here (the registry keeps who wrote it), and a read again changes
-/// nothing.
+/// it as chosen (the registry keeps who wrote it), and a read again changes nothing.
 #[test]
 fn an_owner_write_of_the_row_label_renumbers_this_mac() {
     let root = state();
@@ -630,17 +594,9 @@ fn an_owner_write_of_the_row_label_renumbers_this_mac() {
     let name = renumber(&root, Some("m87"), NOW + 1).expect("the row renumbers the Mac");
     assert_eq!(name.title(), "m87 MissBunny");
     assert_eq!(
-        (name.class, name.rev, name.by),
-        (Class::Chosen, before.rev + 1, None),
-        "a chosen number, by no author here: the registry keeps who wrote it"
-    );
-    assert_eq!(
-        (
-            name.history[0].why,
-            name.history[0].from,
-            name.history[0].to
-        ),
-        (Why::Registry, Some(num(86)), Some(num(87)))
+        (name.class, name.rev),
+        (Class::Chosen, before.rev + 1),
+        "a chosen number: the registry keeps who wrote it"
     );
     assert_eq!(file::read(root.path()).expect("reads"), Some(name));
     assert_eq!(
@@ -782,8 +738,9 @@ fn a_pending_or_untakeable_label_renumbers_nothing() {
 /// and a follow queue nothing.
 ///
 /// NEGATIVE CONTROLS, observed: with `edit_name` queueing nothing, the rename's door is never
-/// asked: `left: [] right: [["label=m88"]]`; with it queueing the nickname the edit left as it
-/// was: `left: [["label=m88", "nickname=MissBunny"]] right: [["label=m88"]]`.
+/// asked: `left: [] right: [["label=m88", "by=person"]]`; with it queueing the nickname the edit
+/// left as it was: `left: [["label=m88", "nickname=MissBunny", "by=person"]] right:
+/// [["label=m88", "by=person"]]`.
 #[test]
 fn a_renumber_here_queues_its_number_to_the_row() {
     let root = state();
@@ -907,9 +864,9 @@ fn a_rename_that_gave_way_follows_the_rows_nickname() {
     });
     assert_eq!(set.expect("a rename").name.title(), "m12 Otter");
     assert_eq!(asked, cells(&["label=m12", "nickname=Otter"]));
-    let name = follow(&root, Some("MissBunny"), NOW + 2);
+    let name = follow(&root, Some("MissBunny"));
     assert_eq!(name.title(), "m12 MissBunny");
-    assert_eq!(follow(&root, Some("MissBunny"), NOW + 3), name);
+    assert_eq!(follow(&root, Some("MissBunny")), name);
 }
 
 /// A rename to the number the name already holds, asked for while the row shows another number
@@ -969,17 +926,20 @@ fn a_number_asked_for_again_is_queued_over_an_unfollowed_row_number() {
     })
     .0
     .expect("a nickname rename");
+    let seen = nickname_undo("MissBunny", "Otter");
     let (undone, asked) = registry::with_door(queued(), || {
         registry::with_label(Some("m9"), false, || {
-            undo_last(
-                root.path(),
-                None,
-                no_labels,
-                ByKind::Person,
-                unread,
-                NOW + 4,
-                false,
-            )
+            history::with_history(Ok(row_of(&seen)), || {
+                undo_last(
+                    root.path(),
+                    &seen,
+                    no_labels,
+                    ByKind::Person,
+                    unread,
+                    NOW + 4,
+                    false,
+                )
+            })
         })
     });
     assert_eq!(
@@ -1059,18 +1019,25 @@ fn a_label_the_vault_gives_another_mac_is_refused_and_judged_again() {
 fn an_undo_of_a_followed_number_queues_the_number_it_restores() {
     let root = state();
     chosen(&root);
-    let name = renumber(&root, Some("m87"), NOW + 1).expect("renumbered");
+    renumber(&root, Some("m87"), NOW + 1).expect("renumbered");
+    let seen = undo_over(vec![owner_write(
+        2,
+        &[(Renamed::Label, Some("m86"), "m87")],
+    )])
+    .expect("the owner's renumber");
     let (undone, asked) = registry::with_door(queued(), || {
         registry::with_label(Some("m87"), false, || {
-            undo_last(
-                root.path(),
-                name.history.first(),
-                no_labels,
-                ByKind::Person,
-                unread,
-                NOW + 2,
-                false,
-            )
+            history::with_history(Ok(row_of(&seen)), || {
+                undo_last(
+                    root.path(),
+                    &seen,
+                    no_labels,
+                    ByKind::Person,
+                    unread,
+                    NOW + 2,
+                    false,
+                )
+            })
         })
     });
     let undone = undone.expect("an undo").name;
@@ -1197,18 +1164,6 @@ fn registry_names_remain_the_edit_base_despite_newer_old_own_book_records() {
         "a nickname edit does not strengthen its number"
     );
     assert_eq!(nicked.rev, 1);
-    assert_eq!(
-        whats(&nicked)[0],
-        (
-            Why::Nickname,
-            Some(num(86)),
-            Some(num(86)),
-            Some("MissBunny".to_owned()),
-            "Bunny".to_owned()
-        ),
-        "the nickname change, newest"
-    );
-    assert_eq!(nicked.history.len(), 2, "after the first name");
 
     let to = NameTo {
         num: num(87),
@@ -1225,9 +1180,9 @@ fn registry_names_remain_the_edit_base_despite_newer_old_own_book_records() {
     )
     .expect("previews a local rename");
     assert_eq!(
-        (preview.name.history[0].from, preview.name.history[0].to),
-        (Some(num(86)), Some(num(87))),
-        "the preview's History holds the rename it would make"
+        preview.name.num,
+        Some(num(87)),
+        "the preview holds the rename it would make"
     );
     assert_eq!(file::read(root.path()).expect("reads"), Some(nicked));
     let renamed = set_name(
@@ -1243,23 +1198,11 @@ fn registry_names_remain_the_edit_base_despite_newer_old_own_book_records() {
     .name;
     assert_eq!(renamed.title(), "m87 Bunny");
     assert_eq!(renamed.rev, 2);
-    let change = &renamed.history[0];
     assert_eq!(
-        (
-            change.why,
-            change.from,
-            change.to,
-            change.by.map(|by| by.kind)
-        ),
-        (
-            Why::Named,
-            Some(num(86)),
-            Some(num(87)),
-            Some(ByKind::Person)
-        ),
-        "the actual previous local number, in History"
+        renamed.prev,
+        Some(num(86)),
+        "the actual previous local number"
     );
-    assert_eq!(renamed.history.len(), 3, "first name, nickname, rename");
     assert_eq!(
         renamed.was.iter().map(|was| was.num).collect::<Vec<_>>(),
         [num(86)]
@@ -1270,28 +1213,6 @@ fn registry_names_remain_the_edit_base_despite_newer_old_own_book_records() {
 
 fn num(n: u32) -> Number {
     Number::new(n).expect("a number")
-}
-
-/// What one History entry says: why, from, to, and the nickname before and after.
-pub(crate) type What = (Why, Option<Number>, Option<Number>, Option<String>, String);
-
-/// What each History entry of `name` says, newest first ([`What`]).
-pub(crate) fn whats(name: &MachineName) -> Vec<What> {
-    name.history
-        .iter()
-        .map(|change| {
-            (
-                change.why,
-                change.from,
-                change.to,
-                change
-                    .nick_from
-                    .as_ref()
-                    .map(|nick| nick.as_str().to_owned()),
-                change.nick_to.as_str().to_owned(),
-            )
-        })
-        .collect()
 }
 
 fn never(_: &str) -> bool {
@@ -1409,18 +1330,6 @@ fn a_chosen_number_and_nickname_are_one_change_with_the_prior_claim_kept() {
     assert_eq!(set.name.was[0].num, num(7));
     assert_eq!(set.name.migration, None);
     assert_eq!(
-        whats(&set.name)[0],
-        (
-            Why::Named,
-            before.num,
-            Some(num(86)),
-            Some(before.display_nick()),
-            "MissBunny".to_owned()
-        ),
-        "one change replaced the old number and nickname"
-    );
-    assert_eq!(set.name.history[0].at_ms, NOW);
-    assert_eq!(
         file::read(root.path()).expect("reads"),
         Some(set.name.clone())
     );
@@ -1474,18 +1383,24 @@ fn renumbering_without_a_nickname_keeps_the_word_and_preview_changes_no_name_or_
             .expect("reads a key")
             .is_none()
     );
-    let set = set_name(
-        root.path(),
-        &to,
-        no_labels,
-        ByKind::Agent,
-        unread,
-        NOW,
-        false,
-    )
-    .expect("renames");
+    let (set, asked) = registry::with_door(registry::Written::Unbound, || {
+        set_name(
+            root.path(),
+            &to,
+            no_labels,
+            ByKind::Agent,
+            unread,
+            NOW,
+            false,
+        )
+    });
+    let set = set.expect("renames");
     assert_eq!((set.name.num, set.name.nick), (Some(num(86)), before.nick));
-    assert_eq!(set.name.by.expect("an actor").kind, ByKind::Agent);
+    assert_eq!(
+        asked,
+        [["label=m86", "by=program"]],
+        "the row's write says a program asked"
+    );
 }
 
 #[test]
@@ -1949,17 +1864,10 @@ fn choosing_the_held_seeded_number_never_weakens_its_claim_against_a_rival() {
         (&same.name.prev, &same.name.was)
     );
     assert_eq!(
-        whats(&nick.name)[0],
-        (
-            Why::Named,
-            Some(num(7)),
-            Some(num(7)),
-            Some(same.name.display_nick()),
-            "MissBunny".to_owned()
-        ),
+        (nick.name.num, nick.name.rev),
+        (Some(num(7)), same.name.rev + 1),
         "a nickname chosen with the held number"
     );
-    assert_eq!(nick.name.history[1..], same.name.history[..]);
 }
 
 #[test]
@@ -2144,15 +2052,15 @@ fn a_nickname_in_view_is_one_in_any_case() {
 fn a_nickname_change_is_chosen_raises_rev_and_keeps_the_claim() {
     let heron = || Nickname::parse("heron").expect("a nickname");
     let held = MachineName::unnumbered(heron(), NOW);
-    let chosen = renicked(&held, heron(), None).expect("a drawn noun chosen is a change");
+    let chosen = renicked(&held, heron()).expect("a drawn noun chosen is a change");
     assert_eq!(
         (chosen.nick_class, chosen.rev),
         (NickClass::Chosen, 1),
         "every changed local nickname advances its revision"
     );
-    assert_eq!(renicked(&chosen, heron(), None), None, "chosen already");
+    assert_eq!(renicked(&chosen, heron()), None, "chosen already");
     let seeded = MachineName { rev: 4, ..chosen };
-    let respelled = renicked(&seeded, Nickname::parse("Heron").expect("a nickname"), None)
+    let respelled = renicked(&seeded, Nickname::parse("Heron").expect("a nickname"))
         .expect("another spelling is another nickname");
     assert_eq!(respelled.rev, 5, "a seeded file's change raises rev");
     assert_eq!(
@@ -2723,59 +2631,6 @@ fn a_move_judged_without_the_vault_s_labels_is_refused() {
     assert_eq!(refused.cause, Cause::Moved, "{refused}");
 }
 
-/// History keeps the newest sixteen changes, newest first: a first name and sixteen nickname
-/// changes leave the first name out, while (the control) a first name and fourteen keep all
-/// fifteen, the first name last.
-#[test]
-fn history_keeps_the_newest_sixteen_newest_first() {
-    for changes in [16_u64, 14] {
-        let root = state();
-        let (first, _) = ensure(root.path(), no_roster, never, NOW).expect("a first name");
-        for i in 1..=changes {
-            let word = Nickname::parse(&format!("Bird{i}")).expect("a nickname");
-            set_nick(
-                root.path(),
-                &NickTo::Word(word),
-                ByKind::Person,
-                unread,
-                NOW + i,
-                false,
-            )
-            .expect("renames");
-        }
-        let name = file::read(root.path()).expect("reads").expect("a name");
-        let kept = usize::try_from(changes).expect("small") + 1;
-        assert_eq!(
-            name.history.len(),
-            kept.min(file::HISTORY_MAX),
-            "{changes} changes"
-        );
-        assert_eq!(name.history[0].nick_to.as_str(), format!("Bird{changes}"));
-        assert!(
-            name.history
-                .windows(2)
-                .all(|pair| pair[0].at_ms > pair[1].at_ms),
-            "newest first: {:?}",
-            name.history
-        );
-        let last = name.history.last().expect("an entry");
-        if kept > file::HISTORY_MAX {
-            assert_eq!(
-                (last.why, last.nick_to.as_str()),
-                (Why::Nickname, "Bird1"),
-                "the first name is the one left out"
-            );
-        } else {
-            assert_eq!(
-                (last.why, &last.nick_to, last.at_ms),
-                (Why::First, &first.shown_nick(), NOW),
-                "every change kept"
-            );
-        }
-    }
-}
-
-/// A chosen m86 MissBunny over the seeded m7 a roster gave, as History's newest change.
 fn renamed_from_m7(root: &aterm_tempfile::TempDir) -> (MachineName, MachineName) {
     let (before, _) = ensure(root.path(), label("m7"), never, NOW).expect("a seeded name");
     let to = NameTo {
@@ -2798,15 +2653,13 @@ fn renamed_from_m7(root: &aterm_tempfile::TempDir) -> (MachineName, MachineName)
 
 /// Keep a nickname-undo control distinct from the noun the fixture happened to draw.
 fn different_nickname(name: &MachineName) -> Nickname {
-    let heron = Nickname::parse("Heron").expect("a nickname");
-    let next = if name.shown_nick() == heron {
+    let next = if name.display_nick().eq_ignore_ascii_case("heron") {
         Nickname::parse("Otter").expect("another nickname")
     } else {
-        heron
+        Nickname::parse("Heron").expect("a nickname")
     };
-    assert_ne!(
-        name.shown_nick(),
-        next,
+    assert!(
+        !name.display_nick().eq_ignore_ascii_case(next.as_str()),
         "the fixture must change the shown nickname"
     );
     next
@@ -2817,52 +2670,146 @@ fn unreadable() -> io::Result<LabLabels> {
     Err(io::Error::other("the vault is busy"))
 }
 
-/// Undo takes the last change back: the number and nickname it replaced return, as a new chosen
-/// claim and never the seeded rank it replaced, the change is marked undone and the undo
-/// recorded as History's newest; the preview answers the same, and a dry run writes nothing. A
-/// nickname change's undo returns the nickname alone, reads no labels and leaves the claim as it
-/// is. Its negative controls: a mutant that passed no nickname to the rename back failed the
-/// first assert, the undo the preview names, and History recording the stored nickname rather
-/// than the shown one failed the title assert (the drawn noun came back lowercase, `puffin`
-/// where the title had shown `Puffin`).
+/// An owner's write `op` to this Mac's row, as History lists it: each cell's `to`, standing,
+/// over `from` (`None`: the row held none there).
+fn owner_write(op: u8, cells: &[(Renamed, Option<&str>, &str)]) -> history::NameWrite {
+    history::NameWrite {
+        op: [op; 32],
+        at_ms: NOW + u64::from(op),
+        mac: "m8".to_owned(),
+        kind: aterm_db::att::EntryKind::Explicit,
+        reverts: None,
+        carried: false,
+        cells: cells
+            .iter()
+            .map(|(cell, from, to)| history::NameCell {
+                cell: *cell,
+                value: Some((*to).to_owned()),
+                stands: true,
+                replaced: vec![from.map(str::to_owned)],
+                unseen: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
+/// This Mac's row holding `writes`, newest first.
+fn row(writes: Vec<history::NameWrite>) -> history::History {
+    history::History {
+        row: Some("mc-0123456789abcdef".to_owned()),
+        pending: Vec::new(),
+        writes,
+    }
+}
+
+/// What Undo makes of this Mac's row holding `writes`, newest first ([`history::undo_of`]).
+fn undo_over(writes: Vec<history::NameWrite>) -> Result<history::Undo, Refused> {
+    history::undo_of(&row(writes))
+}
+
+/// A History whose undo is `seen`: its rename, `seen.op`, wrote what `seen.shown` holds over
+/// what `seen.cells` gives back, and an automatic write holds each other cell's value.
+fn row_of(seen: &history::Undo) -> history::History {
+    let mut rename = owner_write(0, &[]);
+    rename.op = seen.op;
+    let mut other = history::NameWrite {
+        kind: aterm_db::att::EntryKind::Aterm,
+        ..owner_write(1, &[])
+    };
+    for (cell, value) in &seen.shown {
+        let written = history::NameCell {
+            cell: *cell,
+            value: Some(value.clone()),
+            stands: true,
+            replaced: Vec::new(),
+            unseen: Vec::new(),
+        };
+        match seen.cells.iter().find(|(back, _)| back == cell) {
+            Some((_, back)) => rename.cells.push(history::NameCell {
+                replaced: vec![Some(back.clone())],
+                ..written
+            }),
+            None if !value.is_empty() => other.cells.push(written),
+            None => {}
+        }
+    }
+    let history = row(vec![rename, other]);
+    assert_eq!(
+        history::undo_of(&history).as_ref(),
+        Ok(seen),
+        "a History that gives the undo"
+    );
+    history
+}
+
+/// The undo of the rename [`renamed_from_m7`] made, as the row's History gives it: `m7` and the
+/// nickname `before` showed.
+fn rename_undo(before: &MachineName) -> history::Undo {
+    let shown = before.display_nick();
+    undo_over(vec![owner_write(
+        2,
+        &[
+            (Renamed::Label, Some("m7"), "m86"),
+            (Renamed::Nickname, Some(&shown), "MissBunny"),
+        ],
+    )])
+    .expect("an undo")
+}
+
+/// The undo of a nickname rename from `from` to `to`, as the row's History gives it.
+fn nickname_undo(from: &str, to: &str) -> history::Undo {
+    undo_over(vec![owner_write(3, &[(Renamed::Nickname, Some(from), to)])])
+        .expect("a nickname undo")
+}
+
+/// [`undo_last`] of `seen` in `root` while History still gives it ([`history::with_history`]),
+/// with the writes it queued to the row ([`registry::with_door`]).
+fn undo_shown(
+    root: &aterm_tempfile::TempDir,
+    seen: &history::Undo,
+    lab: impl FnOnce() -> io::Result<LabLabels>,
+    kind: ByKind,
+    now: u64,
+    dry_run: bool,
+) -> (io::Result<NameSet>, Vec<Vec<String>>) {
+    registry::with_door(registry::Written::Unbound, || {
+        history::with_history(Ok(row_of(seen)), || {
+            undo_last(root.path(), seen, lab, kind, unread, now, dry_run)
+        })
+    })
+}
+
+/// Undo takes the row's last rename back: the number and nickname it replaced return, as a new
+/// chosen claim and never the seeded rank it replaced; the preview judges the same undo, and a
+/// dry run writes nothing. A nickname rename's undo returns the nickname alone, reads no labels
+/// and leaves the claim as it is.
+/// NEGATIVE CONTROL: with `undo_last` giving `change_claim` the number alone (`NameTo { nick:
+/// None, .. }`), the undone title keeps `MissBunny`.
 #[test]
 fn undo_returns_to_the_number_and_nickname_the_last_change_replaced() {
     let root = state();
     let (before, set) = renamed_from_m7(&root);
-    let back = UndoTo::Name(NameTo {
-        num: num(7),
-        nick: Some(before.shown_nick()),
-    });
+    let seen = rename_undo(&before);
+    assert_eq!(
+        seen.to,
+        UndoTo::Name(NameTo {
+            num: num(7),
+            nick: Some(Nickname::parse(&before.display_nick()).expect("a nickname")),
+        })
+    );
     let preview = rename_preview(root.path(), no_labels, unread, NOW + 2).expect("a read");
-    assert_eq!(preview.undo(), Ok(back.clone()));
-    assert_eq!(undo_to(&set), Ok(back));
-    let dry = undo_last(
-        root.path(),
-        None,
-        no_labels,
-        ByKind::Agent,
-        unread,
-        NOW + 2,
-        true,
-    )
-    .expect("a dry run");
+    assert_eq!(preview.undo(&seen), Ok(()));
+    let (dry, asked) = undo_shown(&root, &seen, no_labels, ByKind::Agent, NOW + 2, true);
+    let dry = dry.expect("a dry run");
     assert!(dry.changed);
+    assert!(asked.is_empty(), "a dry run queues nothing: {asked:?}");
     assert_eq!(
         file::read(root.path()).expect("reads"),
         Some(set.clone()),
         "a dry run writes nothing"
     );
-    let undone = undo_last(
-        root.path(),
-        None,
-        no_labels,
-        ByKind::Agent,
-        unread,
-        NOW + 2,
-        false,
-    )
-    .expect("undoes")
-    .name;
+    let (undone, _) = undo_shown(&root, &seen, no_labels, ByKind::Agent, NOW + 2, false);
+    let undone = undone.expect("undoes").name;
     assert_eq!(undone, dry.name, "the dry run said what the undo does");
     assert_eq!(undone.title(), before.title());
     assert_eq!(
@@ -2877,36 +2824,6 @@ fn undo_returns_to_the_number_and_nickname_the_last_change_replaced() {
     );
     assert_eq!(undone.rev, set.rev + 1);
     assert_eq!(
-        whats(&undone),
-        [
-            (
-                Why::Undone,
-                Some(num(86)),
-                Some(num(7)),
-                Some("MissBunny".to_owned()),
-                before.display_nick()
-            ),
-            (
-                Why::Named,
-                Some(num(7)),
-                Some(num(86)),
-                Some(before.display_nick()),
-                "MissBunny".to_owned()
-            ),
-            (Why::First, None, Some(num(7)), None, before.display_nick()),
-        ]
-    );
-    assert_eq!(
-        undone
-            .history
-            .iter()
-            .map(|change| change.undone)
-            .collect::<Vec<_>>(),
-        [false, true, false],
-        "only the change taken back is marked"
-    );
-    assert_eq!(undone.history[0].by.map(|by| by.kind), Some(ByKind::Agent));
-    assert_eq!(
         file::read(root.path()).expect("reads"),
         Some(undone.clone())
     );
@@ -2914,7 +2831,7 @@ fn undo_returns_to_the_number_and_nickname_the_last_change_replaced() {
     let next = different_nickname(&before);
     let nicked = set_nick(
         root.path(),
-        &NickTo::Word(next),
+        &NickTo::Word(next.clone()),
         ByKind::Person,
         unread,
         NOW + 3,
@@ -2922,19 +2839,11 @@ fn undo_returns_to_the_number_and_nickname_the_last_change_replaced() {
     )
     .expect("a nickname change")
     .name;
+    let seen = nickname_undo(&before.display_nick(), next.as_str());
     let preview = rename_preview(root.path(), unreadable, unread, NOW + 4).expect("a read");
-    assert_eq!(preview.undo(), Ok(UndoTo::Nickname(before.shown_nick())));
-    let back = undo_last(
-        root.path(),
-        None,
-        unreadable,
-        ByKind::Person,
-        unread,
-        NOW + 4,
-        false,
-    )
-    .expect("a nickname undo reads no labels")
-    .name;
+    assert_eq!(preview.undo(&seen), Ok(()));
+    let (back, _) = undo_shown(&root, &seen, unreadable, ByKind::Person, NOW + 4, false);
+    let back = back.expect("a nickname undo reads no labels").name;
     assert_eq!(
         (back.display_nick(), back.nick_class),
         (before.display_nick(), NickClass::Chosen),
@@ -2951,10 +2860,116 @@ fn undo_returns_to_the_number_and_nickname_the_last_change_replaced() {
         ),
         "the claim as it was"
     );
-    assert_eq!(
-        (back.history[0].why, back.history[1].undone),
-        (Why::Undone, true)
+}
+
+/// An undo is one owner write of every cell it gives back, the number and nickname together, as
+/// whoever asked: the KI-1114-532 case, an owner's label restored over the automatic one it
+/// replaced, is written as the owner's (registration does not write over it), where an `aterm
+/// file revert` would have restored registration's automatic write. A nickname that the rename
+/// left as it was is no part of the write.
+/// NEGATIVE CONTROL: with `edit_name` queueing each undo cell as its own `queue_rename`, the door
+/// records two writes for the rename of both.
+#[test]
+fn an_undo_writes_its_cells_as_one_owner_write() {
+    let root = state();
+    let (before, _) = renamed_from_m7(&root);
+    let (undone, asked) = undo_shown(
+        &root,
+        &rename_undo(&before),
+        no_labels,
+        ByKind::Person,
+        NOW + 2,
+        false,
     );
+    undone.expect("undoes");
+    assert_eq!(
+        asked,
+        [[
+            "label=m7".to_owned(),
+            format!("nickname={}", before.display_nick()),
+            "by=person".to_owned()
+        ]],
+        "one write of both cells, a person's"
+    );
+
+    let number = state();
+    ensure(number.path(), label("m7"), never, NOW).expect("registration's m7");
+    set_name(
+        number.path(),
+        &NameTo {
+            num: num(8),
+            nick: None,
+        },
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW + 1,
+        false,
+    )
+    .expect("the owner's m8");
+    let mut born = history::NameWrite {
+        kind: aterm_db::att::EntryKind::Aterm,
+        ..owner_write(1, &[(Renamed::Label, None, "m7")])
+    };
+    born.cells[0].stands = false;
+    born.cells[0].replaced.clear();
+    let seen = undo_over(vec![
+        owner_write(2, &[(Renamed::Label, Some("m7"), "m8")]),
+        born,
+    ])
+    .expect("the owner's rename");
+    let (undone, asked) = undo_shown(&number, &seen, no_labels, ByKind::Agent, NOW + 2, false);
+    let undone = undone.expect("undoes").name;
+    assert_eq!(asked, [["label=m7", "by=program"]]);
+    assert_eq!(
+        (undone.num, undone.class),
+        (Some(num(7)), Class::Chosen),
+        "m7 comes back as an owner's"
+    );
+}
+
+/// An undo of an undo redoes the rename: the undo is the row's newest owner write, so taking it
+/// back gives back what the undo replaced.
+/// NEGATIVE CONTROL: with `undo_of` passing over a write that wrote what the write before it
+/// replaced (an undo, as the file's History did), the second undo is refused.
+#[test]
+fn undoing_an_undo_redoes_the_rename() {
+    let root = state();
+    let (before, set) = renamed_from_m7(&root);
+    let (undone, _) = undo_shown(
+        &root,
+        &rename_undo(&before),
+        no_labels,
+        ByKind::Person,
+        NOW + 2,
+        false,
+    );
+    assert_eq!(undone.expect("undoes").name.title(), before.title());
+    let shown = before.display_nick();
+    let mut rename = owner_write(
+        2,
+        &[
+            (Renamed::Label, Some("m7"), "m86"),
+            (Renamed::Nickname, Some(&shown), "MissBunny"),
+        ],
+    );
+    for cell in &mut rename.cells {
+        cell.stands = false;
+    }
+    let redo = undo_over(vec![
+        owner_write(
+            3,
+            &[
+                (Renamed::Label, Some("m86"), "m7"),
+                (Renamed::Nickname, Some("MissBunny"), &shown),
+            ],
+        ),
+        rename,
+    ])
+    .expect("the undo is a rename");
+    let (redone, asked) = undo_shown(&root, &redo, no_labels, ByKind::Person, NOW + 3, false);
+    assert_eq!(redone.expect("redoes").name.title(), set.title());
+    assert_eq!(asked, [["label=m86", "nickname=MissBunny", "by=person"]]);
 }
 
 /// Undo is refused once another Mac holds the old number by a person's choice, with that
@@ -2966,7 +2981,8 @@ fn undo_returns_to_the_number_and_nickname_the_last_change_replaced() {
 fn undo_is_refused_when_another_mac_now_holds_the_old_number_by_choice() {
     let root = state();
     node_identity(root.path()).expect("our identity");
-    let (_, set) = renamed_from_m7(&root);
+    let (before, set) = renamed_from_m7(&root);
+    let seen = rename_undo(&before);
     let other = NodeIdentity::from_seed(&"b2".repeat(16), &[0x22; 32]).expect("another identity");
     let theirs = node_of(other.node()).expect("their node");
     let mut auto = record(&other, Some(7), 3, Some("Otter"));
@@ -2984,37 +3000,24 @@ fn undo_is_refused_when_another_mac_now_holds_the_old_number_by_choice() {
         (implied, Verdict::HeldByOlderBuild { by: theirs }),
     ] {
         write_private(root.path(), PEERS_FILE, book.as_bytes()).expect("their claim on m7");
-        let why = undo_last(
-            root.path(),
-            None,
-            no_labels,
-            ByKind::Person,
-            unread,
-            NOW + 2,
-            false,
-        )
-        .expect_err("m7 is held");
+        let (why, asked) = undo_shown(&root, &seen, no_labels, ByKind::Person, NOW + 2, false);
+        let why = why.expect_err("m7 is held");
         assert_eq!(
             Refused::of(&why).and_then(Refused::verdict),
             Some(&verdict),
             "{why}"
         );
+        assert!(asked.is_empty(), "nothing queued: {asked:?}");
         let preview = rename_preview(root.path(), no_labels, unread, NOW + 2).expect("a read");
-        assert_eq!(preview.undo().as_ref().err(), Refused::of(&why));
+        assert_eq!(preview.undo(&seen).as_ref().err(), Refused::of(&why));
         assert_eq!(file::read(root.path()).expect("reads"), Some(set.clone()));
     }
     write_private(root.path(), PEERS_FILE, b"").expect("no holder");
-    let back = undo_last(
-        root.path(),
-        None,
-        no_labels,
-        ByKind::Person,
-        unread,
-        NOW + 2,
-        false,
-    )
-    .expect("the control: m7 is free");
-    assert_eq!(back.name.num, Some(num(7)));
+    let (back, _) = undo_shown(&root, &seen, no_labels, ByKind::Person, NOW + 2, false);
+    assert_eq!(
+        back.expect("the control: m7 is free").name.num,
+        Some(num(7))
+    );
 }
 
 /// Undo is refused once the vault gives the old number to another Mac, by any hold, with that
@@ -3023,7 +3026,8 @@ fn undo_is_refused_when_another_mac_now_holds_the_old_number_by_choice() {
 #[test]
 fn undo_is_refused_once_the_vault_gives_the_old_number_to_another_mac() {
     let root = state();
-    let (_, set) = renamed_from_m7(&root);
+    let (before, set) = renamed_from_m7(&root);
+    let seen = rename_undo(&before);
     for hold in [
         LabelHold::Label,
         LabelHold::Alias,
@@ -3036,16 +3040,15 @@ fn undo_is_refused_once_the_vault_gives_the_old_number_to_another_mac() {
             held: BTreeMap::from([(num(7), hold)]),
             ..LabLabels::default()
         };
-        let why = undo_last(
-            root.path(),
-            None,
+        let (why, _) = undo_shown(
+            &root,
+            &seen,
             || Ok(lab.clone()),
             ByKind::Person,
-            unread,
             NOW + 2,
             false,
-        )
-        .expect_err("another Mac's number");
+        );
+        let why = why.expect_err("another Mac's number");
         assert_eq!(
             Refused::of(&why).map(|refused| &refused.cause),
             Some(&Cause::Vault(hold)),
@@ -3053,20 +3056,11 @@ fn undo_is_refused_once_the_vault_gives_the_old_number_to_another_mac() {
         );
         let preview =
             rename_preview(root.path(), || Ok(lab.clone()), unread, NOW + 2).expect("a read");
-        assert_eq!(preview.undo().as_ref().err(), Refused::of(&why));
+        assert_eq!(preview.undo(&seen).as_ref().err(), Refused::of(&why));
         assert_eq!(file::read(root.path()).expect("reads"), Some(set.clone()));
     }
-    let back = undo_last(
-        root.path(),
-        None,
-        no_labels,
-        ByKind::Person,
-        unread,
-        NOW + 2,
-        false,
-    )
-    .expect("the control: no labels");
-    assert_eq!(back.name.num, Some(num(7)));
+    let (back, _) = undo_shown(&root, &seen, no_labels, ByKind::Person, NOW + 2, false);
+    assert_eq!(back.expect("the control: no labels").name.num, Some(num(7)));
 }
 
 /// Undo is refused while another Mac's record carries the nickname it would bring back, whether
@@ -3087,41 +3081,27 @@ fn undo_is_refused_when_another_mac_now_carries_the_old_nickname() {
         )
         .expect("their record");
     };
-    let refused = |labels: fn() -> io::Result<LabLabels>, now: u64| {
-        let why = undo_last(
-            root.path(),
-            None,
-            labels,
-            ByKind::Person,
-            unread,
-            now,
-            false,
-        )
-        .expect_err("their nickname");
+    let refused = |seen: &history::Undo, labels: fn() -> io::Result<LabLabels>, now: u64| {
+        let (why, _) = undo_shown(&root, seen, labels, ByKind::Person, now, false);
+        let why = why.expect_err("their nickname");
         assert_eq!(
             Refused::of(&why).map(|refused| &refused.cause),
             Some(&Cause::Nickname),
             "{why}"
         );
         let preview = rename_preview(root.path(), labels, unread, now).expect("a read");
-        assert_eq!(preview.undo().as_ref().err(), Refused::of(&why));
+        assert_eq!(preview.undo(seen).as_ref().err(), Refused::of(&why));
     };
-    let old = before.shown_nick();
-    carries(old.as_str(), 3);
-    refused(no_labels, NOW + 2);
+    let old = before.display_nick();
+    let seen = rename_undo(&before);
+    carries(&old, 3);
+    refused(&seen, no_labels, NOW + 2);
     assert_eq!(file::read(root.path()).expect("reads"), Some(set));
     carries("Kestrel", 4);
-    let back = undo_last(
-        root.path(),
-        None,
-        no_labels,
-        ByKind::Person,
-        unread,
-        NOW + 2,
-        false,
-    )
-    .expect("the control: the number and nickname come back")
-    .name;
+    let (back, _) = undo_shown(&root, &seen, no_labels, ByKind::Person, NOW + 2, false);
+    let back = back
+        .expect("the control: the number and nickname come back")
+        .name;
     assert_eq!(back.title(), before.title());
 
     let nicked = set_nick(
@@ -3134,154 +3114,21 @@ fn undo_is_refused_when_another_mac_now_carries_the_old_nickname() {
     )
     .expect("a nickname change")
     .name;
-    carries(old.as_str(), 5);
-    refused(unreadable, NOW + 4);
+    let seen = nickname_undo(&old, "Heron");
+    carries(&old, 5);
+    refused(&seen, unreadable, NOW + 4);
     assert_eq!(file::read(root.path()).expect("reads"), Some(nicked));
     carries("Kestrel", 6);
-    let back = undo_last(
-        root.path(),
-        None,
-        unreadable,
-        ByKind::Person,
-        unread,
-        NOW + 4,
-        false,
-    )
-    .expect("the control: the nickname alone comes back")
-    .name;
+    let (back, _) = undo_shown(&root, &seen, unreadable, ByKind::Person, NOW + 4, false);
+    let back = back
+        .expect("the control: the nickname alone comes back")
+        .name;
     assert_eq!(back.title(), before.title());
 }
 
-/// Undo takes back only History's newest change, and only while the name stands as that change
-/// left it: after a change History does not hold (a writer that keeps no History, as an older
-/// build is), of the number or of the nickname alone, it is refused as superseded and nothing
-/// changes, and once such a writer drops History it finds nothing to take back. Control: before
-/// that write, the same undo passes.
-#[test]
-fn undo_is_refused_after_a_newer_change_made_elsewhere() {
-    let superseded = |root: &aterm_tempfile::TempDir| {
-        let why = undo_last(
-            root.path(),
-            None,
-            no_labels,
-            ByKind::Person,
-            unread,
-            NOW + 2,
-            false,
-        )
-        .expect_err("superseded");
-        assert_eq!(
-            Refused::of(&why).map(|refused| &refused.cause),
-            Some(&Cause::Superseded),
-            "{why}"
-        );
-        assert_eq!(
-            rename_preview(root.path(), no_labels, unread, NOW + 2)
-                .expect("a read")
-                .undo()
-                .map_err(|refused| refused.cause),
-            Err(Cause::Superseded)
-        );
-    };
-    let renicked = state();
-    renamed_from_m7(&renicked);
-    let elsewhere = file::replace(renicked.path(), |name| {
-        name.nick = Nickname::parse("Kestrel").expect("a nickname");
-        name.rev += 1;
-        Ok(())
-    })
-    .expect("a nickname change History does not hold, the number kept");
-    superseded(&renicked);
-    assert_eq!(file::read(renicked.path()).expect("reads"), Some(elsewhere));
-
-    let root = state();
-    renamed_from_m7(&root);
-    undo_last(
-        root.path(),
-        None,
-        no_labels,
-        ByKind::Person,
-        unread,
-        NOW + 2,
-        true,
-    )
-    .expect("the control: the change is current");
-    let elsewhere = file::replace(root.path(), |name| {
-        name.num = Some(num(90));
-        name.rev += 1;
-        Ok(())
-    })
-    .expect("a change History does not hold");
-    superseded(&root);
-    assert_eq!(file::read(root.path()).expect("reads"), Some(elsewhere));
-    file::replace(root.path(), |name| {
-        name.history.clear();
-        Ok(())
-    })
-    .expect("an older build's write keeps no History");
-    let why = undo_last(
-        root.path(),
-        None,
-        no_labels,
-        ByKind::Person,
-        unread,
-        NOW + 2,
-        false,
-    )
-    .expect_err("nothing kept");
-    assert_eq!(
-        Refused::of(&why).map(|refused| &refused.cause),
-        Some(&Cause::Nothing),
-        "{why}"
-    );
-}
-
-/// Undo is single-level: the undo it records is never undone, and a change marked undone is not
-/// taken back again; the first name is nothing to take back. Control: the first undo passes.
-#[test]
-fn undo_does_not_undo_an_undo() {
-    let cause = |state: &aterm_tempfile::TempDir| {
-        let why = undo_last(
-            state.path(),
-            None,
-            no_labels,
-            ByKind::Person,
-            unread,
-            NOW + 3,
-            false,
-        )
-        .expect_err("refused");
-        Refused::of(&why).map(|refused| refused.cause.clone())
-    };
-    let root = state();
-    renamed_from_m7(&root);
-    let undone = undo_last(
-        root.path(),
-        None,
-        no_labels,
-        ByKind::Person,
-        unread,
-        NOW + 2,
-        false,
-    )
-    .expect("the control: the first undo")
-    .name;
-    assert_eq!(cause(&root), Some(Cause::Undone), "an undo");
-    assert_eq!(file::read(root.path()).expect("reads"), Some(undone));
-    file::replace(root.path(), |name| {
-        name.history.remove(0);
-        Ok(())
-    })
-    .expect("a change marked undone as the newest");
-    assert_eq!(cause(&root), Some(Cause::Undone), "undone already");
-
-    let fresh = state();
-    ensure(fresh.path(), label("m7"), never, NOW).expect("a first name");
-    assert_eq!(cause(&fresh), Some(Cause::Nothing), "the first name");
-}
-
-/// No undo leaves a Mac unnumbered: the change that gave it its first number is refused, while
-/// (the control) a nickname change while unnumbered is taken back.
+/// No undo leaves a Mac unnumbered: the row's rename that gave it its first number is refused,
+/// over a label the row never held or one it held unset, while (the control) a nickname rename
+/// while unnumbered is taken back.
 #[test]
 fn undo_leaves_no_mac_unnumbered() {
     let root = state();
@@ -3289,56 +3136,37 @@ fn undo_leaves_no_mac_unnumbered() {
     let next = different_nickname(&first);
     set_nick(
         root.path(),
-        &NickTo::Word(next),
+        &NickTo::Word(next.clone()),
         ByKind::Person,
         unread,
         NOW + 1,
         false,
     )
     .expect("a nickname");
-    let back = undo_last(
-        root.path(),
-        None,
+    let (back, _) = undo_shown(
+        &root,
+        &nickname_undo(&first.display_nick(), next.as_str()),
         unreadable,
         ByKind::Person,
-        unread,
         NOW + 2,
         false,
-    )
-    .expect("the control: an unnumbered nickname change")
-    .name;
+    );
+    let back = back
+        .expect("the control: an unnumbered nickname change")
+        .name;
     assert_eq!(
         (back.num, back.display_nick()),
         (None, first.display_nick())
     );
-    set_name(
-        root.path(),
-        &NameTo {
-            num: num(86),
-            nick: None,
-        },
-        no_labels,
-        ByKind::Person,
-        unread,
-        NOW + 3,
-        false,
-    )
-    .expect("a first number");
-    let why = undo_last(
-        root.path(),
-        None,
-        no_labels,
-        ByKind::Person,
-        unread,
-        NOW + 4,
-        false,
-    )
-    .expect_err("no undo leaves it unnumbered");
-    assert_eq!(
-        Refused::of(&why).map(|refused| &refused.cause),
-        Some(&Cause::Unnumbered),
-        "{why}"
-    );
+    let numbered = |replaced: Vec<Option<String>>| {
+        let mut write = owner_write(4, &[(Renamed::Label, None, "m86")]);
+        write.cells[0].replaced = replaced;
+        undo_over(vec![write])
+    };
+    for (replaced, case) in [(Vec::new(), "never held"), (vec![None], "held unset")] {
+        let why = numbered(replaced).expect_err(case);
+        assert_eq!(why.cause, Cause::Unnumbered, "{case}: {why}");
+    }
 }
 
 /// The numbers offered beside a taken one are those a rename takes as `Free`: past each number a
@@ -3440,28 +3268,22 @@ fn a_retired_earlier_number_no_longer_raises_top() {
         )
     };
     assert_eq!(top_of(&active), 90, "the control: an active earlier number");
-    let retired = retire_was(root.path(), num(90), true, ByKind::Person).expect("retires");
+    let retired = retire_was(root.path(), num(90), true).expect("retires");
     assert!(retired.changed);
     assert!(retired.name.was[0].retired);
     assert_eq!(top_of(&retired.name), 10, "only up to the cap");
-    assert_eq!(
-        (retired.name.rev, retired.name.by.map(|by| by.kind)),
-        (active.rev + 1, Some(ByKind::Person))
-    );
-    assert_eq!(
-        (&retired.name.title(), &retired.name.history),
-        (&active.title(), &active.history)
-    );
+    assert_eq!(retired.name.rev, active.rev + 1);
+    assert_eq!(retired.name.title(), active.title());
     assert_eq!(
         file::read(root.path()).expect("reads"),
         Some(retired.name.clone())
     );
-    let again = retire_was(root.path(), num(90), true, ByKind::Agent).expect("retired already");
+    let again = retire_was(root.path(), num(90), true).expect("retired already");
     assert!(!again.changed);
     assert_eq!(again.name, retired.name);
-    let restored = retire_was(root.path(), num(90), false, ByKind::Person).expect("restores");
+    let restored = retire_was(root.path(), num(90), false).expect("restores");
     assert_eq!(top_of(&restored.name), 90);
-    let missing = retire_was(root.path(), num(5), true, ByKind::Person).expect_err("never m5");
+    let missing = retire_was(root.path(), num(5), true).expect_err("never m5");
     assert_eq!(missing.kind(), io::ErrorKind::NotFound);
     assert_eq!(file::read(root.path()).expect("reads"), Some(restored.name));
 }
@@ -3489,24 +3311,17 @@ fn not_heron(word: &str) -> bool {
     word.eq_ignore_ascii_case("heron")
 }
 
-/// What an undo of the name in `root` does as a dry run over the newest change it read, and
-/// that change's undo target: the title [`UndoTo::title`] names is the title the dry run gives.
-fn undo_titled(root: &aterm_tempfile::TempDir) -> (MachineName, UndoTo, MachineName) {
+/// What an undo of the name in `root` does as a dry run over `seen`, and its undo target: the
+/// title [`UndoTo::title`] names is the title the dry run gives.
+fn undo_titled(
+    root: &aterm_tempfile::TempDir,
+    seen: &history::Undo,
+) -> (MachineName, UndoTo, MachineName) {
     let held = file::read(root.path()).expect("reads").expect("a name");
-    let to = undo_to(&held).expect("a change to take back");
-    let dry = undo_last(
-        root.path(),
-        held.history.first(),
-        no_labels,
-        ByKind::Person,
-        unread,
-        NOW + 2,
-        true,
-    )
-    .expect("a dry run")
-    .name;
-    assert_eq!(to.title(&held), dry.title(), "{to:?}");
-    (held, to, dry)
+    let (dry, _) = undo_shown(root, seen, no_labels, ByKind::Person, NOW + 2, true);
+    let dry = dry.expect("a dry run").name;
+    assert_eq!(seen.to.title(&held), dry.title(), "{:?}", seen.to);
+    (held, seen.to.clone(), dry)
 }
 
 /// The title an undo names ([`UndoTo::title`]) is the title its dry run gives, for a number and
@@ -3516,8 +3331,8 @@ fn undo_titled(root: &aterm_tempfile::TempDir) -> (MachineName, UndoTo, MachineN
 #[test]
 fn an_undo_names_the_title_its_dry_run_gives() {
     let both = state();
-    renamed_from_m7(&both);
-    let (_, to, _) = undo_titled(&both);
+    let (before, _) = renamed_from_m7(&both);
+    let (_, to, _) = undo_titled(&both, &rename_undo(&before));
     assert!(
         matches!(to, UndoTo::Name(NameTo { nick: Some(_), .. })),
         "{to:?}"
@@ -3539,7 +3354,9 @@ fn an_undo_names_the_title_its_dry_run_gives() {
         false,
     )
     .expect("renames, keeping the drawn nickname");
-    let (held, to, dry) = undo_titled(&number);
+    let seen = undo_over(vec![owner_write(2, &[(Renamed::Label, Some("m7"), "m86")])])
+        .expect("a number undo");
+    let (held, to, dry) = undo_titled(&number, &seen);
     assert_eq!(
         to,
         UndoTo::Name(NameTo {
@@ -3554,7 +3371,7 @@ fn an_undo_names_the_title_its_dry_run_gives() {
     );
 
     let nick = state();
-    ensure(nick.path(), label("m7"), not_heron, NOW).expect("a seeded name");
+    let (seeded, _) = ensure(nick.path(), label("m7"), not_heron, NOW).expect("a seeded name");
     set_nick(
         nick.path(),
         &NickTo::Word(Nickname::parse("Heron").expect("a nickname")),
@@ -3564,97 +3381,126 @@ fn an_undo_names_the_title_its_dry_run_gives() {
         false,
     )
     .expect("a nickname change");
-    let (_, to, _) = undo_titled(&nick);
+    let (_, to, _) = undo_titled(&nick, &nickname_undo(&seeded.display_nick(), "Heron"));
     assert!(matches!(to, UndoTo::Nickname(_)), "{to:?}");
 }
 
-/// An undo takes back only the change its caller read: once a later change replaced History's
-/// newest, an undo over the change read before it is refused as unseen and writes nothing.
-/// Controls: an undo over a fresh read's newest change takes that change back, and a change to
-/// the name that records no History (retiring an earlier number, which raises `rev`) between that
-/// read and the undo still lets it through, which a fence on `rev` would refuse.
+/// An undo takes back only the rename its caller read: where History, read again under the
+/// naming locks, gives another undo (a later rename of the number or of the nickname, from any
+/// Mac; a later automatic write of the cell the rename did not write; no row this Mac's), the
+/// undo is refused as unseen, writing nothing and queueing nothing. Controls: over History as it
+/// was read, the undo takes the rename back, and a change to the name that is no rename (retiring
+/// an earlier number, which raises `rev`) between that read and the undo still lets it through,
+/// which a fence on `rev` would refuse.
+/// The fence reads the row's whole name: a nickname undo is stopped by an automatic write of the
+/// number it did not write.
+/// NEGATIVE CONTROL: with `edit_name`'s `history::fence` removed, the undo over the later
+/// number writes `m7`; with `fence` comparing the newest rename alone (not `Undo::shown`), the
+/// nickname undo goes through over the moved number.
 #[test]
 fn an_undo_takes_back_only_the_change_it_read() {
     let root = state();
-    renamed_from_m7(&root);
-    let seen = rename_preview(root.path(), no_labels, unread, NOW + 2)
-        .expect("a read")
-        .name()
-        .history[0]
-        .clone();
-    let later = set_name(
-        root.path(),
-        &NameTo {
-            num: num(90),
-            nick: None,
+    let (before, set) = renamed_from_m7(&root);
+    let seen = rename_undo(&before);
+    let read = row_of(&seen);
+    let later = |write: history::NameWrite| {
+        let mut later = read.clone();
+        for older in &mut later.writes {
+            for cell in &mut older.cells {
+                cell.stands &= write.cell(cell.cell).is_none();
+            }
+        }
+        later.writes.insert(0, write);
+        later
+    };
+    let number = owner_write(3, &[(Renamed::Label, Some("m86"), "m90")]);
+    let nickname = owner_write(3, &[(Renamed::Nickname, Some("MissBunny"), "Kestrel")]);
+    let automatic = history::NameWrite {
+        kind: aterm_db::att::EntryKind::Aterm,
+        ..owner_write(3, &[(Renamed::Label, Some("m86"), "m90")])
+    };
+    for (now, case) in [
+        (later(number), "a later number"),
+        (later(nickname), "a later nickname"),
+        (later(automatic), "a later automatic number"),
+        (history::History::default(), "no row this Mac's"),
+    ] {
+        let (why, asked) = registry::with_door(registry::Written::Unbound, || {
+            history::with_history(Ok(now), || {
+                undo_last(
+                    root.path(),
+                    &seen,
+                    no_labels,
+                    ByKind::Person,
+                    unread,
+                    NOW + 3,
+                    false,
+                )
+            })
+        });
+        let why = why.expect_err(case);
+        assert_eq!(
+            Refused::of(&why).map(|refused| &refused.cause),
+            Some(&Cause::Unseen),
+            "{case}: {why}"
+        );
+        assert!(asked.is_empty(), "{case}: nothing queued: {asked:?}");
+        assert_eq!(
+            file::read(root.path()).expect("reads"),
+            Some(set.clone()),
+            "{case}: nothing undone"
+        );
+    }
+    let nick_only = nickname_undo("MissBunny", "Bunny");
+    let mut renumbered = row_of(&nick_only);
+    for write in &mut renumbered.writes {
+        for cell in &mut write.cells {
+            cell.stands &= cell.cell != Renamed::Label;
+        }
+    }
+    renumbered.writes.insert(
+        0,
+        history::NameWrite {
+            kind: aterm_db::att::EntryKind::Aterm,
+            ..owner_write(4, &[(Renamed::Label, Some("m86"), "m9")])
         },
-        no_labels,
-        ByKind::Person,
-        unread,
-        NOW + 2,
-        false,
-    )
-    .expect("a later change")
-    .name;
-    let why = undo_last(
-        root.path(),
-        Some(&seen),
-        no_labels,
-        ByKind::Person,
-        unread,
-        NOW + 3,
-        false,
-    )
-    .expect_err("the change read is no longer the newest");
+    );
+    let (why, _) = registry::with_door(registry::Written::Unbound, || {
+        history::with_history(Ok(renumbered), || {
+            undo_last(
+                root.path(),
+                &nick_only,
+                unreadable,
+                ByKind::Person,
+                unread,
+                NOW + 3,
+                false,
+            )
+        })
+    });
+    let why = why.expect_err("the number the nickname undo did not write moved");
     assert_eq!(
         Refused::of(&why).map(|refused| &refused.cause),
         Some(&Cause::Unseen),
         "{why}"
     );
-    assert_eq!(
-        file::read(root.path()).expect("reads"),
-        Some(later.clone()),
-        "nothing undone"
-    );
 
-    let fresh = later.history[0].clone();
-    let dry = undo_last(
-        root.path(),
-        Some(&fresh),
-        no_labels,
-        ByKind::Person,
-        unread,
-        NOW + 3,
-        true,
-    )
-    .expect("the control: the fresh read's newest change");
-    assert_eq!(dry.name.num, Some(num(86)));
-    let retired = retire_was(root.path(), num(7), true, ByKind::Person)
+    let (dry, _) = undo_shown(&root, &seen, no_labels, ByKind::Person, NOW + 3, true);
+    assert_eq!(
+        dry.expect("the control: History as it was read").name.num,
+        Some(num(7))
+    );
+    let retired = retire_was(root.path(), num(7), true)
         .expect("retires m7")
         .name;
+    assert_eq!(retired.rev, set.rev + 1, "rev rises");
+    let (back, _) = undo_shown(&root, &seen, no_labels, ByKind::Person, NOW + 3, false);
     assert_eq!(
-        (retired.rev, &retired.history),
-        (later.rev + 1, &later.history),
-        "rev rises, History does not"
+        back.expect("the control: History still gives the rename read")
+            .name
+            .num,
+        Some(num(7))
     );
-    let back = undo_last(
-        root.path(),
-        Some(&fresh),
-        no_labels,
-        ByKind::Person,
-        unread,
-        NOW + 3,
-        false,
-    )
-    .expect("the control: History's newest is still the change read")
-    .name;
-    assert_eq!(back.num, Some(num(86)));
-    assert!(back.history[1].undone, "the change read is the one undone");
-    assert_eq!(back.history[1], {
-        let mut undone = fresh;
-        undone.undone = true;
-        undone
-    });
 }
 
 /// Over unread vault labels, Undo Last Rename's offer leaves the number to the undo, as the live
@@ -3667,31 +3513,17 @@ fn undo_unchecked_leaves_an_unread_number_to_the_undo() {
     let root = state();
     node_identity(root.path()).expect("our identity");
     let (before, set) = renamed_from_m7(&root);
+    let seen = rename_undo(&before);
     let preview = rename_preview(root.path(), unreadable, unread, NOW + 2).expect("a read");
-    let (to, why) = preview.undo_unchecked().expect("left to the undo");
-    assert_eq!(
-        to,
-        UndoTo::Name(NameTo {
-            num: num(7),
-            nick: Some(before.shown_nick()),
-        })
-    );
+    let why = preview.undo_unchecked(&seen).expect("left to the undo");
     assert!(why.is_some(), "why the labels were not read");
     assert_eq!(why, preview.unchecked(num(7)));
     assert_eq!(
-        preview.undo().map_err(|refused| refused.cause),
+        preview.undo(&seen).map_err(|refused| refused.cause),
         Err(Cause::Unread)
     );
-    let refused = undo_last(
-        root.path(),
-        set.history.first(),
-        unreadable,
-        ByKind::Person,
-        unread,
-        NOW + 2,
-        false,
-    )
-    .expect_err("the undo checks the number");
+    let (refused, _) = undo_shown(&root, &seen, unreadable, ByKind::Person, NOW + 2, false);
+    let refused = refused.expect_err("the undo checks the number");
     assert_eq!(
         Refused::of(&refused).map(|refused| &refused.cause),
         Some(&Cause::Unread),
@@ -3705,14 +3537,16 @@ fn undo_unchecked_leaves_an_unread_number_to_the_undo() {
         PEERS_FILE,
         entry(
             &other,
-            &record(&other, Some(11), 3, Some(before.shown_nick().as_str())),
+            &record(&other, Some(11), 3, Some(&before.display_nick())),
         )
         .as_bytes(),
     )
     .expect("their record carries the old nickname");
     let preview = rename_preview(root.path(), unreadable, unread, NOW + 2).expect("a read");
     assert_eq!(
-        preview.undo_unchecked().map_err(|refused| refused.cause),
+        preview
+            .undo_unchecked(&seen)
+            .map_err(|refused| refused.cause),
         Err(Cause::Nickname),
         "the control: the nickname is judged over unread labels too"
     );
@@ -3790,7 +3624,7 @@ fn held_by_another_is_another_macs_claim_or_hold() {
     assert_eq!(preview.next_free(num(87), &unchecked), []);
 
     let preview = rename_preview(labelled.path(), no_labels, unread, NOW).expect("a read");
-    let nothing = undo_to(preview.name()).expect_err("only the first name");
+    let nothing = undo_over(Vec::new()).expect_err("a row with no rename");
     assert_eq!(nothing.cause, Cause::Nothing);
     assert!(
         !nothing.held_by_another(),
@@ -3816,8 +3650,8 @@ fn held_by_another_is_another_macs_claim_or_hold() {
 #[test]
 fn an_undo_publishes_the_number_it_takes_back_or_the_chosen_one_it_keeps() {
     let root = state();
-    let (_, set) = renamed_from_m7(&root);
-    assert_eq!(undo_publishes(&set), Some(num(7)));
+    let (before, set) = renamed_from_m7(&root);
+    assert_eq!(undo_publishes(&set, &rename_undo(&before)), Some(num(7)));
     assert_eq!(
         chosen_number(&set),
         Some(num(86)),
@@ -3833,15 +3667,19 @@ fn an_undo_publishes_the_number_it_takes_back_or_the_chosen_one_it_keeps() {
     )
     .expect("a nickname change")
     .name;
-    assert!(matches!(undo_to(&nicked), Ok(UndoTo::Nickname(_))));
-    assert_eq!(undo_publishes(&nicked), Some(num(86)));
+    let nick_back = nickname_undo("MissBunny", "Heron");
+    assert!(matches!(nick_back.to, UndoTo::Nickname(_)));
+    assert_eq!(undo_publishes(&nicked, &nick_back), Some(num(86)));
     let mut waiting = nicked;
     waiting.migration = Some(Migration::Waiting);
-    assert_eq!(undo_publishes(&waiting), None, "a waiting migration");
+    assert_eq!(
+        undo_publishes(&waiting, &nick_back),
+        None,
+        "a waiting migration"
+    );
 
     let fresh = state();
     let (first, _) = ensure(fresh.path(), label("m7"), not_heron, NOW).expect("a seeded name");
-    assert_eq!(undo_publishes(&first), None, "nothing to take back");
     let seeded = set_nick(
         fresh.path(),
         &NickTo::Word(Nickname::parse("Heron").expect("a nickname")),
@@ -3853,9 +3691,13 @@ fn an_undo_publishes_the_number_it_takes_back_or_the_chosen_one_it_keeps() {
     .expect("a nickname change")
     .name;
     assert_eq!(seeded.class, Class::Seeded);
-    assert!(matches!(undo_to(&seeded), Ok(UndoTo::Nickname(_))));
-    assert_eq!(undo_publishes(&seeded), None, "a seeded number");
+    let nick_back = nickname_undo(&first.display_nick(), "Heron");
+    assert_eq!(undo_publishes(&seeded, &nick_back), None, "a seeded number");
     let mut auto = seeded;
     auto.class = Class::Auto;
-    assert_eq!(undo_publishes(&auto), None, "an automatic number");
+    assert_eq!(
+        undo_publishes(&auto, &nick_back),
+        None,
+        "an automatic number"
+    );
 }

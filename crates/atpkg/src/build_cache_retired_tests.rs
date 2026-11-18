@@ -2439,6 +2439,23 @@ fn a_submodule_folder_holding_files_but_no_git_keeps_its_worktree() {
     assert!(copy.is_file(), "the copy stays");
 }
 
+/// A removal's cutoff read once the file clock ([`super::file_clock_now`]) has passed `path`'s
+/// last write, so that write is before it as the file system dates it. Where writes are dated
+/// by a coarse clock (Windows, about 15.6 ms a step; Linux, a jiffy, or a fine stamp within it
+/// once its times were read) a write in the step a cutoff is read in is dated at that cutoff or
+/// after it, and custody keeps the tree for it as it must for one written just after
+/// ([`super::pending::unchanged_since`]); the clock's next step is milliseconds away.
+fn cutoff_after_write_of(path: &Path) -> SystemTime {
+    let written = std::fs::symlink_metadata(path)
+        .and_then(|meta| meta.modified())
+        .expect("its last write's time");
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the file clock to step past the last write",
+        || Some(super::file_clock_now()).filter(|now| *now > written),
+    )
+}
+
 /// Give `path` a modification time a month before the clock: what a move, a `cp -p` or a restore
 /// from a backup keeps, older than any receipt's start.
 fn a_month_old(path: &Path) {
@@ -2682,7 +2699,8 @@ fn a_write_while_the_history_check_reads_keeps_the_worktree() {
 /// back a month; unix, whose files keep a change time), and while an empty folder was made in
 /// it since, each withdrawing its receipt and moving its tree back from its quarantine. With a
 /// snapshot of its files (made as the disk watch's pins make one, through a private index) and
-/// nothing written since, it goes, its quarantine with it, and its branch and its pins stay.
+/// nothing written since (its pins begun once the file clock stepped past the folder's removal,
+/// [`cutoff_after_write_of`]), it goes, its quarantine with it, and its branch and its pins stay.
 /// NEGATIVE CONTROLS: without `pins_hold` the first two go; without the last read against the
 /// pins' tree ([`super::holds`]) the third goes with the edit and the untracked file; without
 /// the change-time and folder dating of custody's last walk the fourth and fifth go (git lists
@@ -2810,7 +2828,7 @@ fn a_pinned_worktree_goes_only_while_its_pins_hold_its_head_and_tree() {
     kept(&why);
     std::fs::remove_dir(wt.join("later")).expect("taken away");
 
-    remove(&snapshot_pins(super::file_clock_now())).expect("pinned, it goes");
+    remove(&snapshot_pins(cutoff_after_write_of(&wt))).expect("pinned, it goes");
     assert!(!wt.exists() && !g.has_worktree(&wt), "{}", g.worktrees());
     assert!(!quarantine.exists(), "its quarantine went with it");
     assert_eq!(rev(&g.checkout(), "refs/heads/agent/pinned"), head);

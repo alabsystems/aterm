@@ -1350,7 +1350,7 @@ fn list_porcelain_is_stable() {
     assert_eq!(
         list_porcelain_lines(&installed, &live, &linked, &pinned),
         vec![
-            "ay\t7987\tsuperseded (kept for rollback)".to_string(),
+            "ay\t7987\tsuperseded".to_string(),
             "ay\t8256\tlive".to_string(),
             "clean\t7345\tlive  pinned".to_string(),
         ],
@@ -1377,7 +1377,7 @@ fn list_includes_programs_provisioned_only_through_development_links() {
         list_porcelain_lines(&installed, &live, &linked, &pinned),
         vec![
             "ay\t-\tDEV-LINKED -> /local/seal",
-            "clean\t12\tsuperseded (kept for rollback)",
+            "clean\t12\tsuperseded",
             "clean\t13\tlive",
         ],
         "existing signed-build rows retain their numeric identity and order",
@@ -3047,27 +3047,6 @@ fn which_names_a_same_named_binary_unrelated_with_no_index_or_behind_a_stub() {
     let _ = std::fs::remove_dir_all(&foreign_dir);
 }
 
-#[test]
-fn a_rolled_back_row_records_what_happened_and_which_prints_it() {
-    let words = crate::state::rolled_back(7345, 8606);
-    assert_eq!(words, "managed 7345 — rolled back from 8606");
-    assert!(crate::state::is_managed(&words));
-    assert_eq!(crate::state::managed_pin(&words), None, "no pin is claimed");
-    let layout = temp_layout("rolled-back-row");
-    let row = crate::ProgramStatus {
-        installed_build: Some(7345),
-        state: words.clone(),
-        tree_root: String::new(),
-    };
-    assert_eq!(managed_state_of(&layout, "clean", 7345, Some(&row)), words);
-    assert!(
-        managed_state_of(&layout, "clean", 8606, Some(&row)).starts_with("managed 8606"),
-        "{}",
-        managed_state_of(&layout, "clean", 8606, Some(&row))
-    );
-    let _ = std::fs::remove_dir_all(&layout.prefix);
-}
-
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
 
@@ -4016,22 +3995,6 @@ fn roll_forward_never_activates_a_pinned_yanked_or_rolled_off_build() {
         roll_forward_interrupted_activations(&layout, || index(&[])),
         vec!["ay".to_string()]
     );
-    crate::flow::rollback(
-        &f,
-        &layout,
-        &crate::sig::testkit::anchor(),
-        "stable",
-        "ay",
-        &[],
-        vendor_floor(),
-        world_now(),
-    )
-    .unwrap();
-    assert_eq!(crate::active_builds(&layout).get("ay"), Some(&17));
-    assert!(
-        roll_forward_interrupted_activations(&layout, || index(&[])).is_empty(),
-        "the rolled-off build stays off"
-    );
     let v281 = vendor_version("2.1.281").build_id();
     let v282 = vendor_version("2.1.282").build_id();
     make_live(&layout, "claude", v281);
@@ -4066,10 +4029,12 @@ fn roll_forward_never_activates_a_pinned_yanked_or_rolled_off_build() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
+/// RL-29: the update pass's gc keeps no older build of a program the signed index serves, a
+/// gate-valid one included, and `aterm pkg rollback` refuses that program: the lab fixes forward.
 #[test]
-fn the_pass_keeps_the_build_a_rollback_lands_on() {
+fn the_pass_reclaims_every_superseded_build_of_an_index_program_and_rollback_refuses_it() {
     use crate::vendor_direct::lane::world::{self, Fake};
-    let layout = world::layout("pass-rollback-target");
+    let layout = world::layout("pass-fix-forward");
     let f = Fake::default();
     *f.index.borrow_mut() = Some(world::signed_index(44, "2099-01-01T00:00:00Z", &["ay@17"]));
     for b in [16, 17] {
@@ -4081,24 +4046,15 @@ fn the_pass_keeps_the_build_a_rollback_lands_on() {
     let seams = world_seams(&trust);
     let installed = crate::active_builds(&layout);
     run_update_pass(&layout, &cfg, &f, &installed, false, &seams);
-    let landed = crate::flow::rollback(
-        &f,
-        &layout,
-        &crate::sig::testkit::anchor(),
-        "stable",
-        "ay",
-        &[],
-        vendor_floor(),
-        world_now(),
-    );
-    assert_eq!(
-        landed.map(|r| r.to_build).map_err(|e| e.to_string()),
-        Ok(16)
-    );
-    assert!(
-        !layout.build_dir("ay", 17).exists(),
-        "the pass's gc ran, and reclaimed the revoked build"
-    );
+    for b in [16, 17] {
+        assert!(
+            !layout.build_dir("ay", b).exists(),
+            "the pass's gc reclaimed superseded build {b}"
+        );
+    }
+    assert!(layout.build_dir("ay", 18).exists(), "the live build stays");
+    assert_eq!(rollback_in(&layout, "ay"), ExitCode::from(1));
+    assert_eq!(crate::active_builds(&layout).get("ay"), Some(&18));
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
@@ -14729,23 +14685,10 @@ fn a_vendor_rollback_moves_to_the_retained_build_without_the_index() {
     use crate::vendor_direct::lane::{self, Verdict};
     use crate::vendor_direct::policy::Policy;
     let layout = world::layout("rollback-by-hand");
-    let index = CountingFetcher::new(layout.prefix.join("unused-index"));
-    let absent = crate::flow::rollback(
-        &index,
-        &layout,
-        &crate::sig::testkit::anchor(),
-        "stable",
-        "ay",
-        &[],
-        vendor_floor(),
-        world_now(),
-    )
-    .unwrap_err();
-    assert!(matches!(absent, crate::FlowError::Rollback(_)), "{absent}");
     assert_eq!(
-        index.resolves(),
-        0,
-        "the flow refuses before any index read"
+        rollback_in(&layout, "ay"),
+        ExitCode::from(1),
+        "a program the index serves is fixed forward, never rolled back"
     );
     let f = Fake::default();
     let trust = world::trust();
@@ -14765,9 +14708,7 @@ fn a_vendor_rollback_moves_to_the_retained_build_without_the_index() {
         };
         lane::install_one(&lane, spec, false)
     };
-    let no_index =
-        || -> Box<dyn crate::flow::Fetcher> { panic!("a vendor rollback reached the index lane") };
-    let rollback = || rollback_in(&layout, "stable", "claude", &[], &no_index);
+    let rollback = || rollback_in(&layout, "claude");
     let active = || crate::active_builds(&layout).get("claude").copied();
     let err = lane::roll_back_by_hand(&layout, &none, spec).unwrap_err();
     assert!(err.contains("not installed"), "{err}");
@@ -15016,8 +14957,6 @@ fn a_vendor_rollback_returns_to_the_legacy_build_the_first_vendor_install_replac
         lane::install_one(&lane, spec, false).verdict,
         Verdict::Installed { .. }
     ));
-    let no_index =
-        || -> Box<dyn crate::flow::Fetcher> { panic!("a vendor rollback reached the index lane") };
     let yanked = Policy::from_entries(["claude@2026091901"]);
     let err = lane::roll_back_by_hand(&layout, &yanked, spec).unwrap_err();
     assert_eq!(
@@ -15026,10 +14965,7 @@ fn a_vendor_rollback_returns_to_the_legacy_build_the_first_vendor_install_replac
     );
     let v281 = vendor_version("2.1.281").build_id();
     assert_eq!(crate::active_builds(&layout).get("claude"), Some(&v281));
-    assert_eq!(
-        rollback_in(&layout, "stable", "claude", &[], &no_index),
-        ExitCode::SUCCESS
-    );
+    assert_eq!(rollback_in(&layout, "claude"), ExitCode::SUCCESS);
     assert_eq!(
         crate::active_builds(&layout).get("claude"),
         Some(&2_026_091_901)
@@ -15056,8 +14992,6 @@ fn a_rollback_to_the_legacy_build_is_attested_by_its_kept_root() {
     use crate::vendor_direct::policy::Policy;
     let legacy_build = 2_026_091_901_u64;
     let spec = crate::vendor_direct::spec("claude").unwrap();
-    let no_index =
-        || -> Box<dyn crate::flow::Fetcher> { panic!("a vendor rollback reached the index lane") };
     let legacy_install = |layout: &crate::store::Layout| {
         let dir = layout.build_dir("claude", legacy_build);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -15120,10 +15054,7 @@ fn a_rollback_to_the_legacy_build_is_attested_by_its_kept_root() {
         root,
         "the vendor build's row replaced it"
     );
-    assert_eq!(
-        rollback_in(&layout, "stable", "claude", &[], &no_index),
-        ExitCode::SUCCESS
-    );
+    assert_eq!(rollback_in(&layout, "claude"), ExitCode::SUCCESS);
     assert_eq!(row(&layout).installed_build, Some(legacy_build));
     assert_eq!(row(&layout).tree_root, root);
     assert_eq!(
@@ -15176,10 +15107,7 @@ fn a_rollback_to_the_legacy_build_is_attested_by_its_kept_root() {
     ));
     *f.index.borrow_mut() = None;
     f.forget_legacy_pkgs();
-    assert_eq!(
-        rollback_in(&layout, "stable", "claude", &[], &no_index),
-        ExitCode::SUCCESS
-    );
+    assert_eq!(rollback_in(&layout, "claude"), ExitCode::SUCCESS);
     assert_eq!(row(&layout).tree_root, root);
     assert_eq!(
         crate::verify::verify_program(&layout, "claude"),

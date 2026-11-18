@@ -1506,9 +1506,10 @@ impl Store {
         Self::open_claimed_classified(session, dir, scope, initialize, claimed, None)
     }
 
-    /// [`Self::open_claimed`], recording into `classes`, where given, each replayed record's
-    /// class and its verdict ([`crate::table::Verdict`]) in the replay's own read batch: what a
-    /// store kept across sessions ([`kept`]) holds its records' classification under.
+    /// [`Self::open_claimed`], recording into `recorded`, where given, each replayed record's
+    /// class and its verdict ([`crate::table::Verdict`]) in the replay's own read batch, and an
+    /// observer's read of its journal: what a store kept across sessions ([`kept`]) holds its
+    /// records' classification under, and reopens from.
     ///
     /// # Errors
     /// As [`Self::open_claimed`].
@@ -1518,7 +1519,7 @@ impl Store {
         scope: Scope,
         initialize: bool,
         claimed: Claimed<'_, '_>,
-        mut classes: Option<&mut kept::Classes>,
+        mut recorded: Option<&mut kept::Recorded>,
     ) -> Result<Self> {
         // Keep each admitted vault source stable through local replay. Live
         // authority is checked before replay, before finalization and before
@@ -1566,6 +1567,9 @@ impl Store {
             // Read physical facts before their group permission: a newly observed checkpoint
             // must not be judged under a permit snapshot taken before that group began.
             let journal = journals::read(dir, &claim[..ANCHOR_LEN], capacity.journal())?;
+            if let Some(recorded) = recorded.as_deref_mut() {
+                recorded.journal = journal.held();
+            }
             let boundary = if pending {
                 acknowledged.into()
             } else {
@@ -1689,7 +1693,7 @@ impl Store {
                             catalog,
                             read_only,
                         )?;
-                        if let Some(classes) = classes.as_deref_mut()
+                        if let Some(classes) = recorded.as_deref_mut().map(|kept| &mut kept.classes)
                             && !classes.contains_key(&class)
                         {
                             classes.insert(class, batch.class_verdict(&class)?);
@@ -1980,9 +1984,8 @@ impl Store {
         if hot_records.saturating_add(records) > quota
             || hot_bytes.saturating_add(bytes) > self.capacity.bytes
         {
-            return Err(Error::repair(
+            return Err(Error::capacity(
                 "table operation capacity exhausted; conflict space is reserved",
-                aterm_types::network_state::RepairCause::Quota,
             ));
         }
         Ok(())
@@ -2007,10 +2010,7 @@ impl Store {
             .writer_records
             .saturating_add(self.room(WRITER_CHECKPOINT_ROOM, checkpoint));
         if count > quota || size > WRITER_BYTES {
-            return Err(Error::repair(
-                "table writer evidence quota exhausted",
-                aterm_types::network_state::RepairCause::Quota,
-            ));
+            return Err(Error::capacity("table writer evidence quota exhausted"));
         }
         Ok(())
     }
@@ -3522,9 +3522,9 @@ impl Store {
         self.check(session)?;
         let mut hash = aterm_digest::Sha256::new();
         hash.update(b"aterm/commons/table-revision/1\0");
-        hash.update(&self.scope.digest());
-        hash.update(&session.access_observation());
-        hash.update(&(self.records.len() as u64).to_le_bytes());
+        hash.update(self.scope.digest());
+        hash.update(session.access_observation());
+        hash.update((self.records.len() as u64).to_le_bytes());
         for (id, stored) in &self.records {
             let payload: u8 = match stored.payload {
                 PayloadState::Ready => 0,
@@ -3532,18 +3532,18 @@ impl Store {
                 PayloadState::AwaitingMembership => 2,
             };
             hash.update(id);
-            hash.update(&[payload, u8::from(stored.cut.is_some())]);
+            hash.update([payload, u8::from(stored.cut.is_some())]);
         }
-        hash.update(&(self.conflicts.len() as u64).to_le_bytes());
+        hash.update((self.conflicts.len() as u64).to_le_bytes());
         for (key, stored) in &self.conflicts {
             hash.update(key);
-            hash.update(&[u8::from(stored.conflict.active())]);
+            hash.update([u8::from(stored.conflict.active())]);
             match stored.conflict.discarded() {
                 Some(source) => {
-                    hash.update(&[1]);
-                    hash.update(&source.header.id);
+                    hash.update([1]);
+                    hash.update(source.header.id);
                 }
-                None => hash.update(&[0]),
+                None => hash.update([0]),
             }
         }
         Ok(hash.finalize())

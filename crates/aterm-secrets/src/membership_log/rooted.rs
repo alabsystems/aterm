@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! A vault log rooted at a final checkpoint (`docs/DESIGN-vault-log-2026-11-14.md` step 4,
-//! tracker FL-148c): the records [`checkpoint::plan_at`]'s prune keeps, every record outside the
+//! trackers FL-148c and FL-148C2): the records [`checkpoint::plan_at`]'s prune keeps, every record outside the
 //! cut, and in place of each record it drops a [`Stub`]. Nothing here signs, writes a records
 //! file or chooses when to prune (FL-148d rewrites the file, FL-148f runs the pass), and nothing
 //! outside the tests prunes: this lands dark.
@@ -12,14 +12,19 @@
 //!   record (a record that follows it is checked against them, and a draft and the next proposal
 //!   follow a Mac's newest record dropped or not), its authored time (the next cut's day), its
 //!   kind, epoch, the op it stands for and what its statement names as replaced (what the
-//!   evaluators and a recomputed checkpoint read), the checkpoint a dropped share signs, whether
-//!   its prune's cut held it gone ([`Stub::gone`]), and its parents. Its place,
-//!   the held records its past ends at, is walked from the parents when the evaluators first need
-//!   it ([`Virtual`]), never kept: a place is as wide as the vault's concurrency and would make a
+//!   evaluators and a recomputed checkpoint read), the checkpoint a dropped share signs, and its
+//!   parents; and a version-2 record's shed frame past its network ([`Stub::frame`]), whose
+//!   SHA-256 is its id, which stands for those fields on the wire and against the byte bound.
+//!   Nothing a cut says of it: whether it counts there is read at each cut, as of a record
+//!   (below, "What a settled cut dropped is gone"). Its place, the held records its past ends
+//!   at, is walked from the parents when the evaluators first need it ([`Virtual`]), never kept: a place is as wide as the vault's concurrency and would make a
 //!   stub of a small record larger than the record. A record whose parent was dropped follows
 //!   that parent's place, so every held record's causal past is its past in the whole log, less
 //!   the dropped records, and the counts against each budget fall by what was dropped. A stub is
-//!   made only here, from a record this log held: no stub is taken from a peer.
+//!   made here, from a record this log held, or read from a peer with a root whose shares sign
+//!   it and that this log computes from it ([`super::served`]): a checkpoint's `dropped` digest
+//!   binds every field of each stub ([`Stub::encode`]), and a version-2 record's stub also checks
+//!   itself against its id ([`Stub::checked`]).
 //! - **Pruned only at what this log computes.** [`Log::rooted_at`] prunes only at a body this
 //!   log computes itself at its heads, and [`Log::adopt`] only at one [`checkpoint::judge`] finds
 //!   final. A rooted log computes and proposes the next checkpoint as the whole log does: the
@@ -32,10 +37,16 @@
 //!   superseded). So a log pruned at a later root computes an earlier checkpoint as the whole log
 //!   does, and holds it settled where the whole log does, its shares following the later cut or
 //!   not. A prune keeps only the roots its own does not nest, so the roots are an antichain and a
-//!   log pruned again and again keeps one root per side of a split. A checkpoint whose every share
-//!   a prune dropped is known by its stubs alone: a root, and the predecessor its body names,
-//!   count as recomputed where the log adopted it, and a stub says whether the cut it was dropped
-//!   at held it gone.
+//!   log pruned again and again keeps one root per side of a split; beside them it keeps each
+//!   nested root whose dropped set holds a stub no root dropped (an op the later root's whole log
+//!   keeps), the one digest that binds that stub, which it serves with its roots
+//!   ([`Rooting::earlier`], [`super::served`]). A checkpoint whose every share a prune dropped
+//!   (one an earlier checkpoint nests, outside the newest final one's chain, as where its shares
+//!   follow that earlier cut) is known by its shares' stubs as by its shares: each is a version-2
+//!   record's and keeps its frame, so its signer and the body it signs ([`Stub::share_body`]),
+//!   and a log judges it, holds it settled and reads what it dropped as the whole log does. And a
+//!   plan reads whether a checkpoint is nested in the newest final one through the stubs, a head
+//!   a prune dropped included, as the whole log reads it through the records.
 //! - **Never back.** [`Log::insert`] answers a dropped record [`super::Inserted::Known`], and
 //!   [`Log::knows`] (what a store holds and contains) covers held and dropped alike, so a peer
 //!   that still holds the whole log is never asked for, and never gives back, a dropped record.
@@ -51,7 +62,8 @@
 //!   never merge, and a prune of a union would not be the union of the prunes (a log that held
 //!   the record before its prune keeps it).
 //! - **Two sides of a split.** A log takes a root only by [`Log::rooted_at`], at a body it
-//!   computes itself; a merge takes no root and no stub from the other log. So a log rooted at
+//!   computes itself, from its own records or from stubs a peer served with that root
+//!   ([`Log::take_served`]); a merge takes no root and no stub from the other log. So a log rooted at
 //!   one side's final cut takes the other side's records as a whole log does, placing those that
 //!   follow its own dropped records by their stubs, and takes back none of them; it computes the
 //!   other side's checkpoint as the whole log does, reading at their stubs the records its own
@@ -90,15 +102,53 @@
 //!   (an edit, or a `Delete` that writes), and one that misstates what its writer read (claims a
 //!   carry of a value it does not seal, or no carry of one it does) reads as it says, in every
 //!   log alike: no log refuses a record another log holds, and a false statement reaches only an
-//!   entry of its writer's audience, which its writer could write anyway. A version-1 op beside
-//!   a cut over a dropped op reads by its held frontier (below, "Not yet").
+//!   entry of its writer's audience, which its writer could write anyway.
+//! - **A version-1 op beside a cut reads by its counting frontier, in every log.** It states
+//!   nothing, so it reads by the counting ops newest in its past ([`super::entries`]'s
+//!   register), which in a rooted log lack every op a prune dropped. In the log's own
+//!   evaluation they lack them in the whole log too: a log prunes only at a final checkpoint
+//!   ([`Log::adopt`]) or, for an earlier root a peer served, a settled one ([`super::served`]),
+//!   so every root is settled in each log that holds its shares, and what it dropped counts in
+//!   none (below). So a version-1 op beside the cut reads alike in the rooted log and in the
+//!   whole log of its records, whether it came before the prune or after, and a stub reads as no
+//!   op of a register in either. Not so at an earlier cut that does not hold the root settled
+//!   (`E`'s, its shares past it, in a log rooted at `L`): there the dropped op counts, the whole
+//!   log's frontier of a version-1 op in that cut holds it and the rooted log's does not. That
+//!   reading reaches no checkpoint: a plan reads no register's frontier ([`checkpoint`]'s keep
+//!   set reads what each version-2 statement names and carries, a `Remove`'s cutoff, a signer's
+//!   newer op of the same register, an owed epoch, which records count and the Commons' newest
+//!   counting `Put`s, and its body's register frontier is the ops no counting version-2 op
+//!   names), so the earlier checkpoint computes, judges and
+//!   settles alike in both logs, as `rooted_tests.rs`'s chain law asserts over the version-1 ops
+//!   of that kind its random vaults write. A plan that read a version-1 frontier would split
+//!   them, and must first read it through the stubs. Decided over the two other ways out.
+//!   Fixing its reading at the prune cannot serve a record taken later, which no prune saw.
+//!   Refusing, or parking, a version-1 op beside a cut would refuse a record the whole log
+//!   takes, so a prune of a union would no longer be the union of the prunes, and would lose
+//!   honest history: a Mac of a build before FL-148E's fence that slept across the cut signs
+//!   version 1, and FL-148F's writers' version 2 does not reach it. The cost, alike in every
+//!   log: such an op over an op a settled cut dropped reads without it, so a reseal of the
+//!   dropped op's value is an edit beside the op that superseded it (`a.key` in conflict) where,
+//!   without the prune's rule, it would be a carry that loses; a version-2 op states its carry
+//!   and is not exposed (`rooted_tests.rs`'s
+//!   `vault_checkpoint_a_version_one_op_beside_a_cut_reads_as_the_whole_log`).
 //! - **What a settled cut dropped is gone.** A checkpoint is settled in a log that recomputes it
 //!   and holds shares of it, or their stubs, signed by more than half of its cut's recent seats,
 //!   whether or not they still count ([`checkpoint::settled`]): unlike finality, which a later
 //!   `Remove` undoes by un-counting a share, it never stops holding, as a prune needs. A record a
 //!   settled checkpoint drops counts in no log ([`checkpoint::gone`]); a log pruned there holds
-//!   only its stub, which says so where a later prune cuts again ([`Stub::gone`]), and a later
-//!   prune drops it again and keeps nothing for its sake. So a `Remove`, or a quorum, at a cutoff
+//!   only its stub, and a later prune drops it again and keeps nothing for its sake. No stub
+//!   says it is gone: each cut reads it so where a checkpoint settled in that cut drops it, by
+//!   the shares that cut holds or dropped, as the whole log reads its record. A flag a prune set
+//!   (FL-148C's `Stub::gone`) read a stub a later cut held gone as gone in an earlier cut too,
+//!   where the checkpoint that made it gone is not settled (its shares lie between the two
+//!   cuts): there the earlier checkpoint's plan keeps it, for a carry or a cutoff, and a log
+//!   pruned later computed that checkpoint otherwise than the whole log. Naming that checkpoint
+//!   in the stub would not do either: several settled checkpoints may drop one stub, settled
+//!   in different cuts, and a cut reads it gone where any of them is settled. So the log keeps
+//!   what decides it, every share of every checkpoint, held or as a stub (a log forgets no
+//!   stub), and each share's body ([`Stub::share_body`]); in the log rooted at a settled cut
+//!   every stub is gone, its root (and each earlier root) settled there. So a `Remove`, or a quorum, at a cutoff
 //!   behind a final cut revives nothing the prune dropped: it still takes its member out and
 //!   stops counting its records past the cutoff, those in the cut too, and an op one of them
 //!   superseded stays dropped in every log, its entry unset until set again, as the design
@@ -124,37 +174,48 @@
 //!   [`Log::project_heads`], which keeps the stubs in the heads' past and their heads).
 //! - **Bounds.** A stub's bytes ([`Stub::bytes`], fewer than its record's) count against the
 //!   byte bound and the memory footprint with the held records', so a rooted log holds no more
-//!   than the whole log was allowed, and a log at its byte bound frees room by a prune. The
-//!   roots' bodies and what the evaluators read of the stubs ([`Virtual`]) count in the memory
-//!   footprint alone: each root's body is a held share's body, and the evaluators' reading is a
+//!   than the whole log was allowed, and a log at its byte bound frees room by a prune. A
+//!   version-2 record's stub counts its frame in place of its fields, still fewer bytes than its
+//!   record, whole or shed, but more than its fields alone: what a receiver that does not hold
+//!   the cut checks it by ([`super::served`]). So a prune frees less of a version-2 op than of a
+//!   version-1 one (its ciphertext alone), and almost nothing of a share, whose frame is its
+//!   checkpoint's body, every head of the cut named: the cost of a share's stub a receiver
+//!   checks against its signer, chosen over a stub that names its checkpoint once for all its
+//!   shares, whose fields would stand on the shares' word as a version-1 stub's do. The roots' bodies, the earlier roots kept beside them, the fields read
+//!   off a version-2 stub's frame and what the evaluators read of the stubs ([`Virtual`]) count
+//!   in the memory footprint alone: each root's body is a held share's body, and the evaluators' reading is a
 //!   cache of the stubs, linear in them. No stub counts against a count budget: the counts bound
 //!   what is weighed, opened and served per record, and a stub is none of these, and a log full
 //!   by count frees room by a prune.
 //!
-//! Not yet (FL-148c's remaining work, which FL-148f's pass waits on):
+//! Not yet (the rows that own it, which FL-148f's pass waits on):
 //!
-//! - **A version-1 op beside the cut over a dropped op.** It states nothing and reads by the
-//!   held ops of its frontier, which lost the dropped op, so a log rooted at a cut that dropped
-//!   an op it read may read its register otherwise than the whole log. Closing it needs its
-//!   reading fixed at the prune, which a record taken later cannot have, or no version-1 op
-//!   beside a cut (FL-148f's writers sign version 2).
-//! - **A stub's `gone` in an earlier cut.** A stub says whether the cut it was dropped at held it
-//!   gone; a recomputation at an earlier cut that cut nests reads it so too, though the checkpoint
-//!   that made it gone may hold its settling shares only between the two cuts (daily checkpoints'
-//!   shares follow their cut by the 14 days of [`checkpoint::MIN_AGE_MS`], past the next few
-//!   cuts). Where that stub names an op or is one, the earlier checkpoint then computes otherwise
-//!   than in the whole log; closing it needs the stub to name the checkpoint that made it gone,
-//!   and that checkpoint's settling shares.
-//! - **Consumers of a register's ops.** [`super::entries`]'s winning ops and carried reps may
-//!   name a dropped op (a winner's rep the prune dropped), which the evaluators place and the
-//!   consumers that open ciphertext or serve records (the mesh inventory, the egress cursor,
-//!   `legacy_applied_held`, the join bundle, the aterm-db frontier) do not yet read as dropped.
-//! - **Serving.** A peer is served no root and no stub: a whole log behind the cut never catches
-//!   up from a rooted one (the records that follow a dropped one wait for it), and a record that
-//!   follows only a record the other side of a split dropped waits until a log that holds it
-//!   serves it. Taking a peer's root needs its stubs authenticated (the `dropped` digest over
-//!   their fields) and its finality judged by shares alone, from a log that does not hold its
-//!   cut.
+//! - **Consumers that read records by id or position** (FL-148E). The set a reconciling peer
+//!   compares ([`super::Store::complete_inventory`]) names a dropped record as known, and a
+//!   cursor at one starts again at genesis ([`super::Store::complete_missing`]). Not yet read as
+//!   dropped: [`super::entries`]'s winning ops and carried reps, which may name a dropped op (the
+//!   evaluators place it; a consumer that opens its ciphertext does not); the mesh egress's
+//!   members cursor, a position in the held records that a prune shifts (it resets on FL-148D's
+//!   rewrite generation); `legacy_applied_held`, whose search for the applied heads walks held
+//!   records alone, so a log that dropped one reads it absent; and the join bundle, the mesh's
+//!   members unit and aterm-db's records exchange (`Store::missing`, `complete_missing`), which
+//!   send records alone, so a peer behind the cut is sent, on every round, records that wait, and
+//!   its summary never matches (they take [`super::Served`] with the client pass). Their own
+//!   crates' tests need a rooted store, which only this crate's tests build.
+//! - **aterm-db's legacy fence counting stubs** (FL-148D). Its legacy exchange counts a rooted
+//!   store's inventory, its stubs among it, against its node bound, which a store within the
+//!   legacy count of held records can pass: the fence must count the stubs once a rooted store
+//!   reaches a records file.
+//! - **A served reply past the stream bound** (FL-148D). A root's reply holds every record the
+//!   peer lacks ([`super::Store::missing_served`]), which a store of this build always fits; a
+//!   store past [`super::MAX_RECORDS_STREAM`] serves records alone and a Mac behind its cut
+//!   waits. Closing it needs a pull that names the records it holds waiting, so a reply need not
+//!   carry them again.
+//! - **Taking a served root into a store's file** (FL-148E's client pass, on FL-148D's
+//!   rewrite). [`super::Store::ingest_served`] takes a root in memory, and a server sends a frame
+//!   only to a pull that asks for one ([`crate::transport::RECORDS_SERVED_HEADER`]); the client
+//!   pass, the server's peer pull and the join bundle read records alone and ask for none, since
+//!   a rooted store's records file is FL-148D's rewrite generation.
 
 use super::checkpoint::{self, Plan};
 use super::{Body, EpochAudience, Kind, Log, MemberId, Record, RecordId};
@@ -221,6 +282,23 @@ pub(super) enum Mutant {
     /// epoch, as slice 3 first did: a stub is superseded for good, so a log a later prune cut
     /// cannot compute an earlier checkpoint that kept what that prune dropped.
     StubsDroppedForGood,
+    /// A prune keeps no root it nests, as FL-148c did: a log pruned twice forgets the earlier
+    /// root whose digest binds a stub the later root's whole log keeps, and serves no root.
+    NoEarlierRoots,
+    /// A prune at a root a root of the log already nests keeps it among the roots, as this
+    /// slice's first cut did: a Mac that takes a later root first holds two nested roots.
+    NestedAsRoot,
+    /// A stub reads gone wherever the cut of a prune that made it, or one after, held it gone,
+    /// as FL-148C's `Stub::gone` flag kept it: in an earlier cut too, where the checkpoint that
+    /// made it gone is not settled ([`LAST_CUT_GONE`]).
+    GoneFromTheLastCut,
+    /// No dropped share's frame is read: a checkpoint every share of which a prune dropped,
+    /// and that is no root, has no body, as before this slice.
+    ShareBodiesUnread,
+    /// A plan reads whether a checkpoint's cut is nested in the newest final one's among the
+    /// held records alone, as before this slice: a checkpoint whose head a prune dropped is
+    /// never nested, and the plan keeps every share of it.
+    HeldNesting,
 }
 
 #[cfg(test)]
@@ -229,6 +307,10 @@ thread_local! {
     pub(super) static MUTANT: std::cell::Cell<Option<Mutant>> = const { std::cell::Cell::new(None) };
     /// Whether this thread is inside [`Log::pruned`].
     static PRUNING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Under [`Mutant::GoneFromTheLastCut`], every record the cut of a prune on this thread held
+    /// gone ([`checkpoint::gone_in_cut`]): what FL-148C's stubs said of themselves.
+    pub(super) static LAST_CUT_GONE: std::cell::RefCell<BTreeSet<RecordId>> =
+        const { std::cell::RefCell::new(BTreeSet::new()) };
 }
 
 #[cfg(test)]
@@ -268,25 +350,148 @@ pub struct Stub {
     pub supersedes: Vec<RecordId>,
     /// The checkpoint a dropped share signs ([`checkpoint::checkpoint_id`] of its body); `None`
     /// for any other kind. What a later cut's judgment counts of the share
-    /// ([`checkpoint::judge`]): its signer, and whether it counts, read at the stub.
+    /// ([`checkpoint::judge`]): its signer, and whether it counts, read at the stub; and, read
+    /// off its frame ([`Stub::share_body`]), the body it signs, so a checkpoint whose every
+    /// share a prune dropped is known as where its shares are held.
     pub shares: Option<RecordId>,
-    /// Whether it counted nowhere in the cut of the prune that last cut this log: a checkpoint
-    /// settled there dropped it ([`checkpoint::gone`]), so it counts in no log that holds that
-    /// cut. A log pruned later cannot always recompute that checkpoint, whose kept records its
-    /// prune dropped, so the stub keeps what its cut said.
-    pub gone: bool,
     /// Its parents. Where a record that follows it sits, the newest held records in its past,
     /// is read off them ([`Log::placed`]), not kept.
     pub parents: Vec<RecordId>,
+    /// A version-2 record's shed frame past its network ([`super::Record::shed_frame`] from its
+    /// kind byte on): the record's id is the SHA-256 of the record magic, version 2, the
+    /// network and these bytes, so a Mac that does not hold the record checks every other field
+    /// but a `Delete`'s `carries` against its id and its signer's signature ([`Stub::checked`]),
+    /// and that `carries` by reading the statement again ([`Log::stub_delete_rep`]). `None` for
+    /// a version-1 record, whose id hashes its ciphertext too: its stub's fields stand on the
+    /// word of the shares that sign the digest naming it.
+    pub frame: Option<Arc<[u8]>>,
 }
 
+/// The tag [`Stub::encode`] writes ahead of a version-1 record's stub; a version-2 record's
+/// stub begins with [`super::VERSION_TWO`].
+const STUB_ONE: u8 = 1;
+
 impl Stub {
-    /// The bytes it takes in place of its record, which count against the byte bound
-    /// ([`Log::passed_by`]): its id and every field, an absent one as its tag alone. The record
-    /// holds each field but the id, plus its network, its signature (longer than the id) and
-    /// its body, so a stub always takes fewer bytes than the record it stands for.
-    #[must_use]
-    pub fn bytes(&self) -> usize {
+    /// The stub a prune makes of the held `record`, carrying `carries`: each field read off the
+    /// record, and a version-2 record's shed frame.
+    pub(super) fn of(record: &Record, carries: Option<RecordId>) -> Self {
+        Self {
+            actor: *record.actor(),
+            sequence: record.sequence(),
+            previous: record.previous().copied(),
+            authored_ms: record.authored_ms(),
+            kind: record.kind(),
+            carries,
+            epoch: match record.body() {
+                Body::Put { epoch, .. } | Body::Delete { epoch, .. } => Some(*epoch),
+                _ => None,
+            },
+            supersedes: record
+                .statement()
+                .map(|statement| statement.supersedes.clone())
+                .unwrap_or_default(),
+            shares: checkpoint::checkpoint_id(record.body()),
+            parents: record.parents().to_vec(),
+            frame: record
+                .shed_frame()
+                .and_then(|frame| frame.get(super::KIND_AT..).map(Arc::from)),
+        }
+    }
+
+    /// The record `frame` (a version-2 shed frame past its network, [`Stub::frame`]) is under
+    /// `network`, read as `reading` reads one, and its signature verified where `signed` asks
+    /// ([`Record::decode_in`]; else [`Record::unsigned`]), and its stub, carrying `carries` where
+    /// it is a `Delete` (the one field no frame holds) and what its statement says it carries
+    /// otherwise.
+    ///
+    /// # Errors
+    /// The bytes are no version-2 record of `network` that `reading` reads, or, where `signed`
+    /// asks, its signer did not sign it.
+    fn from_frame(
+        network: &RecordId,
+        frame: &[u8],
+        carries: Option<RecordId>,
+        reading: super::Reading,
+        signed: bool,
+    ) -> Result<(RecordId, Self)> {
+        let whole = Self::whole_frame(network, frame);
+        let record = if signed {
+            Record::decode_in(&whole, reading)?
+        } else {
+            Record::unsigned(&whole, reading)?
+        };
+        let carries = match record.kind() {
+            Kind::Delete => carries,
+            _ => record.statement().and_then(|statement| statement.carries),
+        };
+        Ok((*record.id(), Self::of(&record, carries)))
+    }
+
+    /// The shed frame of the version-2 record whose frame past its network is `frame`, under
+    /// `network`: the record magic, version 2, the network and `frame`.
+    fn whole_frame(network: &RecordId, frame: &[u8]) -> Vec<u8> {
+        let mut whole = Vec::with_capacity(super::KIND_AT + frame.len());
+        whole.extend_from_slice(super::MAGIC);
+        whole.push(super::VERSION_TWO);
+        whole.extend_from_slice(network);
+        whole.extend_from_slice(frame);
+        whole
+    }
+
+    /// Whether this stub of `id`, read from a peer of `network`, is its record's: a version-2
+    /// record's stub is checked field by field against the record its frame is, signature and
+    /// all, whose id must be `id` (but a `Delete`'s `carries`, [`Log::stub_delete_rep`]); a
+    /// version-1 record's has no frame and is not checked here, but for its kind: no version-1
+    /// record is a share. The frame was read under its reader's format where its bytes were
+    /// ([`Stub::decode`]); held in memory it is read as [`Log::insert`] takes a record, of any
+    /// layout.
+    ///
+    /// # Errors
+    /// Its frame is no record of `network`, is unsigned, is another record's, or says another
+    /// field; or it keeps no frame and is a share's.
+    pub(super) fn checked(&self, id: &RecordId, network: &RecordId) -> Result<()> {
+        let Some(frame) = &self.frame else {
+            // A share is a version-2 record's: no version-1 record is a `Checkpoint`.
+            if self.kind == Kind::Checkpoint {
+                return Err(Error::new("a served share's stub keeps no frame"));
+            }
+            return Ok(());
+        };
+        let (of, stub) =
+            Self::from_frame(network, frame, self.carries, super::Reading::Follow, true)?;
+        if of != *id || stub != *self {
+            return Err(Error::new("a served stub is not the record its frame is"));
+        }
+        Ok(())
+    }
+
+    /// The body a dropped share signs, read off its frame under `network` (every share is a
+    /// version-2 record, whose stub keeps its frame, and a served one is checked against its
+    /// id, [`Stub::checked`]): what a log knows a checkpoint by where a prune dropped every
+    /// share of it ([`checkpoint::settled`]). `None` for any other stub.
+    pub(super) fn share_body(&self, network: &RecordId) -> Option<Body> {
+        self.shares?;
+        #[cfg(test)]
+        if mutant(Mutant::ShareBodiesUnread) {
+            return None;
+        }
+        let whole = Self::whole_frame(network, self.frame.as_ref()?);
+        let record = Record::unsigned(&whole, super::Reading::Follow).ok()?;
+        (checkpoint::checkpoint_id(record.body()) == self.shares).then(|| record.body().clone())
+    }
+
+    /// Whether it is a version-2 `Delete`'s stub: the one whose encoding holds `carries`
+    /// beside its frame, read off the frame's kind byte.
+    fn frames_a_delete(&self) -> bool {
+        self.frame
+            .as_ref()
+            .is_some_and(|frame| frame.first() == Some(&Kind::Delete.code()))
+    }
+
+    /// The bytes a stub's fields take: its id and every field, an absent one as its tag alone.
+    /// What a version-1 record's stub counts after its tag ([`Stub::bytes`]), and what a
+    /// version-2 record's keeps in memory beside its frame, read off it ([`Stub::read_bytes`]).
+    fn fields_bytes(&self) -> usize {
         let id = size_of::<RecordId>();
         let some = |field: &Option<RecordId>| 1 + field.map_or(0, |_| id);
         id + size_of::<MemberId>()
@@ -299,12 +504,257 @@ impl Stub {
             + 2
             + self.supersedes.len() * id
             + some(&self.shares)
-            + 1
             + 2
             + self.parents.len() * id
     }
+
+    /// The bytes it takes in place of its record, which count against the byte bound
+    /// ([`Log::passed_by`]): its encoding ([`Stub::wire_len`]). A version-1 record's stub is its
+    /// tag, id and fields: the record holds each field but the id, plus its network, its
+    /// signature (longer than the id) and its body. A version-2 record's is its tag and frame
+    /// past the network (36 bytes less than its shed frame) and a `Delete`'s `carries` (at most
+    /// 33): at least 3 bytes fewer than its shed frame, which is the whole of a `Checkpoint`
+    /// share. So a stub always takes fewer bytes than the record it stands for, whole or shed.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.wire_len()
+    }
+
+    /// The bytes a version-2 record's stub keeps in memory beside its frame: the fields read
+    /// off it ([`Stub::fields_bytes`]), which count in the memory footprint alone, as what the
+    /// evaluators read of the stubs does ([`Log::footprint`]). `0` for a version-1 record's.
+    pub(super) fn read_bytes(&self) -> usize {
+        if self.frame.is_some() {
+            self.fields_bytes()
+        } else {
+            0
+        }
+    }
+
+    /// The stub of `id` in its one encoding, [`Stub::wire_len`] long: what a checkpoint's
+    /// `dropped` digest hashes ([`checkpoint::dropped_digest`]) and a rooted log serves
+    /// ([`super::served`]). Every number is big-endian, and every field is bound: a stub keeps
+    /// what its record says alone, never whether it counts in some cut, which each cut reads
+    /// for itself ([`checkpoint::gone`]).
+    ///
+    /// A version-1 record's stub:
+    ///
+    /// | bytes | field |
+    /// |---|---|
+    /// | 1 | `1` |
+    /// | 32 | its id |
+    /// | 48 | its signer |
+    /// | 8 | its sequence |
+    /// | 1, then 32 | its previous record: `0`, or `1` and the id |
+    /// | 8 | its authored clock |
+    /// | 1 | its kind, as its record's header writes it |
+    /// | 1, then 32 | what it carries, as `previous` |
+    /// | 1, then 32 | its epoch, as `previous` |
+    /// | 2, then 32 each | what its statement names as replaced |
+    /// | 1, then 32 | the checkpoint a share signs, as `previous` |
+    /// | 2, then 32 each | its parents |
+    ///
+    /// A version-2 record's stub: `2`, its frame ([`Stub::frame`]: every field but its id,
+    /// which hashes the frame, and a `Delete`'s `carries`), and for a `Delete` what it carries,
+    /// as `previous`.
+    pub fn encode(&self, id: &RecordId, out: &mut Vec<u8>) {
+        let some = |out: &mut Vec<u8>, field: &Option<RecordId>| match field {
+            Some(id) => {
+                out.push(1);
+                out.extend_from_slice(id);
+            }
+            None => out.push(0),
+        };
+        if let Some(frame) = &self.frame {
+            out.push(super::VERSION_TWO);
+            out.extend_from_slice(frame);
+            if self.frames_a_delete() {
+                some(out, &self.carries);
+            }
+            return;
+        }
+        let list = |out: &mut Vec<u8>, ids: &[RecordId]| {
+            out.extend_from_slice(&u16::try_from(ids.len()).unwrap_or(u16::MAX).to_be_bytes());
+            for id in ids {
+                out.extend_from_slice(id);
+            }
+        };
+        out.push(STUB_ONE);
+        out.extend_from_slice(id);
+        out.extend_from_slice(&self.actor);
+        out.extend_from_slice(&self.sequence.to_be_bytes());
+        some(out, &self.previous);
+        out.extend_from_slice(&self.authored_ms.to_be_bytes());
+        out.push(self.kind.code());
+        some(out, &self.carries);
+        some(out, &self.epoch);
+        list(out, &self.supersedes);
+        some(out, &self.shares);
+        list(out, &self.parents);
+    }
+
+    /// The bytes [`Stub::encode`] writes.
+    #[must_use]
+    pub fn wire_len(&self) -> usize {
+        match &self.frame {
+            Some(frame) => {
+                let carries = if self.frames_a_delete() {
+                    1 + self.carries.map_or(0, |_| size_of::<RecordId>())
+                } else {
+                    0
+                };
+                1 + frame.len() + carries
+            }
+            None => 1 + self.fields_bytes(),
+        }
+    }
+
+    /// One stub [`Stub::encode`] wrote, read off `bytes` at `at`, which it moves past it. A
+    /// version-2 record's is read as the record
+    /// its frame is under `network`, as `reading` reads one, its id that record's: a reader of
+    /// format 1 refuses it as it refuses that record whole ([`Record::decode_in`]). Its
+    /// signature is not verified here: a receiver verifies it once, where it reads the stub
+    /// ([`Stub::checked`]), and never for a stub it ignores (of a record it holds or dropped).
+    ///
+    /// # Errors
+    /// The bytes end first, a tag or the kind is no value [`Stub::encode`] writes, a list is
+    /// longer than a record's (`MAX_SUPERSEDES` names, `MAX_PARENTS` parents), or a frame is no
+    /// shed version-2 record of `network` that `reading` reads.
+    pub(super) fn decode(
+        bytes: &[u8],
+        at: &mut usize,
+        network: &RecordId,
+        reading: super::Reading,
+    ) -> Result<(RecordId, Self)> {
+        let mut read = Cursor { bytes, at };
+        match read.take(1)?[0] {
+            STUB_ONE => {}
+            super::VERSION_TWO => {
+                let start = *read.at;
+                let kind = read.take(1 + 48 + 8 + 32)?[0];
+                let count = usize::from(read.take(1)?[0]);
+                if count > super::MAX_PARENTS {
+                    return Err(Error::new("a served stub names more than a record can"));
+                }
+                read.take(count * 32 + 8)?;
+                let clear = read.u32()?;
+                if read.u32()? != 0 {
+                    return Err(Error::new("a served stub's frame is a shed frame"));
+                }
+                read.take(usize::try_from(clear).unwrap_or(usize::MAX))?;
+                read.take(64)?;
+                let frame = &bytes[start..*read.at];
+                let carries = if kind == Kind::Delete.code() {
+                    read.some()?
+                } else {
+                    None
+                };
+                #[cfg(test)]
+                let reading = if super::served::mutant(super::served::Mutant::StubsFollow) {
+                    super::Reading::Follow
+                } else {
+                    reading
+                };
+                return Self::from_frame(network, frame, carries, reading, false);
+            }
+            _ => return Err(Error::new("a served stub is of no record version")),
+        }
+        let id = read.id()?;
+        let actor: MemberId = read
+            .take(48)?
+            .try_into()
+            .map_err(|_| Error::new("a served stub is truncated"))?;
+        let sequence = read.u64()?;
+        let previous = read.some()?;
+        let authored_ms = read.u64()?;
+        let kind = Kind::from_code(read.take(1)?[0])?;
+        let carries = read.some()?;
+        let epoch = read.some()?;
+        let supersedes = read.list(super::MAX_SUPERSEDES)?;
+        let shares = read.some()?;
+        let parents = read.list(super::MAX_PARENTS)?;
+        Ok((
+            id,
+            Self {
+                actor,
+                sequence,
+                previous,
+                authored_ms,
+                kind,
+                carries,
+                epoch,
+                supersedes,
+                shares,
+                parents,
+                frame: None,
+            },
+        ))
+    }
 }
 
+/// A reader of what [`Stub::encode`] and [`super::served`] write.
+pub(super) struct Cursor<'a, 'b> {
+    pub(super) bytes: &'a [u8],
+    pub(super) at: &'b mut usize,
+}
+
+impl<'a> Cursor<'a, '_> {
+    pub(super) fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let end = self
+            .at
+            .checked_add(n)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or_else(|| Error::new("a served stub is truncated"))?;
+        let taken = &self.bytes[*self.at..end];
+        *self.at = end;
+        Ok(taken)
+    }
+
+    pub(super) fn id(&mut self) -> Result<RecordId> {
+        self.take(32)?
+            .try_into()
+            .map_err(|_| Error::new("a served stub is truncated"))
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_be_bytes(
+            self.take(4)?
+                .try_into()
+                .map_err(|_| Error::new("a served stub is truncated"))?,
+        ))
+    }
+
+    pub(super) fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_be_bytes(
+            self.take(8)?
+                .try_into()
+                .map_err(|_| Error::new("a served stub is truncated"))?,
+        ))
+    }
+
+    fn some(&mut self) -> Result<Option<RecordId>> {
+        match self.take(1)?[0] {
+            0 => Ok(None),
+            1 => Ok(Some(self.id()?)),
+            _ => Err(Error::new("a served stub's field has no such tag")),
+        }
+    }
+
+    /// A count of `width` bytes, at most `most`, then that many ids.
+    pub(super) fn ids(&mut self, width: usize, most: usize) -> Result<Vec<RecordId>> {
+        let mut count = [0u8; 8];
+        count[8 - width..].copy_from_slice(self.take(width)?);
+        let count = usize::try_from(u64::from_be_bytes(count)).unwrap_or(usize::MAX);
+        if count > most {
+            return Err(Error::new("a served stub names more than a record can"));
+        }
+        (0..count).map(|_| self.id()).collect()
+    }
+
+    fn list(&mut self, most: usize) -> Result<Vec<RecordId>> {
+        self.ids(2, most)
+    }
+}
 /// What every log's register reads of a version-2 op from its statement ([`Log::stated`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Stated {
@@ -546,11 +996,14 @@ pub struct Root {
     pub id: RecordId,
     /// Its body: [`Body::Checkpoint`].
     pub body: Body,
+    /// What its prune dropped, sorted ([`checkpoint::Plan::dropped`]): the stubs its `dropped`
+    /// digest names, which this log serves with it ([`super::served`]).
+    pub dropped: Vec<RecordId>,
 }
 
 impl Root {
     /// Its cut's day and heads.
-    fn cut(&self) -> (u64, &[RecordId]) {
+    pub(super) fn cut(&self) -> (u64, &[RecordId]) {
         match &self.body {
             Body::Checkpoint { cut_ms, heads, .. } => (*cut_ms, heads),
             _ => (0, &[]),
@@ -559,7 +1012,10 @@ impl Root {
 
     /// The bytes its body keeps in memory, counted in [`Log::footprint`].
     pub(super) fn bytes(&self) -> usize {
-        size_of::<RecordId>() + super::encode_body(&self.body).len()
+        size_of::<RecordId>()
+            + super::encode_body(&self.body).len()
+            + size_of::<Vec<RecordId>>()
+            + self.dropped.len() * size_of::<RecordId>()
     }
 }
 
@@ -567,10 +1023,15 @@ impl Root {
 #[derive(Clone, Debug, Default)]
 pub struct Rooting {
     /// The roots, by id: none's cut holds another's heads, so a prune whose cut nests an earlier
-    /// root's takes its place, and the roots are as many as the sides of a split a log holds.
+    /// root's takes its place, a prune at a root one nests is nested beside them (`earlier`,
+    /// where needed), and the roots are as many as the sides of a split a log holds.
     pub roots: Vec<Root>,
     /// Each record a root dropped, by id: a rooted log holds none of them.
     pub stubs: BTreeMap<RecordId, Stub>,
+    /// The roots a later prune nested, by id, each kept while its dropped set holds a stub
+    /// that no root dropped (an op the later root's whole log keeps): the root whose digest
+    /// binds that stub's fields, which this log serves beside its roots ([`Log::served`]).
+    pub earlier: Vec<Root>,
 }
 
 impl Log {
@@ -679,11 +1140,18 @@ impl Log {
     /// The bytes a rooted log keeps in memory beside its records and index: what its roots and
     /// the evaluators' reading of its stubs keep ([`Log::footprint`]). `0` for a whole log.
     pub(super) fn rooted_footprint(&self) -> usize {
-        let roots = self
-            .rooting()
-            .map_or(0, |r| r.roots.iter().map(Root::bytes).sum::<usize>());
+        let Some(rooting) = self.rooting() else {
+            return 0;
+        };
+        let roots = rooting
+            .roots
+            .iter()
+            .chain(&rooting.earlier)
+            .map(Root::bytes)
+            .sum::<usize>();
+        let fields = rooting.stubs.values().map(Stub::read_bytes).sum::<usize>();
         let read = self.stubbed.as_ref().map_or(0, Stubbed::bytes);
-        roots.saturating_add(read)
+        roots.saturating_add(fields).saturating_add(read)
     }
 
     /// Note that the held record at `at` names each of its parents a root dropped: what
@@ -856,6 +1324,27 @@ impl Log {
             }
         }
         reps
+    }
+
+    /// What the dropped version-2 `Delete` `id` stands for, read off its stub's statement at its
+    /// stub's place as a prune read it off its record ([`Log::frame_reps`], `reps` this log's):
+    /// a reading of the frames and stubs in its past alone, so a Mac that takes the stub from a
+    /// peer reads it as the prune that made it did, and checks the `carries` the stub keeps,
+    /// the one field its frame does not hold ([`Stub::frame`]). `None` where it writes, or `id`
+    /// is no such stub.
+    pub(super) fn stub_delete_rep(
+        &self,
+        id: &RecordId,
+        reps: &BTreeMap<RecordId, RecordId>,
+    ) -> Option<RecordId> {
+        let stub = self.stub(id)?;
+        if stub.kind != Kind::Delete || stub.frame.is_none() {
+            return None;
+        }
+        let (audience, _) = self.op_of(id)?;
+        let audience = audience.clone();
+        let at = self.position(id)?;
+        self.deletes_rep(at, &audience, &stub.supersedes, reps)
     }
 
     /// What the `Delete` at `i`, of `audience`, stands for by the ops its statement names as
@@ -1053,6 +1542,7 @@ impl Log {
         let rooting = self.rooting()?;
         Some(Arc::new(Rooting {
             roots: rooting.roots.clone(),
+            earlier: rooting.earlier.clone(),
             stubs: rooting
                 .stubs
                 .iter()
@@ -1079,8 +1569,12 @@ impl Log {
     }
 
     /// Whether `id` lies in `root`'s cut: it is a head or in a head's past, held or dropped.
-    fn in_cut(&self, root: &Root, id: &RecordId) -> bool {
-        let heads = root.cut().1;
+    pub(super) fn in_cut(&self, root: &Root, id: &RecordId) -> bool {
+        self.in_cut_of(root.cut().1, id)
+    }
+
+    /// Whether `id` lies in the cut whose heads are `heads`, as [`Log::in_cut`] reads a root's.
+    pub(super) fn in_cut_of(&self, heads: &[RecordId], id: &RecordId) -> bool {
         heads.contains(id)
             || self.reaches(heads, id)
             || (self.is_dropped(id) && self.stub_in_past(heads, id))
@@ -1128,69 +1622,37 @@ impl Log {
     }
 
     /// The prune `plan` stands for, applied to this log at `body`, the plan's body.
-    fn pruned(&self, plan: &Plan, body: &Body) -> Result<Self> {
+    pub(super) fn pruned(&self, plan: &Plan, body: &Body) -> Result<Self> {
         let Body::Checkpoint { dropped, .. } = body else {
             return Err(Error::new("a log is rooted at a checkpoint"));
         };
-        if checkpoint::dropped_digest(&plan.dropped) != *dropped {
+        if plan.stubs.len() != plan.dropped.len()
+            || checkpoint::dropped_digest(&plan.stubs) != *dropped
+        {
             return Err(Error::new(
                 "a prune drops what its checkpoint's digest names",
             ));
         }
         let id = checkpoint::checkpoint_id(body).ok_or_else(|| Error::new("not a checkpoint"))?;
         let drop: BTreeSet<RecordId> = plan.dropped.iter().copied().collect();
-        // What counted nowhere in the cut, held or a stub already ([`Stub::gone`]).
-        let gone = checkpoint::gone_in_cut(self, body)?;
-        let reps = self.frame_reps();
         #[cfg(test)]
-        let reps = if mutant(Mutant::DeleteStandsForItself) {
-            BTreeMap::new()
-        } else {
-            reps
-        };
+        if mutant(Mutant::GoneFromTheLastCut) {
+            let gone = checkpoint::gone_in_cut(self, body)?;
+            LAST_CUT_GONE.with_borrow_mut(|last| last.extend(gone));
+        }
         let mut rooting = self.rooting().cloned().unwrap_or_default();
-        for record in self.order.iter().filter(|r| drop.contains(r.id())) {
-            let carries = match record.kind() {
-                Kind::Delete => reps.get(record.id()).copied(),
-                _ => record.statement().and_then(|statement| statement.carries),
-            };
-            #[cfg(test)]
-            let shares =
-                checkpoint::checkpoint_id(record.body()).filter(|_| !mutant(Mutant::SharesUnkept));
-            #[cfg(not(test))]
-            let shares = checkpoint::checkpoint_id(record.body());
-            rooting.stubs.insert(
-                *record.id(),
-                Stub {
-                    actor: *record.actor(),
-                    sequence: record.sequence(),
-                    previous: record.previous().copied(),
-                    authored_ms: record.authored_ms(),
-                    kind: record.kind(),
-                    carries,
-                    epoch: match record.body() {
-                        Body::Put { epoch, .. } | Body::Delete { epoch, .. } => Some(*epoch),
-                        _ => None,
-                    },
-                    supersedes: record
-                        .statement()
-                        .map(|statement| statement.supersedes.clone())
-                        .unwrap_or_default(),
-                    shares,
-                    gone: false,
-                    parents: record.parents().to_vec(),
-                },
-            );
+        // Each dropped record's stub is the one the checkpoint's digest names: made from the
+        // record where this log holds it, else this log's stub.
+        for (dropped, stub) in &plan.stubs {
+            rooting.stubs.insert(*dropped, stub.clone());
         }
-        for (id, stub) in &mut rooting.stubs {
-            stub.gone |= gone.contains(id);
-        }
-        if drop.iter().any(|id| !rooting.stubs.contains_key(id)) {
+        if drop.iter().any(|id| !self.knows(id)) {
             return Err(Error::new("a prune drops only records this log holds"));
         }
         let root = Root {
             id,
             body: body.clone(),
+            dropped: plan.dropped.clone(),
         };
         // An earlier root whose cut this one's holds says nothing this one does not: the next
         // cut follows every one of its heads where it follows this one's.
@@ -1198,13 +1660,66 @@ impl Log {
         let keep_nested = mutant(Mutant::KeepNestedRoots);
         #[cfg(not(test))]
         let keep_nested = false;
+        let mut nested = std::mem::take(&mut rooting.earlier);
         if !keep_nested {
-            rooting
-                .roots
-                .retain(|old| !old.cut().1.iter().all(|head| self.in_cut(&root, head)));
+            let (inner, outer): (Vec<Root>, Vec<Root>) = std::mem::take(&mut rooting.roots)
+                .into_iter()
+                .partition(|old| old.cut().1.iter().all(|head| self.in_cut(&root, head)));
+            rooting.roots = outer;
+            nested.extend(inner);
         }
-        rooting.roots.push(root);
-        rooting.roots.sort_by_key(|root| root.id);
+        // And this one, where a root this log holds nests it, is nested so: a Mac behind both
+        // cuts that takes a later root first (a cut's day says nothing of what it nests) holds
+        // the roots its peer holds, whatever the order ([`Log::take_served`]).
+        #[cfg(test)]
+        let file_nested = !keep_nested && !mutant(Mutant::NestedAsRoot);
+        #[cfg(not(test))]
+        let file_nested = !keep_nested;
+        let (_, heads) = root.cut();
+        if file_nested
+            && rooting
+                .roots
+                .iter()
+                .any(|old| heads.iter().all(|head| self.in_cut(old, head)))
+        {
+            nested.push(root);
+        } else {
+            rooting.roots.push(root);
+            rooting.roots.sort_by_key(|root| root.id);
+        }
+        rooting.earlier = Self::earlier_needed(&rooting, nested);
+        self.rebuilt(rooting, &drop)
+    }
+
+    /// Of the nested roots `nested`, those `rooting` keeps beside its roots ([`Rooting::earlier`]):
+    /// each whose dropped set holds a stub `rooting` keeps that none of its roots dropped, the one
+    /// digest that binds that stub's fields. Ascending by id, each once.
+    fn earlier_needed(rooting: &Rooting, nested: Vec<Root>) -> Vec<Root> {
+        #[cfg(test)]
+        if mutant(Mutant::NoEarlierRoots) {
+            return Vec::new();
+        }
+        let current: BTreeSet<&RecordId> = rooting
+            .roots
+            .iter()
+            .flat_map(|root| root.dropped.iter())
+            .collect();
+        let mut out: BTreeMap<RecordId, Root> = BTreeMap::new();
+        for root in nested {
+            if root
+                .dropped
+                .iter()
+                .any(|id| rooting.stubs.contains_key(id) && !current.contains(id))
+            {
+                out.entry(root.id).or_insert(root);
+            }
+        }
+        out.into_values().collect()
+    }
+
+    /// A log of this one's records but `drop`, rooted as `rooting` says: each record placed
+    /// afresh through its stubs, in this log's order, and each waiting record offered again.
+    pub(super) fn rebuilt(&self, rooting: Rooting, drop: &BTreeSet<RecordId>) -> Result<Self> {
         let mut out = Self::new(self.order[0].clone())?;
         out.budgets = self.budgets;
         out.enforce_seats = self.enforce_seats;
@@ -1243,6 +1758,45 @@ impl Log {
         }
         out.stub_heads();
         Ok(out)
+    }
+
+    /// The stub a prune makes of the dropped record `id` ([`Stub`]): from its record where this
+    /// log holds it, else this log's own stub of it. `reps` is this log's [`Log::frame_reps`]
+    /// where `id` is a held `Delete` with a statement (its kept rep), and may be empty
+    /// otherwise. `None` where this log neither holds nor dropped `id`. What a checkpoint's
+    /// `dropped` digest hashes ([`checkpoint::dropped_digest`]), so every Mac that drops `id` at
+    /// one cut makes it alike.
+    pub(super) fn stub_for(
+        &self,
+        id: &RecordId,
+        reps: &BTreeMap<RecordId, RecordId>,
+    ) -> Option<Stub> {
+        let Some(record) = self.get(id) else {
+            return self.stub(id).cloned();
+        };
+        let carries = match record.kind() {
+            Kind::Delete => {
+                #[cfg(test)]
+                if mutant(Mutant::DeleteStandsForItself) {
+                    return Some(Self::record_stub(record, None));
+                }
+                reps.get(record.id()).copied()
+            }
+            _ => record.statement().and_then(|statement| statement.carries),
+        };
+        Some(Self::record_stub(record, carries))
+    }
+
+    /// The stub of the held `record`, carrying `carries`.
+    fn record_stub(record: &Record, carries: Option<RecordId>) -> Stub {
+        #[cfg(test)]
+        if mutant(Mutant::SharesUnkept) {
+            return Stub {
+                shares: None,
+                ..Stub::of(record, carries)
+            };
+        }
+        Stub::of(record, carries)
     }
 
     /// The heads of the whole log this rooted log stands for: no record a stub names as a parent
@@ -1302,4 +1856,4 @@ impl Log {
 
 #[cfg(test)]
 #[path = "rooted_tests.rs"]
-mod tests;
+pub(super) mod tests;

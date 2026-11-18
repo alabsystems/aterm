@@ -1140,6 +1140,61 @@ fn a_counter_reused_in_a_later_period_keeps_the_first_entry() {
     }
 }
 
+/// An exact rank tie goes to the smallest operation digest in either order (tracker LT-B10D1): two
+/// records of one machine at one (period, n, sequence), each by a writer of that machine (a
+/// writer and its successor), and two log entries at one counter, period and sequence. A fold
+/// from a checkpoint's rows then gives what a fold of everything gives, whatever order the
+/// records arrive in.
+/// NEGATIVE CONTROL: with `read_owned` keeping the first of a tie (`held.rank < rank` alone), the
+/// order that meets the larger digest first keeps it: `reversed: false`, `` left: [4, 4, …]
+/// right: [3, 3, …] ``; with `read_log` comparing (period, sequence) alone, the same for the
+/// entry.
+#[test]
+fn an_exact_rank_tie_goes_to_the_smallest_digest_in_any_order() {
+    let m2 = keys::uuid32(&M2);
+    let tie = |id: u8, value: Change| Op {
+        id: [id; 32],
+        actor: {
+            let mut actor = [2; 48];
+            actor[47] = id;
+            actor
+        },
+        sequence: 7,
+        roster: [7; 32],
+        period: 3,
+        revert: None,
+        changes: vec![value],
+    };
+    let row = |tag: &str| Change {
+        collection: FACTS.name.to_owned(),
+        key: m2.clone(),
+        value: Some(json!({"r": 1, "n": 5, "label": tag})),
+    };
+    let entry = |tag: &str| Change {
+        collection: "ev".into(),
+        key: format!("{m2}.1"),
+        value: Some(json!({"events": [tag]})),
+    };
+    let owned = [tie(4, row("larger")), tie(3, row("smaller"))];
+    let logged = [tie(4, entry("larger")), tie(3, entry("smaller"))];
+    for reversed in [false, true] {
+        let order = |ops: &[Op; 2]| -> Vec<Op> {
+            if reversed {
+                ops.iter().rev().cloned().collect()
+            } else {
+                ops.to_vec()
+            }
+        };
+        let read = owned::read_owned(&FACTS, &order(&owned), machine_of);
+        assert_eq!(read.rows[&m2].operation, [3; 32], "reversed: {reversed}");
+        assert_eq!(read.rows[&m2].value["label"], json!("smaller"));
+        let read = owned::read_log(&EV, &order(&logged), machine_of);
+        assert_eq!(read.entries.len(), 1);
+        assert_eq!(read.entries[0].operation, [3; 32], "reversed: {reversed}");
+        assert_eq!(read.inert, 1);
+    }
+}
+
 /// The schema collection reads as the highest version any eligible operation wrote, though an
 /// older build's later write replaced the cell; a lower version may not be published, and two
 /// rows at one version split it.

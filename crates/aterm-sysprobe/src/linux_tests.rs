@@ -1424,6 +1424,35 @@ fn the_sweep_reads_a_fixture_proc() {
     assert_eq!(Root::new(tree(&[]).path()).processes(100, 4096), None);
 }
 
+#[test]
+fn the_sweep_keeps_raw_lifetime_ticks_before_rounding_the_boot_start() {
+    let root = tree(&[
+        (
+            "proc/42/stat",
+            "42 (agent) S 1 42 42 0 -1 4194304 0 0 0 0 1 1 0 0 20 0 1 0 4 0 0\n",
+        ),
+        (
+            "proc/42/status",
+            "Uid:\t1000\t1000\t1000\t1000\nRssAnon:\t100 kB\n",
+        ),
+    ]);
+    let sweep = Root::new(root.path())
+        .processes(3, 4096)
+        .expect("the fixture sweep");
+    let row = sweep
+        .procs
+        .iter()
+        .find(|row| row.pid == 42)
+        .expect("the original process");
+    assert_eq!(row.start, Some(1_333_333_333));
+    assert_eq!(row.birth, Some(4));
+    assert_eq!(
+        row.start.unwrap() * 3 / 1_000_000_000,
+        3,
+        "inverting the rounded boot start would assign the preceding lifetime tick"
+    );
+}
+
 /// A `comm` cut at its 15 bytes is read whole from the process's `exe` link (an unlinked image's
 /// ` (deleted)` left off) or its `argv[0]`, where either begins with it; a shorter one is whole as
 /// it stands; and one neither says whole ends in the mark: a kernel thread's, and one whose

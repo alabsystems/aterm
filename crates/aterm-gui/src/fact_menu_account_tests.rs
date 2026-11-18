@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use aterm_agent::harness::account_card::{Budget, History, Machine, NoTable};
+use aterm_agent::harness::account_names;
 use aterm_agent::harness::account_progress::OwnClaimFinding;
 use aterm_agent::harness::accounts;
 use aterm_agent::harness::profile::{WeeklyFigure, WeeklyGap};
@@ -48,6 +49,7 @@ fn mac(name: &str, ours: bool) -> Mac {
 fn card(who: Who) -> AccountCard {
     AccountCard {
         who,
+        word: None,
         names: Default::default(),
         pool_size: 3,
         this_mac: Some("m20".into()),
@@ -193,7 +195,7 @@ fn state_a(room: usize) -> FactMenuFacts {
     let mut token = TokenFact::for_test(None, email, TokenState::None);
     token.offer = Some(TokenOffer {
         line: "a vault token would keep work signed in: make one".into(),
-        label: email.into(),
+        word: "claude-work-x".into(),
         replace: false,
     });
     FactMenuFacts {
@@ -226,6 +228,15 @@ fn state_a_debug(room: usize) -> FactMenuFacts {
 }
 
 /// (B): a pool account with a vault token, at home on this Mac and in use here.
+/// State B's roster row: `sol-1`, signed in as `sol.m20.1@proton.me`.
+fn sol_row() -> accounts::Row {
+    accounts::Row {
+        label: "sol-1".into(),
+        email: Some("sol.m20.1@proton.me".into()),
+        ..accounts::Row::default()
+    }
+}
+
 fn state_b(room: usize) -> FactMenuFacts {
     let email = "sol.m20.1@proton.me";
     let here = mac("m20", true);
@@ -233,6 +244,15 @@ fn state_b(room: usize) -> FactMenuFacts {
         label: "sol-1".into(),
         name: email.into(),
         enrolled: true,
+    });
+    // The word the card's build gives the row's account with no lab: its key.
+    card.word = account_names::names_of_row(Cli::Claude, &sol_row(), None).map(|(pk, names)| {
+        account_names::Named {
+            pk,
+            row: None,
+            names,
+        }
+        .word()
     });
     card.pool_size = 2;
     card.login = Some(LoginHalf::InUse);
@@ -929,7 +949,7 @@ fn state_f_a_program_that_is_not_claude_code() {
         [
             "No Codex accounts are listed on this Mac.",
             "Add one: aterm harness accounts add --cli",
-            "codex <label>",
+            "codex <account>",
             "\u{22ef}  Account settings\u{2026}",
         ]
     );
@@ -2266,7 +2286,9 @@ fn a_pool_item_keeps_its_trail_or_moves_it_under() {
 
 /// COPY DETAILS HOLDS EVERY FACT, EMAILS AND BOTH CLOCKS: the card's facts unwrapped, what the
 /// card leaves out, each time as local words with its RFC 3339 instant, and the command that
-/// prints older days.
+/// prints older days, which the harness parses and whose word reaches the card's row. Negative
+/// control: the step typing the roster label (`card.who.label()`, as it did) prints `accounts
+/// history sol-1`, and the step's assertion fails; the harness resolves that word to nothing.
 #[test]
 fn copy_details_holds_every_fact_emails_and_both_clocks() {
     let mut facts = state_c(60, true);
@@ -2310,10 +2332,43 @@ fn copy_details_holds_every_fact_emails_and_both_clocks() {
         "Starts since",
         "m22 28, this Mac (m20) 2",
         "Next event 20:10 (2026-11-11T20:10:00Z)",
-        "Older days: aterm harness accounts history sol-1",
     ] {
         assert!(report.contains(want), "{want}\n{report}");
     }
+    // The last line is the step that shows older days, naming the account by the word
+    // `accounts history` takes (its slug, else its key), never its roster label: parsed as the
+    // harness parses it and resolved over the card's row, it reaches that row.
+    let pk = aterm_db::typed::keys::account_pk("claude", "sol.m20.1@proton.me").expect("a key");
+    let older = report.lines().last().unwrap_or_default();
+    assert_eq!(
+        older,
+        format!("Older days: aterm harness accounts history {pk}")
+    );
+    let argv: Vec<String> = older
+        .trim_start_matches("Older days: aterm harness ")
+        .split(' ')
+        .map(str::to_owned)
+        .collect();
+    let word = match aterm_agent::harness::cli::parse(&argv) {
+        Ok((
+            aterm_agent::harness::cli::Cmd::Accounts(
+                aterm_agent::harness::cli::AccountsCmd::History {
+                    name: Some(word), ..
+                },
+            ),
+            _,
+        )) => word,
+        other => panic!("{older} parses as {other:?}"),
+    };
+    let row = sol_row();
+    let candidates = account_names::Candidates {
+        roster: std::slice::from_ref(&row),
+        ..account_names::Candidates::default()
+    };
+    let named = account_names::resolve(Cli::Claude, &word, &candidates)
+        .unwrap_or_else(|why| panic!("{older}: {why}"));
+    assert_eq!(named.row, Some(&row));
+    assert!(!older.contains("sol-1"), "a roster label: {older}");
     assert_eq!(
         report
             .matches("sol.m20.2@proton.me: no usable sign-in route")
@@ -2332,8 +2387,8 @@ fn copy_details_holds_every_fact_emails_and_both_clocks() {
         !report.contains('\u{2581}') && !report.contains('\u{2588}'),
         "no chart"
     );
-    // A login outside the pool has no roster label the history command takes: the report names
-    // no command it could not run for this account.
+    // A login outside the pool has no word the history command takes (`AccountCard::word`): the
+    // report names no command it could not run for this account.
     let outside = details_report(&state_a(60));
     assert!(
         outside.contains("Account: unicorn.m15.2@proton.me"),

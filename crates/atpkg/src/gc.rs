@@ -601,14 +601,14 @@ fn run_in(
             crate::vendor_direct::policy::Policy::current(layout, None).with_channel(channel)
         });
         let witness_is_alab = crate::alab::build_is_alab(layout, &program, witness.build);
-        let lands_on = |b: u64| {
-            (!witness_is_alab || crate::alab::build_is_alab(layout, &program, b))
-                && match &vendor_yanks {
-                    Some(policy) => {
-                        crate::vendor_direct::lane::rollback_lands_on(layout, policy, &program, b)
-                    }
-                    None => crate::flow::rollback_lands_on(layout, channel, &program, b),
-                }
+        // A program the lab releases is fixed forward and keeps no older build; a vendor-direct
+        // one keeps the build a signed yank lands on.
+        let lands_on = |b: u64| match &vendor_yanks {
+            Some(policy) => {
+                (!witness_is_alab || crate::alab::build_is_alab(layout, &program, b))
+                    && crate::vendor_direct::lane::rollback_lands_on(layout, policy, &program, b)
+            }
+            None => false,
         };
         let mut gone = Vec::new();
         let now = std::time::SystemTime::now();

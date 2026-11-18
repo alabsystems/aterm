@@ -34,6 +34,8 @@ fn column(name: &str, source: Source, refers: Option<&str>) -> Column {
         source,
         read_only: source != Source::Schema,
         refers: refers.map(str::to_owned),
+        ty: None,
+        null: None,
     }
 }
 
@@ -209,6 +211,26 @@ fn a_snapshot_round_trips_and_a_cut_or_changed_one_is_refused() {
     snapshot.rev = 7;
     let bytes = snapshot.encode();
     assert_eq!(Snapshot::decode(&bytes).expect("decodes"), snapshot);
+
+    // A column's type and nullability travel in the header and are no part of the content:
+    // a build that states them and one that does not agree on the revision. A column that
+    // states neither keeps the object an earlier build wrote, which still decodes.
+    let untyped = snapshot.content();
+    assert!(!String::from_utf8_lossy(&bytes).contains("\"type\""));
+    let mut typed = snapshot.clone();
+    let at = typed
+        .columns
+        .iter()
+        .position(|column| column.source == Source::Schema)
+        .expect("a schema column");
+    typed.columns[at].ty = Some(aterm_json::json!({"text": 64}));
+    typed.columns[at].null = Some(false);
+    let read = Snapshot::decode(&typed.encode()).expect("decodes");
+    assert_eq!(read, typed);
+    assert_eq!(read.columns[at].ty, Some(aterm_json::json!({"text": 64})));
+    assert_eq!(read.columns[at].null, Some(false));
+    assert_eq!(typed.content(), untyped);
+    assert_ne!(typed.encode(), bytes);
 
     // Cut anywhere, it is not a shorter table.
     for cut in [0, 1, bytes.len() / 2, bytes.len() - 1] {
@@ -971,6 +993,67 @@ fn the_read_verbs_answer_in_every_state() {
     assert_eq!(answer(root, &["cat", "Not A Name"]).code, exit::USAGE);
     assert_eq!(answer(root, &["frobnicate"]).code, exit::USAGE);
     assert_eq!(answer(root, &[]).out, cli::USAGE);
+}
+
+/// `schema` prints what the published snapshot says of its columns: nothing before a pass,
+/// the columns with no type and a line saying so for a snapshot an earlier build wrote, and
+/// the types once a pass states them, which moves no revision.
+#[test]
+fn schema_prints_the_snapshots_columns_and_says_when_none_states_a_type() {
+    let scratch = scratch();
+    let root = &scratch.root;
+    let never = answer(root, &["schema", "ai/accounts"]);
+    assert_eq!((never.code, never.out.as_str()), (exit::OK, ""));
+    assert_eq!(
+        answer(root, &["schema", "ai/accounts", "more"]).code,
+        exit::USAGE
+    );
+
+    let file = File::at(root, &name("ai/accounts"));
+    let earlier = opened(true, frontier(1, &[1]), Some(accounts(vec![ada()])));
+    file.record(file.look().expect("a look"), earlier, 10)
+        .expect("records");
+    let rev = file.published().snapshot.expect("a snapshot").rev;
+    let untyped = answer(root, &["schema", "ai/accounts"]);
+    assert_eq!(
+        untyped.out,
+        "column\ttype\tnull\tsource\tref\n\
+         realm\t\t\tschema\t\n\
+         note\t\t\tschema\t\n\
+         slug\t\t\tderived\t\n\
+         email\t\t\tderived\t\n\
+         pk\t\t\tpk\t\n"
+    );
+    assert!(untyped.err.contains("primary key: pk"), "{}", untyped.err);
+    assert!(
+        untyped.err.contains("\ntypes: not stated ("),
+        "{}",
+        untyped.err
+    );
+
+    let mut typed = accounts(vec![ada()]);
+    typed.columns[0].ty = Some(aterm_json::json!({"text": 64}));
+    typed.columns[0].null = Some(false);
+    typed.columns[1].ty = Some(aterm_json::json!("text"));
+    typed.columns[1].null = Some(true);
+    let later = opened(true, frontier(1, &[1]), Some(typed));
+    file.record(file.look().expect("a look"), later, 20)
+        .expect("records");
+    assert_eq!(file.published().snapshot.expect("a snapshot").rev, rev);
+    let stated = answer(root, &["schema", "ai/accounts"]);
+    assert!(
+        stated
+            .out
+            .contains("realm\t{\"text\":64}\tno\tschema\t\nnote\ttext\tyes\tschema\t\n"),
+        "{}",
+        stated.out
+    );
+    assert!(!stated.err.contains("types:"), "{}", stated.err);
+    let json: Value = aterm_json::from_str(&answer(root, &["schema", "ai/accounts", "--json"]).out)
+        .expect("json");
+    assert_eq!(json["columns"][0]["type"], aterm_json::json!({"text": 64}));
+    assert_eq!(json["columns"][2]["type"], Value::Null);
+    assert_eq!(json["handles"], aterm_json::json!(["slug", "email"]));
 }
 
 #[test]

@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 const NOW: i64 = 1_800_000_000;
 
@@ -33,7 +33,7 @@ fn a_missing_row_intent_retires_only_after_its_owned_worker_validates_the_roster
             *slot.lock().unwrap() = Some(work);
             Ok(())
         };
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         let current = Roster::load(&path).unwrap();
         assert!(
             matches!(
@@ -214,7 +214,7 @@ fn a_retained_or_unreadable_detached_manual_result_does_not_wake_itself() {
             work(); // Grok has no unattended provider route.
             Ok(())
         };
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         let mut fx = live_effects();
         fx.scope = lifetime.enter();
         fx.renew_guard = &guard;
@@ -456,7 +456,7 @@ fn manual_owners_partition_same_labels_and_retire_only_the_exact_token() {
         a.request_pin("same", NOW).unwrap(),
         b.request_pin("same", NOW).unwrap(),
     );
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let first =
         ManualSelectionOwner::claim(&guard, &a, Cli::Claude, first.into(), Some(&row()), NOW)
             .unwrap();
@@ -487,7 +487,7 @@ fn an_owner_inserted_before_transaction_failure_is_retired_by_its_provisional_gu
     let root = aterm_tempfile::tempdir().unwrap();
     let store = accounts::Store::at(root.path());
     let request = store.request_next(NOW).unwrap();
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let ledger = store.ledger_path();
     let retained = ledger.with_extension("retained");
     let existed = ledger.try_exists().unwrap();
@@ -547,7 +547,7 @@ fn unstarted_manual_work_retires_its_owner_before_the_operation_scope() {
     let root = aterm_tempfile::tempdir().unwrap();
     let store = accounts::Store::at(root.path());
     let request = store.request_next(NOW).unwrap();
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let owner = ManualSelectionOwner::claim(
         &guard,
         &store,
@@ -580,7 +580,7 @@ fn a_saved_next_intent_reattaches_without_a_new_nonce_and_no_candidate_retires_i
     fs::create_dir(&home).unwrap();
     let store = accounts::Store::at(&state);
     let request = store.request_next(NOW).unwrap();
-    let old = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let old = AutoRenewGuard::default().shared();
     drop(
         ManualSelectionOwner::claim(
             &old,
@@ -593,7 +593,7 @@ fn a_saved_next_intent_reattaches_without_a_new_nonce_and_no_candidate_retires_i
         .unwrap(),
     );
     drop(old);
-    let restarted = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let restarted = AutoRenewGuard::default().shared();
     let owner = ManualSelectionOwner::claim(
         &restarted,
         &store,
@@ -650,7 +650,7 @@ fn queued_next_rechecks_cancellation_replacement_and_policy_before_admission() {
         let store = accounts::Store::at(&state);
         let request = store.request_next(NOW).unwrap();
         let logins = fs::read(store.logins_file()).ok();
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         let owner = ManualSelectionOwner::claim(
             &guard,
             &store,

@@ -288,7 +288,7 @@ fn sign_back_case(operation: i64, case: i64) -> [bool; 4] {
         fs::write(store.logins_file(), before.to_json()).unwrap();
     }
     let before = store.load_logins(NOW).unwrap().0;
-    let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     for (key, label) in [("local", "account"), ("foreign", "another")] {
         super::recovery_policy_tests::hold_retry(&guard, &store, Cli::Claude, key, label);
         let mut held = guard.lock().unwrap();

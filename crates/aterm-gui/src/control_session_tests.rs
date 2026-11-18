@@ -936,9 +936,11 @@ fn a_programs_own_report_rides_the_await_task_row_and_never_wakes_it() {
 
 /// `supervisor_proven=` on `ls` is `status supervisor_proven=`: `1` only while the live claim
 /// is a proven self-claim, `0` for an unproven one and for a tab nobody claims. A proven
-/// contract v3 claim carries the versions it announced (`supervisor_version=`,
-/// `supervisor_vendor=`, `docs/DESIGN-harness-repos-2026-10-24.md` §5); every other row, the
-/// proven codex-alab self-claim among them (the control), carries `-` for both.
+/// scoped claim carries `supervisor_version=`, the version aterm read from the build its proof
+/// admitted and never the `version=` it states, and `supervisor_vendor=`, the vendor it states
+/// (`docs/DESIGN-harness-repos-2026-10-24.md` §5); every other row, the proven codex-alab
+/// self-claim among them (the control), carries `-` for both, as does a scoped claim whose
+/// proof read no version and that named no vendor.
 #[test]
 fn the_roster_says_whether_the_live_claim_is_proven() {
     let t0 = Arc::new(Mutex::new(Terminal::new(24, 80)));
@@ -961,16 +963,24 @@ fn the_roster_says_whether_the_live_claim_is_proven() {
         else {
             panic!("grok-alab's claim reads as a scoped claim: {words:?}");
         };
-        h.ctx.meta.lock().unwrap().supervisor = Some(crate::session_timeline::SupervisorClaim {
+        let proven = crate::self_claim::Proven {
+            pid: 4243,
+            start: "stand-in".to_string(),
+        };
+        let mut meta = h.ctx.meta.lock().unwrap();
+        // The proof admitted a build of another version than the claim states, for the claim
+        // that states one; it read none for the other.
+        meta.supervisor_verified = claim
+            .version
+            .is_some()
+            .then(|| (proven.clone(), "0.9.0+gdef".to_string()));
+        meta.supervisor = Some(crate::session_timeline::SupervisorClaim {
             holder: "grok-alab@4243".to_string(),
             conn: Some(2),
             expires_us: None,
             proven: None,
             scoped: Some(crate::harness_claim::Scoped {
-                proven: crate::self_claim::Proven {
-                    pid: 4243,
-                    start: "stand-in".to_string(),
-                },
+                proven,
                 claim,
                 child: None,
             }),
@@ -1024,7 +1034,7 @@ fn the_roster_says_whether_the_live_claim_is_proven() {
         " supervisor=codex-alab@4242 supervisor_proven=0 supervisor_version=- \
          supervisor_vendor=- autopilot=",
         " supervisor=- supervisor_proven=0 supervisor_version=- supervisor_vendor=- autopilot=",
-        " supervisor=grok-alab@4243 supervisor_proven=1 supervisor_version=0.3.0+gabc \
+        " supervisor=grok-alab@4243 supervisor_proven=1 supervisor_version=0.9.0+gdef \
          supervisor_vendor=1.0.70 autopilot=",
         " supervisor=grok-alab@4243 supervisor_proven=1 supervisor_version=- \
          supervisor_vendor=- autopilot=",

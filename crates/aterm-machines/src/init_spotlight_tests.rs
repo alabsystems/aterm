@@ -47,7 +47,7 @@ fn indexing_status_requires_a_successful_unambiguous_reading() {
         status,
         Ran {
             status: Some(1),
-            stdout: b"Indexing disabled.".to_vec(),
+            stdout: b"/System/Volumes/Data:\n\tIndexing disabled.\n".to_vec(),
             stderr: Vec::new(),
         },
     );
@@ -531,7 +531,7 @@ fn an_ordinary_account_is_owed_the_scope_by_the_receipt() {
     let disabled = account();
     disabled.on(
         "/usr/bin/mdutil -s /System/Volumes/Data",
-        Ran::ok("Indexing disabled."),
+        Ran::ok("/System/Volumes/Data:\n\tIndexing disabled.\n"),
     );
     assert!(automatic_scope_owed(&disabled));
     assert!(!automatic_scope_owed(&disabled));

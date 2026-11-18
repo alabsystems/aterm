@@ -3996,6 +3996,229 @@ fn an_ack_row_carries_its_verdict_and_await_inbox_re_latches_on_it() {
     });
 }
 
+/// An ask with a deadline, `sid`'s `n`th post, landed at `off`.
+#[track_caller]
+fn an_ask_landed(store: &Store, ctx: &std::sync::Arc<SessionCtx>, sid: &str, n: u64, off: u64) {
+    let poster = {
+        let ctx = ctx.clone();
+        std::thread::spawn(move || cmd_post(&ctx, "to=@t0000100000 kind=ask dl=30000 why?", None))
+    };
+    land_once_queued(store, sid, n, off);
+    let posted = poster.join().expect("the poster finished");
+    assert!(posted.starts_with(&format!("OK {n} ")), "{posted}");
+}
+
+/// `sid`'s row at `off` as `inbox --peek --meta` lists it, `None` where the ring holds none.
+fn listed_at(ctx: &SessionCtx, off: u64) -> Option<String> {
+    let listing = cmd_inbox(ctx, "--peek --meta");
+    let found = listing
+        .lines()
+        .find(|l| l.starts_with("msg ") && l.split(' ').any(|w| w == format!("off={off}")))
+        .map(str::to_string);
+    found
+}
+
+/// **`--wait-ack` ANSWERS BY THE FIRST VERDICT IN LANE ORDER** (ATERM-KI-1115-7889): an
+/// `expired` at @12 below a late ack at @15 answers `ERR expired`, whether the wait reads it
+/// before the ack came or after; an ack at @20 below an `expired` at @23 answers `OK`, the
+/// `expired` taking no row. CONTROL: the newest of the rows answering, as before, a wait read
+/// after the late ack answers `OK` and one read after the `expired` answers `ERR expired`.
+#[test]
+fn wait_ack_takes_the_first_verdict_by_offset() {
+    with_link(|| {
+        stale_after_a_hang();
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        attach_up(&store, next_bridge_generation());
+        an_ask_landed(&store, &ctx, &sid, 1, 7);
+        assert_eq!(
+            cmd_deliver(
+                &store,
+                &format!("{sid} off=12 from=n-lab kind=expired re=7 dl=30000 text=expired")
+            ),
+            "OK 1\n"
+        );
+        assert_eq!(
+            wait_receipt(&ctx, 1, 7, "", 0),
+            "ERR expired id=1 off=7\n",
+            "read before the ack"
+        );
+        assert_eq!(
+            cmd_deliver(
+                &store,
+                &format!(
+                    "{sid} off=15 from=t0000100000@n-lab kind=ack trust=agent re=7 \
+                     verdict=handled text=late"
+                )
+            ),
+            "OK 2\n"
+        );
+        assert_eq!(
+            wait_receipt(&ctx, 1, 7, "", 0),
+            "ERR expired id=1 off=7\n",
+            "read after the late ack: the `expired` below it is the verdict"
+        );
+
+        an_ask_landed(&store, &ctx, &sid, 2, 18);
+        assert_eq!(
+            cmd_deliver(
+                &store,
+                &format!(
+                    "{sid} off=20 from=t0000100000@n-lab kind=ack trust=agent re=18 \
+                     verdict=handled text=ok"
+                )
+            ),
+            "OK 3\n"
+        );
+        assert_eq!(
+            cmd_deliver(
+                &store,
+                &format!("{sid} off=23 from=n-lab kind=expired re=18 dl=30000 text=expired")
+            ),
+            "OK 0\n"
+        );
+        assert_eq!(
+            wait_receipt(&ctx, 2, 18, "", 0),
+            "OK 2 off=18 ack=handled msg=3\n",
+            "the ack below the `expired` is the verdict"
+        );
+    });
+}
+
+/// **ONCE AN ACK CAME FIRST, `--wait-ack` REPORTS THE NEWEST** (ATERM-KI-1115-7889 review): the
+/// first verdict on the lane decides whether the post expired, and its receiver sends an ack
+/// each time its decision changes (`inbox seen <id> <verdict>`), so an ack at @20 `deferred`,
+/// then one at @25 `handled`, answers `ack=deferred` read after the first alone and
+/// `ack=handled` read after both; acks delivered out of lane order (@36 `handled`, then @33
+/// `deferred`) answer by the newest on the lane, `ack=handled`; and an `expired` at @42 below
+/// acks at @45 `handled` and @48 `refused` still answers `ERR expired`. CONTROL: the first ack,
+/// as the first cut of ATERM-KI-1115-7889 reported it, answered `ack=deferred` after both.
+#[test]
+fn wait_ack_reports_the_newest_ack_once_an_ack_came_first() {
+    with_link(|| {
+        stale_after_a_hang();
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        attach_up(&store, next_bridge_generation());
+        let ack = |off: u64, re: u64, verdict: &str| {
+            cmd_deliver(
+                &store,
+                &format!(
+                    "{sid} off={off} from=t0000100000@n-lab kind=ack trust=agent re={re} \
+                     verdict={verdict} text=decided"
+                ),
+            )
+        };
+        an_ask_landed(&store, &ctx, &sid, 1, 17);
+        assert_eq!(ack(20, 17, "deferred"), "OK 1\n");
+        assert_eq!(
+            wait_receipt(&ctx, 1, 17, "", 0),
+            "OK 1 off=17 ack=deferred msg=1\n",
+            "read after the first ack alone"
+        );
+        assert_eq!(ack(25, 17, "handled"), "OK 2\n");
+        assert_eq!(
+            wait_receipt(&ctx, 1, 17, "", 0),
+            "OK 1 off=17 ack=handled msg=2\n",
+            "read after both: the decision as it stands"
+        );
+
+        an_ask_landed(&store, &ctx, &sid, 2, 30);
+        assert_eq!(ack(36, 30, "handled"), "OK 3\n");
+        assert_eq!(ack(33, 30, "deferred"), "OK 4\n");
+        assert_eq!(
+            wait_receipt(&ctx, 2, 30, "", 0),
+            "OK 2 off=30 ack=handled msg=3\n",
+            "the newest on the lane, whatever order the bridge delivered them in"
+        );
+
+        an_ask_landed(&store, &ctx, &sid, 3, 40);
+        assert_eq!(
+            cmd_deliver(
+                &store,
+                &format!("{sid} off=42 from=n-lab kind=expired re=40 dl=30000 text=expired")
+            ),
+            "OK 5\n"
+        );
+        assert_eq!(ack(45, 40, "handled"), "OK 6\n");
+        assert_eq!(ack(48, 40, "refused"), "OK 7\n");
+        assert_eq!(
+            wait_receipt(&ctx, 3, 40, "", 0),
+            "ERR expired id=3 off=40\n",
+            "the `expired` below the acks is the verdict"
+        );
+    });
+}
+
+/// **AN `expired` ABOVE ITS ASK'S ANSWER TAKES NO ROW** (ATERM-KI-1115-7889): the answer at
+/// @10 is the ask's verdict, so the `expired` at @12, published after it landed, is answered
+/// `OK 0`, remembered (a bridge's second offer is answered the same) and never listed.
+/// CONTROL: it took a row, as before, and the asker read an `expired` after its answer.
+#[test]
+fn an_expired_after_its_asks_answer_takes_no_row() {
+    with_link(|| {
+        stale_after_a_hang();
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        attach_up(&store, next_bridge_generation());
+        an_ask_landed(&store, &ctx, &sid, 1, 7);
+        assert_eq!(
+            cmd_deliver(
+                &store,
+                &format!("{sid} off=10 from=t0000100000@n-lab kind=answer trust=agent re=7 text=a")
+            ),
+            "OK 1\n"
+        );
+        let expired = format!("{sid} off=12 from=n-lab kind=expired re=7 dl=30000 text=expired");
+        assert_eq!(cmd_deliver(&store, &expired), "OK 0\n");
+        assert_eq!(cmd_deliver(&store, &expired), "OK 0\n", "offered again");
+        assert!(listed_at(&ctx, 10).is_some(), "the answer is listed");
+        assert_eq!(listed_at(&ctx, 12), None, "the `expired` takes no row");
+        assert_eq!(
+            cmd_await_inbox(&ctx, &["re=7", "since=1"], 0),
+            "OK timeout\n"
+        );
+    });
+}
+
+/// **AN ANSWER ABOVE AN `expired` OF ITS ASK IS LATE, WHATEVER ITS LINE SAYS**
+/// (ATERM-KI-1115-7889): a bridge that lost what it published (a successor before its journal
+/// named the verdict) delivers the answer at @15 without `late=1`; the `expired` at @12 below
+/// it is the verdict, so the row is late. An answer below the `expired`, delivered after it
+/// (@11, read by a later refill), is the ask's first verdict and is not. CONTROL: the line's
+/// `late` alone, as before: the answer at @15 is listed on time.
+#[test]
+fn an_answer_after_an_expired_verdict_is_late_whatever_the_line_says() {
+    with_link(|| {
+        stale_after_a_hang();
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        attach_up(&store, next_bridge_generation());
+        an_ask_landed(&store, &ctx, &sid, 1, 7);
+        assert_eq!(
+            cmd_deliver(
+                &store,
+                &format!("{sid} off=12 from=n-lab kind=expired re=7 dl=30000 text=expired")
+            ),
+            "OK 1\n"
+        );
+        let answer = |off: u64| {
+            cmd_deliver(
+                &store,
+                &format!(
+                    "{sid} off={off} from=t0000100000@n-lab kind=answer trust=agent re=7 text=a"
+                ),
+            )
+        };
+        assert_eq!(answer(15), "OK 2\n");
+        let row = listed_at(&ctx, 15).expect("the answer at @15");
+        assert!(row.contains(" late=1"), "{row}");
+        assert_eq!(answer(11), "OK 3\n");
+        let row = listed_at(&ctx, 11).expect("the answer at @11");
+        assert!(!row.contains(" late=1"), "{row}");
+    });
+}
+
 #[test]
 fn post_wait_ack_returns_the_verdict_or_the_expiry_and_is_bounded_by_dl() {
     with_link(|| {
@@ -5638,6 +5861,99 @@ fn link_log_proved_continues_another_log_below_its_fork() {
             at(25, "another-twenty-five"),
             "OK 3\n",
             "25 is at or above the fork: another record there is shown"
+        );
+    });
+}
+
+/// A PROVED MOVE TOLD AGAIN FROM THE LOG BEFORE KEEPS A SESSION THAT HOLDS AN EARLIER GENERATION
+/// OF THE NEW LOG (ATERM-KI-1116-7314): a bridge told `<b>.0 continues=20 was=<a>.0 proved=1`,
+/// and its attach failed before its witness moved off `<a>.0`; the next attach finds `<b>.1` and
+/// tells `<b>.1 continues=20 was=<a>.0 proved=1`. The session holds `<b>.0`, which lies between
+/// the two, so it keeps what it holds below the fork. So does a session on a later generation of
+/// `<a>` than the move's `was` (`<a>.1`), told by an attach as a move from `<a>.0` whose witness
+/// then never moved. A session holding another log (`<c>.0`), or a later generation of `<b>`
+/// than the one told (`<b>.2`), forgets everything, and so does one past the generation a
+/// lineage move within one log names (`<a>.3` against `<a>.2` was `<a>.0`). NEGATIVE CONTROLS:
+/// the chain rule before (a held clock between `was` and the told one only as generations of
+/// one log) forgot 7, and aterm showed it again; the rule before the later generation's forgot
+/// `<a>.1`.
+#[test]
+fn a_proved_move_told_again_keeps_a_session_on_an_earlier_generation_of_the_new_log() {
+    with_link(|| {
+        let store = new_store();
+        let (sid, _ctx) = registered(&store);
+        let generation = next_bridge_generation();
+        attach_up(&store, generation);
+        let (a, b, c) = ("aa".repeat(16), "bb".repeat(16), "cc".repeat(16));
+        let tell = |line: String| cmd_link(&store, &format!("log {line}"), Some(generation));
+        let at =
+            |off: u64, text: &str| deliver(&store, &sid, off, "t0000100000@n-lab", "note", text);
+        assert_eq!(tell(format!("{a}.0")), "OK\n");
+        assert_eq!(at(7, "seven"), "OK 1\n");
+        assert_eq!(
+            tell(format!("{b}.0 continues=20 was={a}.0 proved=1")),
+            "OK forgot=1\n"
+        );
+        assert_eq!(at(7, "seven"), "OK 1\n", "7 is below the proved fork");
+        let held = LogIdentity::parse(&format!("{b}.0"));
+        let clock = |now: &str, was: &str| LogClock {
+            ident: LogIdentity::parse(now).expect("an identity"),
+            continues: Some((LogIdentity::parse(was).expect("an identity"), 20)),
+        };
+        let before = |clock: &LogClock, held: Option<LogIdentity>| {
+            let (was, fork) = clock.continues?;
+            let held = held?;
+            (held == was || (held.continues_from(was) && clock.ident.continues_from(held)))
+                .then_some(fork)
+        };
+        let again = clock(&format!("{b}.1"), &format!("{a}.0"));
+        assert_eq!(
+            before(&again, held),
+            None,
+            "NEGATIVE CONTROL: the rule before forgot {b}.0"
+        );
+        assert_eq!(again.keep_below(held), Some(20), "{b}.0 is in the chain");
+        // A later generation of `was`, told as a move from it by an attach whose witness then
+        // never moved off it (the sim's keyed reminted seed 90): kept because the session holds
+        // only offsets below that move's cut (the tell forgot the rest, and nothing is delivered
+        // while the witness names `was`), not because the fork lies below the cut.
+        let later = LogIdentity::parse(&format!("{a}.1"));
+        let earlier_rule = |clock: &LogClock, held: Option<LogIdentity>| {
+            let (was, fork) = clock.continues?;
+            let held = held?;
+            (held == was
+                || (clock.ident.continues_from(held)
+                    && (held.id != was.id || held.continues_from(was))))
+            .then_some(fork)
+        };
+        assert_eq!(
+            earlier_rule(&again, later),
+            None,
+            "NEGATIVE CONTROL: the rule before forgot {a}.1"
+        );
+        assert_eq!(again.keep_below(later), Some(20), "{a}.1 is in the chain");
+        let lineage = clock(&format!("{a}.2"), &format!("{a}.0"));
+        assert_eq!(
+            lineage.keep_below(LogIdentity::parse(&format!("{a}.3"))),
+            None,
+            "a lineage move keeps no generation past the one it names"
+        );
+        for other in [format!("{c}.0"), format!("{b}.2")] {
+            assert_eq!(
+                again.keep_below(LogIdentity::parse(&other)),
+                None,
+                "{other} is not in the chain"
+            );
+        }
+        assert_eq!(
+            tell(format!("{b}.1 continues=20 was={a}.0 proved=1")),
+            "OK forgot=1\n"
+        );
+        assert_eq!(at(7, "seven"), "OK 1\n", "7 is still below the fork");
+        assert_eq!(
+            at(25, "twenty-five"),
+            "OK 2\n",
+            "25, at or above the fork, is shown"
         );
     });
 }

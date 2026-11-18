@@ -20,7 +20,7 @@ pub(crate) fn native_supervisor_fields(
     now: u64,
 ) -> (String, String) {
     let live = meta.live_supervisor(now);
-    let (version, vendor) = crate::harness_claim::wire_versions(meta.live_scoped(now));
+    let (version, vendor) = crate::harness_claim::wire_versions(meta, now);
     (
         format!(
             "{} supervisor_proven={} supervisor_version={version} supervisor_vendor={vendor}",

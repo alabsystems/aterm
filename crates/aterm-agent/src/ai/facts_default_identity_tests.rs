@@ -51,7 +51,7 @@ fn passthrough_facts_withhold_a_known_mismatched_default_identity() {
             assert_eq!(view.serving_login, Some(("CODEX_AUTH_PATH", None)));
             assert!(view.serving_login_file.is_some());
             assert_eq!(view.launch_refused, None);
-            assert!(matches!(view.default_row, Some(DefaultRow::Serves(_))));
+            assert!(matches!(view.default_row, Some(DefaultRow::Serves(..))));
             assert_eq!(
                 files.each_ref().map(|path| std::fs::read(path).ok()),
                 before

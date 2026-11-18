@@ -1579,6 +1579,12 @@ pub trait System: Sync {
         Err("this system keeps no repository convergence record".into())
     }
 
+    /// Read prior empty-origin observations without taking a repository lease. These are
+    /// scheduling evidence only; fresh account, source and checkout checks still admit reuse.
+    fn repository_empty_checkouts(&self) -> crate::sync::repository_refresh::EmptyCheckouts {
+        crate::sync::repository_refresh::EmptyCheckouts::default()
+    }
+
     /// Whether another owner works this account's repositories now, read without taking or
     /// trying the repository lease: what a plan reads in place of the lease it never takes
     /// (`init.github.native`'s probe). The default, a system with no record: no.
@@ -3530,6 +3536,13 @@ impl System for Live {
         crate::sync::repository_refresh::RepositoryPass::open(&state, now)
     }
 
+    fn repository_empty_checkouts(&self) -> crate::sync::repository_refresh::EmptyCheckouts {
+        aterm_types::dirs::account_state_dir().map_or_else(
+            crate::sync::repository_refresh::EmptyCheckouts::default,
+            |state| crate::sync::repository_refresh::empty_checkouts(&state),
+        )
+    }
+
     /// Another process's refresh claim in the shared record
     /// ([`crate::sync::repository_refresh::running`]), or a repository another live process is
     /// still cloning, filling or refreshing (its progress record, [`crate::repository_progress`]:
@@ -3736,6 +3749,9 @@ mod fake {
         pub checkout_records: Option<Arc<super::CheckoutRecords>>,
         repository_observations: Mutex<Vec<crate::repository_progress::Progress>>,
         repository_record: Arc<crate::sync::repository_refresh::Memory>,
+        /// An owned on-disk record where a fixture exercises persistence across fresh passes.
+        pub repository_record_file: Option<PathBuf>,
+
         exclusive_paths: Arc<Mutex<std::collections::BTreeSet<PathBuf>>>,
         exclusive_errors: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
         /// The tools a test models instead of scripting ([`Fake::simulate`]).
@@ -6028,14 +6044,30 @@ mod fake {
         }
 
         fn repository_pass(&self) -> Result<crate::sync::repository_refresh::Access, String> {
+            if let Some(state) = &self.repository_record_file {
+                return crate::sync::repository_refresh::RepositoryPass::open(
+                    state,
+                    self.now.saturating_mul(1000),
+                );
+            }
             Ok(crate::sync::repository_refresh::RepositoryPass::memory(
                 &self.repository_record,
                 self.now.saturating_mul(1000),
             ))
         }
 
+        fn repository_empty_checkouts(&self) -> crate::sync::repository_refresh::EmptyCheckouts {
+            self.repository_record_file.as_ref().map_or_else(
+                || self.repository_record.empty_checkouts(),
+                |state| crate::sync::repository_refresh::empty_checkouts(state),
+            )
+        }
+
         fn repository_pass_running(&self) -> bool {
-            self.repository_record.running()
+            self.repository_record_file.as_ref().map_or_else(
+                || self.repository_record.running(),
+                |state| crate::sync::repository_refresh::running(state),
+            )
         }
 
         fn checkout_records(&self) -> Option<Arc<super::CheckoutRecords>> {

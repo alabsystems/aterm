@@ -1059,6 +1059,7 @@ fn a_weekly_usage_limit_does_not_raise_a_nag_exception() {
         next: None,
         ready: Some(Ready {
             label: "m8-3".to_string(),
+            word: None,
         }),
         held: None,
     });
@@ -1123,6 +1124,63 @@ fn a_weekly_usage_limit_does_not_raise_a_nag_exception() {
     };
     let e = exception_for(&st, &left_lost, &cfg(), t + MIN).expect("told");
     assert_eq!(e.notice.as_ref().map(|n| n.id), Some("login-left"), "{e:?}");
+}
+
+/// A READY ROW'S PIN IS ASKED BY THE WORD THAT NAMES ITS ACCOUNT, NEVER BY ITS LABEL: where the
+/// roster holds the tab off a ready row (its pin, or a restart asked again), the limit's notice
+/// is [`notice::LIMIT_USE`] filled with the ready row's word (`Ready::word`), so its step types
+/// `accounts use <word>` and none of its parts prints the row's label, which `accounts use`
+/// refuses. A ready row with no address has no word, so no pin is asked for: the tab is told no
+/// other account can take over ([`notice::LIMIT_ROSTER`], [`notice::LIMIT_ROSTER_KEPT`] where
+/// nothing resumes it at the reset). NEGATIVE CONTROL: with `limit_use` filling `{label}` with
+/// `ready.label`, the notice's word is `m2-2`, not `claude-ada-x`, and this fails (2026-11-16,
+/// by hand, then restored).
+#[test]
+fn a_ready_rows_pin_is_asked_by_its_accounts_word() {
+    use crate::supervise::policy::turn_end::{HeldBy, Ready, RosterWord};
+    let roster = |word: Option<&str>, held: Option<HeldBy>| RosterWord::Row {
+        next: None,
+        ready: Some(Ready {
+            label: "m2-2".to_string(),
+            word: word.map(str::to_owned),
+        }),
+        held,
+    };
+    for resumes in [true, false] {
+        for (held, refused) in [(Some(HeldBy::Pin), None), (None, Some(Unmade::Again))] {
+            let at = format!("{held:?} {refused:?} resumes={resumes}");
+            let named = roster(Some("claude-ada-x"), held);
+            let (text, label, why) =
+                limit_roster_step(Some(&named), Ok(()), resumes, refused, None)
+                    .flatten()
+                    .unwrap_or_else(|| panic!("{at}: a notice"));
+            assert_eq!(text.id, notice::LIMIT_USE.id, "{at}");
+            assert_eq!(label, Some("claude-ada-x"), "{at}");
+            let filled = text.fill(label, why);
+            assert!(
+                filled
+                    .todo
+                    .ends_with("aterm harness accounts use claude-ada-x"),
+                "{at}: {filled:?}"
+            );
+            for part in [&filled.happened, &filled.did, &filled.todo, &filled.expect] {
+                assert!(!part.contains("m2-2"), "{at}: {part}");
+            }
+
+            let unnamed = roster(None, held);
+            let (text, label, why) =
+                limit_roster_step(Some(&unnamed), Ok(()), resumes, refused, None)
+                    .flatten()
+                    .unwrap_or_else(|| panic!("{at}: a notice"));
+            let want = if resumes {
+                notice::LIMIT_ROSTER
+            } else {
+                notice::LIMIT_ROSTER_KEPT
+            };
+            assert_eq!((text.id, label, why), (want.id, None, None), "{at}");
+            assert!(!text.todo.contains("accounts use"), "{at}");
+        }
+    }
 }
 
 /// A SIGN-IN UNDER WAY OVER A MANAGED WORKER'S WEEKLY WALL ENDS THE CHAIN WITH NO EXCEPTION, as on

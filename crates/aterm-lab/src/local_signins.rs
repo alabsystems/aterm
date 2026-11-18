@@ -58,9 +58,9 @@ use std::time::{Duration, Instant};
 const HANG: Duration = Duration::from_secs(60);
 
 /// How long both Macs stay up after the passes before the zero counts are read: an exposure
-/// window past the upkeep's 60-second fallback wake (`harness_host`'s `WAKE_FALLBACK`), so at
-/// least one pass that no pass of this lane kicked falls inside what is counted. Not a budget:
-/// nothing is waited for.
+/// window past the accounts' keeper's longest wait (aterm-gui's `accounts_keeper::LOOK_EVERY`,
+/// 60 seconds), so a wake of the keeper no pass of this lane brought falls inside what is
+/// counted. Not a budget: nothing is waited for.
 const HOLD: Duration = Duration::from_secs(70);
 
 /// The jail (SBPL; the last matching rule wins). A name lookup (the resolver's socket), an IP
@@ -188,8 +188,9 @@ pub fn survey_rows(reply: &aterm_json::Value) -> BTreeMap<String, BTreeSet<Row>>
     out
 }
 
-/// The rows of `aterm harness accounts --cli all --json`: every object that names a `label`
-/// and a `condition`, under the `cli` its nearest enclosing object names.
+/// The rows of `aterm harness accounts --cli all --json`: every object that names a row (by its
+/// `label`, or by its account, [`laid_label`]) and a `condition`, under the `cli` its nearest
+/// enclosing object names.
 #[must_use]
 pub fn report_rows(report: &aterm_json::Value) -> BTreeSet<Row> {
     fn walk(v: &aterm_json::Value, cli: &str, out: &mut BTreeSet<Row>) {
@@ -203,7 +204,7 @@ pub fn report_rows(report: &aterm_json::Value) -> BTreeSet<Row> {
             return;
         };
         let cli = v["cli"].as_str().unwrap_or(cli).to_string();
-        if let (Some(label), Some(condition)) = (v["label"].as_str(), v["condition"].as_str()) {
+        if let (Some(label), Some(condition)) = (laid_label(v), v["condition"].as_str()) {
             out.insert(Row {
                 pool: cli.clone(),
                 label: label.into(),
@@ -217,6 +218,21 @@ pub fn report_rows(report: &aterm_json::Value) -> BTreeSet<Row> {
     let mut out = BTreeSet::new();
     walk(report, "", &mut out);
     out
+}
+
+/// The label a report row `row` was laid out under: its `label`, which only a row with no
+/// address keeps (the report's schema 3 names every other row by its account), else the label
+/// its account's address carries, which every address this lane lays holds
+/// (`<label>@example.test`, `local_signins_heal`'s default row): read off its account's `name`
+/// (`claude ac-def@example.test`), the provider word and the address. `None` for an object that
+/// names no row.
+fn laid_label(row: &aterm_json::Value) -> Option<String> {
+    if let Some(label) = row["label"].as_str() {
+        return Some(label.to_owned());
+    }
+    row["ac"].as_str()?;
+    let (_, address) = row["name"].as_str()?.rsplit_once(' ')?;
+    address.strip_suffix("@example.test").map(str::to_owned)
 }
 
 /// Each expected row of `side` judged against `rows`: `(label, laid, got)` for every row whose

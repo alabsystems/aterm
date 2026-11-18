@@ -163,7 +163,8 @@ impl OwnedDisplay {
             .ok_or(Error::NoObject)
     }
 
-    /// Connect over `fd`, a socket already connected to a compositor.
+    /// Connect over `fd`, a socket already connected to a compositor (a Unix descriptor).
+    #[cfg(unix)]
     pub fn connect_to_fd(fd: std::os::fd::OwnedFd) -> Result<OwnedDisplay, Error> {
         use std::os::fd::IntoRawFd as _;
         let c = client()?;

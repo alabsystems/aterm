@@ -3,6 +3,218 @@
 
 use super::*;
 
+fn process_facts(sweep: Option<&[ProcessReading]>) -> ProcessFacts {
+    ProcessFacts::new(sweep.map(<[ProcessReading]>::to_vec), true, None, None)
+}
+
+fn zombie_sample(
+    model: &mut aterm_vitals::Vitals,
+    rows: &[ProcessReading],
+    at_ms: u64,
+) -> (
+    aterm_vitals::Sample,
+    aterm_vitals::Snapshot,
+    Arc<ZombieFacts>,
+) {
+    let sample = aterm_vitals::Sample {
+        at_ns: at_ms * 1_000_000,
+        mono_ms: at_ms,
+        procs: Some(
+            rows.iter()
+                .map(|row| crate::vitals_host::proc_sample(row, Instant::now()))
+                .collect(),
+        ),
+        ..aterm_vitals::Sample::default()
+    };
+    let snapshot = model.absorb(&sample);
+    let facts = model
+        .current_zombie_facts()
+        .expect("supported current sweep");
+    (sample, snapshot, facts)
+}
+
+fn zombie_rows() -> Vec<ProcessReading> {
+    vec![
+        ProcessReading {
+            pid: 7001,
+            start: Some(71),
+            uid: Some(501),
+            state: aterm_sysprobe::jobs::RunState::Running,
+            ..ProcessReading::default()
+        },
+        ProcessReading {
+            pid: 7002,
+            ppid: 7001,
+            start: Some(72),
+            uid: Some(501),
+            state: aterm_sysprobe::jobs::RunState::Zombie,
+            ..ProcessReading::default()
+        },
+    ]
+}
+
+/// Neither a matching timestamp nor an old receipt alone can pair a different source.
+#[test]
+fn one_zombie_book_gui_transport_refuses_absent_mismatched_and_scene_sources() {
+    let mut model = aterm_vitals::Vitals::new();
+    let rows = zombie_rows();
+    let _ = zombie_sample(&mut model, &rows, 1_000);
+    let (sample, snapshot, receipt) = zombie_sample(&mut model, &rows, 11_000);
+    assert_eq!(receipt.parent_pile(7001).unwrap().count(), 1);
+    let pair = |rows, sample: &aterm_vitals::Sample, snapshot: &aterm_vitals::Snapshot| {
+        ProcessFacts::new(
+            rows,
+            true,
+            Some((sample, snapshot)),
+            Some(Arc::clone(&receipt)),
+        )
+    };
+    let matched = pair(Some(rows.clone()), &sample, &snapshot);
+    assert_eq!(matched.source_seq, Some(snapshot.seq));
+    assert!(Arc::ptr_eq(matched.zombies.as_ref().unwrap(), &receipt));
+
+    let absent = pair(None, &sample, &snapshot);
+    assert!(!absent.complete() && absent.zombies.is_none());
+    let mut other_snapshot = snapshot.clone();
+    other_snapshot.seq += 1;
+    assert!(
+        pair(Some(rows.clone()), &sample, &other_snapshot)
+            .zombies
+            .is_none()
+    );
+    let mut other_sample = sample.clone();
+    other_sample.at_ns += 1;
+    assert!(
+        pair(Some(rows.clone()), &other_sample, &snapshot)
+            .zombies
+            .is_none()
+    );
+    other_sample = sample.clone();
+    other_sample.mono_ms += 1;
+    assert!(
+        pair(Some(rows.clone()), &other_sample, &snapshot)
+            .zombies
+            .is_none()
+    );
+    other_sample = sample.clone();
+    other_sample.zombie_read = ZombieRead::Unsupported;
+    assert!(
+        pair(Some(rows.clone()), &other_sample, &snapshot)
+            .zombies
+            .is_none()
+    );
+    other_sample = sample.clone();
+    other_sample.procs = None;
+    assert!(
+        pair(Some(rows.clone()), &other_sample, &snapshot)
+            .zombies
+            .is_none()
+    );
+    for alter in [0, 1, 2, 3, 4, 5, 6, 7, 8] {
+        let mut other = rows.clone();
+        match alter {
+            0 => other[1].start = Some(73),
+            1 => other[1].ppid = 7003,
+            2 => other[1].state = aterm_sysprobe::jobs::RunState::Running,
+            3 => other[1].name = "later-name".into(),
+            4 => other[0].state = aterm_sysprobe::jobs::RunState::Stopped,
+            5 => other[1].birth_ms = Some(73),
+            6 => other[1].pgid = 73,
+            7 => other[1].sid = 73,
+            _ => other[1].uid = Some(502),
+        }
+        assert!(pair(Some(other), &sample, &snapshot).zombies.is_none());
+    }
+    let scene = ProcessFacts::new(Some(rows), true, None, Some(receipt));
+    assert!(scene.source_seq.is_none() && scene.zombies.is_none());
+}
+
+/// The adapter cannot age a canonical pile on its later detail clock, and pacing cannot
+/// attach a newer source to the old immutable jobs view.
+#[test]
+fn one_zombie_book_gui_jobs_keeps_original_cutoff_and_cached_receipt() {
+    let mut model = aterm_vitals::Vitals::new();
+    let rows = zombie_rows();
+    let _ = zombie_sample(&mut model, &rows, 1_000);
+    let (early_sample, early_snapshot, early) = zombie_sample(&mut model, &rows, 10_999);
+    let early_input = ProcessFacts::new(
+        Some(rows.clone()),
+        true,
+        Some((&early_sample, &early_snapshot)),
+        Some(Arc::clone(&early)),
+    );
+    let mut pass = JobsPass::new();
+    let mut read = |at, facts: &ProcessFacts, force| {
+        pass.tick(
+            at,
+            || at + 1_000_000,
+            facts,
+            &[],
+            &[],
+            &[],
+            &GrantFacts::default(),
+            0,
+            false,
+            force,
+        )
+        .expect("an actual sweep produces a jobs view")
+    };
+    let before = read(1_000_000, &early_input, true);
+    let original = before
+        .zombie_facts
+        .as_ref()
+        .expect("supported empty receipt");
+    assert!(Arc::ptr_eq(original, &early));
+    assert!(
+        original.piles().is_empty(),
+        "a later detail clock cannot cross the age cutoff"
+    );
+
+    let (sample, snapshot, receipt) = zombie_sample(&mut model, &rows, 11_000);
+    assert_eq!(receipt.parent_pile(7001).unwrap().count(), 1);
+    let input = ProcessFacts::new(
+        Some(rows),
+        true,
+        Some((&sample, &snapshot)),
+        Some(Arc::clone(&receipt)),
+    );
+    let cached = read(1_000_001, &input, false);
+    assert!(Arc::ptr_eq(&before, &cached));
+    assert!(Arc::ptr_eq(cached.zombie_facts.as_ref().unwrap(), &early));
+    let renewed = read(1_000_001, &input, true);
+    assert!(!Arc::ptr_eq(&before, &renewed));
+    assert!(Arc::ptr_eq(
+        renewed.zombie_facts.as_ref().unwrap(),
+        &receipt
+    ));
+    assert_eq!(renewed.zombie_facts.as_ref().unwrap().mono_ms(), 11_000);
+
+    let absent = ProcessFacts::new(None, true, None, None);
+    assert!(Arc::ptr_eq(&renewed, &read(1_000_002, &absent, true)));
+
+    let mut partial_sample = sample;
+    partial_sample.procs_truncated = true;
+    let partial_snapshot = model.absorb(&partial_sample);
+    let partial_receipt = model
+        .current_zombie_facts()
+        .expect("supported partial sweep");
+    assert!(!partial_receipt.whole());
+    let partial = ProcessFacts::new(
+        Some(zombie_rows()),
+        false,
+        Some((&partial_sample, &partial_snapshot)),
+        Some(partial_receipt),
+    );
+    assert!(
+        partial.zombies.is_some(),
+        "transport retains the source's qualification"
+    );
+    assert!(
+        read(1_000_003, &partial, true).zombie_facts.is_none(),
+        "an incomplete census cannot become an exact Jobs count"
+    );
+}
+
 /// Start facts [`probe::judge_start`] judges `at`, read the held age after the fork.
 fn judged(at: AtStart) -> StartFacts {
     let unstarted = StartFacts {
@@ -616,7 +828,7 @@ fn an_edges_reading_inside_the_cadence_runs_the_engine() {
         .tick(
             10_000,
             || 10_000,
-            Some(&sweep.procs),
+            &process_facts(Some(&sweep.procs)),
             &tabs,
             &[],
             &[],
@@ -630,7 +842,7 @@ fn an_edges_reading_inside_the_cadence_runs_the_engine() {
         .tick(
             11_900,
             || 11_900,
-            Some(&sweep.procs),
+            &process_facts(Some(&sweep.procs)),
             &tabs,
             &[],
             &[],
@@ -645,7 +857,7 @@ fn an_edges_reading_inside_the_cadence_runs_the_engine() {
         .tick(
             11_900,
             || 11_900,
-            Some(&sweep.procs),
+            &process_facts(Some(&sweep.procs)),
             &tabs,
             &[],
             &[],
@@ -660,7 +872,7 @@ fn an_edges_reading_inside_the_cadence_runs_the_engine() {
         pass.tick(
             11_950,
             || 11_950,
-            None,
+            &process_facts(None),
             &tabs,
             &[],
             &[],
@@ -721,7 +933,7 @@ fn an_ended_calls_row_runs_from_its_leaders_start_to_its_exit_on_the_passs_clock
         pass.tick(
             at_ms,
             clock,
-            Some(&sweep.procs),
+            &process_facts(Some(&sweep.procs)),
             &tabs,
             &[],
             &[],
@@ -1103,7 +1315,7 @@ fn the_pass_hands_the_engine_this_users_held_programs_and_the_stand_in() {
         .tick(
             10_000,
             || 10_000,
-            Some(&sweep),
+            &process_facts(Some(&sweep)),
             &[],
             &[],
             &[],
@@ -1191,7 +1403,7 @@ fn the_pass_tells_the_check_whether_a_program_waits_at_it() {
         let _ = pass.tick(
             10_000,
             || 10_000,
-            Some(&[row(10), row(20)]),
+            &process_facts(Some(&[row(10), row(20)])),
             &[],
             &[],
             &[],
@@ -1497,7 +1709,7 @@ fn the_pass_hands_the_engine_the_daemon_it_judged_against() {
         let _ = pass.tick(
             10_000,
             || 10_000,
-            Some(&first),
+            &process_facts(Some(&first)),
             &[],
             &[],
             &[],
@@ -1516,7 +1728,7 @@ fn the_pass_hands_the_engine_the_daemon_it_judged_against() {
         pass.tick(
             12_000,
             || 12_000,
-            Some(&then),
+            &process_facts(Some(&then)),
             &[],
             &[],
             &[],
@@ -1631,7 +1843,7 @@ fn a_pass_dates_a_row_from_its_first_unrun_read_and_keeps_its_verdict() {
             .tick(
                 at_ms,
                 || at_ms,
-                Some(rows),
+                &process_facts(Some(rows)),
                 &[],
                 &[],
                 &[],
@@ -1750,7 +1962,7 @@ fn the_pass_hands_the_engine_the_grant_time_and_the_adopted_tabs() {
             .tick(
                 10_000,
                 || 10_000,
-                Some(&[row(10, 400), row(20, 2)]),
+                &process_facts(Some(&[row(10, 400), row(20, 2)])),
                 std::slice::from_ref(&tab),
                 &[],
                 &[],
@@ -1789,7 +2001,7 @@ fn the_pass_hands_the_engine_the_grant_time_and_the_adopted_tabs() {
     let view = crate::vitals_host::jobs_step(
         &mut pass(),
         &req.tab_reads(epoch, || epoch),
-        Some(&[row(10, 400), row(20, 2)]),
+        &process_facts(Some(&[row(10, 400), row(20, 2)])),
         &req,
         false,
     )
@@ -1822,7 +2034,7 @@ fn with_this_process_coalition_unread_no_held_program_is_aterms() {
         .tick(
             10_000,
             || 10_000,
-            Some(&[row(10, 400), row(20, 2)]),
+            &process_facts(Some(&[row(10, 400), row(20, 2)])),
             &[],
             &[],
             &[],
@@ -1915,7 +2127,7 @@ fn naming_needs_an_actual_jobs_pass_instead_of_a_carried_view() {
             pass.tick(
                 at_ms,
                 || at_ms,
-                sweep,
+                &process_facts(sweep),
                 &[],
                 &[],
                 &[],

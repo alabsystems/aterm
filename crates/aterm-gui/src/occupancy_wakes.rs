@@ -297,13 +297,22 @@ struct Shelf {
 }
 
 impl Shelf {
-    fn named_slots(&self) -> bool {
+    /// Whether a live wake's need or one of its machine atoms reads true by `names`.
+    fn names(&self, names: fn(&SysWait) -> bool) -> bool {
         self.book.wakes.iter().filter(|w| w.state.live()).any(|w| {
-            w.need.as_ref().is_some_and(SysWait::names_slots)
+            w.need.as_ref().is_some_and(names)
                 || w.when
                     .iter()
-                    .any(|a| matches!(&a.atom, Atom::Sys(sys) if sys.names_slots()))
+                    .any(|a| matches!(&a.atom, Atom::Sys(sys) if names(sys)))
         })
+    }
+
+    fn named_slots(&self) -> bool {
+        self.names(SysWait::names_slots)
+    }
+
+    fn named_spotlight(&self) -> bool {
+        self.names(SysWait::names_spotlight)
     }
 
     fn reads_sys(&self) -> bool {
@@ -972,6 +981,15 @@ impl WakeHost {
     /// Whether `sid`'s live wakes name build slots (a parked wait arms their sampling).
     pub(crate) fn names_slots(&self, sid: &str) -> bool {
         self.lock().shelves.get(sid).is_some_and(Shelf::named_slots)
+    }
+
+    /// Whether `sid`'s live wakes name `spotlight` (a parked wait arms the split by coalition
+    /// that alone reads it).
+    pub(crate) fn names_spotlight(&self, sid: &str) -> bool {
+        self.lock()
+            .shelves
+            .get(sid)
+            .is_some_and(Shelf::named_spotlight)
     }
 
     /// ONE PASS of `conn`'s parked `await wake` on `sid`: an end owed to it, else the levels read
@@ -2191,6 +2209,7 @@ pub(crate) fn cmd_await_wake(
             hung_up: &crate::control::caller_hung_up,
             exited: &exited,
             arm_slots: &|| crate::occupancy_host::SLOTS_ARMED.arm(),
+            arm_split: &|| crate::vitals_host::SPLIT_ARMED.arm(),
         },
     );
     deliver(host.take_outs());
@@ -2218,6 +2237,9 @@ pub(crate) struct Waits<'a, A> {
     pub(crate) exited: &'a dyn Fn() -> bool,
     /// Arm the build slots' sampling while it waits on a wake naming them.
     pub(crate) arm_slots: &'a dyn Fn() -> A,
+    /// Arm the split by coalition while it waits on a wake naming `spotlight`, whose reading
+    /// only a split makes ([`crate::vitals_host::SPLIT_ARMED`]).
+    pub(crate) arm_split: &'a dyn Fn() -> A,
 }
 
 /// THE PARKED WAIT: parked, then a pass at each change or [`crate::sys_host::AWAIT_PERIOD`],
@@ -2234,6 +2256,7 @@ pub(crate) fn await_wake<A>(
         return Pass::Reply { reply, ord: None };
     }
     let _armed = host.names_slots(&seat.sid).then(|| (waits.arm_slots)());
+    let _split = host.names_spotlight(&seat.sid).then(|| (waits.arm_split)());
     loop {
         if let reply @ Pass::Reply { .. } = host.pass(env, &seat.sid, conn) {
             return reply;

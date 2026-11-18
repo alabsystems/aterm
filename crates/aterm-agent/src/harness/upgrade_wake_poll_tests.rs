@@ -11,21 +11,10 @@ fn replace(path: &Path) {
     std::fs::rename(&tmp, path).unwrap();
 }
 
-fn poll(path: Option<PathBuf>) -> (SidePoll, impl Fn() -> usize) {
-    let told = Arc::new(AtomicUsize::new(0));
-    let count = Arc::clone(&told);
-    let side = SidePoll::new(
-        path,
-        Box::new(move || {
-            count.fetch_add(1, Ordering::SeqCst);
-        }),
-    );
-    (side, move || told.load(Ordering::SeqCst))
-}
-
 /// Off macOS the fallback is a look at the marks ([`Polled`]), tested on every unix here: a
-/// wait answers `true` only for a mark that moved, once per move; a side mark is told and
-/// ends no wait; a pulled trigger answers `false` at once and leaves a move for the next look.
+/// wait answers `true` only for a mark that moved, once per move; an agent's own mark is told
+/// and ends no wait; a pulled trigger answers `false` at once and leaves a move for the next
+/// look.
 #[cfg(unix)]
 #[test]
 fn the_polled_wake_answers_only_a_mark_that_moved() {
@@ -51,9 +40,6 @@ fn the_polled_wake_answers_only_a_mark_that_moved() {
     let fixed = |path: PathBuf| -> Locate { Box::new(move || Some(path.clone())) };
     let mut wake = Polled::with_claude_sources(Some(&home), vec![fixed(twin.clone())]);
     wake.waking(fixed(word.clone()));
-    let store = root.join("accounts");
-    let (side, heard) = poll(Some(store.join("wake")));
-    wake.sides.push(side);
     let muse_twin = agents.join("muse");
     std::os::unix::fs::symlink(&old, &muse_twin).unwrap();
     let muse_told = Arc::new(AtomicUsize::new(0));
@@ -80,9 +66,9 @@ fn the_polled_wake_answers_only_a_mark_that_moved() {
         "an agent's own twin wakes no other agent's worker"
     );
     assert_eq!(
-        (muse_told.load(Ordering::SeqCst), heard()),
-        (1, 0),
-        "the agent's own listener is told, and no other"
+        muse_told.load(Ordering::SeqCst),
+        1,
+        "the agent's own listener is told"
     );
     assert!(!wake.wait(TICK));
     assert_eq!(muse_told.load(Ordering::SeqCst), 1, "told once");
@@ -105,11 +91,6 @@ fn the_polled_wake_answers_only_a_mark_that_moved() {
     assert!(wake.wait(TICK), "the native link appeared");
     std::fs::write(agents.join("unrelated"), b"x").unwrap();
     assert!(!wake.wait(TICK), "a neighbour is no activation");
-
-    std::fs::create_dir_all(&store).unwrap();
-    replace(&store.join("wake"));
-    assert!(!wake.wait(TICK), "a side mark ends no wait");
-    assert_eq!(heard(), 1, "its listener is told");
 
     replace(&word);
     ring(&wake.pulled);
@@ -158,43 +139,4 @@ fn the_polled_twin_is_the_one_atpkg_lays_and_a_landing_moves_it() {
     land("2026102802");
     assert!(mark.changed(), "a newer build's landing moved the twin");
     assert!(!mark.changed(), "told once");
-}
-
-#[test]
-fn a_fallback_tick_tells_a_side_listener_only_when_its_marker_changed() {
-    let scratch_dir = aterm_tempfile::Builder::new()
-        .prefix("aterm-accounts-side-poll-")
-        .tempdir()
-        .unwrap();
-    let root = scratch_dir.path();
-    let store = root.join("accounts");
-    let marker = store.join("wake");
-
-    let (mut none, heard_none) = poll(None);
-    let (mut side, heard) = poll(Some(marker.clone()));
-    for _ in 0..5 {
-        assert!(!side.look() && !none.look());
-    }
-    assert_eq!((heard(), heard_none()), (0, 0), "nothing there: no news");
-
-    std::fs::create_dir_all(&store).unwrap();
-    replace(&marker);
-    assert!(side.look(), "the marker was made");
-    assert_eq!(heard(), 1);
-    for _ in 0..5 {
-        assert!(!side.look());
-    }
-    assert_eq!(heard(), 1, "left alone: no tick tells it again");
-    replace(&marker);
-    assert!(side.look(), "replaced");
-    assert_eq!(heard(), 2);
-    std::fs::write(store.join("state.json"), b"{}").unwrap();
-    assert!(!side.look());
-    assert_eq!(heard(), 2, "a write beside the marker is not it");
-    let (mut late, heard_late) = poll(Some(marker.clone()));
-    assert!(!late.look());
-    assert_eq!(heard_late(), 0, "the baseline is no news");
-    std::fs::remove_file(&marker).unwrap();
-    assert!(side.look() && !side.look());
-    assert_eq!(heard(), 3);
 }

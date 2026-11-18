@@ -797,5 +797,113 @@ pub fn reveal_bound<T>(
     })
 }
 
+/// Whether `held` is what a reveal of `parts` of `mailbox` would hand over now: the mailbox is
+/// live and `accept`ed as [`reveal_bound`] accepts it, every part opens ([`open_credential`])
+/// from the one observation, and each value equals its `held` one ([`same_bytes`]), whichever
+/// entries and generation hold it. What the holder of a revealed bundle asks so it learns,
+/// with nothing revealed again, whether the registry still holds what it was handed: a value
+/// replaced, under a new reference or in place under the same one, reads `false`. The values
+/// are read in this process, compared and dropped; none is handed on, nothing derived from one
+/// is kept, and nothing is journalled.
+///
+/// # Errors
+/// The store cannot be read.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one observation's two projections, its store, the bundle asked and the one held"
+)]
+pub fn bound_same_in(
+    addresses: &Projection,
+    mailboxes: &Projection,
+    table: &str,
+    store: &dyn Store,
+    mailbox: &str,
+    parts: &[Credential],
+    held: &[&[u8]],
+    accept: impl FnOnce(&Mailbox) -> bool,
+) -> Result<std::result::Result<bool, Withheld>> {
+    same_of(
+        addresses,
+        mailboxes,
+        table,
+        Values::Store(store),
+        mailbox,
+        parts,
+        held,
+        accept,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one observation's two projections and its values, the bundle asked and the one held"
+)]
+fn same_of(
+    addresses: &Projection,
+    mailboxes: &Projection,
+    table: &str,
+    values: Values<'_>,
+    mailbox: &str,
+    parts: &[Credential],
+    held: &[&[u8]],
+    accept: impl FnOnce(&Mailbox) -> bool,
+) -> Result<std::result::Result<bool, Withheld>> {
+    let Some(found) = mailboxes
+        .rows
+        .get(mailbox)
+        .and_then(|row| mailbox_of(addresses, mailbox, row))
+    else {
+        return Ok(Err(Withheld::NoMailbox));
+    };
+    if !accept(&found) {
+        return Ok(Err(Withheld::NoMailbox));
+    }
+    // Every part is opened and compared, whatever an earlier one read.
+    let mut same = parts.len() == held.len();
+    for (at, part) in parts.iter().enumerate() {
+        let ask = Ask {
+            mailbox,
+            which: *part,
+            when_ms: 0,
+        };
+        match open_credential(addresses, mailboxes, table, values, ask)? {
+            Ok((_, value)) => {
+                same &= held
+                    .get(at)
+                    .is_some_and(|held| same_bytes(value.plaintext().as_bytes(), held));
+            }
+            Err(why) => return Ok(Err(why)),
+        }
+    }
+    Ok(Ok(same))
+}
+
+/// Whether two values are the same bytes, in time that depends on their lengths alone.
+fn same_bytes(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// [`bound_same_in`] over this Mac's registry, as [`reveal_bound`] reads it.
+///
+/// # Errors
+/// The registry is not declared here, its log does not read, or the store cannot be read.
+#[cfg(unix)]
+pub fn bound_same(
+    registry: &Registry,
+    store: &dyn Store,
+    mailbox: &str,
+    parts: &[Credential],
+    held: &[&[u8]],
+    accept: impl FnOnce(&Mailbox) -> bool,
+) -> Result<std::result::Result<bool, Withheld>> {
+    let handle = crate::att::Handle::at(registry.paths().clone(), &crate::att::REGISTRY);
+    let table = handle.compiled().name();
+    read_with(&handle, store, |addresses, mailboxes, values| {
+        same_of(
+            addresses, mailboxes, &table, values, mailbox, parts, held, accept,
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests;

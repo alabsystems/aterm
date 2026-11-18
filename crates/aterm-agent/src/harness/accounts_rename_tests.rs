@@ -53,6 +53,7 @@ pub(crate) fn seed_reference(state: &mut State, logins: &mut Logins, label: &str
                     account: label.into(),
                     at: NOW,
                     held: Some("kept-reason".into()),
+                    owner: None,
                 },
             );
         }

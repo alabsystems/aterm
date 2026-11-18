@@ -363,7 +363,7 @@ fn empty_cell_plans_run_without_compiler_admission_and_are_consumed_without_rewa
             ..crate::LIVE
         };
         ADMISSIONS.store(0, Ordering::SeqCst);
-        let invocation = crate::RunPlan::capture(&ctx, seams);
+        let invocation = crate::RunPlan::capture(&ctx, seams).expect("complete graph and plan");
         assert!(matches!(
             invocation
                 .cells
@@ -445,7 +445,7 @@ fn selected_cell_work_preserves_the_normal_cold_claim_and_disk_selection() {
         admit_memory: refuse,
         ..crate::LIVE
     };
-    let invocation = crate::RunPlan::capture(&ctx, seams);
+    let invocation = crate::RunPlan::capture(&ctx, seams).expect("complete graph and plan");
     assert!(matches!(
         invocation
             .cells
@@ -512,7 +512,8 @@ fn an_empty_cell_stage_neither_borrows_a_compiler_token_nor_keeps_a_compiler_pea
             prepare_cells: Some(captured),
             ..crate::LIVE
         },
-    );
+    )
+    .expect("complete graph and plan");
     let spec = invocation
         .stages
         .iter()
@@ -631,7 +632,7 @@ fn prepared_cells_reject_a_different_live_context_before_projection_and_executio
         prepare_build_dir: |_| Ok(()),
         ..crate::LIVE
     };
-    let invocation = crate::RunPlan::capture(&first, seams);
+    let invocation = crate::RunPlan::capture(&first, seams).expect("complete graph and plan");
     let mut output = Vec::new();
     let code = crate::run_with_plan(
         &second,

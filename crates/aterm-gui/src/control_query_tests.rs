@@ -1716,6 +1716,18 @@ fn metrics_carries_commons_repairs_counts() {
 /// - `emit_accounts_upkeep` printing `pool_syncs` under `accounts_upkeep_passes` and `passes`
 ///   under `accounts_pool_syncs`: `accounts_upkeep_passes moved by 2199023255552, its count by
 ///   1099511627776`.
+///
+/// NEGATIVE CONTROL (2026-11-15): `emit_accounts_upkeep` printing `duty_skips` under
+/// `accounts_duty_runs` and `duty_runs` under `accounts_duty_skips`: `accounts_duty_runs moved
+/// by 6597069766656, its count by 5497558138880`; restored, the file touched.
+///
+/// The keeper's counts (`crate::accounts_keeper::counts`) and each caller's passes are moved
+/// the same way; the traced opens and the store locks, which no test moves by a step, each
+/// read as a count.
+///
+/// NEGATIVE CONTROL (2026-11-16): `emit_accounts_upkeep` printing `keeper.bell` under
+/// `accounts_keeper_wakes_file`: `accounts_keeper_wakes_file moved by 6597069766656, its count
+/// by 5497558138880`; restored, the file touched.
 #[test]
 fn metrics_carries_the_accounts_upkeeps_counts() {
     use crate::metrics::wire::law_tests;
@@ -1723,9 +1735,24 @@ fn metrics_carries_the_accounts_upkeeps_counts() {
     const STEP: u64 = 1 << 40;
     let mut keys = vec![
         "accounts_upkeep_passes",
+        "accounts_upkeep_passes_keeper",
+        "accounts_upkeep_passes_session",
+        "accounts_upkeep_passes_moved",
+        "accounts_keeper_wakes_file",
+        "accounts_keeper_wakes_bell",
+        "accounts_keeper_wakes_deadline",
+        "accounts_keeper_wakes_wall",
+        "accounts_keeper_wakes_asked",
+        "accounts_keeper_wakes_forced",
+        "accounts_keeper_wakes_unwatched",
+        "accounts_keeper_unmoved",
         "accounts_pool_syncs",
         "accounts_pool_syncs_guarded",
         "accounts_receipt_admissions",
+        "accounts_duty_runs",
+        "accounts_duty_skips",
+        "accounts_duty_kept",
+        "accounts_duty_poisoned",
     ];
     if cfg!(unix) {
         keys.extend([
@@ -1745,19 +1772,55 @@ fn metrics_carries_the_accounts_upkeeps_counts() {
             })
             .collect()
     };
+    let counted = ["accounts_trace_opened", "accounts_store_locks"];
+    let counted_read = || {
+        let reply = super::cmd_metrics(None, "");
+        let tokens = law_tests::tokens(reply.trim_end());
+        counted
+            .iter()
+            .map(|key| {
+                tokens
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .and_then(|(_, v)| v.parse::<u64>().ok())
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        counted_read().iter().all(Option::is_some),
+        "{counted:?}: {:?}",
+        counted_read()
+    );
     let before = read();
     add_for_test(UpkeepCounts {
         passes: STEP,
-        pool_syncs: 2 * STEP,
-        pool_syncs_guarded: 3 * STEP,
-        receipt_admissions: 4 * STEP,
+        passes_keeper: 2 * STEP,
+        passes_session: 3 * STEP,
+        passes_moved: 4 * STEP,
+        pool_syncs: 13 * STEP,
+        pool_syncs_guarded: 14 * STEP,
+        receipt_admissions: 15 * STEP,
+        duty_runs: 16 * STEP,
+        duty_skips: 17 * STEP,
+        duty_kept: 18 * STEP,
+        duty_poisoned: 19 * STEP,
+    });
+    crate::accounts_keeper::add_for_test(crate::accounts_keeper::KeeperCounts {
+        file: 5 * STEP,
+        bell: 6 * STEP,
+        deadline: 7 * STEP,
+        wall: 8 * STEP,
+        asked: 9 * STEP,
+        forced: 10 * STEP,
+        unwatched: 11 * STEP,
+        unmoved: 12 * STEP,
     });
     #[cfg(unix)]
     aterm_db::alab::add_admission_counts_for_test(aterm_db::alab::AdmissionCounts {
-        reads: 5 * STEP,
-        records: 6 * STEP,
-        bytes: 7 * STEP,
-        observations: 8 * STEP,
+        reads: 20 * STEP,
+        records: 21 * STEP,
+        bytes: 22 * STEP,
+        observations: 23 * STEP,
     });
     let after = read();
     for (i, (key, nth)) in keys.iter().zip(1u64..).enumerate() {

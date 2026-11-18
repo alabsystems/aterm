@@ -662,6 +662,12 @@ impl Default for LanesSeen {
 pub struct JobTick {
     /// The host's monotonic clock, ms.
     pub at_ms: u64,
+    /// The original process reading's [`crate::model::Snapshot::seq`], independent of this
+    /// assessment's clock. Missing authority cannot admit zombie facts.
+    pub source_seq: Option<u64>,
+    /// The model's immutable zombie receipt for `source_seq`. Only a matching whole receipt
+    /// supplies exact zombie projections; it is never aged again at this tick's clock.
+    pub zombie_facts: Option<std::sync::Arc<crate::blockage::ZombieFacts>>,
     /// The host's clock, ms, once it had read [`JobTick::procs`]: each shell's terminal group,
     /// which says what is in front, is read after the sweep, past `at_ms`.
     pub read_ms: u64,
@@ -1150,11 +1156,12 @@ pub struct Stop {
 /// A job's unreaped children.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Zombies {
-    /// Zombies seen at least [`ZOMBIE_AGE_MS`].
+    /// The total of canonical mature piles whose parent is a live process of this job.
     pub count: u32,
     /// The parent holding most of them.
     pub parent: u32,
-    /// New zombies a minute, × 10, since the parent's first.
+    /// The named parent's canonical pile rate, × 10 per minute. This is that parent's rate,
+    /// not the total count divided by the named parent's age.
     pub per_min_deci: u64,
 }
 
@@ -1431,9 +1438,12 @@ pub struct JobsView {
     /// The tabs, ascending, whose every live job waits at the person's own terminal read this
     /// tick and none is watched at the fast cadence (stuck, or on a suspect wait).
     pub parked_tabs: Vec<u64>,
-    /// The pass's clock ([`JobTick::at_ms`]): every figure of the view is as of it, however
-    /// long a snapshot carries the view after it.
+    /// The assessment's clock ([`JobTick::at_ms`]), retained when a snapshot carries the view.
+    /// Zombie figures keep their original canonical reading in [`Self::zombie_facts`].
     pub at_ms: u64,
+    /// The exact matching whole receipt used for zombie rows and findings. A cached view
+    /// retains this original source and clock; missing or incomplete input remains absent.
+    pub zombie_facts: Option<std::sync::Arc<crate::blockage::ZombieFacts>>,
 }
 
 impl JobsView {

@@ -1156,6 +1156,18 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// What a save asks of a row its baseline held and the saved file does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Absent {
+    /// The owner deleted it: it is retired, or ended where the table says its rows end. A grid
+    /// export holds the rows the owner asked to edit, so one left out was taken out.
+    Retires,
+    /// Nothing: a shared file's face is a whole table any tool may rewrite, so a row missing
+    /// from it is no word about the row (docs/DESIGN-shared-files-2026-11-11.md §3, "What a
+    /// commit does"). A row is retired by its `row` cell.
+    Keeps,
+}
+
 /// Read the owner's saved `text` against the export's `base`: the cells whose text changed,
 /// type-checked, as edits that carry the candidates the export showed; new rows (their pk left
 /// empty) born under the key `birth` derives; deleted rows retired, or ended when the table says
@@ -1172,6 +1184,23 @@ pub fn plan(
     text: &str,
     birth: Birth<'_>,
 ) -> std::result::Result<Plan, Vec<Problem>> {
+    plan_saved(table, collection, base, text, birth, Absent::Retires)
+}
+
+/// [`plan`], a row the save left out asking for what `absent` says. The key's header cell may
+/// carry the revision a face was written at (`=pk@<rev>`); the baseline's header names it
+/// exactly as the saved file must.
+///
+/// # Errors
+/// As [`plan`].
+pub fn plan_saved(
+    table: &Table,
+    collection: &'static Collection,
+    base: &Base,
+    text: &str,
+    birth: Birth<'_>,
+    absent: Absent,
+) -> std::result::Result<Plan, Vec<Problem>> {
     let whole = |rule: &str| {
         vec![Problem {
             record: 0,
@@ -1186,7 +1215,13 @@ pub fn plan(
         ));
     }
     let pk_header = format!("{READ_ONLY}{PK}");
-    if base.header.last() != Some(&pk_header) {
+    if !base.header.last().is_some_and(|last| {
+        *last == pk_header
+            || last
+                .strip_prefix(&pk_header)
+                .and_then(|rest| rest.strip_prefix('@'))
+                .is_some_and(|rev| !rev.is_empty() && rev.bytes().all(|b| b.is_ascii_digit()))
+    }) {
         return Err(whole("not a grid baseline"));
     }
     let Ok(sheet) = Sheet::scan(text, Delimiter::Tab) else {
@@ -1371,11 +1406,12 @@ pub fn plan(
         }
     }
     // Rows the owner deleted: retired, or ended, so their history stays.
-    if let Some(Lifecycle {
-        column: lifecycle,
-        ends: word,
-        ..
-    }) = self::lifecycle(table, collection)
+    if absent == Absent::Retires
+        && let Some(Lifecycle {
+            column: lifecycle,
+            ends: word,
+            ..
+        }) = self::lifecycle(table, collection)
     {
         for (pk, seen) in &base.rows {
             if present.contains(pk.as_str()) {

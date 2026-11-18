@@ -384,7 +384,12 @@ pub fn run_provision(
     }
     record("doc tool", doc_tool_check(&home, check_only), &mut checks);
     record("rust shims", rust_shim_check(), &mut checks);
-    record("x86 slice", x86_slice_check(), &mut checks);
+    let stock = source_stock(repo, "HEAD");
+    record(
+        "x86 slice",
+        x86_slice_check(stock.as_ref().map_err(Clone::clone)),
+        &mut checks,
+    );
     record("apple sdk", apple_clt_check(), &mut checks);
     let source_helper = if check_only {
         Ok(None)
@@ -1472,22 +1477,58 @@ fn front_door_verdict(
     ))
 }
 
-/// The x86_64 compat slice of the universal binary rides upstream stable.
+/// The x86_64 compat slice of the universal binary uses the selected source's stock release.
 /// STOCK EXCEPTION (Trust lacks an x86_64-apple-darwin std: `targo --unverified check
 /// --target x86_64-apple-darwin -p aterm` fails E0463, can't find crate for `std`); this
 /// row audits that stock lane, nothing else.
 #[cfg(unix)]
-fn x86_slice_check() -> Check {
+fn source_stock(repo: &Path, commit: &str) -> std::result::Result<crate::buildplan::Stock, String> {
+    let name = crate::trust_lock::stock_toolchain_at(&crate::ledger::GitCli::new(repo), commit)?;
+    let home = std::env::var_os("HOME").ok_or("compat target probe requires HOME")?;
+    crate::buildplan::Stock::under(&home, &name)
+}
+
+/// Reuse the selected candidate's captured stock namespace, including its original refusal.
+#[cfg(unix)]
+fn candidate_stock<'a>(
+    repo: &Path,
+    commit: &str,
+    compiler: std::result::Result<&'a crate::trust_lock::CompilerInputs, String>,
+) -> std::result::Result<&'a crate::buildplan::Stock, String> {
+    let compiler = compiler?;
+    let pin = crate::trust_lock::CompilerPin::at(&crate::ledger::GitCli::new(repo), commit)?;
+    if compiler.pin != pin {
+        return Err("the machine audit has no matching selected-source compiler context".into());
+    }
+    let stock = compiler.stock()?;
+    if stock.toolchain() != pin.stock_toolchain {
+        return Err("the captured stock namespace differs from the selected source".into());
+    }
+    Ok(stock)
+}
+
+#[cfg(unix)]
+fn x86_slice_check(stock: std::result::Result<&crate::buildplan::Stock, String>) -> Check {
     if !cfg!(target_os = "macos") {
         return Check::Skip("universal DMG builds run on macOS".into());
     }
-    match gates::x86_target_probe() {
+    let stock = match stock {
+        Ok(stock) => stock,
+        Err(why) => {
+            return Check::Fail {
+                what: why,
+                fix: "restore the selected source's trust.lock".into(),
+            };
+        }
+    };
+    let target = crate::buildplan::require_rustup_target_in(stock, "x86_64-apple-darwin");
+    match target {
         Ok(()) => match gates::rosetta_runs(&mut |command| command.output()) {
-            Ok(()) => Check::Pass(
-                "stable x86_64-apple-darwin target installed and Rosetta runs it (universal \
-                 slice)"
-                    .into(),
-            ),
+            Ok(()) => Check::Pass(format!(
+                "stock {} x86_64-apple-darwin target installed and Rosetta runs it \
+                 (universal slice)",
+                stock.toolchain()
+            )),
             Err(_) => Check::Fail {
                 what: "Rosetta does not run x86_64 programs here — a universal cut runs its \
                        x86_64 slice under it before it ships"
@@ -1706,7 +1747,14 @@ pub struct Finding {
 /// The machine audit `ship release` runs, using its explicitly selected profile when given.
 #[cfg(unix)]
 #[must_use]
-pub fn audit(repo: &Path, id: &str, profile: Option<&Path>, dry: bool) -> Vec<Finding> {
+pub(crate) fn audit(
+    repo: &Path,
+    commit: &str,
+    id: &str,
+    profile: Option<&Path>,
+    dry: bool,
+    compiler: std::result::Result<&crate::trust_lock::CompilerInputs, String>,
+) -> Vec<Finding> {
     let mut found: Vec<(&'static str, Check)> = Vec::new();
     let Ok(home) = std::env::var("HOME") else {
         return vec![Finding {
@@ -1734,7 +1782,10 @@ pub fn audit(repo: &Path, id: &str, profile: Option<&Path>, dry: bool) -> Vec<Fi
     }
     found.push(("doc tool", doc_tool_check(&home, true)));
     found.push(("rust shims", rust_shim_check()));
-    found.push(("x86 slice", x86_slice_check()));
+    found.push((
+        "x86 slice",
+        x86_slice_check(candidate_stock(repo, commit, compiler)),
+    ));
     found.push(("apple sdk", apple_clt_check()));
     let (apple, apple_sha1) = apple_identity_check(
         id,
@@ -1885,11 +1936,13 @@ fn audit_roster_at(
 /// [`audit`] off unix.
 #[cfg(not(unix))]
 #[must_use]
-pub fn audit(
+pub(crate) fn audit(
     _repo: &std::path::Path,
+    _commit: &str,
     _id: &str,
     _profile: Option<&std::path::Path>,
     _dry: bool,
+    _compiler: std::result::Result<&crate::trust_lock::CompilerInputs, String>,
 ) -> Vec<Finding> {
     vec![Finding {
         label: "toolchain",

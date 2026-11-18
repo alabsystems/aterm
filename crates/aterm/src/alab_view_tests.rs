@@ -152,9 +152,11 @@ fn a_write_of_this_macs_own_moves_the_lab_a_cache_holds() {
         by: "person",
         session: None,
         now_ms: 1,
-        attempt: Duration::ZERO,
+        attempt: std::time::Duration::ZERO,
         json: false,
         stdin: None,
+        editor: &|_, _, _| Err("a rename opens no editor".to_owned()),
+        say: &|_| {},
     };
     #[expect(
         clippy::disallowed_methods,
@@ -202,6 +204,9 @@ fn the_lab_is_served_from_the_snapshot_across_a_restart_while_the_registry_refus
     aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
     let registry = Registry::at(paths.clone());
     registry.open().unwrap();
+    // The lab's tracker is declared and holds no entry, so its logs' files have a snapshot the
+    // fenced pass holds like every other file's.
+    aterm_db::file::fixture::declare(paths, &aterm_db::att::TRACKER);
     let ada = keys::address_pk(ADA).unwrap();
     let account = keys::account_pk("claude", ADA).unwrap();
     let machine = keys::machine_pk("m7");
@@ -522,6 +527,127 @@ fn equal_machine_labels_do_not_transfer_a_preference_between_registry_keys() {
             .len(),
         1,
         "the same label collision must not suppress this machine's own preference"
+    );
+}
+
+/// The harness lab names every account LabView names, an agy account's included, though its
+/// accounts hold only the pooled CLIs': what a surface prints of an account and what a word names
+/// (`harness::account_names`) read every realm's names from it. It bars every account whose
+/// status lets no sign-in be tried, of every realm (`Lab::barred`): the paused agy account here,
+/// which no `LabAccount` carries, and not the active Claude one.
+#[test]
+fn the_harness_lab_names_every_account_of_every_realm() {
+    use aterm_db::{alab::view::Account, typed::keys};
+
+    let email = "ada@x.example";
+    let mut view = naming_view(Some("m3"), MachineNickname::Unset);
+    for (realm, slug) in [("claude", "claude-ada-x"), ("google", "google-ada-x")] {
+        let pk = keys::account_pk(realm, email).unwrap();
+        view.accounts.insert(
+            pk.clone(),
+            Account {
+                pk: pk.clone(),
+                provider: keys::provider_of_realm(realm).map(str::to_owned),
+                realm: Some(realm.into()),
+                slug: slug.into(),
+                name: keys::account_name(realm, email),
+                legacy_label: None,
+                login: Some(email.into()),
+                identity: None,
+                status: Some(
+                    if realm == "google" {
+                        "paused"
+                    } else {
+                        "active"
+                    }
+                    .into(),
+                ),
+                plan: None,
+                region: None,
+                flow: None,
+                browser: None,
+                live: true,
+            },
+        );
+        view.names.insert(
+            pk,
+            aterm_file::AccountNames {
+                realm: realm.into(),
+                slug: slug.into(),
+                name: keys::account_name(realm, email),
+                email: Some(email.into()),
+                login: Some(email.into()),
+                live: true,
+            },
+        );
+    }
+    let lab = harness_lab_with_placed(&view, &BTreeMap::new(), &BTreeMap::new());
+    assert_eq!(
+        lab.accounts.len(),
+        1,
+        "Lab.accounts holds only the realms harness_lab_with_placed maps (claude, codex, grok \
+         and Kimi's two), so agy's Google account is not among them"
+    );
+    assert_eq!(lab.names, view.names);
+    assert_eq!(
+        lab.barred,
+        std::iter::once(keys::account_pk("google", email).unwrap()).collect(),
+        "the paused agy account is barred, the active Claude one is not"
+    );
+}
+
+/// A native receipt is decided from the lab's accounts, machines and binding, never from the
+/// accounts' names, which no receipt reads: a lab that differs only in a name or a slug (an
+/// owner relabelled an account, or added an agy one, and the shared files have not caught up)
+/// decides as the same lab, while one whose pooled accounts differ does not.
+/// NEGATIVE CONTROL: with `decided` keeping `names`, the relabelled lab decides differently:
+/// `` assertion `left == right` failed: a slug alone changes nothing a receipt decided ``.
+#[test]
+fn a_receipt_is_decided_from_the_labs_accounts_never_their_names() {
+    use aterm_db::typed::keys;
+
+    let email = "ada@x.example";
+    let pk = keys::account_pk("claude", email).unwrap();
+    let names = |slug: &str| aterm_file::AccountNames {
+        realm: "claude".into(),
+        slug: slug.into(),
+        name: keys::account_name("claude", email),
+        email: Some(email.into()),
+        login: Some(email.into()),
+        live: true,
+    };
+    let lab = Lab {
+        names: BTreeMap::from([(pk.clone(), names("claude-ada-x"))]),
+        ..Lab::default()
+    };
+    let mut relabelled = lab.clone();
+    relabelled.names.insert(pk.clone(), names("claude-m2-work"));
+    let google = keys::account_pk("google", email).unwrap();
+    relabelled.names.insert(google, names("google-ada-x"));
+    assert_eq!(
+        decided(&lab),
+        decided(&relabelled),
+        "a slug alone changes nothing a receipt decided"
+    );
+    let pooled = Lab {
+        accounts: vec![LabAccount {
+            pk: pk.clone(),
+            cli: Cli::Claude,
+            vendor: Vendor::default(),
+            label: keys::reserved_slug("claude", &pk),
+            legacy_label: None,
+            email: email.into(),
+            identity: None,
+            browser: None,
+            joinable: true,
+            preferred: Vec::new(),
+        }],
+        ..lab.clone()
+    };
+    assert_ne!(
+        decided(&lab),
+        decided(&pooled),
+        "an account a receipt reads"
     );
 }
 
@@ -897,19 +1023,13 @@ fn current_commons_policy_hides_a_source_and_preserves_its_history() {
     );
 }
 
-/// The lab is read from the shared files a pass wrote, and its mail routes from the registry read
-/// beside them.
-#[test]
-fn native_cache_projects_mail_from_its_captured_source() {
+/// Write into `registry` a mailbox whose login is `owner@example.test` and the alias
+/// `ai@example.test` placed in it; answer the mailbox's key.
+fn one_mailbox_and_its_alias(registry: &Registry) -> String {
     use aterm_db::alab::registry::{ADDRESS, MAILBOX};
     use aterm_db::typed::{cell, keys};
     use aterm_json::json;
-    use aterm_secrets::commons::roster::Role;
 
-    let lab = aterm_db::table::fixture::Lab::new(&[Role::Writer]);
-    let paths = &lab.paths[0];
-    let registry = Registry::at(paths.clone());
-    let table = registry.open().unwrap();
     let login = keys::address_pk("owner@example.test").unwrap();
     let alias = keys::address_pk("ai@example.test").unwrap();
     let mailbox = keys::mailbox_pk(&login).unwrap();
@@ -939,6 +1059,20 @@ fn native_cache_projects_mail_from_its_captured_source() {
     })
     .collect();
     registry.write(vec![changes]).unwrap();
+    mailbox
+}
+
+/// The lab is read from the shared files a pass wrote, and its mail routes from the registry read
+/// beside them.
+#[test]
+fn native_cache_projects_mail_from_its_captured_source() {
+    use aterm_secrets::commons::roster::Role;
+
+    let lab = aterm_db::table::fixture::Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let registry = Registry::at(paths.clone());
+    let table = registry.open().unwrap();
+    let mailbox = one_mailbox_and_its_alias(&registry);
     let config = paths.home.join("aterm.toml");
     let source = registry.observe_projection(&config).unwrap();
     let cache = Cache {
@@ -979,6 +1113,113 @@ fn native_cache_projects_mail_from_its_captured_source() {
     assert_eq!(
         projected.lab.mailboxes["ai@example.test"],
         "owner@example.test"
+    );
+}
+
+/// L10's mail half (the accounts upkeep design's law of a run that did not finish): A LAB READ
+/// WITHOUT THE MAIL METADATA THE REGISTRY REFUSED IS NEVER KEPT, AND THE REGISTRY'S ANSWER IS USED
+/// ONCE IT GIVES ONE, THOUGH NO MARK OF THE SNAPSHOTS MOVED. A stand-in lab's registry holds a
+/// mailbox and an alias placed in it, and a pass writes the shared files. The home is then fenced
+/// under a writer succession that stays pending (ATERM-KI-1109-1): the registry refuses its mail
+/// metadata, and the snapshots still answer. Each read below is made under a trace scope and
+/// judged as if a minute later, so no read counts as unsettled:
+///
+/// - the first serves the lab without its mail routes, looks at the vault, and records the
+///   refusal as a retry ([`MAIL_REFUSED`]) and no deadline;
+/// - one within a run's first rerun wait (`aterm_uds::trace::RERUN_FIRST`) serves the held lab
+///   as it is, records the retry again and no deadline (the backoff's rerun is the one owed),
+///   and looks at nothing of the vault;
+/// - with the fence taken away (its folder renamed aside) and that wait gone by, the next uses
+///   the registry's answer: the alias's mailbox is served, no retry is recorded, and the
+///   registry journal's `lstat`s are;
+/// - the one after serves that lab, mail routes and all, from what is held, and may be kept.
+///
+/// NEGATIVE CONTROLS (2026-11-16), each restored and the file touched:
+/// - "keep on Err": both `trace::retry(MAIL_REFUSED)` lines in `alab_view.rs` deleted. The
+///   verdicts failed, left `[(None, None), (None, None), (None, None), (None, None)]`: the refused
+///   read and the one within the wait would be kept from a lab with no mail routes.
+/// - In one build, the retry of the read within the wait deleted, and the wait judged through
+///   `Since` outside `trace::unrecorded`. The verdicts failed, the second read's
+///   `(None, Some(Instant { .. }))` against `(Some(Retry(..)), None)`.
+/// - `Cache::mail_refused_lately` answering `false` (no wait). The vault looks failed, left
+///   `[true, true, true, false]`, right `[true, false, true, false]`.
+#[test]
+fn a_lab_read_without_its_refused_mail_metadata_is_never_kept_and_its_answer_is_used_once_given() {
+    use aterm_secrets::commons::roster::Role;
+    use aterm_uds::trace::{self, Unkept};
+    use std::borrow::Cow;
+    use std::time::Duration;
+
+    let lab = aterm_db::table::fixture::Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let config = paths.home.join("aterm.toml");
+    aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
+    let registry = Registry::at(paths.clone());
+    registry.open().unwrap();
+    one_mailbox_and_its_alias(&registry);
+    materialize(paths, &config);
+    aterm_db::file::fixture::fence_pending(paths, &lab.bootstrap(0));
+    assert!(
+        registry.observe_projection(&config).is_err(),
+        "the fenced registry refuses a strict reader"
+    );
+
+    let cache = fresh(paths, &config);
+    let read = || {
+        trace::read_as_if_later(Duration::from_secs(60), || {
+            trace::scope(|| alab_roster::Source::snapshot(&cache))
+        })
+    };
+    let routes = |snapshot: &SourceSnapshot| snapshot.lab().map(|lab| lab.mailboxes.clone());
+    let in_vault =
+        |traced: &trace::Trace| traced.files().any(|(path, _)| path.starts_with(&paths.dir));
+    let refusal = Some(Unkept::Retry(Cow::Borrowed(MAIL_REFUSED)));
+
+    let (first, refused) = read();
+    let (again, gated) = read();
+    // The fence taken away, and the rerun wait since the refusal gone by.
+    std::fs::rename(
+        paths.dir.join("commons/writer-generation"),
+        paths.home.join("fence-aside"),
+    )
+    .unwrap();
+    *cache.mail_refused.lock().unwrap() = Instant::now().checked_sub(trace::RERUN_FIRST);
+    let (given, answered) = read();
+    let (held, kept) = read();
+
+    let reads = [&refused, &gated, &answered, &kept];
+    assert_eq!(
+        reads.map(|traced| (traced.unkept(), traced.mono_deadline())),
+        [
+            (refusal.clone(), None),
+            (refusal.clone(), None),
+            (None, None),
+            (None, None)
+        ],
+        "a read that served the lab without its refused mail metadata is not kept, and records \
+         no deadline before the backoff's rerun; one that served it with them may be kept"
+    );
+    let none = Some(BTreeMap::new());
+    let mail = Some(BTreeMap::from([(
+        "ai@example.test".to_owned(),
+        "owner@example.test".to_owned(),
+    )]));
+    assert_eq!(
+        [&first, &again, &given, &held].map(routes),
+        [none.clone(), none, mail.clone(), mail],
+        "the lab is served without its mail routes while refused, and with them once answered"
+    );
+    assert_eq!(
+        reads.map(in_vault),
+        [true, false, true, false],
+        "within the rerun wait, and once its answer is held, the registry is not read again"
+    );
+    assert!(
+        answered
+            .files()
+            .any(|(path, _)| path.starts_with(&paths.dir)
+                && path.extension().is_some_and(|suffix| suffix == "astream")),
+        "an answered read records the registry journal's lstats"
     );
 }
 

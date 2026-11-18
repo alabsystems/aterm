@@ -45,6 +45,17 @@ impl Gate {
 /// so its length is no latency budget.
 const SHORT: Duration = Duration::from_millis(50);
 
+// Freshness has one immutable clock authority across the reader and its workers. Native
+// counter timestamps, Reader's elapsed CPU sample clock and lane hang detectors still move.
+fn lane_instant() -> Instant {
+    static AT: LazyLock<Instant> = LazyLock::new(Instant::now);
+    *AT
+}
+
+fn lane_continuous() -> Option<u64> {
+    Some(0)
+}
+
 /// The sweep's lane's stall at `snap`, if it stalled.
 fn procs_stall(snap: &Snapshot) -> Option<aterm_vitals::lanes::LaneStall> {
     snap.stalled
@@ -61,6 +72,8 @@ fn procs_stalled(snap: &Snapshot) -> bool {
 /// A reader whose sweep is `sweep`, read on a lane waited for `wait`.
 fn reader_with(sweep: SweepFn, wait: Duration) -> Reader {
     let mut reader = Reader::new(Arc::default());
+    reader.clock = lane_instant;
+    reader.memory_probes.continuous_ns = lane_continuous;
     reader.split = SplitReader::new(
         CoalProbe {
             sweep,
@@ -122,7 +135,7 @@ fn overview(snap: &Snapshot, state: Freshness) -> String {
 /// The workers' copy a test's probe publishes to: every pull sent (no gap), each waited for a
 /// minute at most (a hang detector).
 fn workers() -> Shared {
-    Shared::paced(Duration::ZERO, MUST_HAPPEN)
+    Shared::paced_with_clocks(Duration::ZERO, MUST_HAPPEN, lane_instant, lane_continuous)
 }
 
 /// A sweep the kernel never answers still lets a pull's reading publish CPU, memory, swap, disk

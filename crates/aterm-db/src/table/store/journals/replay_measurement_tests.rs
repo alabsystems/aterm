@@ -41,6 +41,7 @@ fn observed(links: &Arc<Vec<Linked>>, start: usize, end: usize) -> Replay {
     let read = Read {
         links: Arc::clone(links),
         refused: None,
+        seen: None,
     };
     if start == 0 {
         read.witnessed(through(end)).unwrap()

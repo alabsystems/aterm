@@ -927,11 +927,12 @@ pub const TOOLS: &[Tool] = &[
             ],
         }),
         &[],
-        "stable's foreign standard libraries and wasm32 (STOCK EXCEPTION), until Trust ships them: \
-         the cells, the web modules and the shipped binary's x86_64 slice (rows 23, 24). The pin \
-         is rustup-init, which under the name `rustup` is rustup itself: `verify provision` \
-         copies it into the cache beside its cargo and rustc proxies and never runs its \
-         self-install, and the toolchains stay in rustup's own home",
+        "the foreign standard libraries and wasm32 Trust does not ship yet (STOCK EXCEPTION): \
+         the stock pin's for the cells and the web modules, and the release trust.lock's \
+         `[stock] toolchain` names for the shipped binary's x86_64 slice (rows 23, 24), each by \
+         name, never rustup's `stable`. The pin is rustup-init, which under the name `rustup` is \
+         rustup itself: `verify provision` copies it into the cache beside its cargo and rustc \
+         proxies and never runs its self-install, and the toolchains stay in rustup's own home",
     ),
     workspace(
         "chrome-headless-shell",

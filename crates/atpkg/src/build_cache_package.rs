@@ -898,8 +898,14 @@ fn admit_on(
                 "existing policy cache needs a compatible actual compiler registrar".into(),
             );
         }
-        let (_, created) = super::create_with_policy(home, args.target, &workspace, None, false)
-            .map_err(|error| format!("legacy package cache owner publication refused: {error}"))?;
+        let (_, created) = super::create_with_policy(
+            home,
+            args.target,
+            &workspace,
+            None,
+            super::Admission::Create,
+        )
+        .map_err(|error| format!("legacy package cache owner publication refused: {error}"))?;
         return Ok(legacy(args.target, created));
     }
     let producer = kernel
@@ -1076,9 +1082,14 @@ fn admit_on(
         }),
         superseded: false,
     };
-    let (recorded, created) =
-        super::create_with_policy(home, args.target, &workspace, Some(policy.clone()), false)
-            .map_err(|error| format!("package cache owner publication refused: {error}"))?;
+    let (recorded, created) = super::create_with_policy(
+        home,
+        args.target,
+        &workspace,
+        Some(policy.clone()),
+        super::Admission::Create,
+    )
+    .map_err(|error| format!("package cache owner publication refused: {error}"))?;
     let created = created || recovered_creation;
     if !recorded {
         return Ok(legacy(args.target, false));

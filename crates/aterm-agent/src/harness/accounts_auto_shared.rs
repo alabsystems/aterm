@@ -3,6 +3,9 @@
 
 //! Compose automatic login scheduling with the executable's checked authority.
 //! A relay or account proposal never supplies this callback.
+//!
+//! Traced by the accounts keeper: what this file reads of the file system itself, it reads
+//! through `aterm_uds::trace::fs` (census `traced-reads`).
 
 use super::super::cli::{
     AccountsHost, RenewBrowser,
@@ -80,8 +83,9 @@ fn needs_adoption(
     grant: &Grant,
     (store, records): (&accounts::Store, &accounts::AccountRecords),
     home: &Path,
-    now: i64,
+    now: impl Into<trace::Now>,
 ) -> bool {
+    let now: trace::Now = now.into();
     if candidate.row.browser.is_some() {
         return false;
     }
@@ -120,7 +124,8 @@ fn needs_adoption(
             &records.raw_roster,
             &records.state,
             &records.logins,
-            now,
+            // Its checkpoint's staging folder is read past the trace.
+            now.raw(),
         )
     {
         return false;
@@ -130,7 +135,8 @@ fn needs_adoption(
         &records.state,
         &records.logins,
         accounts::enrolled_in(candidate.cli, &records.roster, home).contains(&row.label),
-        now,
+        // Its condition and walls compare the reading as a number.
+        now.raw(),
     )
 }
 
@@ -227,7 +233,7 @@ impl<'a> CheckpointAuthority<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(super) enum PreparationKind {
     #[default]
     Native,
@@ -249,6 +255,17 @@ impl PreparationKind {
 pub(super) struct PreparationOrder {
     next: PreparationKind,
     active: bool,
+}
+
+/// What moves the guard's generation ([`AutoRenewGuard`] is watched): the kind tried first next.
+/// Whether a discovery pass is active is left out: the one pass that sets it clears it on the same
+/// thread before it returns ([`PreparationPass`]), so a pass that admits nothing leaves the guard
+/// as it found it, and a pass that finds another active records a retry ([`PreparationPass::claim`])
+/// in place of a generation it could wait on.
+impl std::hash::Hash for PreparationOrder {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.next.hash(state);
+    }
 }
 
 impl PreparationOrder {
@@ -317,13 +334,20 @@ impl PreparationOrder {
 #[path = "accounts_preparation_order_tests.rs"]
 mod order_tests;
 
+#[cfg(test)]
+#[path = "accounts_auto_shared_watched_tests.rs"]
+mod watched_tests;
+
 struct PreparationPass {
-    guard: Arc<std::sync::Mutex<AutoRenewGuard>>,
+    guard: Arc<Watched<AutoRenewGuard>>,
     first: PreparationKind,
 }
 
 impl PreparationPass {
-    fn claim(guard: &Arc<std::sync::Mutex<AutoRenewGuard>>) -> Option<Self> {
+    /// The discovery pass, where no renewal is in flight and no other pass is active. One that
+    /// finds another active records a retry in the armed trace: the end of that pass moves no
+    /// generation ([`PreparationOrder`]'s hash), so only a rerun finds it ended.
+    fn claim(guard: &Arc<Watched<AutoRenewGuard>>) -> Option<Self> {
         let first = {
             let mut state = guard
                 .lock()
@@ -331,7 +355,11 @@ impl PreparationPass {
             if state.in_flight {
                 return None;
             }
-            state.preparation_order.begin()?
+            let Some(first) = state.preparation_order.begin() else {
+                trace::retry("another upkeep's preparation pass is active");
+                return None;
+            };
+            first
         };
         Some(Self {
             guard: Arc::clone(guard),
@@ -386,7 +414,7 @@ pub(super) fn adopt_first(
     home: &Path,
     state_dir: &Path,
     roster: &Path,
-    now: i64,
+    now: trace::Now,
     fx: &UpkeepEffects<'_>,
 ) {
     if fx
@@ -423,20 +451,23 @@ fn prepare_shared(
     home: &Path,
     state_dir: &Path,
     roster: &Path,
-    now: i64,
+    now: impl Into<trace::Now>,
     fx: &UpkeepEffects<'_>,
 ) -> bool {
-    prepare_shared_with_clock(home, state_dir, roster, now, fx, Instant::now)
+    let now: trace::Now = now.into();
+    let clock = guard_reads(fx.renew_guard).clock;
+    prepare_shared_with_clock(home, state_dir, roster, now, fx, clock)
 }
 
 pub(super) fn prepare_shared_with_clock(
     home: &Path,
     state_dir: &Path,
     roster: &Path,
-    now: i64,
+    now: impl Into<trace::Now>,
     fx: &UpkeepEffects<'_>,
     clock: impl Fn() -> Instant,
 ) -> bool {
+    let now: trace::Now = now.into();
     if fx
         .scope
         .as_ref()
@@ -501,6 +532,8 @@ pub(super) fn prepare_shared_with_clock(
             continue;
         };
         let completion = permit.follow_scope(fx.scope.as_ref());
+        // A sign-in starts: what follows stamps its start, so it takes the reading raw.
+        let now = now.raw();
         let Ok(signin) = sign_in.begin(cli, &label, signin, &store, now) else {
             return false;
         };
@@ -715,7 +748,7 @@ fn shared_priority(
 )]
 fn ordered_shared_candidates(
     candidates: Vec<Candidate>,
-    guard: &Arc<std::sync::Mutex<AutoRenewGuard>>,
+    guard: &Arc<Watched<AutoRenewGuard>>,
 ) -> Vec<Candidate> {
     let mut prepared: Vec<_> = candidates
         .into_iter()
@@ -813,7 +846,7 @@ pub(super) fn prepare_native(
     home: &Path,
     state: &Path,
     config: &Path,
-    guard: &Arc<std::sync::Mutex<AutoRenewGuard>>,
+    guard: &Arc<Watched<AutoRenewGuard>>,
     spawn: &SpawnRenewal<'_>,
     log: &SignInLog,
     scope: Option<&super::super::account_work::Scope>,
@@ -829,7 +862,7 @@ pub(super) fn prepare_native(
         if permit.is_some() {
             return false;
         }
-        permit = AutoRenewPermit::claim_native_preparation(guard, Instant::now(), id).map(
+        permit = AutoRenewPermit::claim_native_preparation(guard, guard_now(guard), id).map(
             |mut permit| {
                 permit.follow_scope(scope);
                 (permit, id.clone())

@@ -15,11 +15,11 @@ pub const RECORD_ENV: &str = "ATERM_RELEASE_TOOL_RECORD";
 pub const FREEZER_ENV: &str = "ATERM_RELEASE_FREEZER_COMMIT";
 pub const CONTRACT_ENV: &str = "ATERM_RELEASE_FREEZER_CONTRACT";
 pub const REFREEZE_ENV: &str = "ATERM_RELEASE_REFROZEN_COMMIT";
-pub const CONTRACT: &str = "cutter.toml/2";
+pub const CONTRACT: &str = "cutter.toml/3";
 const RECORD: &str = "tool.toml";
 const CUTTER_RECORD: &str = "cutter.toml";
 const SCHEMA: u32 = 1;
-const CUTTER_SCHEMA: u32 = 2;
+const CUTTER_SCHEMA: u32 = 3;
 
 /// Recovery permission only; none of these launch hints is a content proof.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -35,6 +35,32 @@ impl Recovery {
         Self::from_launch(commit, crate::cutter::running_stamp().is_ok(), |name| {
             std::env::var(name).ok()
         })
+    }
+
+    /// Retry permission after the running cutter failed its source/compiler/input check.
+    /// A valid stamp alone cannot license repeated repair of that same candidate.
+    pub fn after_failed_check(commit: &str) -> Self {
+        Self::failed_launch(
+            commit,
+            crate::cutter::running_stamp()
+                .ok()
+                .map(crate::cutter::Stamp::commit),
+            |name| std::env::var(name).ok(),
+        )
+    }
+
+    fn failed_launch(
+        commit: &str,
+        running: Option<&str>,
+        get: impl Fn(&str) -> Option<String>,
+    ) -> Self {
+        if get(REFREEZE_ENV).as_deref() == Some(commit) {
+            Self::Refuse
+        } else if running == Some(commit) {
+            Self::Refreeze
+        } else {
+            Self::from_launch(commit, running.is_some(), get)
+        }
     }
 
     fn from_launch(commit: &str, has_stamp: bool, get: impl Fn(&str) -> Option<String>) -> Self {
@@ -88,7 +114,13 @@ pub struct Cutter {
     schema: u32,
     pub commit: String,
     pub built_from: String,
+    /// Compiler and SDK identity taken before the build and rechecked before publication.
+    /// Independent of the optional complete graph used for cross-candidate adoption.
+    pub seal: Option<String>,
     pub inputs: Option<crate::cutter_inputs::Inputs>,
+    /// Complete candidate compiler declaration; absence is historical, not reuse authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiler: Option<crate::release::CompilerPin>,
     pub tool: Tool,
 }
 
@@ -102,10 +134,15 @@ impl Cutter {
             || !aterm_codec::hex::is_lower(&self.commit, 40)
             || !aterm_codec::hex::is_lower(&self.built_from, 40)
             || (self.built_from != self.commit && self.inputs.is_none())
+            || self
+                .seal
+                .as_ref()
+                .is_some_and(|seal| !aterm_codec::hex::is_lower(seal, 64))
             || self.inputs.as_ref().is_some_and(|inputs| {
-                [&inputs.digest, &inputs.sources, &inputs.seal]
-                    .iter()
-                    .any(|digest| !aterm_codec::hex::is_lower(digest, 64))
+                self.seal.as_ref() != Some(&inputs.seal)
+                    || [&inputs.digest, &inputs.sources, &inputs.seal]
+                        .iter()
+                        .any(|digest| !aterm_codec::hex::is_lower(digest, 64))
             })
             || !aterm_codec::hex::is_lower(&self.tool.sha256, 64)
             || !release.is_absolute()
@@ -168,7 +205,8 @@ pub(crate) fn adopt_cutter(
     let Ok(previous) = read_cutter(release) else {
         return Ok(None);
     };
-    if previous.inputs.as_ref() != Some(&observation.inputs)
+    if previous.seal.as_ref() != Some(&observation.inputs.seal)
+        || previous.inputs.as_ref() != Some(&observation.inputs)
         || crate::dmg::sha256_file(source)? != previous.tool.sha256
     {
         return Ok(None);
@@ -192,6 +230,7 @@ pub fn stage_cutter(
     commit: &str,
     source: &Path,
     log: &Path,
+    seal: Option<String>,
     inputs: Option<crate::cutter_inputs::Inputs>,
 ) -> Result<Cutter, String> {
     let digest = {
@@ -210,7 +249,9 @@ pub fn stage_cutter(
         schema: CUTTER_SCHEMA,
         commit: commit.into(),
         built_from: commit.into(),
+        seal,
         inputs,
+        compiler: None,
         tool: Tool {
             path: dir.join("aterm-release"),
             sha256: digest,
@@ -266,6 +307,12 @@ pub struct Tool {
 pub struct ToolSet {
     schema: u32,
     pub commit: String,
+    /// Candidate roles used for both executables in this set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiler: Option<crate::release::CompilerPin>,
+    /// Rechecked machine inputs used to build both tools (universal release hosts only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<String>,
     pub set_sha256: String,
     pub cutter: Tool,
     pub verify: Tool,
@@ -277,6 +324,8 @@ impl ToolSet {
         Self {
             schema: SCHEMA,
             commit: commit.to_owned(),
+            compiler: None,
+            inputs: None,
             set_sha256,
             cutter,
             verify,

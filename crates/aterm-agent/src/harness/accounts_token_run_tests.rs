@@ -155,20 +155,37 @@ fn word(decision: &Decision) -> Option<&'static str> {
     decision.fallback().map(Fallback::word)
 }
 
-/// THE VERB'S WORDS: a label, an email or `--auto`, then `--`, the program and its arguments.
+/// THE VERB'S WORDS: one account word (a provider word and address typed as two words is one) or
+/// `--auto`, then `--`, the program and its arguments.
 #[test]
-fn the_verb_takes_a_name_or_auto_then_the_program() {
-    let run = parse(&os(&["work", "--", "/s/claude", "--resume", "x"])).unwrap();
-    assert_eq!(run.named.as_deref(), Some("work"));
+fn the_verb_takes_an_account_or_auto_then_the_program() {
+    let run = parse(&os(&[
+        "ac-0123456789abcdef",
+        "--",
+        "/s/claude",
+        "--resume",
+        "x",
+    ]))
+    .unwrap();
+    assert_eq!(run.named.as_deref(), Some("ac-0123456789abcdef"));
     assert_eq!(run.program, OsString::from("/s/claude"));
     assert_eq!(run.args, os(&["--resume", "x"]));
+    let joined = parse(&os(&["claude", "ada@x.example", "--", "claude", "--", "x"])).unwrap();
+    assert_eq!(joined.named.as_deref(), Some("claude ada@x.example"));
+    assert_eq!(
+        joined.args,
+        os(&["--", "x"]),
+        "only the first `--` ends the account"
+    );
     assert_eq!(parse(&os(&["--auto", "--", "claude"])).unwrap().named, None);
     for refused in [
-        &["work", "claude"][..],
-        &["work", "--"],
+        &["claude-ada-x", "claude"][..],
+        &["claude-ada-x", "--"],
         &["--", "claude"],
         &["--work", "--", "claude"],
         &["", "--", "claude"],
+        &["claude-ada-x", "claude-bob-x", "--", "claude"],
+        &["--auto", "claude-ada-x", "--", "claude"],
     ] {
         assert!(parse(&os(refused)).is_err(), "{refused:?}");
     }
@@ -282,7 +299,7 @@ fn a_launch_off_its_stored_login_gets_no_descriptor_and_a_named_reason() {
     assert!(read.is_none());
     let ctx = world.ctx(&[("HTTPS_PROXY", VALUE)], None);
     check(
-        &decided(&world.run(Some("work"), &[]), &ctx).0,
+        &decided(&world.run(Some("person@example.com"), &[]), &ctx).0,
         "outside: `HTTPS_PROXY` in the environment",
     );
 
@@ -317,9 +334,48 @@ fn a_launch_off_its_stored_login_gets_no_descriptor_and_a_named_reason() {
     assert_eq!(word(&decision), Some("shape"));
     check(&decision, "shape: its own `--settings` or `--bare`");
 
-    // A login of another row than the one the line names.
+    // A login of another account than the one the line names, each account its own key.
+    fn apart(_realm: &str, email: &str) -> Option<String> {
+        let key = if email == "lent@example.com" {
+            "ac-00000000000000a1"
+        } else {
+            KEY
+        };
+        Some(key.to_owned())
+    }
+    // The account the line names is named by its key (its slug beside it under a lab), never its
+    // address.
+    let named = crate::harness::account_names::names_of_login(
+        accounts::Cli::Claude,
+        None,
+        "person@example.com",
+        None,
+    )
+    .expect("a key")
+    .0;
     let ctx = world.ctx(&[(accounts::LOGIN_ENV, "/logins/lent")], None);
-    check(&decided(&world.run(Some("work"), &[]), &ctx).0, "outside: ");
+    let run = world.run(Some("person@example.com"), &[]);
+    let other = crate::harness::journal::with_keyer(apart, || decide_with(&run, &ctx));
+    check(&other.decision, "outside: ");
+    assert!(
+        other
+            .decision
+            .fallback()
+            .map(Fallback::why)
+            .is_some_and(|why| {
+                why.contains(&format!("names the login of another account than {named}"))
+                    && !why.contains("person@example.com")
+            }),
+        "{:?}",
+        other.decision
+    );
+    // It runs as typed on the launch's own row's stored login, which another Mac holds here: it
+    // starts nothing.
+    assert!(
+        refusal(&other, false).is_some_and(|why| why.contains("lent is held by m7")),
+        "{:?}",
+        other.unstored
+    );
 }
 
 /// THE CLAIMS SNAPSHOT (an unlabelled run only): a held row is `held`, another Mac's lease or an
@@ -349,8 +405,8 @@ fn an_unlabelled_run_reads_the_claims_ring_from_a_snapshot() {
     assert_eq!(word(&decision), Some("claimed"), "{decision:?}");
     assert!(matches!(decision, Decision::Stored(_)));
     assert_eq!(noted, Some((entry(), "claimed")));
-    // A labelled line reads no claims: it reaches the vault (none here: absent).
-    let (decision, _, _) = decided(&world.run(Some("work"), &[]), &ctx);
+    // A line that names its account reads no claims: it reaches the vault (none here: absent).
+    let (decision, _, _) = decided(&world.run(Some("person@example.com"), &[]), &ctx);
     assert_eq!(decision, Decision::Stored(Fallback::Absent));
 
     let world = World::new();
@@ -388,9 +444,13 @@ fn an_unlabelled_run_reads_the_claims_ring_from_a_snapshot() {
 /// (`absent`), and a program outside atpkg's store (`program`, whose account it resolves after
 /// the judgment). A run the judgment leaves as typed (a subcommand) is no such fallback. A run on
 /// `away` whose token is in use here is served, and one whose token could not then be served
-/// starts nothing too ([`refusal`]). NEGATIVE CONTROLS: the default login's row, enrolled here,
-/// still falls back to its stored login on the same lease and the same busy vault, and runs as
-/// typed where its token could not be served.
+/// starts nothing too ([`refusal`]). A line whose word names no account (a roster label an older
+/// aterm typed) is served nothing and starts nothing on either row. NEGATIVE CONTROLS: the
+/// default login's row, enrolled here, still falls back to its stored login on the same lease and
+/// the same busy vault, runs as typed where its token could not be served, and runs a label's
+/// line as typed. With `decide_with` giving a named `outside` no `unstored` (S2's form), ``
+/// `token-run away` started on a login this Mac must not run `` (2026-11-16, by hand, then
+/// restored).
 #[cfg(unix)]
 #[test]
 fn a_run_starts_nothing_where_its_fallback_is_a_login_this_mac_must_not_run() {
@@ -430,8 +490,40 @@ fn a_run_starts_nothing_where_its_fallback_is_a_login_this_mac_must_not_run() {
     // The hold refuses every route, so `--auto` never reaches the vault on `lent`.
     let why = refused(&world.run(None, &[]), &lent, "held");
     assert!(why.contains("lent is held by m7"), "{why}");
-    let why = refused(&world.run(Some("lent"), &[]), &lent, "absent");
+    let why = refused(&world.run(Some("lent@example.com"), &[]), &lent, "absent");
     assert!(why.contains("lent is held by m7"), "{why}");
+    // A line an older aterm typed with the row's label names no account: `outside`, so nothing
+    // is served, and the launch's own row's stored login still starts nothing where this Mac must
+    // not run it (a word naming another account is judged the same, `outside`: the keyer here keys
+    // every account alike, so the named-reason test holds that one). CONTROL: on `work`, whose
+    // login is made here, the label's line runs as typed.
+    for (word, ctx, says) in [
+        ("away", &away, "away has no login on this Mac"),
+        ("lent", &lent, "lent is held by m7"),
+    ] {
+        let decided = resolved(&world.run(Some(word), &[]), ctx);
+        assert_eq!(
+            decided.decision.fallback().map(Fallback::word),
+            Some("outside"),
+            "{word}: {:?}",
+            decided.decision
+        );
+        assert_eq!(decided.noted, None);
+        let why = refusal(&decided, false).unwrap_or_else(|| {
+            panic!("`token-run {word}` started on a login this Mac must not run")
+        });
+        assert!(why.contains(says), "{word}: {why}");
+    }
+    let typed = resolved(&world.run(Some("work"), &[]), &work);
+    assert_eq!(
+        typed.decision.fallback().map(Fallback::word),
+        Some("outside")
+    );
+    assert_eq!(
+        refusal(&typed, false),
+        None,
+        "CONTROL: a label's line on a login made here runs as typed"
+    );
 
     // A program outside the store: its account is still resolved.
     std::fs::create_dir_all(world.path().join("bin")).unwrap();
@@ -494,16 +586,18 @@ fn a_run_starts_nothing_where_its_fallback_is_a_login_this_mac_must_not_run() {
     // A vault writer holds the state: `busy`, labelled and unlabelled.
     let held =
         aterm_secrets::client::test_hold_state_lock(&lab.paths).expect("a pass holds the state");
-    for named in [None, Some("away")] {
+    for named in [None, Some("away@example.com")] {
         refused(&world.run(named, &[]), &away, "busy");
     }
     falls_back(&world.run(None, &[]), &work, "busy");
     drop(held);
 }
 
-/// THE VAULT: the lab's token decides `Token` for the account its record names, for `--auto`
-/// and the row's label alike; a vault apply holding the state makes `--auto` fall back with
-/// `busy` at once.
+/// THE VAULT: the lab's token decides `Token` for the account its record names, for `--auto` and
+/// every word that names the account (its key, its address, its provider word and address)
+/// alike; a roster label names no account, so a line typed with one runs as typed (`outside`)
+/// and is served nothing; a vault apply holding the state makes `--auto` fall back with `busy`
+/// at once.
 #[cfg(unix)]
 #[test]
 fn a_token_in_use_here_is_served_and_a_busy_vault_is_passed_over_at_once() {
@@ -511,7 +605,21 @@ fn a_token_in_use_here_is_served_and_a_busy_vault_is_passed_over_at_once() {
     crate::harness::journal::with_keyer(keyer, || mint(&lab));
     let world = World::new();
     let ctx = world.ctx(&[], Some(&lab));
-    for named in [None, Some("work"), Some("person@example.com")] {
+    // The key the relaunch line types: the resolver's, of the row's claims address.
+    let pk = crate::harness::account_names::names_of_login(
+        accounts::Cli::Claude,
+        None,
+        "person@example.com",
+        None,
+    )
+    .expect("a key")
+    .0;
+    for named in [
+        None,
+        Some(pk.as_str()),
+        Some("person@example.com"),
+        Some("claude person@example.com"),
+    ] {
         let (decision, read, noted) = decided(&world.run(named, &["--continue"]), &ctx);
         let Decision::Token {
             entry: served,
@@ -520,7 +628,7 @@ fn a_token_in_use_here_is_served_and_a_busy_vault_is_passed_over_at_once() {
         else {
             panic!("{named:?}: {decision:?}");
         };
-        assert_eq!((*served, account.named()), (entry(), "work"));
+        assert_eq!((*served, account.label.as_deref()), (entry(), Some("work")));
         let read = read.expect("the read");
         assert_eq!(
             read.token().map(|t| t.as_slice().to_vec()),
@@ -528,6 +636,9 @@ fn a_token_in_use_here_is_served_and_a_busy_vault_is_passed_over_at_once() {
         );
         assert_eq!(noted, None);
     }
+    let (decision, read, _) = decided(&world.run(Some("work"), &["--continue"]), &ctx);
+    assert_eq!(word(&decision), Some("outside"), "a label names no account");
+    assert!(read.is_none(), "nothing read to serve");
     let held =
         aterm_secrets::client::test_hold_state_lock(&lab.paths).expect("a pass holds the state");
     let began = Instant::now();
@@ -542,6 +653,69 @@ fn a_token_in_use_here_is_served_and_a_busy_vault_is_passed_over_at_once() {
     drop(held);
 }
 
+/// A WORD IS KEYED AS ITS ACCOUNT'S TOKEN ENTRY IS: a roster row's account by its row, and one
+/// no row here holds by its claims address, the address its key is hashed from, though the lab's
+/// copy names a login address apart from it (the launch's own entry is its login record's, which
+/// reports the claims address). A key or an address names its account from the roster and the
+/// launch's login with no lab read; only a slug reads the lab. A word that names an account of
+/// another pool says the wrapper serves Claude Code's alone, naming no `--cli`.
+/// NEGATIVE CONTROLS (2026-11-16, by hand, then restored): with `account_key_of` keying a
+/// row-less account by its login address first (S2's form), `the slug reached the login
+/// address's key`; with it reading the lab before the roster and the login, `a key or an address
+/// read the lab` (5 reads, not 1); with `resolve_in` ignoring `OtherPool`, `` `oai-eve-v` is an
+/// OpenAI account: add `--cli codex` ``.
+#[test]
+fn a_word_is_keyed_as_its_accounts_token_entry_and_reads_the_lab_only_for_a_slug() {
+    fn lab_keyer(realm: &str, email: &str) -> Option<String> {
+        aterm_db::typed::keys::account_pk(realm, email).ok()
+    }
+    let pk = |realm: &str, email: &str| lab_keyer(realm, email).expect("a key");
+    let (claims, login) = ("ada@x.example", "ada.login@x.example");
+    let ada = pk("claude", claims);
+    let names = |realm: &str, slug: &str, email: &str, login: &str| aterm_file::AccountNames {
+        realm: realm.to_owned(),
+        slug: slug.to_owned(),
+        name: aterm_db::typed::keys::account_name(realm, email),
+        email: Some(email.to_owned()),
+        login: Some(login.to_owned()),
+        live: true,
+    };
+    let mut lab = crate::harness::alab_roster::Lab::default();
+    lab.names
+        .insert(ada.clone(), names("claude", "claude-ada-x", claims, login));
+    lab.names.insert(
+        pk("codex", "eve@v.example"),
+        names("codex", "oai-eve-v", "eve@v.example", "eve@v.example"),
+    );
+    let lab = Arc::new(lab);
+    let reads = Cell::new(0);
+    let loader = || {
+        reads.set(reads.get() + 1);
+        Some(lab.clone())
+    };
+    crate::harness::journal::with_keyer(lab_keyer, || {
+        let keyed = account_key_of("claude-ada-x", None, &loader, Some(claims)).expect("its slug");
+        assert_eq!(keyed.key, ada, "the slug reached the login address's key");
+        assert_eq!(keyed.logged, format!("{ada} (claude-ada-x)"));
+        assert_eq!(reads.get(), 1, "a slug reads the lab");
+        for word in [ada.clone(), claims.to_owned(), format!("claude {claims}")] {
+            let keyed = account_key_of(&word, None, &loader, Some(claims)).expect("the word");
+            assert_eq!(keyed.key, ada, "{word}");
+        }
+        let roster = Roster::parse(ROSTER).expect("the roster");
+        let keyed =
+            account_key_of("person@example.com", Some(&roster), &loader, None).expect("a row's");
+        assert_eq!(keyed.key, pk("claude", "person@example.com"));
+        assert_eq!(reads.get(), 1, "a key or an address read the lab");
+        let why = account_key_of("oai-eve-v", None, &loader, None).expect_err("an OpenAI account");
+        assert!(
+            why.contains("`oai-eve-v` is an OpenAI account: the token wrapper serves only a Claude Code account"),
+            "{why}"
+        );
+        assert!(!why.contains("--cli"), "{why}");
+    });
+}
+
 /// THE HOLD AT THE WRAPPER (§5.6): the lab's token, minted here with nothing compared yet, is held
 /// while the row's stored login works here, the roster saying which login that is: the launch
 /// stays on it (`awaiting-basis`, journaled), and nothing is read to serve. CONTROL: with no login
@@ -553,7 +727,7 @@ fn a_token_awaiting_its_basis_is_held_at_the_wrapper_while_the_stored_login_work
     crate::harness::journal::with_keyer(keyer, || mint(&lab));
     let world = World::new();
     let ctx = world.ctx(&[], Some(&lab));
-    let (decision, _, _) = decided(&world.run(Some("work"), &[]), &ctx);
+    let (decision, _, _) = decided(&world.run(Some("person@example.com"), &[]), &ctx);
     assert!(
         matches!(decision, Decision::Token { .. }),
         "CONTROL: {decision:?}"
@@ -564,7 +738,7 @@ fn a_token_awaiting_its_basis_is_held_at_the_wrapper_while_the_stored_login_work
         r#"{"oauthAccount":{"emailAddress":"person@example.com"}}"#,
     )
     .expect("the login record");
-    let (decision, read, noted) = decided(&world.run(Some("work"), &[]), &ctx);
+    let (decision, read, noted) = decided(&world.run(Some("person@example.com"), &[]), &ctx);
     assert_eq!(decision, Decision::Stored(Fallback::AwaitingBasis));
     assert!(read.is_none(), "nothing read to serve");
     assert_eq!(noted, Some((entry(), "awaiting-basis")));
@@ -688,4 +862,98 @@ fn the_exec_d_program_reads_the_token_from_its_descriptor() {
             entry().name()
         )
     );
+}
+
+/// The variable the fallback stand-ins' parent sets beside [`REPORT`]: the wrapper stand-in
+/// falls back ([`as_typed_stand_in`]).
+#[cfg(target_os = "macos")]
+const AS_TYPED: &str = "ATERM_TEST_TOKEN_RUN_AS_TYPED";
+
+/// A variable of the person's own that the fallback passes on.
+#[cfg(target_os = "macos")]
+const KEPT: &str = "ATERM_TEST_TOKEN_RUN_KEPT";
+
+/// The stand-in for the wrapper where it falls back: execs the program stand-in
+/// ([`as_typed_reader_stand_in`], this test binary again) as typed, as `token-run` does wherever
+/// the judgment did not say `Token`.
+#[cfg(target_os = "macos")]
+#[test]
+fn as_typed_stand_in() {
+    if std::env::var_os(REPORT).is_none() || std::env::var_os(AS_TYPED).is_none() {
+        return;
+    }
+    let exe = std::env::current_exe().expect("the test binary");
+    let args = os(&[
+        "harness::accounts_token_run::tests::as_typed_reader_stand_in",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+        "--quiet",
+    ]);
+    let error = as_typed(exe.as_os_str(), &args);
+    panic!("the exec failed: {error}");
+}
+
+/// The program the fallback starts: writes the marker, the `minted_at` and the person's own
+/// variable it holds.
+#[cfg(target_os = "macos")]
+#[test]
+fn as_typed_reader_stand_in() {
+    let (Some(report), Some(_)) = (std::env::var_os(REPORT), std::env::var_os(AS_TYPED)) else {
+        return;
+    };
+    let read = |name: &str| std::env::var(name).unwrap_or_default();
+    std::fs::write(
+        report,
+        format!(
+            "marker={}\nminted={}\nkept={}\n",
+            read(token_route::MARKER_ENV),
+            read(token_route::MINTED_ENV),
+            read(KEPT)
+        ),
+    )
+    .expect("the report");
+}
+
+/// FALLING BACK (§5.3): the program the wrapper execs as typed holds none of the marker and
+/// `minted_at` it inherited (a token session's, handed to a tool child after Claude Code consumed
+/// the descriptor; the judgment set the marker aside), so it never reads as a route of its own,
+/// and it keeps every other variable. NEGATIVE CONTROL (2026-11-16): with `as_typed` on this
+/// process's whole environment, the program holds both and this test fails.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_fallback_execs_the_program_without_the_marker_it_inherited() {
+    let world = World::new();
+    let report = world.path().join("report");
+    let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+    command
+        .args([
+            "harness::accounts_token_run::tests::as_typed_stand_in",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+            "--quiet",
+        ])
+        .env(REPORT, &report)
+        .env(AS_TYPED, "1")
+        .env(KEPT, "the person's")
+        .env(
+            token_route::MARKER_ENV,
+            "aterm-claude-token-ac-0000000000000000",
+        )
+        .env(token_route::MINTED_ENV, "1");
+    let out = aterm_uds::deadline::output_while_process_progressing(
+        &mut command,
+        aterm_spec::wait::MUST_HAPPEN,
+        "the falling-back wrapper",
+    )
+    .expect("the wrapper ran");
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said = std::fs::read_to_string(&report).expect("the program's report");
+    assert_eq!(said, "marker=\nminted=\nkept=the person's\n");
 }

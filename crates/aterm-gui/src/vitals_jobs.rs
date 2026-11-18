@@ -22,6 +22,7 @@ use aterm_sysprobe::jobs::{
 };
 use aterm_sysprobe::procs::ProcessReading;
 use aterm_sysprobe::volumes::Table;
+use aterm_vitals::blockage::{ZombieFacts, ZombieRead};
 use aterm_vitals::jobs::{
     Block, Class, Consumer, Demand, Fd, FdKind, HeldProc, JobCounters, JobKind, JobProc, JobRow,
     JobTab, JobTick, Jobs, JobsView, Knote, KnoteFilter, LanesSeen, Machine, NamingError,
@@ -36,6 +37,70 @@ use crate::program_check_watch::RunningCheck;
 /// The engine's fast cadence, also the floor between passes, so a 2 Hz lens does not double the
 /// detailed reads.
 const FAST_MS: u64 = 2_000;
+
+/// One owned native sweep and the canonical zombie judgment made from that exact input.
+/// A cached or synthetic model frame cannot lend its receipt to another native reading.
+pub(crate) struct ProcessFacts {
+    sweep: Option<Vec<ProcessReading>>,
+    complete: bool,
+    source_seq: Option<u64>,
+    zombies: Option<Arc<ZombieFacts>>,
+}
+
+impl ProcessFacts {
+    pub(crate) fn new(
+        sweep: Option<Vec<ProcessReading>>,
+        complete: bool,
+        source: Option<(&aterm_vitals::Sample, &aterm_vitals::Snapshot)>,
+        zombies: Option<Arc<ZombieFacts>>,
+    ) -> Self {
+        let complete = complete && sweep.is_some();
+        let same_sweep = sweep
+            .as_deref()
+            .zip(source.and_then(|(sample, _)| sample.procs.as_deref()))
+            .is_some_and(|(native, model)| {
+                native.len() == model.len()
+                    && native.iter().zip(model).all(|(native, model)| {
+                        native.pid == model.pid
+                            && native.ppid == model.ppid
+                            && native.start == model.start
+                            && native.version == model.version
+                            && native.birth_ms == model.birth_ms
+                            && native.name == model.name
+                            && native.pgid == model.pgid
+                            && native.sid == model.sid
+                            && native.uid == model.uid
+                            && crate::vitals_host::proc_state(native.state) == model.state
+                    })
+            });
+        let source_seq = source
+            .filter(|(sample, snapshot)| same_sweep && snapshot.at_ns == sample.at_ns)
+            .map(|(_, snapshot)| snapshot.seq);
+        let zombies = zombies.filter(|facts| {
+            source.is_some_and(|(sample, _)| {
+                matches!(sample.zombie_read, ZombieRead::Sweep)
+                    && source_seq == Some(facts.seq())
+                    && facts.at_ns() == sample.at_ns
+                    && facts.mono_ms() == sample.mono_ms
+                    && facts.whole() == complete
+            })
+        });
+        Self {
+            sweep,
+            complete,
+            source_seq,
+            zombies,
+        }
+    }
+
+    pub(crate) fn sweep(&self) -> Option<&[ProcessReading]> {
+        self.sweep.as_deref()
+    }
+
+    pub(crate) fn complete(&self) -> bool {
+        self.complete
+    }
+}
 
 /// The readers the pass asks of this user's processes outside every job, the held stand-in, the
 /// stuck check's board and the wall clock (`KERNEL` live, `INERT` in unit tests). None reads a
@@ -402,7 +467,7 @@ impl JobsPass {
         &mut self,
         at_ms: u64,
         read_ms: impl Fn() -> u64,
-        sweep: Option<&[ProcessReading]>,
+        facts: &ProcessFacts,
         tabs: &[TabRoot],
         ttys: &[(u64, TtyMode)],
         feeds: &[(u64, TabFeed)],
@@ -412,7 +477,7 @@ impl JobsPass {
         now: bool,
     ) -> Option<Arc<JobsView>> {
         self.naming_fresh = false;
-        let Some(sweep) = sweep else {
+        let Some(sweep) = facts.sweep() else {
             return self.view.clone();
         };
         if !now && self.next_ms.is_some_and(|due| at_ms < due) {
@@ -500,6 +565,8 @@ impl JobsPass {
             probe_ms,
             self_uid,
             sweep,
+            source_seq: facts.source_seq,
+            zombie_facts: facts.zombies.clone(),
             procs,
             tabs,
             machine: Machine {

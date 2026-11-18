@@ -626,7 +626,22 @@ fn relative_to(abs: &str, root: &Path, canonical_root: Option<&Path>) -> String 
     std::iter::once(root)
         .chain(canonical_root)
         .find_map(|base| p.strip_prefix(base).ok())
-        .map_or_else(|| abs.to_owned(), |rel| rel.to_string_lossy().into_owned())
+        .map_or_else(|| abs.to_owned(), repo_spelling)
+}
+
+/// The tree path `rel` as a finding names it: its parts joined by `/`, as git spells it and as
+/// every other finding id is.
+#[cfg(not(windows))]
+fn repo_spelling(rel: &Path) -> String {
+    rel.to_string_lossy().into_owned()
+}
+
+/// The tree path `rel` as a finding names it: its parts joined by `/`, as git spells it and as
+/// every other finding id is, where Windows' own spelling joins them by `\` (which no Windows
+/// file name holds).
+#[cfg(windows)]
+fn repo_spelling(rel: &Path) -> String {
+    rel.to_string_lossy().replace('\\', "/")
 }
 
 /// Every directory whose nearest `rustfmt.toml` resolves a different edition than its manifest.

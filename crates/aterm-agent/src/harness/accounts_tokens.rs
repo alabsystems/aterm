@@ -3,7 +3,10 @@
 
 //! Claude Code setup-tokens on this Mac (`docs/DESIGN-claude-setup-token-2026-11-05.md` §4.6,
 //! §5.1, slice S6): the account-to-token table, the token states, and the verb
-//! `aterm harness accounts token <label|email> [--replace | --remove]`.
+//! `aterm harness accounts token <account> [--replace | --remove]`, which names its account as
+//! every accounts verb does (`account_names::resolve`: its slug, its key, its provider word and
+//! address, or its address; never a roster label), and every line of which names it by its
+//! name and slug, or, where a line may reach a log, by its slug or key, never by a label.
 //!
 //! - **The table.** `tokens.json` in Claude Code's accounts store, mode 0600, schema 1, written
 //!   atomically under its own `tokens.lock` (never `accounts.lock`, which a relaunch holds
@@ -31,7 +34,11 @@
 //!
 //! Nothing here prints, journals, logs or writes the token: it lives in the capture's zeroizing
 //! buffer, then in the vault.
+//!
+//! Traced by the accounts keeper: what this file reads of the file system itself, it reads
+//! through `aterm_uds::trace::fs` (census `traced-reads`).
 
+use super::account_names::{self, Candidates, Login, Named, OtherPool, Word};
 use super::accounts::{self, Cli, Roster, Row, Store};
 use super::accounts_step::Step;
 use super::cli::{AccountsHost, Env, TokenMode};
@@ -1729,11 +1736,12 @@ impl TokenState {
     /// no other Mac's), or `unreadable here` (this Mac cannot tell what it replaces); or while a
     /// token made here is not yet in vault (`pending`), so a second Mac never replaces a token in
     /// use on every Mac or one that awaits verification on the Mac that made it, and a re-run
-    /// never replaces a write still on its way. `expires_at` dates the words.
+    /// never replaces a write still on its way. `shown` names the account as a message to a
+    /// person does ([`Named::shown`]); `expires_at` dates the words.
     #[must_use]
     pub fn bare_refusal(
         &self,
-        email: &str,
+        shown: &str,
         expires_at: Option<u64>,
         pending: bool,
     ) -> Option<String> {
@@ -1742,7 +1750,7 @@ impl TokenState {
                        ends or you revoke it at claude.ai)";
         if pending {
             return Some(format!(
-                "a token for {email} made here is not yet in vault: this Mac's vault pass signs \
+                "a token for {shown} made here is not yet in vault: this Mac's vault pass signs \
                  it; {replace}"
             ));
         }
@@ -1799,11 +1807,11 @@ impl TokenState {
                 .to_owned(),
             _ => return None,
         };
-        Some(format!("a token for {email} is {state}{until}; {replace}"))
+        Some(format!("a token for {shown} is {state}{until}; {replace}"))
     }
 
-    /// The step a surface offers for the account `label` (its row's label, or its email) in this
-    /// state (§5.9), where it offers one: for an account whose token is `none`, `ended`,
+    /// The step a surface offers for the account `word` names ([`Named::word`]: its slug, else its
+    /// key) in this state (§5.9), where it offers one: for an account whose token is `none`, `ended`,
     /// `mismatched`, or `rejected` and in use on no other Mac, a bare run, and for a token that
     /// is `soon` or `exposed`, `rejected` while in use on other Macs, `unverified (windows
     /// differ)` on the Mac that made it, or `unverified (windows shared)` there where its route
@@ -1819,7 +1827,7 @@ impl TokenState {
     /// to come, or its route put it in use on every Mac), or while a token made here is not yet
     /// in vault (`pending`).
     #[must_use]
-    pub fn offer(&self, label: &str, pending: bool) -> Option<Step> {
+    pub fn offer(&self, word: &Word, pending: bool) -> Option<Step> {
         if pending {
             return None;
         }
@@ -1847,7 +1855,7 @@ impl TokenState {
             }
         };
         Some(Step::Token {
-            label: label.to_owned(),
+            word: word.clone(),
             replace,
         })
     }
@@ -2044,8 +2052,15 @@ pub struct SessionLogin {
 struct Account {
     /// Its email: the row's claims email, else the login record's.
     email: String,
-    /// The row's label, where one names it.
+    /// The label of its row here, where it has one: the local key the row's records are kept
+    /// under (its sign-in records, its headless profile, the table's `label` column), which
+    /// nothing prints.
     label: Option<String>,
+    /// How a message to a person names it: its name and slug ([`Named::shown`]).
+    shown: String,
+    /// The word a step, a refusal and a log line name it by: its slug, else its key
+    /// ([`Named::word`]), never its address.
+    word: Word,
     /// The `c-<12 hex>` key of its login record here, where one names it.
     account_id: Option<String>,
     /// The lab key.
@@ -2055,95 +2070,189 @@ struct Account {
 }
 
 impl Account {
-    /// How the verb names it (its token is made by itself in aterm's sign-in window, and its
-    /// lines may reach a log or a captured standard error): its row's label, never its address.
+    /// How the verb names it where its lines may reach a log or a captured standard error (its
+    /// token is made by itself in aterm's sign-in window): its word, never its address.
     fn quietly(&self) -> String {
-        self.label
-            .clone()
-            .unwrap_or_else(|| "this account".to_owned())
+        self.word.to_string()
+    }
+
+    /// How a line of a run `via` names it: its name and slug for a person at a terminal of
+    /// their own on this Mac ([`Via::Desk`]), else, where nobody is there to read it (the
+    /// upkeep's, an agent's or a script's run, whose output a log or a fleet relay may keep), its
+    /// word ([`Self::quietly`]).
+    fn named_for(&self, via: Via) -> String {
+        match via {
+            Via::Desk => self.shown.clone(),
+            Via::Unattended | Via::Headless => self.quietly(),
+        }
     }
 
     /// What the outcome adds for a row another Mac holds: launches here refuse it.
     fn held_note(&self) -> String {
-        match (&self.holder, &self.label) {
-            (Some(holder), Some(label)) => {
-                format!("; the token serves {label} on {holder}, the Mac that holds it")
+        match &self.holder {
+            Some(holder) => format!(
+                "; the token serves {} on {holder}, the Mac that holds it",
+                self.word
+            ),
+            None => String::new(),
+        }
+    }
+
+    /// The step a person takes to make its token ([`Step::Token`]), bare.
+    fn step(&self) -> String {
+        Step::Token {
+            word: self.word.clone(),
+            replace: false,
+        }
+        .to_string()
+    }
+
+    /// The account `named` names among `candidates`, with `logins` this Mac's sessions are on.
+    /// Its vault key is its row's account key as the lab journal keys it, else its login's
+    /// ([`journal::account_key`], [`journal::claude_email_key`]): the key every token surface
+    /// names its entry by (`TokenEntry`, the route, the view). Its word is the one the verb takes
+    /// among the same candidates ([`Named::word_among`]).
+    ///
+    /// # Errors
+    /// The account has no row here and no session here is on it, or this aterm cannot key it.
+    fn of_named(
+        env: &Env,
+        named: &Named<'_>,
+        logins: &[SessionLogin],
+        candidates: &Candidates<'_>,
+    ) -> Result<Self, String> {
+        let row = named.row;
+        // A row's claims address, else the address of the login a session here is on, as its
+        // record spells it.
+        let addresses: Vec<&str> = match row {
+            Some(row) => row.expected_identity_email().into_iter().collect(),
+            None => [named.names.login.as_deref(), named.names.email.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect(),
+        };
+        let logged_in = logins.iter().find(|login| {
+            addresses
+                .iter()
+                .any(|address| accounts::email_matches(&login.email, address))
+        });
+        let email = match (row, logged_in) {
+            (Some(_), _) => addresses.first().copied().unwrap_or_default().to_owned(),
+            (None, Some(login)) => login.email.clone(),
+            (None, None) => {
+                return Err(format!(
+                    "no session on this Mac is on {}, and no roster row here holds it: a token \
+                     is made for an account a session here is on, or one a row here holds",
+                    named.logged()
+                ));
             }
-            _ => String::new(),
+        };
+        let key = row
+            .and_then(|row| journal::account_key(Cli::Claude, row))
+            .or_else(|| journal::claude_email_key(&email))
+            .and_then(|key| Key::parse(key.as_str()))
+            .ok_or_else(|| {
+                "this aterm cannot key the account (no lab journal is installed), so it names no \
+                 vault entry for it"
+                    .to_owned()
+            })?;
+        let account_id = logged_in
+            .and_then(|login| login.account_id.clone())
+            .or_else(|| {
+                let home = env.home.as_deref()?;
+                profile::account_for_login(&[], home, row?.dir.as_deref(), &email)
+                    .map(|key| key.to_string())
+            });
+        Ok(Self {
+            email,
+            label: row.map(|row| row.label.clone()),
+            shown: named.shown(),
+            word: named.word_among(Cli::Claude, candidates),
+            account_id,
+            key,
+            holder: row.and_then(|row| row.held_by.clone()),
+        })
+    }
+}
+
+/// Claude Code's roster, where one is configured here.
+///
+/// # Errors
+/// The roster there is refused.
+fn claude_roster(env: &Env) -> Result<Option<Roster>, String> {
+    match env.accounts_roster_for(Cli::Claude) {
+        Some(path) if aterm_uds::trace::fs::exists(&path) => Roster::load_for(Cli::Claude, &path)
+            .map(Some)
+            .map_err(|why| format!("the roster at {} is refused: {why}", path.display())),
+        _ => Ok(None),
+    }
+}
+
+/// How a run's caller names the account it makes a token for ([`run_with_clock`]).
+#[derive(Clone, Copy, Debug)]
+enum Of<'a> {
+    /// The verb's account word, as a person or a script typed it
+    /// ([`account_names::resolve`]).
+    Word(&'a str),
+    /// The Claude row this label is the local key of: a run the row's own sign-in or this Mac's
+    /// upkeep starts for a row it holds, which no word names.
+    Row(&'a str),
+}
+
+/// The account `of` names (§4.6). A word is resolved among Claude Code's roster rows, the
+/// accounts the sessions on this Mac are on (`logins`) and the lab's accounts
+/// ([`account_names::resolve`]: a slug, a key, a provider word and address, or an address that
+/// names one account; never a roster label), and names an account a row here holds or a session
+/// here is on; a row another Mac holds is accepted, since it is named here. A row is the one its
+/// label keys, which must hold an address.
+fn account_of(env: &Env, of: Of<'_>, logins: &[SessionLogin]) -> Result<Account, String> {
+    let roster = claude_roster(env)?;
+    let rows: &[Row] = roster.as_ref().map_or(&[], |roster| roster.rows.as_slice());
+    let lab = super::alab_roster::current();
+    let lab = lab.as_deref();
+    let here: Vec<Login<'_>> = logins
+        .iter()
+        .map(|login| Login {
+            region: None,
+            email: &login.email,
+        })
+        .collect();
+    let candidates = Candidates {
+        roster: rows,
+        logins: &here,
+        lab,
+        held: &[],
+    };
+    match of {
+        Of::Word(word) => {
+            let named = account_names::resolve_in(
+                Cli::Claude,
+                word,
+                &candidates,
+                OtherPool::Alone(CLAUDE_ONLY),
+            )?;
+            Account::of_named(env, &named, logins, &candidates)
+        }
+        Of::Row(label) => {
+            let row = rows
+                .iter()
+                .find(|row| row.label == label)
+                .ok_or_else(|| "its Claude Code row is no longer in the roster".to_owned())?;
+            let (pk, names) = account_names::names_of_row(Cli::Claude, row, lab)
+                .ok_or_else(|| "its Claude Code row holds no address".to_owned())?;
+            let named = Named {
+                pk,
+                row: Some(row),
+                names,
+            };
+            Account::of_named(env, &named, logins, &candidates)
         }
     }
 }
 
-/// The account `name` names (§4.6): a label names a Claude row with an email; an email names an
-/// account a session on this Mac is logged into, or one a row names. A row another Mac holds is
-/// accepted, since it is named here.
-fn account_of(env: &Env, name: &str, logins: &[SessionLogin]) -> Result<Account, String> {
-    let roster = match env.accounts_roster_for(Cli::Claude) {
-        Some(path) if path.exists() => Some(
-            Roster::load_for(Cli::Claude, &path)
-                .map_err(|why| format!("the roster at {} is refused: {why}", path.display()))?,
-        ),
-        _ => None,
-    };
-    let rows: &[Row] = roster.as_ref().map_or(&[], |roster| roster.rows.as_slice());
-    let (row, email) = if name.contains('@') {
-        let row = rows.iter().find(|row| row.matches_email(name));
-        let logged_in = logins
-            .iter()
-            .find(|login| accounts::email_matches(&login.email, name));
-        if row.is_none() && logged_in.is_none() {
-            return Err(format!(
-                "no session on this Mac is logged into {name}, and no row names it: a token is \
-                 made for an account a session here is on, or for a row by its label"
-            ));
-        }
-        let email = row
-            .and_then(Row::expected_identity_email)
-            .or(logged_in.map(|login| login.email.as_str()))
-            .unwrap_or(name)
-            .to_owned();
-        (row, email)
-    } else {
-        let row = rows.iter().find(|row| row.label == name).ok_or_else(|| {
-            format!(
-                "no Claude Code row is labelled {name} (`{}` lists them)",
-                Step::Report(Cli::Claude)
-            )
-        })?;
-        let email = row.expected_identity_email().ok_or_else(|| {
-            format!(
-                "{name} names no email, and a token is made for an account by its email \
-                 (`aterm harness accounts adopt-default {name} --email <e>` names it)"
-            )
-        })?;
-        (Some(row), email.to_owned())
-    };
-    let key = row
-        .and_then(|row| journal::account_key(Cli::Claude, row))
-        .or_else(|| journal::claude_email_key(&email))
-        .and_then(|key| Key::parse(key.as_str()))
-        .ok_or_else(|| {
-            "this aterm cannot key the account (no lab journal is installed), so it names no \
-             vault entry for it"
-                .to_owned()
-        })?;
-    let account_id = logins
-        .iter()
-        .find(|login| accounts::email_matches(&login.email, &email))
-        .and_then(|login| login.account_id.clone())
-        .or_else(|| {
-            let home = env.home.as_deref()?;
-            profile::account_for_login(&[], home, row?.dir.as_deref(), &email)
-                .map(|key| key.to_string())
-        });
-    Ok(Account {
-        email,
-        label: row.map(|row| row.label.clone()),
-        account_id,
-        key,
-        holder: row.and_then(|row| row.held_by.clone()),
-    })
-}
+/// What the verb answers a word that names an account of another pool only: it makes Claude
+/// Code's tokens alone, so no `--cli` takes the word.
+const CLAUDE_ONLY: &str = "a token is made only for a Claude Code account";
 
 /// The preflight's words for a write route that cannot store a token (§4.6).
 fn route_refusal(route: WriteRoute) -> Option<&'static str> {
@@ -2201,27 +2310,21 @@ fn check_record_refusal(store: &Store, account: &Account) -> Option<String> {
     let stopped = steps
         .get(account.key.as_str())
         .filter(|stopped| stopped.word.is_bot_protection())?;
-    let step = account.label.as_ref().map(|label| {
-        Step::Token {
-            label: label.clone(),
-            replace: false,
-        }
-        .to_string()
-    });
     Some(format!(
         "the token step for {} {}; nothing was made",
         account.quietly(),
-        stopped.words(step.as_deref())
+        stopped.words(Some(&account.step()))
     ))
 }
 
-/// `aterm harness accounts token <name> [--replace | --remove]` (§4.6): the module's summary
-/// says what it does. Every refusal comes before any spawn. Exit 0 on a token stored, waiting or
-/// removed; 130 at Ctrl-C during the sign-in; 1 on every refusal.
+/// `aterm harness accounts token <account> [--replace | --remove]` (§4.6): the module's summary
+/// says what it does. `word` is the account word ([`account_names::resolve`]). Every refusal
+/// comes before any spawn. Exit 0 on a token stored, waiting or removed; 130 at Ctrl-C during the
+/// sign-in; 1 on every refusal.
 pub fn run(
     env: &Env,
     host: &dyn AccountsHost,
-    name: &str,
+    word: &str,
     mode: TokenMode,
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -2236,7 +2339,7 @@ pub fn run(
     run_with_clock(
         env,
         host,
-        name,
+        Of::Word(word),
         mode,
         (via, None),
         out,
@@ -2247,7 +2350,7 @@ pub fn run(
 }
 
 /// Where a run's token page opens ([`run_with_clock`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Via {
     /// The verb's own route for a person at a terminal of their own on this Mac
     /// ([`super::cli::person_at_terminal`]): aterm's sign-in window at this Mac's own desk, and
@@ -2285,7 +2388,7 @@ const HEADLESS_ROUTE_WITHIN: Duration = Duration::from_secs(3 * 60);
 fn run_with_clock(
     env: &Env,
     host: &dyn AccountsHost,
-    name: &str,
+    of: Of<'_>,
     mode: TokenMode,
     (via, upkeep): (Via, Option<&Finding>),
     out: &mut dyn Write,
@@ -2327,7 +2430,7 @@ fn run_with_clock(
         );
     }
     let logins = host.session_logins(env);
-    let account = match account_of(env, name, &logins) {
+    let account = match account_of(env, of, &logins) {
         Ok(account) => account,
         Err(why) => return refuse(err, &why),
     };
@@ -2346,7 +2449,12 @@ fn run_with_clock(
         && let Some(label) = account.label.as_deref()
         && left_to_a_person_here(env, &store, label, host.now().max(env.now))
     {
-        return refuse(err, &super::cli::left_words(Cli::Claude, label));
+        let named = super::account_names::RowName {
+            shown: account.shown.clone(),
+            word: account.word.clone(),
+            logged: account.word.to_string(),
+        };
+        return refuse(err, &super::cli::left_words(Cli::Claude, &named));
     }
     // Nor is the account's token page loaded again with nobody at this terminal where its token
     // step's own record of a check stands: only a person's act at a terminal on this Mac runs
@@ -2443,7 +2551,7 @@ fn run_with_clock(
         _ => None,
     };
     if !matches!(mode, TokenMode::Replace)
-        && let Some(why) = state.bare_refusal(&account.email, expires_at, pending)
+        && let Some(why) = state.bare_refusal(&account.shown, expires_at, pending)
     {
         return refuse(err, &why);
     }
@@ -2566,7 +2674,9 @@ fn run_with_clock(
     if let Some(checked) = checked {
         if code == ExitCode::SUCCESS {
             checked.end_after(&store, account.key.as_str(), now);
-        } else if let Some(pending) = checked.hold_after(&store, account.key.as_str(), now, err) {
+        } else if let Some(pending) =
+            checked.hold_after(&store, (account.key.as_str(), &account.quietly()), now, err)
+        {
             unrecorded(pending);
         }
     }
@@ -2649,7 +2759,7 @@ impl CheckedRow {
     }
 
     /// Where the capture that started at `now` left a bot protection's record of the account
-    /// `key`'s step ([`token_steps::Stopped`]: Cloudflare's check or block page, a human check,
+    /// `key`'s step (the account a line names by `word`, [`Account::quietly`]) ([`token_steps::Stopped`]: Cloudflare's check or block page, a human check,
     /// headless or in aterm's window), records it as the row's account's [`accounts::CheckStop`]
     /// too (`accounts_sync::write_check_stop`), so every door with nobody at this Mac holds the
     /// row and its token step for a person (`accounts_sync::left_to_a_person`) by the one rule a
@@ -2661,7 +2771,7 @@ impl CheckedRow {
     fn hold_after(
         &self,
         store: &Store,
-        key: &str,
+        (key, word): (&str, &str),
         now: u64,
         err: &mut dyn Write,
     ) -> Option<super::accounts_sync::PendingCheck> {
@@ -2684,10 +2794,9 @@ impl CheckedRow {
         }
         let _ = writeln!(
             err,
-            "aterm harness accounts token: {}: the check its page carried could not be recorded \
-             on the account (its records stayed busy); the token step's own record holds its \
-             token step",
-            self.row.label
+            "aterm harness accounts token: {word}: the check its page carried could not be \
+             recorded on the account (its records stayed busy); the token step's own record holds \
+             its token step"
         );
         Some(check)
     }
@@ -2707,8 +2816,8 @@ pub enum SignedIn {
     Elsewhere,
 }
 
-/// MAKES AN ACCOUNT'S YEAR-LONG TOKEN IN THE RUN THAT JUST SIGNED IT IN: where `label`'s account
-/// has no token in the vault, or only one whose end has passed, and this run could make one
+/// MAKES AN ACCOUNT'S YEAR-LONG TOKEN IN THE RUN THAT JUST SIGNED IT IN: where the account of the
+/// Claude row `label` keys (the row the run signed in, by its local key) has no token in the vault, or only one whose end has passed, and this run could make one
 /// ([`step_due_after`]), the verb runs with every refusal of its own, and its exit is the answer;
 /// `None` where no token is made, with nothing written, a token the vault holds that only a
 /// person replaces included. The caller holds no sign-in lock (§4.6: a token is made under its
@@ -2751,16 +2860,23 @@ pub(super) fn after_sign_in(
         SignedIn::Window => Via::Unattended,
         SignedIn::Headless => Via::Headless,
         SignedIn::Elsewhere => {
-            offer_after_sign_in(env, host, label, out);
+            let at_terminal = super::cli::person_at_terminal(host);
+            let via = if at_terminal {
+                Via::Desk
+            } else {
+                Via::Unattended
+            };
+            offer_after_sign_in(env, host, label, via, out);
             return None;
         }
     };
     let Some(due) = step_due_after(env, host, label, via) else {
         if via == Via::Headless {
-            offer_after_sign_in(env, host, label, out);
+            offer_after_sign_in(env, host, label, via, out);
         }
         return None;
     };
+    let account = &due.account;
     if via != Via::Desk && check_holds(&due) {
         let where_ = if via == Via::Headless {
             "on the headless browser profile"
@@ -2769,32 +2885,32 @@ pub(super) fn after_sign_in(
         };
         let _ = writeln!(
             out,
-            "{label}: its token's consent page carried a check the last time it was tried, so \
-             this run makes none {where_}; `{}` run by a person at this Mac makes one",
-            Step::Token {
-                label: label.to_owned(),
-                replace: false,
-            }
+            "{}: its token's consent page carried a check the last time it was tried, so this \
+             run makes none {where_}; `{}` run by a person at this Mac makes one",
+            account.named_for(via),
+            account.step()
         );
         return None;
     }
     let _ = match via {
         Via::Desk | Via::Unattended => writeln!(
             out,
-            "{label}: it has no year-long token in use here, so this run makes one, as `aterm \
-             harness accounts token {label}` does"
+            "{}: it has no year-long token in use here, so this run makes one, as `{}` does",
+            account.named_for(via),
+            account.step()
         ),
         Via::Headless => writeln!(
             out,
-            "{label}: it has no year-long token in use here, so this run makes one on the \
-             headless browser profile it just signed in on"
+            "{}: it has no year-long token in use here, so this run makes one on the headless \
+             browser profile it just signed in on",
+            account.named_for(via)
         ),
     };
     let _ = out.flush();
     Some(run_with_clock(
         env,
         host,
-        label,
+        Of::Row(label),
         TokenMode::Make,
         (via, None),
         out,
@@ -2804,27 +2920,33 @@ pub(super) fn after_sign_in(
     ))
 }
 
-/// Says the step once, on `out`, where the bare verb would make `label`'s token and the run that
-/// signed it in makes none ([`after_sign_in`]); nothing is run or written.
-fn offer_after_sign_in(env: &Env, host: &dyn AccountsHost, label: &str, out: &mut dyn Write) {
-    if step_due_after(env, host, label, Via::Desk).is_none() {
+/// Says the step once, on `out`, where the bare verb would make the token of the account of the
+/// Claude row `label` keys and the run that signed it in makes none ([`after_sign_in`]); nothing
+/// is run or written. The line names the account as a line of a run `via` does
+/// ([`Account::named_for`]).
+fn offer_after_sign_in(
+    env: &Env,
+    host: &dyn AccountsHost,
+    label: &str,
+    via: Via,
+    out: &mut dyn Write,
+) {
+    let Some(due) = step_due_after(env, host, label, Via::Desk) else {
         return;
-    }
+    };
     let _ = writeln!(
         out,
-        "{label}: it has no year-long token in use here; this run signed it in neither in \
-         aterm's sign-in window nor on a headless browser profile a sign-in proved, so it makes \
-         none: run `{}`",
-        Step::Token {
-            label: label.to_owned(),
-            replace: false,
-        }
+        "{}: it has no year-long token in use here; this run signed it in neither in aterm's \
+         sign-in window nor on a headless browser profile a sign-in proved, so it makes none: \
+         run `{}`",
+        due.account.named_for(via),
+        due.account.step()
     );
 }
 
 /// What this Mac's upkeep finds of an account's token that it makes in its place with nobody
 /// there (plan package FL-138, [`backfill_due`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Gap {
     /// The vault holds no token of the account.
     None,
@@ -2926,7 +3048,7 @@ fn short_lived_by(meta: &Meta, cli: Option<&str>) -> bool {
 /// An account's token gap this Mac's upkeep found ([`backfill_due`]): the account's key, the gap,
 /// the `minted_at` of the token the vault holds (`None`: it holds none), and the route that fills
 /// it with nobody there.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Finding {
     /// The account's key (`ac-<16 hex>`).
     pub key: String,
@@ -3015,7 +3137,7 @@ pub fn backfill_due(
     if !host.on_macos() || setup_token::route_in(&host.verb_env()).is_some() {
         return Backfill::Nothing;
     }
-    let Ok(account) = account_of(env, label, &host.session_logins(env)) else {
+    let Ok(account) = account_of(env, Of::Row(label), &host.session_logins(env)) else {
         return Backfill::Nothing;
     };
     let (Some(store), Some(vault)) = (env.accounts_store_for(Cli::Claude), host.token_vault())
@@ -3205,11 +3327,13 @@ pub(super) fn backfill_run(
         Backfill::Due(_) | Backfill::NotSeated | Backfill::Nothing => return None,
     }
     let store = env.accounts_store_for(Cli::Claude)?;
+    let account = account_of(env, Of::Row(label), &host.session_logins(env)).ok()?;
     let _ = writeln!(
         out,
-        "{label}: its year-long token is {}, so this Mac's upkeep makes one, as `aterm harness \
-         accounts token {label}` does",
-        finding.gap.word()
+        "{}: its year-long token is {}, so this Mac's upkeep makes one, as `{}` does",
+        account.named_for(finding.via),
+        finding.gap.word(),
+        account.step()
     );
     let _ = out.flush();
     let cli = host
@@ -3221,7 +3345,7 @@ pub(super) fn backfill_run(
     let code = run_with_clock(
         env,
         host,
-        label,
+        Of::Row(label),
         finding.gap.mode(),
         (finding.via, Some(finding)),
         out,
@@ -3255,15 +3379,15 @@ pub(super) fn backfill_run(
 fn check_holds(due: &DueAfter) -> bool {
     token_steps::read(&due.store).map_or(true, |steps| {
         steps
-            .get(due.key.as_str())
+            .get(due.account.key.as_str())
             .is_some_and(|stopped| stopped.word.is_bot_protection())
     })
 }
 
-/// What [`step_due_after`] found of a step that is due: the accounts store and the account's key.
+/// What [`step_due_after`] found of a step that is due: the accounts store and the account.
 struct DueAfter {
     store: Store,
-    key: String,
+    account: Account,
 }
 
 /// When the token `found` names was made, where the vault holds one with its meta.
@@ -3292,7 +3416,7 @@ fn step_due_after(env: &Env, host: &dyn AccountsHost, label: &str, via: Via) -> 
     {
         return None;
     }
-    let account = account_of(env, label, &host.session_logins(env)).ok()?;
+    let account = account_of(env, Of::Row(label), &host.session_logins(env)).ok()?;
     let (Some(store), Some(vault)) = (env.accounts_store_for(Cli::Claude), host.token_vault())
     else {
         return None;
@@ -3320,10 +3444,7 @@ fn step_due_after(env: &Env, host: &dyn AccountsHost, label: &str, via: Via) -> 
             TokenState::of(&found, row, now),
             TokenState::None | TokenState::Ended
         ))
-    .then(|| DueAfter {
-        key: account.key.as_str().to_owned(),
-        store,
-    })
+    .then(|| DueAfter { store, account })
 }
 
 /// What [`mint`] makes a token of: the account, the Claude Code build and its version, the
@@ -3582,23 +3703,23 @@ fn mint(
             "stored a Claude Code token for {} in the vault, {valid}; it serves every Mac, each \
              one where the account's stored login is usable once a session on that login there \
              has reported its windows{held}",
-            account.email
+            account.shown
         ),
         InVault::InVault => format!(
             "stored a Claude Code token for {} in the vault, {valid}; it serves this Mac once a \
              session on the account's stored login here has reported its windows, and every Mac \
              once it is verified{held}",
-            account.email
+            account.shown
         ),
         InVault::SignedHere => format!(
             "stored a Claude Code token for {} here, {valid}; not yet in vault: no server \
              answered, and this Mac's vault pass posts it{held}",
-            account.email
+            account.shown
         ),
         InVault::Waiting(why) => format!(
             "not yet in vault: the token for {} ({valid}) waits in the vault's waiting writes: \
              {why}; this Mac's vault pass signs it{held}",
-            account.email
+            account.shown
         ),
         InVault::Overtaken(_) | InVault::Removed => String::new(),
     };
@@ -3665,14 +3786,7 @@ fn hold(store: &Store, key: &Key, stopped: Option<&token_steps::Stopped>, err: &
 /// What a refusal adds where its stop holds the account's step: what tries it again
 /// ([`token_steps::Stopped::again`]).
 fn held_words(account: &Account, stopped: &token_steps::Stopped) -> String {
-    let step = account.label.as_ref().map(|label| {
-        Step::Token {
-            label: label.clone(),
-            replace: false,
-        }
-        .to_string()
-    });
-    format!("; {}", stopped.again(step.as_deref()))
+    format!("; {}", stopped.again(Some(&account.step())))
 }
 
 /// How long a token's meta says it lasts, as the capture's words would: printed days, else
@@ -3954,23 +4068,23 @@ fn remove(
     let line = match &removed {
         MemberUnset::Posted => format!(
             "removed the Claude Code token for {} from the vault; {stays}",
-            account.email
+            account.shown
         ),
         MemberUnset::SignedHere => format!(
             "removed the Claude Code token for {} here; not yet in vault: no server answered, \
              and this Mac's vault pass posts it; {stays}",
-            account.email
+            account.shown
         ),
         MemberUnset::TookBack => format!(
             "took back this Mac's token for {}, which still waited to be signed: nothing of it \
              reached the vault",
-            account.email
+            account.shown
         ),
         MemberUnset::Absent => {
             let _ = writeln!(
                 out,
                 "the vault holds no Claude Code token for {}",
-                account.email
+                account.shown
             );
             return ExitCode::SUCCESS;
         }
@@ -3983,7 +4097,7 @@ fn remove(
                 err,
                 &format!(
                     "the token for {} is not removed: {by} put it back",
-                    account.email
+                    account.shown
                 ),
             );
         }
@@ -4049,20 +4163,27 @@ fn remove(
 /// end (unix seconds): a row whose account's token, read value-free from the vault at `paths` in
 /// one read ([`claude_token::listed`]) and judged with this Mac's table in `store` at `now`, is in
 /// use here with its record naming the row's email ([`super::token_route::standing_judged`]).
-/// Renewal is off for them: the upkeep never signs one in by itself, and `accounts renew <label>`
+/// Renewal is off for them: the upkeep never signs one in by itself, and `accounts renew <account>`
 /// says so. A row with no login made here is one too (FL-135) where this Mac's claims cover its
 /// account ([`super::claims::covers`]: a pool file, or a lab naming this Mac its home): its fleet
 /// token runs it ([`accounts::LoginHere::OnToken`]), so the ladder signs it in nowhere and leaves
 /// no login that would enrol it. Where they do not, nothing would keep a second Mac off the
 /// account, so it is none, and its sign-in goes on as any row's. Empty where the vault could not
 /// be read just now (renewal then goes on as before, which signs in nothing a token would have
-/// served).
+/// served). Only a standing judged takes the reading raw ([`rows_on_token_of`]).
+///
+/// The vault is read outside an armed trace scope's record (`claude_token::listed` reads it as
+/// aterm-secrets does). A run the keeper keeps took no reading raw, so it found no standing of a
+/// token of a row it judges (one enrolled, or one this Mac's claims cover); a token the vault
+/// holds later only puts a row on its token, which takes
+/// it off every renewal door ([`accounts::OtherMacs::on_token`]), so it opens none that kept run
+/// found shut.
 #[must_use]
 pub fn rows_on_token(
     paths: &Paths,
     store: &Store,
     roster: &Roster,
-    now: i64,
+    now: impl Into<aterm_uds::trace::Now>,
 ) -> BTreeMap<String, u64> {
     rows_on_token_read(paths, store, roster, now).unwrap_or_default()
 }
@@ -4075,7 +4196,7 @@ pub fn rows_on_token_read(
     paths: &Paths,
     store: &Store,
     roster: &Roster,
-    now: i64,
+    now: impl Into<aterm_uds::trace::Now>,
 ) -> Option<BTreeMap<String, u64>> {
     rows_on_token_of(
         paths,
@@ -4090,45 +4211,63 @@ pub fn rows_on_token_read(
 /// `tokens_here`), with no session of any account needed: every split pair the vault's listing
 /// holds is settled first where it is this Mac's turn ([`settle_splits`]), and where one was
 /// written the vault is listed again, so the rows a settled pair now serves read as on their
-/// token at this pass.
+/// token at this pass. A listing that holds a split pair settles it at the reading `now` taken
+/// raw; one that holds none takes no reading for a settle. Either way each listed standing of a
+/// row it judges is then judged at the reading taken raw ([`rows_on_token_of`]).
 #[must_use]
 pub fn rows_on_token_settled(
     paths: &Paths,
     store: &Store,
     roster: &Roster,
-    now: i64,
+    now: impl Into<aterm_uds::trace::Now>,
 ) -> Option<BTreeMap<String, u64>> {
+    let now: aterm_uds::trace::Now = now.into();
     let list = || claude_token::listed(paths).unwrap_or(Lookup::Unknown);
     let mut listed = list();
-    if settle_splits(
-        &Vault(paths.clone()),
-        &listed,
-        u64::try_from(now).unwrap_or(0),
-    ) {
+    if holds_split(&listed)
+        && settle_splits(
+            &Vault(paths.clone()),
+            &listed,
+            u64::try_from(now.raw()).unwrap_or(0),
+        )
+    {
         listed = list();
     }
     rows_on_token_of(paths, listed, store, roster, now)
 }
 
+/// Whether `listed` holds a pair two Macs wrote at once ([`settle_splits`] settles each).
+fn holds_split(listed: &Lookup<Vec<Standing>>) -> bool {
+    matches!(listed, Lookup::Found(standings)
+        if standings
+            .iter()
+            .any(|standing| standing.check == Check::Mismatched(Mismatch::Draft)))
+}
+
 /// [`rows_on_token_read`] over a listing of the vault at `paths` already read (`listed`, as
 /// [`claude_token::listed`] returns it): `None` where it is unknown. `paths` names the home whose
 /// stored logins the judgment's hold reads ([`super::token_route::standing_judged`]); no vault is
-/// read here.
+/// read here. The rows judged are those with a token entry and an email that are enrolled or
+/// that this Mac's claims cover ([`super::claims::covers`], FL-135); each listed standing of a
+/// judged row's token is judged at the reading `now` taken raw
+/// ([`super::token_route::standing_judged`] compares it as a number), so a listing that holds
+/// none compares nothing, and a run that judged one is never kept by an armed trace scope
+/// (ATERM-KI-1116-9216).
 #[must_use]
 pub fn rows_on_token_of(
     paths: &Paths,
     listed: Lookup<Vec<Standing>>,
     store: &Store,
     roster: &Roster,
-    now: i64,
+    now: impl Into<aterm_uds::trace::Now>,
 ) -> Option<BTreeMap<String, u64>> {
+    let now: aterm_uds::trace::Now = now.into();
     let mut out = BTreeMap::new();
     let standings = match listed {
         Lookup::Found(standings) => standings,
         Lookup::Absent => return Some(out),
         Lookup::Unknown => return None,
     };
-    let now = u64::try_from(now).unwrap_or(0);
     let enrolled = accounts::enrolled(roster);
     for row in &roster.rows {
         let (Some(entry), Some(email), true) = (
@@ -4156,7 +4295,7 @@ pub fn rows_on_token_of(
             Some(roster),
             &standing.key,
             &account,
-            now,
+            u64::try_from(now.raw()).unwrap_or(0),
         ) == super::token_route::TokenFact::InUse
             && let Some(meta) = standing.meta.as_ref()
         {

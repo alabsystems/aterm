@@ -4819,11 +4819,15 @@ mod fd {
         rels.sort_by_key(|r| r.components().count());
         let mut pinned = Vec::with_capacity(rels.len());
         for rel in rels {
-            let path = w.path.join(&rel);
-            let fd = if rel.as_os_str().is_empty() {
-                dirfd::openat(w.root, ".", dir_flags(), Mode::empty())?
+            // The directory itself is spelled as the pass's hook and lines spell it everywhere
+            // else: `w.path`, never `w.path.join("")`, which ends in a separator.
+            let (path, fd) = if rel.as_os_str().is_empty() {
+                let fd = dirfd::openat(w.root, ".", dir_flags(), Mode::empty())?;
+                (w.path.to_path_buf(), fd)
             } else {
-                reopen(w.root, w.path, &path, w.on)?
+                let path = w.path.join(&rel);
+                let fd = reopen(w.root, w.path, &path, w.on)?;
+                (path, fd)
             };
             pinned.push(Pinned {
                 profile: locked.iter().any(|l| same_path(l, &path)),

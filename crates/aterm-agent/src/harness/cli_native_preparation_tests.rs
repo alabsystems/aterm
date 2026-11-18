@@ -92,8 +92,15 @@ fn actual_native_driver_prepares_publishes_and_changed_policy_never_dispatches()
                     request.clone(),
                     lifetime.enter().unwrap(),
                 );
+                let word = crate::harness::account_names::key_word_of_row(Cli::Codex, row);
                 let drove = work.with_native_context(env, |native| {
-                    plan.drive(Cli::Codex, &LocalOnly(env.now), row, &store, Some(native))
+                    plan.drive(
+                        Cli::Codex,
+                        &LocalOnly(env.now),
+                        (row, &word),
+                        &store,
+                        Some(native),
+                    )
                 });
                 native_preparation_fixture::STOP.with(|stop| stop.set(false));
                 assert_eq!(

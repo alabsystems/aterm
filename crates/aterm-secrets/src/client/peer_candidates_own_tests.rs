@@ -286,3 +286,83 @@ fn the_names_a_pass_resolves_are_counted_as_its_resolver_is_handed_them() {
     assert_eq!(handed.load(Ordering::Relaxed), 15);
     assert_eq!(counts.get(Count::NamesResolved), 15);
 }
+
+/// A sweep hands its resolver the names it chose, once, and never the source's own: of six names
+/// heard (one the source's, in another case), the first sweep resolves the 4 first by name, the
+/// sweep 5 s later the one left, and each name it resolved is counted once.
+///
+/// Negative control: `sweep_asks_its_source` (`.filter(|target|
+/// !target.names_source(primary) || true)` in `sweep_of`: the first sweep's URLs are 3, wants 4,
+/// the source's own name having taken a slot that resolves to the source).
+#[cfg(unix)]
+#[test]
+fn a_sweep_resolves_each_name_it_chose_once_and_never_the_sources() {
+    use super::super::subscriber_gate::Turn;
+    use crate::pass_counts::{Count, PassCounts, metered};
+    const PRIMARY: &str = "http://m22.local:7484/v1/alab";
+    let counts = Arc::new(PassCounts::default());
+    let _metered = metered(&counts);
+    let handed = std::sync::Mutex::new(Vec::<Vec<String>>::new());
+    let resolve = |names: &[String], _: Duration| {
+        handed.lock().expect("handed").push(names.to_vec());
+        names
+            .iter()
+            .map(|name| DiscoveredVault {
+                url: format!(
+                    "http://{}.local:7484/v1/alab",
+                    name.chars()
+                        .filter(char::is_ascii_alphanumeric)
+                        .collect::<String>()
+                ),
+                txt: None,
+            })
+            .collect()
+    };
+    let heard = || {
+        [
+            "node-03",
+            "M22",
+            "node-01",
+            "alab-secrets (2)",
+            "node-02",
+            "node-04",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    };
+    let start = Instant::now();
+    let mut sweeps = Sweeps::default();
+    sweeps.caught_up(start, 0);
+    let first = start + crate::server::sweep_after(0);
+    assert_eq!(sweeps.turn(first, false), Turn::Sweep);
+    let sweep = |sweeps: &mut Sweeps, at: Instant| {
+        sweep_of(
+            "alab",
+            PRIMARY,
+            &[],
+            &[],
+            Pool::Names(heard()),
+            sweeps,
+            at,
+            Duration::from_secs(1),
+            resolve,
+        )
+    };
+    let (asked, urls) = sweep(&mut sweeps, first);
+    assert_eq!(asked, 4);
+    assert_eq!(urls.len(), 4, "{urls:?}");
+    sweeps.swept(first, asked, 0, 0);
+    let retry = first + Duration::from_secs(5);
+    assert_eq!(sweeps.turn(retry, false), Turn::Sweep);
+    let (asked, _) = sweep(&mut sweeps, retry);
+    assert_eq!(asked, 1);
+    let handed = handed.into_inner().expect("handed");
+    assert_eq!(
+        handed,
+        [
+            vec!["alab-secrets (2)", "node-01", "node-02", "node-03"],
+            vec!["node-04"],
+        ]
+    );
+    assert_eq!(counts.get(Count::NamesResolved), 5);
+}

@@ -13,10 +13,12 @@
 //! [`Cell::Unread`], never a zero; a cell that is known to hold nothing (a machine that answered
 //! has no reason for silence) is [`Cell::Empty`].
 
-use super::read::{At, Harness, How, Pair, State, Tally, Task};
+use super::read::{At, Harness, How, Limits, Load, OutSrc, Pair, Rate, State, Tally, Task};
 use crate::relation::{Cell, Row, Schema, col, opt};
 use crate::typed::{Member, Ty, keys};
 use aterm_json::{Value, json};
+use aterm_types::needs::NeedWord;
+use aterm_types::update_standing::UpdateFact;
 
 /// The status words of a machine row: the registry's, `retired` for a row its owner retired,
 /// and `unregistered` for a machine that answered and that no registry row names.
@@ -126,16 +128,30 @@ pub struct MachineRow {
     pub agents_listed: Option<u32>,
     /// Free space on its home volume, MiB.
     pub disk_free_mb: Option<At<u64>>,
-    /// Cores busy ×100, of cores.
+    /// Cores busy ×100, of cores, as its own look says them.
     pub cpu: Pair<u64>,
-    /// MiB in use, of MiB installed (the registry's figure).
+    /// MiB in use, of MiB installed, as its own look says them; the registry's figure is
+    /// [`Self::ram_gb`].
     pub mem: Pair<u64>,
-    /// GPU cores busy ×100, of GPU cores.
+    /// GPU cores busy ×100 (its device's busy share of its cores), of GPU cores.
     pub gpu: Pair<u64>,
-    /// MiB used on its home volume, of the volume's MiB.
+    /// MiB used on its home volume (its size less its free space), of the volume's MiB.
     pub disk: Pair<u64>,
-    /// Kilobits a second moving, of its link's rate.
+    /// Kilobits a second its fastest counted link moves in its busier direction, of that link's
+    /// rate (each direction's).
     pub net: Pair<u64>,
+    /// Its own four at-limit verdicts, as its look says them and each unread on its own: the
+    /// fold decides none. `None` where it sent no look.
+    pub limits: Option<At<Limits>>,
+    /// Its own system-load score (the deck dial's): its level and how far past capacity.
+    pub load: Option<At<Load>>,
+    /// Where its updater stands, as its last answer says.
+    pub update: Option<At<UpdateFact>>,
+    /// Old and not updating: the build its answer of now names behind the build most proven
+    /// answers of now name, and its updater not moving it on (`fold::old_and_not_updating`).
+    /// `None` where it gave no answer of now, where its build or the fleet's is unread, and,
+    /// for a machine behind, where its standing cannot tell (`fold::installing`).
+    pub old: Option<bool>,
     /// The accounts the registry's preferences expect on it.
     pub accounts_expected: Option<u32>,
     /// The accounts some evidence says run on it now.
@@ -172,6 +188,10 @@ impl MachineRow {
             gpu: Pair::UNREAD,
             disk: Pair::UNREAD,
             net: Pair::UNREAD,
+            limits: None,
+            load: None,
+            update: None,
+            old: None,
             accounts_expected: None,
             accounts_active: None,
         }
@@ -270,7 +290,7 @@ pub static MACHINES: Schema = Schema {
         opt(
             "facts_at",
             Ty::Time,
-            "when build and disk_free_mb were read",
+            "when build, disk_free_mb and the updater's standing were read",
         ),
         opt(
             "disk_free_mb",
@@ -281,11 +301,7 @@ pub static MACHINES: Schema = Schema {
         opt("cpu_cores", Ty::Uint, "cores"),
         opt("cpu_at", Ty::Time, "when the cpu pair was read"),
         opt("mem_used_mb", Ty::Uint, "memory in use, MiB"),
-        opt(
-            "mem_total_mb",
-            Ty::Uint,
-            "memory installed, MiB, from the registry",
-        ),
+        opt("mem_total_mb", Ty::Uint, "memory installed, MiB"),
         opt("mem_at", Ty::Time, "when the memory pair was read"),
         opt("gpu_used_x100", Ty::Uint, "GPU cores busy, hundredths"),
         opt("gpu_cores", Ty::Uint, "GPU cores"),
@@ -296,6 +312,28 @@ pub static MACHINES: Schema = Schema {
         opt("net_used_kbps", Ty::Uint, "network traffic, kbit/s"),
         opt("net_link_kbps", Ty::Uint, "link rate, kbit/s"),
         opt("net_at", Ty::Time, "when the network pair was read"),
+        opt("cpu_limit", Ty::Bool, "its own verdict: CPU at its limit"),
+        opt(
+            "mem_limit",
+            Ty::Bool,
+            "its own verdict: memory at its limit",
+        ),
+        opt("gpu_limit", Ty::Bool, "its own verdict: GPU at its limit"),
+        opt("disk_limit", Ty::Bool, "its own verdict: disk at its limit"),
+        opt("load_x100", Ty::Uint, "its load dial's level, 0 to 100"),
+        opt(
+            "load_over_x100",
+            Ty::Uint,
+            "how far past capacity its load dial reads, 0 to 100",
+        ),
+        opt("look_at", Ty::Time, "when its verdicts and load were read"),
+        opt("update", Ty::Text(24), "where its updater stands"),
+        opt("update_to", Ty::Text(64), "the build its standing names"),
+        opt(
+            "old",
+            Ty::Bool,
+            "its build behind the one most machines answering now run, and its updater not moving it on",
+        ),
         opt(
             "accounts_expected",
             Ty::Uint,
@@ -319,7 +357,15 @@ impl Row for MachineRow {
             .build
             .as_ref()
             .map(|at| at.at_ms)
-            .max(self.disk_free_mb.map(|at| at.at_ms));
+            .max(self.disk_free_mb.map(|at| at.at_ms))
+            .max(self.update.as_ref().map(|at| at.at_ms));
+        let limits = self.limits.map(|at| at.v);
+        let verdict =
+            |pick: fn(&Limits) -> Option<bool>| Cell::read(limits.as_ref().and_then(pick));
+        let look_at = self
+            .limits
+            .map(|at| at.at_ms)
+            .max(self.load.map(|at| at.at_ms));
         let agents_at = self
             .tally
             .map(|at| at.at_ms)
@@ -358,6 +404,19 @@ impl Row for MachineRow {
         for measure in [&self.cpu, &self.mem, &self.gpu, &self.disk, &self.net] {
             pair(&mut cells, measure);
         }
+        let update = self.update.as_ref().map(|at| &at.v);
+        cells.extend([
+            verdict(|limits| limits.cpu),
+            verdict(|limits| limits.mem),
+            verdict(|limits| limits.gpu),
+            verdict(|limits| limits.disk),
+            Cell::read(self.load.map(|at| at.v.level_x100)),
+            Cell::read(self.load.and_then(|at| at.v.over_x100)),
+            Cell::read(look_at),
+            Cell::read(update.map(|update| update.standing.word().to_owned())),
+            Cell::read(update.and_then(|update| update.to.clone())),
+            Cell::read(self.old),
+        ]);
         cells.push(Cell::read(self.accounts_expected));
         cells.push(Cell::read(self.accounts_active));
         cells
@@ -924,6 +983,31 @@ pub struct AgentRow {
     pub model: Option<String>,
     /// Whether it is pinned; unread where its row did not say.
     pub pinned: Option<bool>,
+    /// Whether its session log has a turn open; unread from an aterm before the turn, or where
+    /// its log was unread.
+    pub turn_open: Option<bool>,
+    /// Since when its open turn has been open: the read's time less the turn's age.
+    pub turn_since_ms: Option<u64>,
+    /// Since when its open step (a tool call, an approval, a question) has been open.
+    pub step_since_ms: Option<u64>,
+    /// When its last output was written: the read's time less that output's age.
+    pub out_at_ms: Option<u64>,
+    /// Where its last output was read.
+    pub out_src: Option<OutSrc>,
+    /// Its background shells running (`bg=`).
+    pub jobs: Option<u32>,
+    /// Tool steps its agent run in front has taken.
+    pub tools: Option<u32>,
+    /// Its need word, as its row says ([`super::read::AgentSeen::need`]).
+    pub need: Option<Option<NeedWord>>,
+    /// The comprehension system's activity word, as its row sent it.
+    pub activity: Option<String>,
+    /// Its conversation's input tokens so far.
+    pub tok_in: Option<u64>,
+    /// Its conversation's output tokens so far.
+    pub tok_out: Option<u64>,
+    /// Its token rate between two reads of it; one read alone has none.
+    pub rate: Option<Rate>,
     pub read_at_ms: u64,
     pub how: How,
     /// Whether the answer that listed it proved a node key this Mac binds. An unproven row is a
@@ -976,6 +1060,64 @@ pub static AGENTS: Schema = Schema {
             Ty::Bool,
             "whether a person or a lead agent pinned it; unread from an aterm before the pin",
         ),
+        opt(
+            "turn_open",
+            Ty::Bool,
+            "whether its session log has a turn open; unread from an aterm before the turn",
+        ),
+        opt(
+            "turn_since",
+            Ty::Time,
+            "since when its open turn has been open; empty where none is open",
+        ),
+        opt(
+            "step_since",
+            Ty::Time,
+            "since when its open step (a tool call, an approval, a question) has been open; empty where none is",
+        ),
+        opt("out_at", Ty::Time, "when its last output was written"),
+        opt(
+            "out_src",
+            Ty::Enum(OutSrc::WORDS),
+            "where its last output was read: its transcript, or its screen, which a spinner also moves",
+        ),
+        opt("jobs", Ty::Uint, "its background shells running"),
+        opt(
+            "tools",
+            Ty::Uint,
+            "tool steps its agent run in front has taken",
+        ),
+        opt(
+            "need",
+            Ty::Text(16),
+            "the need word its row says, a fact its class reads; empty where it says none",
+        ),
+        opt(
+            "activity",
+            Ty::Text(32),
+            "the comprehension system's activity word, where its machine sends one",
+        ),
+        opt("tok_in", Ty::Uint, "its conversation's input tokens so far"),
+        opt(
+            "tok_out",
+            Ty::Uint,
+            "its conversation's output tokens so far",
+        ),
+        opt(
+            "tok_in_per_min",
+            Ty::Uint,
+            "input tokens a minute between two reads of it",
+        ),
+        opt(
+            "tok_out_per_min",
+            Ty::Uint,
+            "output tokens a minute between two reads of it",
+        ),
+        opt(
+            "rate_over_ms",
+            Ty::Uint,
+            "the interval its token rate covers, ms",
+        ),
         col("read_at", Ty::Time, "when its row was read"),
         col("how", Ty::Enum(&["self", "survey"]), "self or survey"),
         col(
@@ -1009,6 +1151,31 @@ impl Row for AgentRow {
             },
             Cell::read(self.model.clone()),
             Cell::read(self.pinned),
+            Cell::read(self.turn_open),
+            // A turn's and a step's times are known empty where its log says none is open, and
+            // unread where its log was not read.
+            match self.turn_open {
+                Some(true) => Cell::read(self.turn_since_ms),
+                Some(false) => Cell::Empty,
+                None => Cell::Unread,
+            },
+            self.turn_open
+                .map_or(Cell::Unread, |_| Cell::known(self.step_since_ms)),
+            Cell::read(self.out_at_ms),
+            Cell::read(self.out_src.map(OutSrc::word)),
+            Cell::read(self.jobs),
+            Cell::read(self.tools),
+            match self.need {
+                None => Cell::Unread,
+                Some(None) => Cell::Empty,
+                Some(Some(need)) => Cell::of(need.word()),
+            },
+            Cell::read(self.activity.clone()),
+            Cell::read(self.tok_in),
+            Cell::read(self.tok_out),
+            Cell::read(self.rate.map(|rate| rate.in_per_min)),
+            Cell::read(self.rate.map(|rate| rate.out_per_min)),
+            Cell::read(self.rate.map(|rate| rate.over_ms)),
             Cell::of(self.read_at_ms),
             Cell::of(self.how.word()),
             Cell::of(self.proven),

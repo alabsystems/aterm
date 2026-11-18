@@ -4550,14 +4550,23 @@ fn a_short_manifest_and_targo_twins_name_what_their_long_spellings_name() {
         );
         assert!(paired.is_dir() && inside.is_dir(), "{var}");
     }
-    assert!(!produce(super::super::BUILD_DIR_TWIN, &inside, Tool::Cargo, &[]).unwrap());
+    // Upstream cargo ignores the twin but still admits its already registered default target.
+    let ignored = world.home.join("ignored-build");
+    assert!(produce(super::super::BUILD_DIR_TWIN, &ignored, Tool::Cargo, &[]).unwrap());
+    assert!(!ignored.exists());
     assert!(!outside.exists());
     // A target in `TARGO_TARGET_DIR` that cargo did not make owes custody it cannot have.
     let made = world.home.join("made-by-hand.noindex");
     std::fs::create_dir(&made).unwrap();
     for var in ["TARGO_TARGET_DIR", "TARGO_BUILD_TARGET_DIR"] {
         assert!(produce(var, &made, Tool::Targo, &[]).is_err(), "{var}");
-        assert!(!produce(var, &made, Tool::Cargo, &[]).unwrap(), "{var}");
+        assert!(produce(var, &made, Tool::Cargo, &[]).unwrap(), "{var}");
+        assert!(!made.join(MARKER).exists(), "{var}");
+        assert!(
+            roots(&world.home)
+                .iter()
+                .all(|receipt| receipt.root != made)
+        );
     }
 
     // The twins, a `-C` in a cluster and a `TARGO_HOME`'s config each leave a choice the
@@ -10156,7 +10165,15 @@ fn through_placed_front(
     if let Some(directory) = build_env {
         command.env(super::super::BUILD_DIR_ENV, directory);
     }
-    aterm_uds::deadline::ends_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
+    // The front can run a real build (the compiler and its build scripts), which a loaded Mac
+    // stretches past any wall-clock minute while it keeps working: the run is held to its own
+    // and its descendants' progress, a minute without any being the hang.
+    aterm_uds::deadline::output_while_process_progressing(
+        &mut command,
+        aterm_spec::wait::MUST_HAPPEN,
+        "the placed front's run of its tool",
+    )
+    .unwrap_or_else(|why| panic!("{why}"))
 }
 
 #[cfg(target_os = "macos")]
@@ -11320,66 +11337,60 @@ fn ordinary_update_reaches_the_real_driver_without_building_or_changing_cache_cu
     }
 }
 
+/// A real compiler, run through the clean front with its two outputs configured by `source`,
+/// writes the library under the target directory and its intermediates under the selected
+/// build directory, and both roots are recorded with the owner as their custody.
 #[cfg(target_os = "macos")]
-#[test]
-fn a_real_compiler_writes_both_configured_outputs_under_recorded_custody() {
-    for source in [
-        "cli",
-        "toml11-cli",
-        "discovered",
-        "toml11-discovered",
-        "nested",
-        "legacy",
-    ] {
-        let world = World::new();
-        std::fs::write(
+fn a_real_compiler_writes_both_configured_outputs_under_recorded_custody(source: &str) {
+    let world = World::new();
+    std::fs::write(
         world.owner.join("Cargo.toml"),
         "[package]\nname='configured-output-probe'\nversion='0.0.0'\nedition='2024'\n[workspace]\n",
     )
     .unwrap();
-        std::fs::create_dir(world.owner.join("src")).unwrap();
-        std::fs::write(
-            world.owner.join("src/lib.rs"),
-            "pub fn value() -> usize { 42 }\n",
-        )
-        .unwrap();
-        let intermediates = match source {
-            "cli" | "toml11-cli" => world.home.join("intermediates.noindex"),
-            "nested" => world.owner.join(".cargo/intermediates.noindex"),
-            _ => world.owner.join("intermediates.noindex"),
-        };
-        let mut args = vec![
-            "--unverified".into(),
-            "build".into(),
-            "--offline".into(),
-            "-j1".into(),
-        ];
-        if matches!(source, "cli" | "toml11-cli") {
-            args.extend([
-                "--target-dir".into(),
-                world.target.display().to_string(),
-                "--config".into(),
-                if source == "toml11-cli" {
-                    format!("build.\"build\\x2Ddir\"='{}'", intermediates.display())
-                } else {
-                    format!("build.build-dir='{}'", intermediates.display())
-                },
-            ]);
+    std::fs::create_dir(world.owner.join("src")).unwrap();
+    std::fs::write(
+        world.owner.join("src/lib.rs"),
+        "pub fn value() -> usize { 42 }\n",
+    )
+    .unwrap();
+    let intermediates = match source {
+        "cli" | "toml11-cli" => world.home.join("intermediates.noindex"),
+        "nested" => world.owner.join(".cargo/intermediates.noindex"),
+        _ => world.owner.join("intermediates.noindex"),
+    };
+    let mut args = vec![
+        "--unverified".into(),
+        "build".into(),
+        "--offline".into(),
+        "-j1".into(),
+    ];
+    if matches!(source, "cli" | "toml11-cli") {
+        args.extend([
+            "--target-dir".into(),
+            world.target.display().to_string(),
+            "--config".into(),
+            if source == "toml11-cli" {
+                format!("build.\"build\\x2Ddir\"='{}'", intermediates.display())
+            } else {
+                format!("build.build-dir='{}'", intermediates.display())
+            },
+        ]);
+    } else {
+        let config = world.owner.join(".cargo");
+        let leaf = if source == "nested" {
+            "layers/layout.toml"
         } else {
-            let config = world.owner.join(".cargo");
-            let leaf = if source == "nested" {
-                "layers/layout.toml"
-            } else {
-                "layout.toml"
-            };
-            std::fs::create_dir_all(config.join(leaf).parent().unwrap()).unwrap();
-            let root = if source == "legacy" {
-                "config"
-            } else {
-                "config.toml"
-            };
-            std::fs::write(config.join(root), format!("include=['{leaf}']")).unwrap();
-            std::fs::write(
+            "layout.toml"
+        };
+        std::fs::create_dir_all(config.join(leaf).parent().unwrap()).unwrap();
+        let root = if source == "legacy" {
+            "config"
+        } else {
+            "config.toml"
+        };
+        std::fs::write(config.join(root), format!("include=['{leaf}']")).unwrap();
+        std::fs::write(
                 config.join(leaf),
                 if source == "toml11-discovered" {
                     format!("build = {{\n target-dir = '{}',\n \"build\\x2Ddir\" = 'intermediates.noindex',\n}}\n", world.target.display())
@@ -11391,61 +11402,99 @@ fn a_real_compiler_writes_both_configured_outputs_under_recorded_custody() {
                 },
             )
             .unwrap();
-            if source == "legacy" {
-                std::fs::write(
-                    config.join("config.toml"),
-                    "build.build-dir='ignored-build'",
-                )
-                .unwrap();
-            }
-        }
-        let out = through_clean_front(&world, Path::new(env!("CARGO")), &args);
-        assert!(
-            out.status.success(),
-            "real {source} configured build: {out:?}"
-        );
-        assert!(
-            world
-                .target
-                .join("debug/libconfigured_output_probe.rlib")
-                .is_file()
-        );
-        // The driver may use legacy deps/ or per-unit build directories. Inspect actual
-        // compiler output without binding this custody test to either disposable layout.
-        let mut pending = vec![intermediates.clone()];
-        let mut visited = 0;
-        let mut compiled = false;
-        while let Some(dir) = pending.pop() {
-            visited += 1;
-            assert!(visited < 128, "the dependency-free fixture stays bounded");
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let entry = entry.unwrap();
-                if entry.file_type().unwrap().is_dir() {
-                    pending.push(entry.path());
-                } else if entry.file_name().to_str().is_some_and(|name| {
-                    name.starts_with("libconfigured_output_probe")
-                        && (name.ends_with(".rmeta") || name.ends_with(".rlib"))
-                }) {
-                    compiled = true;
-                }
-            }
-        }
-        assert!(
-            compiled,
-            "the compiler wrote intermediates in the selected root: {out:?}"
-        );
-        let recorded = roots(&world.home);
-        assert_eq!(recorded.len(), 2);
-        for output in [&world.target, &intermediates] {
-            let entry = recorded.iter().find(|entry| entry.root == *output).unwrap();
-            let receipt = super::read(&entry.receipt_path).unwrap();
-            assert_eq!(
-                receipt.owners.as_slice(),
-                std::slice::from_ref(&world.owner)
-            );
-            assert!(!receipt.owners_unknown && same(&world.home, &receipt));
+        if source == "legacy" {
+            std::fs::write(
+                config.join("config.toml"),
+                "build.build-dir='ignored-build'",
+            )
+            .unwrap();
         }
     }
+    let out = through_clean_front(&world, Path::new(env!("CARGO")), &args);
+    assert!(
+        out.status.success(),
+        "real {source} configured build: {out:?}"
+    );
+    assert!(
+        world
+            .target
+            .join("debug/libconfigured_output_probe.rlib")
+            .is_file()
+    );
+    // The driver may use legacy deps/ or per-unit build directories. Inspect actual
+    // compiler output without binding this custody test to either disposable layout.
+    let mut pending = vec![intermediates.clone()];
+    let mut visited = 0;
+    let mut compiled = false;
+    while let Some(dir) = pending.pop() {
+        visited += 1;
+        assert!(visited < 128, "the dependency-free fixture stays bounded");
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(entry.path());
+            } else if entry.file_name().to_str().is_some_and(|name| {
+                name.starts_with("libconfigured_output_probe")
+                    && (name.ends_with(".rmeta") || name.ends_with(".rlib"))
+            }) {
+                compiled = true;
+            }
+        }
+    }
+    assert!(
+        compiled,
+        "the compiler wrote intermediates in the selected root: {out:?}"
+    );
+    let recorded = roots(&world.home);
+    assert_eq!(recorded.len(), 2);
+    for output in [&world.target, &intermediates] {
+        let entry = recorded.iter().find(|entry| entry.root == *output).unwrap();
+        let receipt = super::read(&entry.receipt_path).unwrap();
+        assert_eq!(
+            receipt.owners.as_slice(),
+            std::slice::from_ref(&world.owner)
+        );
+        assert!(!receipt.owners_unknown && same(&world.home, &receipt));
+    }
+}
+
+// One test per configuration source, so each real build is judged on its own within the
+// test runner's one-minute hang detector: all six in one test took 58.7 s alone and passed
+// the detector on a loaded machine.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_real_compiler_writes_both_configured_outputs_from_the_command_line() {
+    a_real_compiler_writes_both_configured_outputs_under_recorded_custody("cli");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_real_compiler_writes_both_configured_outputs_from_a_toml_1_1_command_line() {
+    a_real_compiler_writes_both_configured_outputs_under_recorded_custody("toml11-cli");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_real_compiler_writes_both_configured_outputs_from_a_discovered_config() {
+    a_real_compiler_writes_both_configured_outputs_under_recorded_custody("discovered");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_real_compiler_writes_both_configured_outputs_from_a_discovered_toml_1_1_config() {
+    a_real_compiler_writes_both_configured_outputs_under_recorded_custody("toml11-discovered");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_real_compiler_writes_both_configured_outputs_from_a_nested_include() {
+    a_real_compiler_writes_both_configured_outputs_under_recorded_custody("nested");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_real_compiler_writes_both_configured_outputs_from_a_legacy_config() {
+    a_real_compiler_writes_both_configured_outputs_under_recorded_custody("legacy");
 }
 
 #[cfg(target_os = "macos")]
@@ -11504,7 +11553,13 @@ fn a_real_clean_and_rebuild_publish_fresh_owned_output_over_only_a_missing_root(
     if let Some(path) = std::env::var_os("PATH") {
         foreign.env("PATH", path);
     }
-    let out = aterm_uds::deadline::ends_within(&mut foreign, aterm_spec::wait::MUST_HAPPEN);
+    // A real build, held to its progress as `through_placed_front`'s is.
+    let out = aterm_uds::deadline::output_while_process_progressing(
+        &mut foreign,
+        aterm_spec::wait::MUST_HAPPEN,
+        "the foreign producer's build",
+    )
+    .unwrap_or_else(|why| panic!("{why}"));
     assert!(
         out.status.success(),
         "unregistered compiler output: {out:?}"
@@ -11701,6 +11756,19 @@ fn a_real_metadata_into_a_tagged_folder_leaves_nothing_adoptable() {
             );
         }
     }
+}
+
+#[test]
+fn configured_suppression_refuses_an_overfull_index_before_changing_receipts() {
+    let world = World::new();
+    world.build();
+    let before = std::fs::read(world.path()).unwrap();
+    let directory = world.path().parent().unwrap().to_path_buf();
+    for n in 0..MAX_ROOTS {
+        std::fs::write(directory.join(format!("extra-{n}")), b"").unwrap();
+    }
+    assert!(suppress_configured(&world.home).is_err());
+    assert_eq!(std::fs::read(world.path()).unwrap(), before);
 }
 
 #[test]
@@ -12612,99 +12680,6 @@ fn the_fronts_placement_lands_where_targo_writes_it() {
     assert!(roots(&world.home).is_empty());
 }
 
-/// THE HOP PICKS ITS COMPILER BY THE LAUNCHER'S trust.lock, so a `-C` whose directory
-/// finds another outcome is refused: a tree with its own lock, a tree with none from a
-/// locked launcher, and a lock that does not read on either side, the same file included.
-/// NEGATIVE CONTROL: a `-C` into the launcher's own locked tree, by an absolute or a
-/// relative path, one between two trees with no lock, a call with no `-C`, and the lint,
-/// whose words are its own.
-#[test]
-fn a_dash_c_whose_trust_lock_differs_from_the_launchers_is_refused() {
-    use super::super::Tool;
-    let scratch = aterm_tempfile::tempdir().unwrap();
-    let base = std::fs::canonicalize(scratch.path()).unwrap();
-    let lock = crate::trust_lock::render_body(&crate::trust_lock::TrustLock {
-        build: 16387,
-        tree_root: "46ca692db799c27b4874df3de5c635ddb0845d32ff2d23cb2546e613dc5626f1".into(),
-        compiler_commit: "29ebb403de7a102850d6cb10a62d5cc3baf723ed".into(),
-        receipt:
-            "SEED-MINT sha256:4cd1415f6a19170ee60a26f5fdb2e799e3fc2dbfc939caff1c64a83fa554c620"
-                .into(),
-        stock_toolchain: "1.99.1".into(),
-    });
-    let tree = |name: &str, lock: Option<&str>| {
-        let dir = base.join(name);
-        std::fs::create_dir_all(dir.join("sub")).unwrap();
-        if let Some(lock) = lock {
-            std::fs::write(dir.join("trust.lock"), lock).unwrap();
-        }
-        dir
-    };
-    let locked = tree("locked", Some(&lock));
-    let other = tree("other", Some(&lock));
-    let bare = tree("bare", None);
-    let bare_too = tree("bare-too", None);
-    let broken = tree("broken", Some("not a lock"));
-    let guard = |cwd: &Path, words: &[&str], tool: Tool| {
-        let words: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
-        directory_lock_guard(&words, tool, "-", Some(cwd))
-    };
-    let into = |dir: &Path| {
-        vec![
-            "-Zunstable-options".to_owned(),
-            "-C".to_owned(),
-            dir.display().to_string(),
-            "trust".to_owned(),
-            "check".to_owned(),
-        ]
-    };
-    let call = |cwd: &Path, words: Vec<String>, tool: Tool| {
-        let words: Vec<&str> = words.iter().map(String::as_str).collect();
-        guard(cwd, &words, tool)
-    };
-    for (row, launcher, dir) in [
-        ("its own lock", &locked, other.clone()),
-        ("no lock there", &locked, bare.clone()),
-        ("no lock here", &bare, locked.clone()),
-        ("unreadable there", &bare, broken.join("sub")),
-        ("unreadable both", &broken, broken.join("sub")),
-    ] {
-        let refused = call(launcher, into(&dir), Tool::Targo);
-        let why = refused.expect_err(row).to_string();
-        assert!(why.contains("trust.lock"), "{row}: {why}");
-        assert!(
-            why.contains("run the call from the tree it builds"),
-            "{row}: {why}"
-        );
-    }
-    for (row, launcher, words) in [
-        ("same tree", &locked, into(&locked.join("sub"))),
-        (
-            "same tree, relative",
-            &locked,
-            ["-Zunstable-options", "-C", "sub", "trust", "check"]
-                .map(str::to_owned)
-                .to_vec(),
-        ),
-        ("no lock either side", &bare, into(&bare_too)),
-        (
-            "no -C",
-            &locked,
-            ["trust", "check"].map(str::to_owned).to_vec(),
-        ),
-    ] {
-        assert!(call(launcher, words, Tool::Targo).is_ok(), "{row}");
-    }
-    assert!(call(&locked, into(&other), Tool::Tippy).is_ok(), "lint");
-    // The shim's own leading `--config` pair is no word a `-C` is read past.
-    let mut placed = vec![
-        "--config".to_owned(),
-        "build.build-dir='/x/.ubd/build.noindex'".to_owned(),
-    ];
-    placed.extend(into(&other));
-    assert!(directory_lock_guard(&placed, Tool::Targo, "config", Some(&locked)).is_err());
-}
-
 /// A workspace rooted at HOME, which atpkg never manages, builds into `~/target` whenever
 /// its call names no target: the local fallback's `{workspace-root}/target` and a cache
 /// placement's final artifacts alike. Where that folder is a root recorded for another
@@ -12712,6 +12687,96 @@ fn a_dash_c_whose_trust_lock_differs_from_the_launchers_is_refused() {
 /// builds there, so the call holds it in custody (`owners_unknown`); the same member naming
 /// it explicitly is refused, as it owes custody no owner may take. NEGATIVE CONTROL: where
 /// nothing is recorded there, nothing is.
+#[test]
+fn a_cache_placed_build_keeps_its_default_target_after_the_previous_owner_goes() {
+    for shape in ["recorded", "linked", "corrupt", "ordinary", "fresh"] {
+        let world = World::new();
+        let owner = world.another_owner();
+        let target = owner.join("target");
+        let root = if shape == "linked" {
+            world.target.clone()
+        } else {
+            target.clone()
+        };
+        let recorded = matches!(shape, "recorded" | "linked" | "corrupt");
+        if recorded {
+            assert!(create_checked(&world.home, &root, &world.owner).unwrap());
+        }
+        if shape != "fresh" {
+            std::fs::create_dir_all(root.join("debug/deps")).unwrap();
+            std::fs::write(root.join("debug/deps/keep"), b"reusable output").unwrap();
+            std::fs::write(root.join("debug/.cargo-lock"), b"").unwrap();
+        }
+        if shape == "linked" {
+            std::os::unix::fs::symlink(&root, &target).unwrap();
+        }
+        if shape == "corrupt" {
+            let path = world
+                .home
+                .join(INDEX)
+                .join(format!("{}.json", key(&root).unwrap()));
+            std::fs::write(path, b"invalid receipt").unwrap();
+        }
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(&owner),
+            env: &|_| None,
+            read: &live_read,
+            read_manifest: &live_read,
+            writable: &|_| Some(true),
+        };
+        let args = ["--unverified".into(), "build".into()];
+        assert!(matches!(
+            super::super::decide(&args, super::super::Tool::Targo, &machine),
+            Some(super::super::BuildDir::Cache(_))
+        ));
+        let observed = observe_for_producer(
+            &args,
+            super::super::Tool::Targo,
+            &world.home,
+            &machine,
+            true,
+        );
+        if shape == "corrupt" {
+            assert!(observed.is_err(), "{shape}: {observed:?}");
+            assert!(target.join("debug/deps/keep").is_file());
+            continue;
+        }
+        assert_eq!(observed.unwrap(), recorded, "{shape}");
+        std::fs::remove_dir_all(&world.owner).unwrap();
+        let processes = |_: &[PathBuf], _: &[u32]| Ok(aterm_uds::holders::PathScan::default());
+        let fence = super::super::fence::Fence::new(&processes);
+        assert!(
+            reclaim_on(
+                &world.home,
+                world.later(),
+                super::super::ReclaimAfter::CALM,
+                None,
+                &mut |_, _| true,
+                &fence,
+            )
+            .is_empty(),
+            "{shape}"
+        );
+        if recorded {
+            assert!(target.join("debug/deps/keep").is_file());
+            let receipt = roots(&world.home)
+                .into_iter()
+                .find(|r| r.root == root)
+                .unwrap();
+            assert!(receipt.owners.contains(&owner));
+            assert!(!receipt.owners_unknown);
+        } else {
+            assert_eq!(target.exists(), shape != "fresh");
+            assert!(
+                roots(&world.home).is_empty(),
+                "{shape}: ordinary targets remain unowned"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_home_rooted_workspace_holds_a_recorded_home_target_in_custody() {
     use super::super::{BUILD_DIR_ENV, Tool};

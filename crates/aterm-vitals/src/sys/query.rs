@@ -108,6 +108,17 @@ impl View {
         Self::ALL.into_iter().find(|v| v.word() == w)
     }
 
+    /// The ordinary snapshot freshness threshold for this view, in milliseconds.
+    #[must_use]
+    pub fn freshness_default_ms(self) -> u64 {
+        match self {
+            Self::Cores => 1_000,
+            Self::Why => 5_000,
+            Self::Disk => 10_000,
+            _ => 2_000,
+        }
+    }
+
     /// Returns the default scope for `self`, or `None` for scope views and `why`.
     #[must_use]
     pub fn default_scope(self) -> Option<ScopeArg> {
@@ -479,12 +490,7 @@ impl SysQuery {
     /// Returns the default snapshot freshness threshold in milliseconds for `self.view`.
     #[must_use]
     pub fn freshness_default_ms(&self) -> u64 {
-        match self.view {
-            View::Cores => 1_000,
-            View::Why => 5_000,
-            View::Disk => 10_000,
-            _ => 2_000,
-        }
+        self.view.freshness_default_ms()
     }
 }
 

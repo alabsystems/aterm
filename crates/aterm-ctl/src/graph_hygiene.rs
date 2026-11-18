@@ -102,6 +102,39 @@ pub(crate) fn read_entry(path: &Path) -> std::io::Result<(String, Option<SystemT
     crate::read_bounded_regular_utf8(path, crate::MAX_GRAPH_ENTRY_BYTES)
 }
 
+/// What a discovery graph says of one session ([`session_served_in`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Served {
+    /// Its entry names this pid, a process that runs and was born no later than the entry was
+    /// written ([`writer_gone`]): that instance holds the session.
+    By(u32),
+    /// No instance serves it: it has no entry, or the process its entry names ended or another
+    /// process took its pid.
+    Gone,
+    /// The graph cannot say: its folder or the entry could not be read, the entry names no pid,
+    /// or the word is no session id.
+    Unknown,
+}
+
+/// What `dir`'s `graph` folder, where every instance publishes each session it holds and from
+/// which it retires the session as its tab closes, says of session `sid`. Reads one entry and
+/// the process it names; connects to no socket.
+#[must_use]
+pub fn session_served_in(dir: &Path, sid: &str) -> Served {
+    let Some(sid) = aterm_types::control_request::Sid::parse(sid) else {
+        return Served::Unknown;
+    };
+    match read_entry(&dir.join("graph").join(sid.as_str())) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Served::Gone,
+        Err(_) => Served::Unknown,
+        Ok((body, written)) => match aterm_types::control_socket::graph_entry_pid(&body) {
+            Some(pid) if pid != 0 && writer_gone(pid, written) => Served::Gone,
+            Some(pid) if pid != 0 => Served::By(pid),
+            _ => Served::Unknown,
+        },
+    }
+}
+
 /// Remove the graph entry at `entry`.
 pub(crate) fn prune_dead_entry(entry: &Path, seen: &str) -> bool {
     let (Some(dir), Some(name)) = (entry.parent(), entry.file_name()) else {

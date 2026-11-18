@@ -403,10 +403,12 @@ fn paging_host(
                     Paging::Repeats => crate::membership_log::store::Missing {
                         records: server.missing_within(&[], cap).records,
                         more: true,
+                        served: None,
                     },
                     Paging::EmptyMore => crate::membership_log::store::Missing {
                         records: Vec::new(),
                         more: true,
+                        served: None,
                     },
                 };
                 kept.lock()
@@ -485,7 +487,16 @@ fn vault_fence_a_pull_larger_than_one_reply_arrives_in_closed_prefixes() {
         &key,
     );
     save_records(&control, &encode_records(&held[..1])).expect("the genesis");
-    let one = records_pass(&control, None, &[], Some(&found), None, None).expect("one pass");
+    let one = records_pass(
+        &control,
+        None,
+        &[],
+        Some(&found),
+        None,
+        None,
+        Ask::All(None),
+    )
+    .expect("one pass");
     assert!(one.more && !one.fresh(), "control: {one:?}");
     assert!(one.added > 0 && one.added < 40, "control: {one:?}");
 
@@ -605,7 +616,8 @@ fn vault_fence_only_a_stated_reply_with_records_says_more() {
             &key,
         );
         save_records(&member, &encode_records(&held[..1])).expect("the genesis");
-        let pass = records_pass(&member, None, &[], Some(&found), None, None).expect("a pass");
+        let pass = records_pass(&member, None, &[], Some(&found), None, None, Ask::All(None))
+            .expect("a pass");
         stop.store(true, Ordering::SeqCst);
         let _ = TcpStream::connect(addr);
         worker.join().expect("the host ends");
@@ -1805,6 +1817,7 @@ fn a_member_whose_server_holds_records_it_cannot_take_lets_no_key_in_by_proof() 
             untaken: true,
             unstated: false,
             more: false,
+            source_short: false,
         },
         "the next pass names what it could not take, and the server sends nothing"
     );
@@ -1940,6 +1953,50 @@ fn a_peer_that_holds_a_record_this_build_cannot_read_sends_it_once() {
         Some(child.id()),
         "the pull to the peer names what it could not take first"
     );
+}
+
+/// A source-first pass ([`subscriber_gate::Gate::SourceFirst`]) asks its peers only for what its
+/// source could not give: a source that sends a record this build cannot read and its child
+/// sends a stream the store cannot take whole, and that pass asks the peer, which holds the same;
+/// every pass after names what the store could not take, the source sends nothing, and no pass
+/// asks the peer. A memo's heads named in a pull are no shortfall: every peer holds what the
+/// source could not give.
+///
+/// Negative control: `fan_out_on_named_heads` (`|| primary_named.heads > 0` in `records_pass`'s
+/// `source_short`: the peer is asked 3 times, wants 1).
+#[test]
+fn a_mixed_fleet_memo_does_not_fan_out() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let founded = Founded::new(6);
+    let (newer, parents) = founded.unread(6);
+    let mut chain = Chain::of(&founded.records);
+    let newer_id = chain.push_raw(newer, parents);
+    let child = founded.after(8, newer_id, "child");
+    chain.push(&child);
+    let chain = Arc::new(std::sync::Mutex::new(chain));
+    let source = chain_host(&chain, 400);
+    let peer = chain_host(&chain, 400);
+    let member = member_of(root.path(), &source);
+    save_records(&member, &encode_records(&founded.records)).expect("the member's store");
+    let found = |_: &Config| {
+        vec![crate::discover::DiscoveredVault {
+            url: peer.url("team"),
+            txt: None,
+        }]
+    };
+    let found = PeerDiscovery::supplied(&found);
+    let gate = subscriber_gate::Gate::SourceFirst;
+    for _ in 1..=3 {
+        subscriber_records(&member, &[], Some(&found), None, Some(&gate));
+    }
+    let (asked_source, asked_peer) = (source.answers(), peer.answers());
+    source.end();
+    peer.end();
+    assert_eq!(asked_source.len(), 3, "each pass asks the source");
+    assert!(asked_source[1].body.is_empty() && asked_source[2].body.is_empty());
+    assert_eq!(asked_peer.len(), 1, "only the first pass asks the peer");
 }
 
 /// F23 (rule 8, failure case 1): a server that judged a member's post and still lacks its

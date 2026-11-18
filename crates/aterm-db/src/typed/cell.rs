@@ -208,6 +208,15 @@ fn refuse(collection: &Collection, column: &str, rule: &str) -> Error {
     Error::new(&format!("{}.{column}: {rule}", collection.name))
 }
 
+/// The rule `x` breaks as a value of `ty` in a column that takes null where `null` says, or
+/// `Ok` where it breaks none. The rule names no part of the value.
+///
+/// # Errors
+/// The rule it breaks.
+pub fn rule(ty: &Ty, x: &Value, null: bool) -> std::result::Result<(), &'static str> {
+    check(ty, x, null)
+}
+
 /// Check one value against a type. The rule it breaks names no part of the value.
 fn check(ty: &Ty, x: &Value, null: bool) -> std::result::Result<(), &'static str> {
     if x.is_null() {

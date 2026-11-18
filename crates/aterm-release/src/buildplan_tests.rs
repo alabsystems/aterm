@@ -929,7 +929,7 @@ use std::ffi::OsString;
 use super::{
     BuildOutput, LC_SEGMENT_64, MACH_HEADER_64_LEN, MACH_MAGIC_64, MH_EXECUTE, PrivateSliceDir,
     RELEASE_SYSTEM_PATH, ReleaseEnv, Renderer, SECTION_64_LEN, SEGMENT_COMMAND_64_LEN, SliceArch,
-    SliceBuild, cargo_build_args, current_release_uid, parse_thin_macho_update_pin,
+    SliceBuild, Stock, cargo_build_args, current_release_uid, parse_thin_macho_update_pin,
     publish_verified_output, release_build_command, release_env, release_tool_path,
     resolve_release_rustup_shim_dir, slice_drives_a_session, turn_verdict,
     validate_app_version_reports, validate_cli_app_version, validate_embedded_update_pin,
@@ -1467,7 +1467,9 @@ fn a_slices_cargo_names_this_executable_its_compiler_wrapper_and_gains_nothing_e
     .remove(0);
     let wrapper = std::path::Path::new("/r/aterm-release");
     let root = std::path::Path::new("/private/take/snapshot/src");
+    let sdk = crate::build_inputs::AppleSdk::capture().unwrap();
     let env = |units| ReleaseEnv {
+        sdk: &sdk,
         path: "/t/bin:/usr/bin".into(),
         home: std::ffi::OsStr::new("/h"),
         tmp: std::path::Path::new("/private/take/tmp"),
@@ -1476,7 +1478,7 @@ fn a_slices_cargo_names_this_executable_its_compiler_wrapper_and_gains_nothing_e
         short_commit: "0123456789ab",
         commit: "0123456789abcdef0123456789abcdef01234567",
         target_dir: "/private/take/target".into(),
-        rustup_home: None,
+        stock: None,
         index_hint: None,
         units,
     };
@@ -1523,13 +1525,34 @@ fn the_release_build_enables_no_development_seam() {
             "{target:?}: the cutter builds the `release` profile the pins below read: {args:?}"
         );
     }
-    for (rustup_home, index_hint) in [
+    // The compat slice's release is the one its candidate's lock names, taken as the release
+    // takes it (`trust_lock::stock_toolchain`); a release no rustup channel spells.
+    let locked = crate::trust_lock::stock_toolchain(
+        Some(atpkg::trust_lock::TrustLock {
+            build: 16387,
+            tree_root: "4".repeat(64),
+            compiler_commit: "29ebb403de7a102850d6cb10a62d5cc3baf723ed".into(),
+            receipt: "SEED-MINT sha256:00".into(),
+            stock_toolchain: "1.90.2".into(),
+        }),
+        "the fixture",
+    )
+    .unwrap();
+    let stock = Stock {
+        home: "/h".into(),
+        rustup_home: "/h/.rustup".into(),
+        shim: Ok("/stock/shims".into()),
+        toolchain: locked.clone(),
+    };
+    for (stock, index_hint) in [
         (None, None),
         (None, Some("8..72")),
-        (Some(OsString::from("/h/.rustup")), Some("8..72")),
+        (Some(stock), Some("8..72")),
     ] {
-        let compat = rustup_home.is_some();
+        let compat = stock.is_some();
+        let sdk = crate::build_inputs::AppleSdk::capture().unwrap();
         let e = ReleaseEnv {
+            sdk: &sdk,
             path: "/t/bin:/usr/bin".into(),
             home: std::ffi::OsStr::new("/h"),
             tmp: std::path::Path::new("/private/take/tmp"),
@@ -1538,7 +1561,7 @@ fn the_release_build_enables_no_development_seam() {
             short_commit: "0123456789ab",
             commit: "0123456789abcdef0123456789abcdef01234567",
             target_dir: "/private/take/target".into(),
-            rustup_home,
+            stock,
             index_hint,
             units: None,
         };
@@ -1634,8 +1657,13 @@ fn the_release_build_enables_no_development_seam() {
         }
         assert_eq!(
             get("RUSTUP_TOOLCHAIN").as_deref(),
-            compat.then_some("stable"),
-            "only the compat slice names a stock toolchain"
+            compat.then_some(locked.as_str()),
+            "only the compat slice names a stock toolchain, and it is the lock's release"
+        );
+        assert_eq!(
+            get("RUSTUP_HOME").as_deref(),
+            compat.then_some("/h/.rustup"),
+            "the compat slice's rustup home comes with its release"
         );
     }
 
@@ -1727,6 +1755,176 @@ fn the_release_build_enables_no_development_seam() {
     assert_no_debug_assertions(".cargo/config.toml", &config);
 }
 
+/// A TAKE'S TARGET SLICE BUILDS ON THE STOCK RELEASE ITS COMMIT'S LOCK NAMES: a take of a commit
+/// whose `trust.lock` names one release runs its x86_64 slice with `RUSTUP_TOOLCHAIN` naming that
+/// release, while the checkout this test runs in names another; its native slice names none. A
+/// take of a lockless commit still prepares and builds its native slice, and refuses a target
+/// slice with the missing lock named. NEGATIVE CONTROL: a slice environment that read the
+/// checkout's lock instead of the take's names the checkout's release, and the first assertion
+/// on the environment fails.
+#[test]
+fn a_takes_target_slice_builds_on_the_release_its_commits_lock_names() {
+    use super::{SliceRun, Take, X86_64};
+    use crate::snapshot_take as fx;
+    let dir = fx::scratch();
+    let (repo, lockless) = fx::fixture(dir.path());
+    let checkout = crate::trust_lock::checkout_stock_toolchain().unwrap();
+    let named = "1.90.7";
+    assert_ne!(
+        named, checkout,
+        "the commit's lock and the checkout's differ"
+    );
+    let mut lock =
+        atpkg::trust_lock::read(&aterm_tempfile::manifest_dir().join("../../trust.lock")).unwrap();
+    lock.stock_toolchain = named.into();
+    std::fs::write(
+        repo.join("trust.lock"),
+        atpkg::trust_lock::render_body(&lock),
+    )
+    .unwrap();
+    fx::git(&repo, &["add", "trust.lock"]);
+    fx::git(&repo, &["commit", "-qm", "lock"]);
+    let locked = fx::git(&repo, &["rev-parse", "HEAD"]);
+    let targo = fx::stub_targo(dir.path(), &format!("itoa 1.0.0 {}\n", fx::checksum()));
+    let cache = dir.path().join("a-release.noindex");
+    let toolchain = |take: &Take, target: Option<&str>| {
+        let run = SliceRun {
+            verb: "build",
+            pkg: "aterm",
+            target,
+            target_dir: take.slice_target(target),
+            build_number: 7,
+            index_hint: None,
+            static_crt: false,
+            units: None,
+        };
+        take.slice_env(&run, OsString::from("/usr/bin"), None)
+            .map(|env| {
+                release_env(&env)
+                    .into_iter()
+                    .find(|(name, _)| *name == "RUSTUP_TOOLCHAIN")
+                    .map(|(_, value)| value)
+            })
+    };
+    {
+        let take = Take::prepare_in(&repo, &locked, fx::held(cache.clone()), &|| {
+            Ok(targo.clone())
+        })
+        .unwrap();
+        assert_eq!(take.stock(), Ok(named));
+        assert_eq!(
+            toolchain(&take, Some(X86_64)),
+            Ok(Some(OsString::from(named))),
+            "the x86_64 slice runs the take's stock release, never the checkout's {checkout}"
+        );
+        assert_eq!(
+            toolchain(&take, None),
+            Ok(None),
+            "the native slice runs no stock release"
+        );
+    }
+    let take = Take::prepare_in(&repo, &lockless, fx::held(cache), &|| Ok(targo.clone())).unwrap();
+    assert_eq!(
+        toolchain(&take, None),
+        Ok(None),
+        "a lockless commit's native slice still builds"
+    );
+    let refused = toolchain(&take, Some(X86_64)).unwrap_err();
+    assert!(
+        refused.contains("carries no trust.lock") && refused.contains("never falls back"),
+        "{refused}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stock_probe_and_slice_environment_keep_the_captured_home_and_proxy() {
+    use super::{SliceRun, Take, TakePurpose, X86_64, stock_rustc_version_in};
+    use crate::snapshot_take as fx;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::Path;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (repo, _) = fx::fixture(root.path());
+    let mut lock =
+        atpkg::trust_lock::read(&aterm_tempfile::manifest_dir().join("../../trust.lock")).unwrap();
+    lock.stock_toolchain = "1.90.7".into();
+    std::fs::write(
+        repo.join("trust.lock"),
+        atpkg::trust_lock::render_body(&lock),
+    )
+    .unwrap();
+    fx::git(&repo, &["add", "trust.lock"]);
+    fx::git(&repo, &["commit", "-qm", "captured stock"]);
+    let commit = fx::git(&repo, &["rev-parse", "HEAD"]);
+    let vendor = fx::stub_targo(root.path(), &format!("itoa 1.0.0 {}\n", fx::checksum()));
+    for label in ["a", "b"] {
+        let shim = root.path().join(label).join("proxy");
+        std::fs::create_dir_all(&shim).unwrap();
+        let script = shim.join("rustc");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$HOME\" \"$RUSTUP_HOME\" \"$RUSTUP_TOOLCHAIN\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let stock = Stock {
+            home: root.path().join(label).join("home").into_os_string(),
+            rustup_home: root.path().join(label).join("rustup").into_os_string(),
+            toolchain: lock.stock_toolchain.clone(),
+            shim: Ok(shim.canonicalize().unwrap()),
+        };
+        let mut take = Take::prepare_in(
+            &repo,
+            &commit,
+            fx::held(root.path().join("capture-release.noindex")),
+            &|| Ok(vendor.clone()),
+        )
+        .unwrap();
+        // The input seal is supplied DATA here: this checks the subsequent production
+        // consumer, while the publication tests independently enforce its authority.
+        take.purpose = TakePurpose::Universal;
+        take.inputs = Some("a".repeat(64));
+        take.home = stock.home.clone();
+        take.compiler = Some(crate::trust_lock::CompilerInputs {
+            bin: root.path().canonicalize().unwrap(),
+            pin: crate::trust_lock::CompilerPin::of(&lock),
+            stock: Ok(stock.clone()),
+        });
+        let run = SliceRun {
+            verb: "build",
+            pkg: "aterm",
+            target: Some(X86_64),
+            target_dir: take.slice_target(Some(X86_64)),
+            build_number: 0,
+            index_hint: None,
+            static_crt: false,
+            units: None,
+        };
+        let env = take
+            .slice_env(
+                &run,
+                release_tool_path(take.stock_context().unwrap().shim().unwrap()).unwrap(),
+                None,
+            )
+            .unwrap();
+        let actual = stock_rustc_version_in(env.stock.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            actual,
+            format!(
+                "{}\n{}\n{}\n",
+                Path::new(&stock.home).display(),
+                Path::new(&stock.rustup_home).display(),
+                lock.stock_toolchain
+            )
+        );
+        let env = release_env(&env);
+        for (name, value) in stock.env() {
+            assert!(env.contains(&(name, value)));
+        }
+        assert!(env.contains(&("HOME", stock.home.clone())));
+    }
+}
+
 fn assert_no_debug_assertions(shown: &str, table: &aterm_toml::Table) {
     fn walk(shown: &str, path: &str, value: &aterm_toml::Value) {
         match value {
@@ -1781,6 +1979,7 @@ fn a_verified_take_publishes_its_binary_and_symbols_out_of_the_stage() {
         BuildOutput {
             app: app.clone(),
             snapshot_digest: "d".repeat(64),
+            inputs: None,
             slices: vec![SliceBuild {
                 triple: "aarch64-apple-darwin",
                 secs: 1,
@@ -1852,6 +2051,7 @@ fn a_verified_take_refuses_a_symlinked_output_directory() {
         BuildOutput {
             app: stage.join("aterm.app"),
             snapshot_digest: "d".repeat(64),
+            inputs: None,
             slices: Vec::new(),
             archs: "x86_64 arm64".into(),
             compiler_line: "trust".into(),

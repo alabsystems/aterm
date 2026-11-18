@@ -500,6 +500,7 @@ fn codex_request<'a>(
         cli: Cli::Codex,
         route,
         row,
+        word: None,
         staging,
         store: context.store,
         hosts,

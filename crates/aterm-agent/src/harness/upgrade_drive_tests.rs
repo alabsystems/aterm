@@ -11,6 +11,7 @@ use super::super::relaunch::{
 };
 use super::super::upgrade::Dialect;
 use super::*;
+use crate::harness::accounts::InheritNoLogin;
 #[cfg(unix)]
 use crate::harness::native_restart::fixture::retain_bound_preparation;
 use crate::supervise::ScratchDir;
@@ -2727,9 +2728,9 @@ fn parked() -> Command {
 fn parked_bare() -> Command {
     let mut c = Command::new(std::env::current_exe().expect("exe"));
     c.arg(PARK[0])
+        .inherit_no_login()
         .env(PARK_ENV, "1")
         .env("ATERM_PARENT_SESSION_ID", TAB)
-        .env_remove(crate::harness::accounts::LOGIN_ENV)
         .env_remove("HOME")
         .stdin(aterm_uds::spawnfd::Stdio::null())
         .stdout(aterm_uds::spawnfd::Stdio::null())
@@ -10757,6 +10758,7 @@ fn stand_in_shell_with(cwd: Option<&Path>, env: &[(&str, Option<&str>)]) -> Shel
     let mut command = Command::new(image.path().join("bash"));
     command
         .args(["-c", "printf 'ran\\n'; read -r _"])
+        .inherit_no_login()
         .stdin(aterm_uds::spawnfd::Stdio::piped())
         .stdout(aterm_uds::spawnfd::Stdio::piped());
     if let Some(cwd) = cwd {
@@ -12564,9 +12566,11 @@ fn an_agent_whose_host_ended_is_relaunched_in_its_reopened_tab() {
     let r = after_host_ended(&a.opts, &a.snap, true);
     assert_eq!(r.step, "would-relaunch");
     assert_eq!(r.session, SESSION);
+    // Its shell lives: the other tab's restart can still type its line, so it holds the claim.
     let old = St {
         tab: "s-0000000000000000dead".to_string(),
         pid: a.snap.pid,
+        shell: a.shell.id(),
         phase: super::super::upgrade::Phase::Exiting { at_s: now_s() },
         ..St::default()
     };
@@ -19402,6 +19406,7 @@ fn tty_zsh_with(env: &[(&str, Option<&str>)]) -> TtyChild {
         zsh.args(["-f", "-c", "printf 'ran\\n' > \"$1\"; \"$2\" 60; :", "zsh"])
             .arg(&proof)
             .arg(&sleeper)
+            .inherit_no_login()
             .stdout(tty()?)
             .stderr(tty()?);
         for (name, value) in env {
@@ -19543,6 +19548,178 @@ fn host_a_pty_when_asked() {
     said(format!("\n{ENDED}{status}\n").as_bytes());
 }
 
+/// What tells [`start_children_on_this_binarys_login_when_asked`] to start a child from each
+/// spawning helper and judge the login its exec environment reads as.
+#[cfg(target_os = "macos")]
+const LOGIN_PROBE_ENV: &str = "UPGRADE_DRIVE_TEST_LOGIN_PROBE";
+
+/// The login probe's argv: this test binary, running only
+/// [`start_children_on_this_binarys_login_when_asked`].
+#[cfg(target_os = "macos")]
+const LOGIN_PROBE: [&str; 3] = [
+    "harness::upgrade_drive::tests::start_children_on_this_binarys_login_when_asked",
+    "--exact",
+    "--nocapture",
+];
+
+/// What the login probe says, on a line of its own, before the helpers it started a child from,
+/// once each of those children read as the stored login in its default home.
+#[cfg(target_os = "macos")]
+const LOGIN_PROBE_PASSED: &str = "the login probe's children read as the stored login: ";
+
+/// The helpers the login probe starts a child from: every helper of these tests whose child's
+/// exec environment the code under test judges (the login wall's and the stall's stand-in agents
+/// are [`parked_bare`]'s), and the checked relaunch fixture's source process, which aterm-gui's
+/// tests start too.
+#[cfg(target_os = "macos")]
+const LOGIN_PROBE_HELPERS: &str =
+    "parked_bare, tty_agent, tty_zsh, stand_in_shell_with, PtyHost, checked_fixture::World";
+
+/// The login probe's body: a child from each of [`LOGIN_PROBE_HELPERS`] ([`parked_bare`],
+/// [`tty_agent`], [`tty_zsh`], [`stand_in_shell_at`], the program a [`PtyHost`] hosts, and a
+/// [`crate::harness::relaunch::checked_fixture::World`]'s source process), each judged by its
+/// kernel exec environment as the code under test judges it (`ProcessLogin::of_exec_env`). A
+/// child that reads as anything but the stored login in its default home is named with its route
+/// and the login or route variables it holds, never a value.
+#[cfg(target_os = "macos")]
+#[test]
+fn start_children_on_this_binarys_login_when_asked() {
+    use crate::harness::accounts::{AuthRoute, ProcessLogin, names_a_login_or_route};
+    use std::ffi::OsStr;
+    if std::env::var_os(LOGIN_PROBE_ENV).is_none() {
+        return;
+    }
+    let stored = ProcessLogin::of_env([]);
+    let mut judged = Vec::new();
+    let mut judge = |what: &'static str, pid: u32| -> Option<String> {
+        judged.push(what);
+        let Some(args) = atpkg::caller_shell::process_args(pid) else {
+            return Some(format!("{what}: its exec environment is unread"));
+        };
+        let read = ProcessLogin::of_exec_env(&args.env);
+        if read.as_ref() == Some(&stored) {
+            return None;
+        }
+        let held: Vec<&str> = args
+            .env
+            .iter()
+            .filter_map(|entry| entry.split_once('='))
+            .map(|(name, _)| name)
+            .filter(|name| names_a_login_or_route(name))
+            .collect();
+        Some(match read {
+            None => format!("{what}: its exec environment reads empty"),
+            Some(read) => format!(
+                "{what} reads as the {} route, {} login named, {} home, holding {held:?}",
+                match read.route {
+                    AuthRoute::Stored => "stored",
+                    AuthRoute::VaultToken { .. } => "token",
+                    AuthRoute::Outside => "outside",
+                },
+                if read.login.is_some() { "a" } else { "no" },
+                if read.default_home {
+                    "the default"
+                } else {
+                    "another"
+                },
+            ),
+        })
+    };
+    let mut wrong = Vec::new();
+    let mut agent = parked_bare().spawn().expect("the stand-in agent");
+    wait_exec(agent.id());
+    wrong.extend(judge("parked_bare", agent.id()));
+    let _ = agent.kill();
+    let _ = agent.wait();
+    let on_pty = tty_agent(&[], None);
+    wrong.extend(judge("tty_agent", on_pty.id()));
+    on_pty.end();
+    let zsh = tty_zsh();
+    wrong.extend(judge("tty_zsh", zsh.id()));
+    zsh.end();
+    let bash = stand_in_shell_at(None);
+    wrong.extend(judge("stand_in_shell_with", bash.id()));
+    drop(bash);
+    let dir = scratch("login-probe");
+    let exe = std::env::current_exe().expect("exe");
+    let mut host = PtyHost::spawn(
+        &[exe.as_os_str(), OsStr::new(PARK[0]), OsStr::new(PARK[1])],
+        &dir.join("pty-host.log"),
+        &[(PARK_ENV, "1")],
+    );
+    let hosted = host.hosted("the login probe's program on the host's pty");
+    wait_exec(hosted);
+    wrong.extend(judge("PtyHost", hosted));
+    host.end("the login probe's pty host");
+    let mut world = crate::harness::relaunch::checked_fixture::World::new(
+        aterm_types::tab_id::TabId::from_bits(0x10_91_4e),
+    )
+    .expect("the checked relaunch fixture's world");
+    wrong.extend(judge("checked_fixture::World", world.process().pid));
+    world
+        .close()
+        .expect("the checked relaunch fixture's world closes");
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    println!("\n{LOGIN_PROBE_PASSED}{}", judged.join(", "));
+}
+
+/// A HELPER'S CHILD INHERITS NO LOGIN OR ROUTE THIS BINARY DOES ([`InheritNoLogin`]): under the
+/// wrapper's marker and minted time with no descriptor (what a token session's shell hands this
+/// binary), and apart under a stored login's selector and Claude home, the login probe's
+/// children ([`start_children_on_this_binarys_login_when_asked`]) each read as the stored login
+/// in its default home, as they do under a landing check's cleared environment. NEGATIVE CONTROL
+/// (2026-11-16): with [`InheritNoLogin`] taking nothing out, the marker's children read as the
+/// outside route and the selector's as a login named in another home.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_helpers_child_inherits_no_login_or_route_of_this_binary() {
+    use crate::harness::accounts::{HOME_ENV, LOGIN_ENV};
+    use crate::harness::token_route::{MARKER_ENV, MINTED_ENV};
+    use std::ffi::OsStr;
+    let dir = scratch("inherit-no-login");
+    let (login, home) = (dir.join("login"), dir.join("claude"));
+    let cases: [(&str, [(&str, &OsStr); 2]); 2] = [
+        (
+            "the wrapper's marker",
+            [
+                (MARKER_ENV, OsStr::new("aterm-claude-token-probe")),
+                (MINTED_ENV, OsStr::new("1")),
+            ],
+        ),
+        (
+            "a stored login's selector and home",
+            [(LOGIN_ENV, login.as_os_str()), (HOME_ENV, home.as_os_str())],
+        ),
+    ];
+    for (case, env) in cases {
+        let mut probe = Command::new(std::env::current_exe().expect("exe"));
+        probe
+            .args(LOGIN_PROBE)
+            .inherit_no_login()
+            .env(LOGIN_PROBE_ENV, "1");
+        for (name, value) in env {
+            probe.env(name, value);
+        }
+        let out = aterm_uds::deadline::output_while_process_progressing(
+            &mut probe,
+            aterm_spec::wait::MUST_HAPPEN,
+            "the login probe",
+        )
+        .unwrap_or_else(|e| panic!("{case}: the login probe: {e}"));
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success()
+                && said.contains(&format!("\n{LOGIN_PROBE_PASSED}{LOGIN_PROBE_HELPERS}\n")),
+            "{case}: the login probe {}:\n{said}",
+            out.status
+        );
+    }
+}
+
 /// `argv` on a pty a process of its own opened ([`host_a_pty_when_asked`]): the shape of
 /// `script -q /dev/null argv…`, of every tmux or screen pane. All the host says goes to its log:
 /// the pid of the program it started, what that program wrote on the pty, how it ended, and the
@@ -19573,6 +19750,7 @@ impl PtyHost {
         let also = said.try_clone().expect("the pty host's log, again");
         let mut c = Command::new(std::env::current_exe().expect("exe"));
         c.args(PTY_HOST)
+            .inherit_no_login()
             .env(PTY_HOST_ENV, std::ffi::OsStr::from_bytes(&words))
             .stdin(aterm_uds::spawnfd::Stdio::piped())
             .stdout(said)
@@ -19731,10 +19909,9 @@ fn tty_agent(env: &[(&str, &Path)], cwd: Option<&Path>) -> TtyChild {
         let mut agent = std::process::Command::new(&me);
         agent
             .args(PARK)
+            .inherit_no_login()
             .env(PARK_ENV, "1")
             .env("ATERM_PARENT_SESSION_ID", TAB)
-            .env_remove(crate::harness::accounts::LOGIN_ENV)
-            .env_remove(crate::harness::accounts::HOME_ENV)
             .env_remove("HOME")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -34837,8 +35014,22 @@ fn agy_limit_reset_aligns_with_live_screen_model_and_unnamed_refill() {
     );
 }
 
+/// The key a relaunch line types for `person@example.com`'s account: the resolver's
+/// ([`crate::harness::account_names::names_of_login`]), whatever keyer the journal has.
+#[cfg(target_os = "macos")]
+fn person_key() -> String {
+    crate::harness::account_names::names_of_login(
+        crate::harness::accounts::Cli::Claude,
+        None,
+        "person@example.com",
+        None,
+    )
+    .expect("a key")
+    .0
+}
+
 /// THE PLAN'S HALF OF THE ONE JUDGMENT (DESIGN-claude-setup-token S8, §5.4): a token decision
-/// types the wrapper, with the row's label, before the store build (the managed twin's, never the
+/// types the wrapper, with the account's key (never the row's label), before the store build (the managed twin's, never the
 /// twin), and the plan's account intent is the token's; any other decision types the line of
 /// today. A line after a stored login unsets no token state, so it keeps its length; a twin whose
 /// build cannot be read makes the plan the stored login's, typed through the twin.
@@ -34905,8 +35096,9 @@ fn a_token_decision_types_the_wrapper_before_the_store_build() {
         plan.unwrap_or_else(|_| panic!("a plan"))
     };
     let served = format!(
-        "'{}' 'harness' 'accounts' 'token-run' 'work' '--' '{}' '--verbose' '--resume' '{SESSION}'",
+        "'{}' 'harness' 'accounts' 'token-run' '{}' '--' '{}' '--verbose' '--resume' '{SESSION}'",
         aterm.display(),
+        person_key(),
         build.display()
     );
     for exe in [build.as_path(), twin.as_path()] {
@@ -34972,6 +35164,109 @@ fn a_token_decision_types_the_wrapper_before_the_store_build() {
         "typed through the twin: {}",
         unreadable.line
     );
+}
+
+/// THE LINE'S WORD COMES BACK TO THE ENTRY IT SERVES (SF-07H S2): the key a token line types for a
+/// row whose claims address differs from its login address, read back out of the line by the
+/// wrapper's own parse and judged by the wrapper over the same roster and home, holds the launch
+/// to the very entry the plan serves, never `outside`, under the lab journal's keyer as the app
+/// installs it (each address its own key).
+/// NEGATIVE CONTROL (2026-11-16, by hand, then restored): with `account_key_of` keying a row by
+/// its login address (`row.email`) where the plan keys it by its row, `the wrapper judged the
+/// line's word outside`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_token_lines_word_comes_back_to_the_entry_it_serves() {
+    use crate::harness::accounts_pool::ExecutionIntent;
+    use crate::harness::accounts_token_run;
+    use crate::harness::relaunch::{TOKEN_BUILDS, TOKEN_SEAM};
+    use crate::harness::token_route::{Decision, TokenFact};
+    fn lab_keyer(realm: &str, email: &str) -> Option<String> {
+        aterm_db::typed::keys::account_pk(realm, email).ok()
+    }
+    const ROSTER: &str = "[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\nemail = \
+                          \"login@example.com\"\nidentity_email = \"person@example.com\"\n";
+    let dir = scratch("line-token-round-trip");
+    let opts = drive(&dir);
+    std::fs::create_dir_all(dir.join("config")).expect("config");
+    std::fs::write(dir.join("config/accounts.toml"), ROSTER).expect("the roster");
+    std::fs::create_dir_all(opts.home.join(".claude")).expect("user dir");
+    let project = dir.join("proj");
+    std::fs::create_dir_all(&project).expect("project");
+    let cwd = project.to_str().expect("utf-8").to_owned();
+    let build = dir.join("store/claude/7/bin/claude");
+    std::fs::create_dir_all(build.parent().unwrap()).expect("the build's folder");
+    std::fs::write(&build, "a build").expect("the build");
+    let agents = dir.join("agents");
+    std::fs::create_dir_all(&agents).expect("agents");
+    let aterm = PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm");
+    let argv = vec!["claude".to_string(), "--verbose".to_string()];
+    TOKEN_SEAM.with(|seam| *seam.borrow_mut() = Some((aterm.clone(), TokenFact::InUse)));
+    TOKEN_BUILDS.with(|seam| *seam.borrow_mut() = Some(dir.join("store/claude")));
+    super::AGENTS_DIR.with(|d| *d.borrow_mut() = Some(agents.clone()));
+    let launch = crate::harness::relaunch::Launch {
+        auth_observed: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
+        running: None,
+        launch_env: None,
+        serve: crate::harness::relaunch::Serve::Judge,
+        session: SESSION,
+        resume: true,
+        cwd: &cwd,
+        agent: 0,
+        argv: &argv,
+        exe: &build,
+        mode: None,
+        login: None,
+        home: None,
+        homedir: None,
+    };
+    let plan = crate::harness::journal::with_keyer(lab_keyer, || {
+        crate::harness::relaunch::plan(&opts, &launch, 999_999, &[(999_999, 1, "zsh".into())])
+    });
+    TOKEN_SEAM.with(|seam| *seam.borrow_mut() = None);
+    TOKEN_BUILDS.with(|seam| *seam.borrow_mut() = None);
+    super::AGENTS_DIR.with(|d| *d.borrow_mut() = None);
+    let plan = plan.unwrap_or_else(|_| panic!("a plan"));
+    let Some(ExecutionIntent::Token { entry: served, .. }) =
+        plan.command.as_ref().and_then(|c| c.account_intent.clone())
+    else {
+        panic!("a token line: {}", plan.line);
+    };
+    let word = plan
+        .line
+        .split("'token-run' '")
+        .nth(1)
+        .and_then(|rest| rest.split('\'').next())
+        .expect("the line's word")
+        .to_owned();
+    assert!(word.starts_with("ac-"), "{}", plan.line);
+    let run = accounts_token_run::parse(&[
+        std::ffi::OsString::from(&word),
+        std::ffi::OsString::from("--"),
+        build.clone().into_os_string(),
+        std::ffi::OsString::from("--verbose"),
+    ])
+    .expect("the wrapper parses the line's words");
+    let ctx = accounts_token_run::Ctx {
+        env: vec![("HOME".to_owned(), opts.home.display().to_string())],
+        home: Some(opts.home.clone()),
+        cwd: project.clone(),
+        roster: Some(crate::harness::accounts::Roster::parse(ROSTER).expect("the roster parses")),
+        store: None,
+        builds: Some(dir.join("store/claude")),
+        vault: None,
+        now: 1_800_000_000,
+        macos: true,
+    };
+    let judged =
+        crate::harness::journal::with_keyer(lab_keyer, || accounts_token_run::judged(&run, &ctx));
+    assert!(
+        !matches!(judged.decision, Decision::AsTyped(_)),
+        "the wrapper judged the line's word outside: {:?}",
+        judged.decision
+    );
+    assert_eq!(judged.entry, Some(served), "{word}");
 }
 
 /// A ROUTE MOVE'S LINE AND A RESTORED TOKEN SESSION'S (DESIGN-claude-setup-token S10, §5.4, §5.5):
@@ -35042,8 +35337,9 @@ fn a_route_move_serves_its_target_and_a_token_session_comes_back_through_the_wra
         }
     };
     let served = format!(
-        "'{}' 'harness' 'accounts' 'token-run' 'work' '--' '{}' '--chrome' '--resume' '{SESSION}'",
+        "'{}' 'harness' 'accounts' 'token-run' '{}' '--' '{}' '--chrome' '--resume' '{SESSION}'",
         aterm.display(),
+        person_key(),
         build.display()
     );
     let token = AuthRoute::VaultToken { entry };
@@ -35508,5 +35804,256 @@ fn another_users_arguments_are_withheld_for_good_and_ones_own_are_read() {
         args_of(1).map(|args| args.is_some()),
         Ok(false),
         "pid 1 is root's: withheld"
+    );
+}
+
+/// The ledger's text, empty where nothing was written.
+fn ledger_text(opts: &Opts) -> String {
+    std::fs::read_to_string(state_dir(opts).join("ledger.jsonl")).unwrap_or_default()
+}
+
+/// ANOTHER TAB'S RESTART IN FLIGHT IS A CLAIM ONLY WHILE SOMETHING OF IT CAN STILL ACT
+/// (2026-11-16, conversation `e6815796`): its record stayed `Exiting` for tab
+/// `s-1461842565d6125debab`, agent 93995 and shell 92191 both gone, after the person resumed the
+/// conversation by hand in tab `tnpb8a0y0s5`, and every carrier there answered
+/// `wait:conversation-in-other-tab` for good. The rule ([`St::claim_lives`]): the agent the
+/// record names, the process its relaunch started, or its shell. A live pid the record names by
+/// pid alone holds it unless it is proven another process, one born after the record was last
+/// written; a start unread, or no such second, proves nothing.
+#[test]
+fn another_tabs_restart_holds_its_claim_only_while_something_of_it_lives() {
+    const AGENT: u32 = 100;
+    const SHELL: u32 = 200;
+    const RELAUNCH: u32 = 300;
+    const SAVED: u64 = 1_794_849_642;
+    let before = "Mon Nov 16 06:13:17 2026";
+    let after = "Mon Nov 16 18:00:00 2026";
+    assert!(
+        super::super::unix_time::parse_lstart(before).is_some_and(|at| at < SAVED)
+            && super::super::unix_time::parse_lstart(after).is_some_and(|at| at > SAVED),
+        "PRECONDITION: the two starts lie either side of the record's last write"
+    );
+    let st = St {
+        phase: Phase::Exiting { at_s: SAVED },
+        pid: AGENT,
+        pid_start: before.to_string(),
+        shell: SHELL,
+        tab: "s-another-tab".to_string(),
+        ..St::default()
+    };
+    let lives = |st: &St, saved: Option<u64>, live: &[(u32, Option<&str>)]| {
+        st.claim_lives(
+            saved,
+            |pid| live.iter().any(|(p, _)| *p == pid),
+            |pid| {
+                live.iter()
+                    .find(|(p, _)| *p == pid)
+                    .and_then(|(_, start)| start.map(str::to_string))
+            },
+        )
+    };
+    assert!(!lives(&st, Some(SAVED), &[]), "nothing of it lives");
+    assert!(
+        lives(&st, Some(SAVED), &[(AGENT, Some(before))]),
+        "its agent runs"
+    );
+    assert!(
+        !lives(&st, Some(SAVED), &[(AGENT, Some(after))]),
+        "another process at its agent's pid, by the recorded start"
+    );
+    assert!(
+        lives(&st, Some(SAVED), &[(SHELL, Some(before))]),
+        "its shell lives"
+    );
+    assert!(
+        !lives(&st, Some(SAVED), &[(SHELL, Some(after))]),
+        "a process born after the record was written is not the shell it names"
+    );
+    assert!(
+        lives(&st, Some(SAVED), &[(SHELL, None)]) && lives(&st, None, &[(SHELL, Some(after))]),
+        "an unread start, or an unread record time, proves nothing: the pid holds"
+    );
+    let bare = St {
+        pid_start: String::new(),
+        ..st.clone()
+    };
+    assert!(
+        lives(&bare, Some(SAVED), &[(AGENT, Some(before))])
+            && !lives(&bare, Some(SAVED), &[(AGENT, Some(after))]),
+        "an agent named by pid alone is weighed as the shell is"
+    );
+    let relaunched = St {
+        phase: Phase::Relaunched { at_s: SAVED },
+        relaunched_pid: RELAUNCH,
+        ..st.clone()
+    };
+    assert!(
+        lives(&relaunched, Some(SAVED), &[(RELAUNCH, Some(before))])
+            && !lives(&relaunched, Some(SAVED), &[(RELAUNCH, Some(after))])
+            && !lives(&relaunched, Some(SAVED), &[]),
+        "its relaunch, named by pid alone"
+    );
+    let started = St {
+        relaunched_start: before.to_string(),
+        ..relaunched
+    };
+    assert!(
+        lives(&started, Some(SAVED), &[(RELAUNCH, Some(before))])
+            && !lives(&started, None, &[(RELAUNCH, Some(after))]),
+        "its relaunch, by the recorded start"
+    );
+    let retired = St {
+        native_retired_unissued: true,
+        ..st
+    };
+    assert!(
+        lives(&retired, Some(SAVED), &[]),
+        "a retirement not issued keeps its own hold"
+    );
+}
+
+/// THE UPGRADE'S VISIT CLOSES ANOTHER TAB'S DEAD RESTART ([`St::claim_lives`]): the conversation
+/// runs in this tab and its record is in flight for another whose agent and shell are gone. The
+/// visit closes it `resumed-elsewhere`, its ledger saying why, and carries on; a dry run writes
+/// nothing. Negative control: the same record with a live shell still answers
+/// `wait:conversation-in-other-tab`, the record as it lay.
+#[cfg(unix)]
+#[test]
+fn a_visit_closes_another_tabs_restart_whose_agent_and_shell_are_gone() {
+    let dir = scratch("visit-other-tab-dead");
+    let opts = drive(&dir);
+    let mut agent = parked().spawn().expect("spawn");
+    wait_exec(agent.id());
+    let sf = register(&opts.home, agent.id(), SESSION);
+    let mut shell = stand_in_shell();
+    let record = |shell: u32| St {
+        phase: Phase::Exiting { at_s: now_s() },
+        pid: dead_pid(),
+        shell,
+        tab: "s-another-tab".to_string(),
+        to: "9.9.9".to_string(),
+        source: "same".to_string(),
+        ..St::default()
+    };
+    std::fs::create_dir_all(state_dir(&opts)).expect("state");
+    let k = Script::new(shell.id(), usize::MAX, None);
+    let live = record(shell.id());
+    std::fs::write(state_path(&opts, SESSION), live.to_json()).expect("write");
+    let held = visit(&opts, &sf, &table(), &newer(), &k);
+    let held_record = load(&opts, SESSION);
+    let held_lines = ledger_lines(&opts);
+    let dead = record(dead_pid());
+    std::fs::write(state_path(&opts, SESSION), dead.to_json()).expect("write");
+    let dry = visit(
+        &Opts {
+            dry_run: true,
+            ..opts.clone()
+        },
+        &sf,
+        &table(),
+        &newer(),
+        &k,
+    );
+    let dry_record = load(&opts, SESSION);
+    let dry_lines = ledger_lines(&opts);
+    let closed = visit(&opts, &sf, &table(), &newer(), &k);
+    let _ = agent.kill();
+    let _ = agent.wait();
+    let _ = shell.kill();
+    let _ = shell.wait();
+    assert_eq!(held.step, "wait:conversation-in-other-tab", "{held:?}");
+    assert_eq!((held_record, held_lines), (Some(live), 0), "as it lay");
+    assert_ne!(dry.step, "wait:conversation-in-other-tab", "{dry:?}");
+    assert_eq!((dry_record, dry_lines), (Some(dead), 0), "a dry run writes");
+    assert_ne!(closed.step, "wait:conversation-in-other-tab", "{closed:?}");
+    let after = load(&opts, SESSION).expect("the record");
+    assert_eq!(
+        (after.phase, after.tab.as_str()),
+        (
+            Phase::Failed("resumed-elsewhere".to_string()),
+            "s-another-tab"
+        ),
+        "{closed:?}"
+    );
+    let ledger = ledger_text(&opts);
+    assert!(
+        ledger.contains("failed:resumed-elsewhere") && ledger.contains("s-another-tab"),
+        "{ledger}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// AN EXIT CLOSES ANOTHER TAB'S DEAD RESTART ([`St::claim_lives`]): the agent that ended in this
+/// tab held a conversation whose record is in flight for another tab, that tab's agent and shell
+/// gone. The exit is relaunched as over any closed record (`would-relaunch` in a dry run, which
+/// writes nothing), and a real run closes the record `resumed-elsewhere` with its ledger line.
+/// The negative control, a live shell, is
+/// [`an_agent_whose_host_ended_is_relaunched_in_its_reopened_tab`]'s wait.
+#[test]
+fn an_exit_closes_another_tabs_restart_whose_agent_and_shell_are_gone() {
+    let a = DeadAgent::new("exit-other-tab-dead");
+    let writes = Opts {
+        dry_run: false,
+        ..a.opts.clone()
+    };
+    let old = St {
+        tab: "s-0000000000000000dead".to_string(),
+        pid: dead_pid(),
+        shell: dead_pid(),
+        phase: super::super::upgrade::Phase::Exiting { at_s: now_s() },
+        ..St::default()
+    };
+    save(&writes, SESSION, &old);
+    let old = load(&writes, SESSION);
+    let stall = Some(super::super::restart_stamp::Cause::Stall);
+    let dry = after_exit(&a.opts, &a.snap, &ExitRecord::Removed, true, stall);
+    assert_eq!(dry.step, "would-relaunch", "{dry:?}");
+    assert_eq!(
+        (load(&writes, SESSION), ledger_lines(&writes)),
+        (old, 0),
+        "a dry run writes nothing"
+    );
+    let r = after_exit(&writes, &a.snap, &ExitRecord::Removed, true, stall);
+    assert_ne!(r.step, "wait:conversation-in-other-tab", "{r:?}");
+    let ledger = ledger_text(&writes);
+    assert!(
+        ledger.contains("failed:resumed-elsewhere") && ledger.contains("s-0000000000000000dead"),
+        "{r:?}: {ledger}"
+    );
+    assert!(
+        load(&writes, SESSION).is_some_and(|st| !st.in_flight()
+            || st.tab == TAB
+            || st.phase == Phase::Failed("resumed-elsewhere".to_string())),
+        "closed, or this exit's own: {r:?}"
+    );
+}
+
+/// A RESTART ASKED CLOSES ANOTHER TAB'S DEAD RESTART ([`St::claim_lives`]): the record of the
+/// asker's conversation is in flight for another tab whose agent and shell are gone, so it holds
+/// no claim: it is closed `resumed-elsewhere` with its ledger line and the asked restart is made
+/// of its asker. The negative control, a live shell, is
+/// [`a_restart_asked_over_its_own_record_in_another_tab_holds_no_claim`].
+#[cfg(unix)]
+#[test]
+fn a_restart_asked_closes_another_tabs_restart_whose_agent_and_shell_are_gone() {
+    let why = Restart::Memory;
+    let (r, saved, ..) = restart_over(
+        "dead-record-other-tab",
+        |_| why.clone(),
+        |_, _| St {
+            phase: Phase::Exiting { at_s: now_s() },
+            pid: dead_pid(),
+            shell: dead_pid(),
+            tab: "s-another-tab".to_string(),
+            cause: "exit".to_string(),
+            ..St::default()
+        },
+    );
+    assert_ne!(r.step, "wait:conversation-in-other-tab", "{r:?}");
+    assert!(
+        saved.as_ref().is_some_and(
+            |st| st.tab == TAB || st.phase == Phase::Failed("resumed-elsewhere".to_string())
+        ),
+        "closed, or the asked restart's own: {r:?} {saved:?}"
     );
 }

@@ -132,12 +132,38 @@ fn the_cat_stands_on_the_ribbon_at_the_runs_progress() {
     assert!(done.nose() - done.cat_x() > CatPose::Loaf.front_paw() + 5.0);
 }
 
+/// How far right the ellipse `(cx, cy, rx, ry)`, grown by an outline `grow` wide, reaches on the
+/// row `y`: the rightmost point within `grow` of its edge there.
+fn outline_reach((cx, cy, rx, ry): (f32, f32, f32, f32), grow: f32, y: f32) -> f32 {
+    (0..3600)
+        .map(|at| {
+            let t = at as f32 * std::f32::consts::TAU / 3600.0;
+            (cx + rx * t.cos(), cy + ry * t.sin())
+        })
+        .filter(|(_, by)| (by - y).abs() <= grow)
+        .map(|(bx, by)| bx + (grow * grow - (by - y) * (by - y)).sqrt())
+        .fold(f32::MIN, f32::max)
+}
+
 /// The cat's own image puts its feet at [`CAT_FEET`]: its lowest opaque row stands within an
-/// outline's reach of them, and its front paw reaches [`CatPose::front_paw`] and no further.
+/// outline's reach of them, and every pose's front paw reaches [`CatPose::front_paw`] and no
+/// further. Standing or loafing, that is the last opaque pixel of the paws' row just above the
+/// ground. A sitting cat's tail lies along that row past its paw, and on the paw's middle row
+/// its haunch's outline reaches as far as the paw's, so there it is where the paw's dark outline
+/// ends half way down the paw ([`cat::SIT_PAW`]), against the paw's outline there, grown by what
+/// [`CatPose::front_paw`] adds to the paw's radius. NEGATIVE CONTROL: on that row the paw's
+/// outline reaches past the haunch's ([`cat::SIT_HAUNCH`]) by more than the check allows, so a
+/// sitting cat drawn with no paw there, or one short of its haunch, fails it.
 #[test]
 fn the_cats_feet_stand_where_its_box_says() {
-    let (w, h) = ((350.0 * CatArt::ASPECT).round() as u32, 350);
+    // Four device pixels a unit, so an edge pixel is a quarter unit.
+    let (w, h) = ((700.0 * CatArt::ASPECT).round() as u32, 700);
     let unit = h as f32 / CAT_H;
+    let pixel = |tile: &Tile, x: u32, y: u32| {
+        let at = ((y * tile.width() + x) * 4) as usize;
+        let p = &tile.pixels()[at..at + 4];
+        [p[0], p[1], p[2], p[3]]
+    };
     for pose in CatPose::ALL {
         let tile = CatArt {
             pose,
@@ -154,21 +180,235 @@ fn the_cats_feet_stand_where_its_box_says() {
             (lowest as f32 - feet).abs() <= 4.0 * unit,
             "{pose:?}: lowest {lowest}, feet {feet}"
         );
-        // The paws' row, just above the ground: the front paw's edge, no further.
-        let row = ((CAT_FEET.1 - 4.0) * unit) as u32;
-        let right = (0..w)
-            .rev()
-            .find(|x| alpha(&tile, *x, row) == 255)
-            .expect("paws on the ground");
-        let reach = right as f32 / unit - CAT_FEET.0;
-        if matches!(pose, CatPose::Walk | CatPose::Loaf) {
+        let (reach, expected, within, clear) = if matches!(pose, CatPose::Walk | CatPose::Loaf) {
+            // The paws' row, just above the ground: its last opaque pixel.
+            let row = ((CAT_FEET.1 - 4.0) * unit) as u32;
+            let last = (0..w)
+                .rev()
+                .find(|x| alpha(&tile, *x, row) == 255)
+                .expect("paws on the ground");
+            (last as f32 / unit - CAT_FEET.0, pose.front_paw(), 2.0, None)
+        } else {
+            let s = cat::scale(pose);
+            let paw @ (px, py, rx, ry) = cat::SIT_PAW;
+            let grow = pose.front_paw() / s - px - rx;
+            let row = ((CAT_FEET.1 + (py + ry / 2.0) * s) * unit) as u32;
+            // The row's centre, in the pose's own units.
+            let y = ((row as f32 + 0.5) / unit - CAT_FEET.1) / s;
+            let clear = outline_reach(paw, grow, y) - outline_reach(cat::SIT_HAUNCH, grow, y);
+            // From the paw's centre out: past its coat, the outline's dark run.
+            let dark = |x: u32| {
+                let [r, g, b, a] = pixel(&tile, x, row);
+                a == 255 && r.max(g).max(b) < 0x60
+            };
+            let from = ((CAT_FEET.0 + px * s) * unit) as u32;
+            let edge = (from..w).find(|x| dark(*x)).expect("the paw's outline");
+            let end = (edge..w).find(|x| !dark(*x)).expect("past the outline");
+            (
+                end as f32 / unit - CAT_FEET.0,
+                outline_reach(paw, grow, y) * s,
+                0.75,
+                Some(clear * s),
+            )
+        };
+        assert!(
+            (reach - expected).abs() < within,
+            "{pose:?}: the front paw reaches {reach}, not {expected}"
+        );
+        if let Some(clear) = clear {
             assert!(
-                (reach - pose.front_paw()).abs() < 2.0,
-                "{pose:?}: the front paw reaches {reach}, not {}",
-                pose.front_paw()
+                clear > 2.0 * within,
+                "{pose:?}: on its row the paw reaches past the haunch, by {clear}"
             );
         }
     }
+}
+
+/// The road and the loaf composited as the lockup draws them (the road's image, then the cat's
+/// over it at its feet), two device pixels a unit: the road's bake, the cat's bake, and the
+/// cat's top-left in the road's image.
+fn done_lockup(length: u16) -> (Tile, Tile, (i32, i32)) {
+    let art = RoadArt {
+        length,
+        permille: 1000,
+        done: true,
+        dark: true,
+    };
+    let (w, h) = road_size(art);
+    let unit = h as f32 / ROAD_H;
+    let road = art.road();
+    let cat_h = (CAT_H * unit).round() as u32;
+    let cat_w = (cat_h as f32 * CatArt::ASPECT).round() as u32;
+    let cat = CatArt::on(road, CatPose::Loaf, true).bake(cat_w, cat_h);
+    let (fx, fy) = road.feet();
+    let at = (
+        ((fx - ROAD_X - CAT_FEET.0) * unit).round() as i32,
+        ((fy - CAT_FEET.1) * unit).round() as i32,
+    );
+    (art.bake(w, h), cat, at)
+}
+
+/// The most opaque the cat draws over the road's device box `(x0, y0)..(x1, y1)` in design units.
+fn cat_over(cat: &Tile, at: (i32, i32), (x0, y0, x1, y1): (f32, f32, f32, f32)) -> u8 {
+    let unit = H as f32 / ROAD_H;
+    let col = |x: f32| ((x - ROAD_X) * unit) as i32 - at.0;
+    let row = |y: f32| (y * unit) as i32 - at.1;
+    let mut most = 0;
+    for y in row(y0)..=row(y1) {
+        for x in col(x0)..=col(x1) {
+            if (0..cat.width() as i32).contains(&x) && (0..cat.height() as i32).contains(&y) {
+                most = most.max(alpha(cat, x as u32, y as u32));
+            }
+        }
+    }
+    most
+}
+
+/// THE DONE SPARKLES READ OVER THE LOAF ON EVERY ROAD: baked and composited as the lockup draws
+/// them, the cat draws nothing over any of the road's sparkles from the least road to the longest,
+/// each shows in the road's image, and at the artboard's length they stand where the design put
+/// them. NEGATIVE CONTROL: sparkles at fixed shares of the whole road, as they first stood, lie
+/// under the loaf's opaque body on the least road.
+#[test]
+fn the_done_sparkles_read_over_the_loaf_on_every_road() {
+    let lengths = [
+        LEAST_LENGTH as u16,
+        448,
+        472,
+        517,
+        608,
+        LENGTH,
+        1500,
+        MAX_LENGTH as u16,
+    ];
+    let artboard = road_art(1000, true, true).road();
+    let design: Vec<_> = road::sparkles(artboard).collect();
+    for ((x, _), ..) in &design {
+        let share = (x - ROAD_X) / f32::from(LENGTH);
+        assert!(
+            [0.4015, 0.5362, 0.6559, 0.7481]
+                .iter()
+                .any(|s| (s - share).abs() < 1e-4),
+            "at the artboard's length the sparkle at {x} stands where the design put it"
+        );
+    }
+    for length in lengths {
+        let (road_tile, cat, at) = done_lockup(length);
+        let road = RoadArt {
+            length,
+            permille: 1000,
+            done: true,
+            dark: true,
+        }
+        .road();
+        let unit = H as f32 / ROAD_H;
+        for ((x, y), r, ..) in road::sparkles(road) {
+            assert_eq!(
+                cat_over(&cat, at, (x - r, y - r, x + r, y + r)),
+                0,
+                "{length}: the cat covers the sparkle at ({x:.1}, {y:.1})"
+            );
+            let (col, row) = (((x - ROAD_X) * unit) as u32, (y * unit) as u32);
+            assert!(
+                alpha(&road_tile, col, row) > 100,
+                "{length}: the sparkle at ({x:.1}, {y:.1}) shows"
+            );
+        }
+    }
+    let (_, cat, at) = done_lockup(LEAST_LENGTH as u16);
+    let hidden = design
+        .iter()
+        .filter(|((x, y), ..)| {
+            let up = centre_y(*x) - y;
+            let old = ROAD_X + (x - ROAD_X) / f32::from(LENGTH) * LEAST_LENGTH;
+            let y = centre_y(old) - up;
+            cat_over(&cat, at, (old, y, old, y)) == 255
+        })
+        .count();
+    assert!(
+        hidden >= 2,
+        "at fixed shares the loaf hides sparkles on the least road: {hidden}"
+    );
+}
+
+/// A DISC'S GLOW ON A LAYER ITS SIZE IS ITS GLOW ON A WHOLE LAYER: the star's halo, blurred on a
+/// layer cropped to the disc and the blur's reach, draws the very pixels a canvas-size layer
+/// draws, on roads of several lengths (the star near the right edge) at 1x, 2x and 3x Mono 22 and
+/// a few other scales, and on the artboard's road at every height from 40 to 760 pixels in steps
+/// of 9. NEGATIVE CONTROL: at 2x and over, the whole layer's glow reaches pixels further than a
+/// few past the disc's box, which a crop short of the blur's reach could not draw.
+#[test]
+fn a_discs_glow_on_a_layer_its_size_is_its_glow_on_a_whole_layer() {
+    let ink = Ink::of(true);
+    let scales = [
+        1.0,
+        22.0 / 26.0,
+        22.0 / 26.0 * 2.0,
+        2.0,
+        22.0 / 26.0 * 3.0,
+        3.0,
+    ];
+    let cases = scales
+        .iter()
+        .flat_map(|scale| {
+            let h = (ROAD_H * scale).round() as u32;
+            [400_u16, 802, 1777, 3000].map(|length| (h, length))
+        })
+        .chain((40..=760).step_by(9).map(|h| (h, LENGTH)));
+    let mut compared = 0;
+    let mut controlled = 0;
+    for (h, length) in cases {
+        let art = RoadArt {
+            length,
+            permille: 300,
+            done: false,
+            dark: true,
+        };
+        let w = (h as f32 * art.aspect()).round() as u32;
+        let road = art.road();
+        let star = road.star();
+        let unit = h as f32 / ROAD_H;
+        let canvas = || {
+            let map = Affine::scale(unit).then(Affine::translate(-ROAD_X, 0.0));
+            let mut c = canvas::Canvas::new(w, h, map);
+            for (lane, x, y) in road.dots() {
+                c.dot(x, y, 1.15, ink.stripes[lane], ink.dots);
+            }
+            c
+        };
+        let mut whole = canvas();
+        let mut halo = whole.layer();
+        halo.dot(star.0, star.1, 13.0, ink.teal, 1.0);
+        whole.glow(&halo, 2.5, 0.22, (0.0, 0.0));
+        let mut cropped = canvas();
+        road::halo(&mut cropped, star, &ink);
+        assert!(
+            whole.tile.pixels() == cropped.tile.pixels(),
+            "{h} {length}: the halo"
+        );
+        compared += 1;
+        if length == LENGTH && h as f32 >= 2.0 * ROAD_H {
+            // A crop for no blur: the disc's box and 7 pixels (a least blur's reach and 3).
+            let plain = canvas();
+            let (cx, cy) = ((star.0 - ROAD_X) * unit, star.1 * unit);
+            let near = 13.0 * unit + 7.0;
+            let span = |c: f32, to: u32| {
+                ((c - near - 40.0).max(0.0) as u32)..((c + near + 40.0) as u32).min(to)
+            };
+            let beyond = span(cy, h).any(|y| {
+                span(cx, w).any(|x| {
+                    let far =
+                        (x as f32 + 0.5 - cx).abs() > near || (y as f32 + 0.5 - cy).abs() > near;
+                    let at = ((y * w + x) * 4) as usize;
+                    far && whole.tile.pixels()[at..at + 4] != plain.tile.pixels()[at..at + 4]
+                })
+            });
+            assert!(beyond, "{h}: the glow reaches past a crop with no blur");
+            controlled += 1;
+        }
+    }
+    assert_eq!(compared, 24 + 81);
+    assert!(controlled >= 2, "{controlled} heights controlled");
 }
 
 /// The dots lie ahead of the nose, converging on the star; done, there are none, and the

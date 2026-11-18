@@ -108,20 +108,38 @@ fn selected(sys: &dyn System, user: &User) -> Option<Vec<repos::Repo>> {
 
 impl Checkouts {
     pub(super) fn capture(sys: &dyn System, user: &User) -> Self {
-        let mut scope = Self::empty(user);
-        for repo in selected(sys, user).unwrap_or_default() {
-            scope.enlist(sys, &repo);
-        }
-        scope.metadata = scope.observe(sys);
-        scope
+        Self::capture_with(
+            sys,
+            user,
+            &selected(sys, user).unwrap_or_default(),
+            &mut |path| sys.scoped_path_metadata(path),
+        )
     }
 
     /// `repo`'s checkout alone, enlisted and read as [`Self::capture`] enlists and reads it with
     /// the rest: its [`Self::part`] is that capture's part for its folder.
     fn one(sys: &dyn System, user: &User, repo: &repos::Repo) -> Self {
+        Self::capture_with(sys, user, std::slice::from_ref(repo), &mut |path| {
+            sys.scoped_path_metadata(path)
+        })
+    }
+
+    fn capture_with(
+        sys: &dyn System,
+        user: &User,
+        repositories: &[repos::Repo],
+        read: &mut dyn FnMut(&Path) -> io::Result<crate::port::ScopedPathMetadata>,
+    ) -> Self {
         let mut scope = Self::empty(user);
-        scope.enlist(sys, repo);
-        scope.metadata = scope.observe(sys);
+        {
+            let mut admission = Admission::new(Path::new(&user.home), user.uid, read);
+            for repo in repositories {
+                scope.enlist(sys, repo, &mut admission);
+            }
+        }
+        // Discovery's admission ends here. Final metadata is observed afresh rather than
+        // reusing the admission facts read while finding the watched paths.
+        scope.metadata = scope.observe_with(read);
         scope
     }
 
@@ -140,7 +158,7 @@ impl Checkouts {
 
     /// Watch `repo`'s checkout in `~`, with its required dependencies; never one named like a
     /// standard home folder, where no checkout is made.
-    fn enlist(&mut self, sys: &dyn System, repo: &repos::Repo) {
+    fn enlist(&mut self, sys: &dyn System, repo: &repos::Repo, admission: &mut Admission<'_>) {
         if repos::HOME_FOLDERS
             .iter()
             .any(|name| name.eq_ignore_ascii_case(&repo.name))
@@ -153,9 +171,15 @@ impl Checkouts {
         if !repo.required_submodules.is_empty() {
             self.insert(root.join(".gitmodules"), true, MarkMoved::GITMODULES);
         }
-        self.checkout(sys, &root, &admin, !repo.required_submodules.is_empty());
+        self.checkout(
+            sys,
+            &root,
+            &admin,
+            !repo.required_submodules.is_empty(),
+            admission,
+        );
         for relative in &repo.required_submodules {
-            self.checkout(sys, &root.join(relative), &admin, true);
+            self.checkout(sys, &root.join(relative), &admin, true, admission);
         }
     }
 
@@ -171,14 +195,21 @@ impl Checkouts {
             .or_insert((version, Class(class)));
     }
 
-    fn checkout(&mut self, sys: &dyn System, root: &Path, allowed_admin: &Path, objects: bool) {
+    fn checkout(
+        &mut self,
+        sys: &dyn System,
+        root: &Path,
+        allowed_admin: &Path,
+        objects: bool,
+        admission: &mut Admission<'_>,
+    ) {
         self.insert(root.to_path_buf(), false, MarkMoved::ROOT);
         let marker = root.join(".git");
         self.insert(marker.clone(), true, MarkMoved::GIT_DIR);
-        if !self.admitted(sys, root, true) {
+        if !admission.admitted(root) {
             return;
         }
-        let Ok(metadata) = sys.scoped_path_metadata(&marker) else {
+        let Ok(metadata) = admission.metadata(&marker) else {
             return;
         };
         let stat = metadata.stat;
@@ -188,7 +219,7 @@ impl Checkouts {
         let admin = if stat.dir {
             marker
         } else {
-            let Some(pointer) = self.line(sys, &marker) else {
+            let Some(pointer) = self.line(sys, &marker, admission) else {
                 return;
             };
             let Some(pointer) = pointer.strip_prefix("gitdir: ") else {
@@ -203,18 +234,24 @@ impl Checkouts {
             }
             target
         };
-        self.admin(sys, &admin, objects);
+        self.admin(sys, &admin, objects, admission);
         let common = admin.join("commondir");
-        if self.admitted(sys, &admin, true)
-            && let Some(pointer) = self.line(sys, &common)
+        if admission.admitted(&admin)
+            && let Some(pointer) = self.line(sys, &common, admission)
             && let Some(target) = normalize(&admin, &pointer)
             && target.starts_with(allowed_admin)
         {
-            self.admin(sys, &target, objects);
+            self.admin(sys, &target, objects, admission);
         }
     }
 
-    fn admin(&mut self, sys: &dyn System, admin: &Path, objects: bool) {
+    fn admin(
+        &mut self,
+        sys: &dyn System,
+        admin: &Path,
+        objects: bool,
+        admission: &mut Admission<'_>,
+    ) {
         self.insert(admin.to_path_buf(), true, MarkMoved::ADMIN_DIR);
         for (name, class) in [
             ("config", MarkMoved::CONFIG),
@@ -230,10 +267,10 @@ impl Checkouts {
         ] {
             self.insert(admin.join(name), true, class);
         }
-        if !self.admitted(sys, admin, true) {
+        if !admission.admitted(admin) {
             return;
         }
-        if let Some(head) = self.line(sys, &admin.join("HEAD"))
+        if let Some(head) = self.line(sys, &admin.join("HEAD"), admission)
             && let Some(reference) = head.strip_prefix("ref: ")
             && reference.starts_with("refs/")
             && let Some(path) = normalize(admin, reference)
@@ -251,7 +288,7 @@ impl Checkouts {
             ] {
                 self.insert(path, true, class);
             }
-            if self.admitted(sys, &object_root, true) {
+            if admission.admitted(&object_root) {
                 let names: Vec<_> = (0..=255).map(|value| format!("{value:02x}")).collect();
                 if let Ok(names) = sys.scoped_child_directories(&object_root, self.uid, &names) {
                     for name in names {
@@ -262,8 +299,8 @@ impl Checkouts {
         }
     }
 
-    fn line(&self, sys: &dyn System, path: &Path) -> Option<String> {
-        if !self.admitted(sys, path.parent()?, true) {
+    fn line(&self, sys: &dyn System, path: &Path, admission: &mut Admission<'_>) -> Option<String> {
+        if !admission.admitted(path.parent()?) {
             return None;
         }
         let bytes = sys
@@ -273,33 +310,6 @@ impl Checkouts {
             .ok()?
             .trim_end_matches(['\r', '\n']);
         (!text.is_empty() && !text.contains(['\r', '\n', '\0'])).then(|| text.to_owned())
-    }
-
-    fn admitted(&self, sys: &dyn System, path: &Path, directory: bool) -> bool {
-        let Ok(tail) = path.strip_prefix(&self.home) else {
-            return false;
-        };
-        let mut at = self.home.clone();
-        let valid = |path: &Path, directory: bool| {
-            sys.scoped_path_metadata(path).is_ok_and(|m| {
-                let s = m.stat;
-                s.uid == self.uid && !s.symlink && (!directory || s.dir) && s.mode & 0o022 == 0
-            })
-        };
-        if !valid(&at, true) {
-            return false;
-        }
-        let parts: Vec<_> = tail.components().collect();
-        for (i, part) in parts.iter().enumerate() {
-            let Component::Normal(name) = part else {
-                return false;
-            };
-            at.push(name);
-            if !valid(&at, i + 1 != parts.len() || directory) {
-                return false;
-            }
-        }
-        true
     }
 
     pub(super) fn observe(&self, sys: &dyn System) -> RepositoryCheckoutMetadata {
@@ -314,13 +324,7 @@ impl Checkouts {
             shapes: Vec::new(),
             versions: Vec::new(),
         };
-        let mut admission = Admission {
-            home: &self.home,
-            uid: self.uid,
-            read,
-            stats: BTreeMap::new(),
-            directories: BTreeMap::new(),
-        };
+        let mut admission = Admission::new(&self.home, self.uid, read);
         let mut ancestors = BTreeSet::new();
         for (path, (version, _)) in &self.paths {
             for parent in path.ancestors().take_while(|p| p.starts_with(&self.home)) {
@@ -624,8 +628,9 @@ impl Drop for Ended<'_> {
     }
 }
 
-/// Per-round component admission. A shared ancestor is observed once, while an unsafe
-/// ancestor stops all deeper path reads. A later round re-admits every component afresh.
+/// Per-observation component admission. Discovery and final metadata each have their own
+/// observation: a shared ancestor is read once within it, and an unsafe ancestor stops deeper
+/// reads. Neither another phase nor a later capture reuses its admissions.
 struct Admission<'a> {
     home: &'a Path,
     uid: u32,
@@ -634,7 +639,31 @@ struct Admission<'a> {
     directories: BTreeMap<PathBuf, bool>,
 }
 
-impl Admission<'_> {
+impl<'a> Admission<'a> {
+    fn new(
+        home: &'a Path,
+        uid: u32,
+        read: &'a mut dyn FnMut(&Path) -> io::Result<crate::port::ScopedPathMetadata>,
+    ) -> Self {
+        Self {
+            home,
+            uid,
+            read,
+            stats: BTreeMap::new(),
+            directories: BTreeMap::new(),
+        }
+    }
+
+    fn admitted(&mut self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(self.home) else {
+            return false;
+        };
+        relative
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+            && self.directory(path)
+    }
+
     fn stat(&mut self, path: &Path) -> Result<crate::port::Stat, io::ErrorKind> {
         self.metadata(path).map(|m| m.stat)
     }

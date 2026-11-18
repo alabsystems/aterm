@@ -1840,6 +1840,8 @@ fn the_cause_model_binds_the_schedule() {
     );
 
     rig.resolver.inputs.lose_watch(&head());
+    // Notifications from before the loss do not belong to the gap's write below.
+    let _ = rig.heard();
     fire(&mut state, &["Lose"]);
     assert_eq!(
         cause_projection(&rig, reads),

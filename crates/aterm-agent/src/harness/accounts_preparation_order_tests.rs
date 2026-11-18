@@ -69,7 +69,7 @@ fn preparation_order_conforms_and_rejects_wrong_priority() {
 
 #[test]
 fn discovery_pass_is_exclusive_and_refusal_keeps_its_priority() {
-    let guard = Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let first = PreparationPass::claim(&guard).unwrap();
     assert_eq!(first.first, PreparationKind::Native);
     assert!(PreparationPass::claim(&guard).is_none());

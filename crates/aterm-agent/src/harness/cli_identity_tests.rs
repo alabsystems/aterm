@@ -174,14 +174,18 @@ fn codex_publication_refuses_credential_identity_changed_after_the_report() {
             for kind in [0, 3, 4, 5, 6, 7] {
                 let tmp = tmp_dir("codex-publication-identity");
                 let env = env_at(&tmp);
-                assert_eq!(run_line(
-                    "accounts add account --cli codex --email alias@example.test --identity-email owner@example.test",
+                listed_by_hand(
                     &env,
-                ).0, exit(0));
+                    Cli::Codex,
+                    accounts::Row {
+                        identity_email: Some("owner@example.test".to_owned()),
+                        ..by_hand("account", Some("alias@example.test"))
+                    },
+                );
                 if prior {
                     let good = TerminalCodex::new(Some("owner@example.test"));
                     assert_eq!(
-                        command("accounts login account --cli codex", &env, &good).0,
+                        command("accounts login owner@example.test --cli codex", &env, &good).0,
                         exit(0)
                     );
                 }
@@ -203,8 +207,11 @@ fn codex_publication_refuses_credential_identity_changed_after_the_report() {
                 host.replacement = Some(replacement.clone());
                 host.driver_reports_identity = path != "renew-probe";
                 let verb = if path == "login" { "login" } else { "renew" };
-                let (code, out, err) =
-                    command(&format!("accounts {verb} account --cli codex"), &env, &host);
+                let (code, out, err) = command(
+                    &format!("accounts {verb} owner@example.test --cli codex"),
+                    &env,
+                    &host,
+                );
                 let refused = matches!(kind, 3..=5);
                 assert_eq!(
                     code,
@@ -257,13 +264,10 @@ fn completed_held_codex_renewal_keeps_its_staging_without_publishing_or_probing(
     for held in [false, true] {
         let tmp = tmp_dir("codex-completed-held");
         let env = env_at(&tmp);
-        assert_eq!(
-            run_line(
-                "accounts add account --cli codex --email owner@example.test",
-                &env
-            )
-            .0,
-            exit(0)
+        listed_by_hand(
+            &env,
+            Cli::Codex,
+            by_hand("account", Some("owner@example.test")),
         );
         let store = env.accounts_store_for(Cli::Codex).unwrap();
         let path = env.accounts_roster_for(Cli::Codex).unwrap();
@@ -330,13 +334,16 @@ fn completed_held_codex_renewal_keeps_its_staging_without_publishing_or_probing(
 fn codex_login_alias_is_separate_from_reported_identity_and_round_trips() {
     let tmp = tmp_dir("codex-login-identity");
     let env = env_at(&tmp);
-    let (code, _, err) = run_line(
-        "accounts add account --cli codex --email login+alias@example.test --identity-email owner@example.test",
+    listed_by_hand(
         &env,
+        Cli::Codex,
+        accounts::Row {
+            identity_email: Some("owner@example.test".to_owned()),
+            ..by_hand("account", Some("login+alias@example.test"))
+        },
     );
-    assert_eq!(code, exit(0), "{err}");
     let host = TerminalCodex::new(Some(" OWNER@example.test\n"));
-    let (code, out, err) = command("accounts login account --cli codex", &env, &host);
+    let (code, out, err) = command("accounts login owner@example.test --cli codex", &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
     assert_eq!(host.probes.borrow().len(), 1);
     let store = env.accounts_store_for(Cli::Codex).unwrap();
@@ -355,11 +362,14 @@ fn codex_login_alias_is_separate_from_reported_identity_and_round_trips() {
     let (code, json, err) = command("accounts list --json --cli codex", &env, &host);
     assert_eq!(code, exit(0), "{err}");
     let report: aterm_json::Value = aterm_json::from_str(&json).unwrap();
+    let id = crate::harness::account_names::Listing::of(Cli::Codex, &roster.rows, None)
+        .id("account")
+        .to_owned();
     let account = report["accounts"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|row| row["label"].as_str() == Some("account"))
+        .find(|row| row["ac"].as_str() == Some(id.as_str()))
         .unwrap();
     assert_eq!(account["email"].as_str(), Some("login+alias@example.test"));
     assert_eq!(
@@ -415,13 +425,30 @@ fn no_pool_sign_in_moves_the_default_row_off_a_codex_that_ignores_codex_auth_pat
             program: Some(old.clone()),
             ..TerminalCodex::new(Some("owner@example.test"))
         };
-        let (code, out, err) = command(&format!("accounts {verb} main --cli codex"), &env, &host);
+        let (code, out, err) = command(
+            &format!("accounts {verb} owner@example.test --cli codex"),
+            &env,
+            &host,
+        );
         assert_eq!(code, exit(1), "{verb}: {out}{err}");
         assert!(
-            err.contains("a sign-in here would bind `main` to a login of its own")
+            err.contains("a sign-in here would bind it to a login of its own")
                 && err.contains("`aterm ai login codex`")
                 && err.contains("nothing was run"),
             "{verb}: {err}"
+        );
+        // The refusal names the account by its name (`oai` and its address, no lab slugging it
+        // here), never the row's label `main`. NEGATIVE CONTROL: with `sign_in_plan` handing
+        // `default_row_staging` the label, this fails on `… main is the row on this
+        // machine's own login …` (2026-11-16, by hand, then restored).
+        assert!(
+            err.contains("oai owner@example.test is the row on this machine's own login"),
+            "{verb}: {err}"
+        );
+        assert!(
+            !err.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+                .any(|token| token == "main"),
+            "{verb}: the label `main` is printed: {err}"
         );
         assert!(host.homes.borrow().is_empty(), "{verb}: no sign-in ran");
         assert_eq!(
@@ -434,7 +461,7 @@ fn no_pool_sign_in_moves_the_default_row_off_a_codex_that_ignores_codex_auth_pat
         program: Some(new),
         ..TerminalCodex::new(Some("owner@example.test"))
     };
-    let (code, out, err) = command("accounts login main --cli codex", &env, &host);
+    let (code, out, err) = command("accounts login owner@example.test --cli codex", &env, &host);
     assert_eq!(code, exit(0), "CONTROL: {out}{err}");
     assert_eq!(host.homes.borrow().len(), 1);
     assert_eq!(
@@ -467,17 +494,18 @@ fn a_codex_sign_ins_by_hand_line_is_judged_by_the_program_a_sign_in_runs() {
     let signed_in = |launch: fn(&Path) -> PathBuf, sign_in: fn(&Path) -> PathBuf| {
         let tmp = tmp_dir("codex-by-hand");
         let env = env_at(&tmp);
-        let (code, _, err) = run_line(
-            "accounts add account --cli codex --email owner@example.test",
+        listed_by_hand(
             &env,
+            Cli::Codex,
+            by_hand("account", Some("owner@example.test")),
         );
-        assert_eq!(code, exit(0), "{err}");
         let host = TerminalCodex {
             program: Some(launch(tmp.path())),
             sign_in_program: Some(sign_in(tmp.path())),
             ..TerminalCodex::new(Some("owner@example.test"))
         };
-        let (code, out, err) = command("accounts login account --cli codex", &env, &host);
+        let (code, out, err) =
+            command("accounts login owner@example.test --cli codex", &env, &host);
         assert_eq!(code, exit(0), "{out}{err}");
         let out = out.replace(&tmp.path().display().to_string(), "<root>");
         let line = |pick: &dyn Fn(&str) -> bool| {
@@ -487,7 +515,7 @@ fn a_codex_sign_ins_by_hand_line_is_judged_by_the_program_a_sign_in_runs() {
                 .to_owned()
         };
         (
-            line(&|l| l.starts_with("account: renewed")),
+            line(&|l| l.starts_with("oai owner@example.test: renewed")),
             line(&|l| l.contains("CODEX_AUTH_PATH=")),
         )
     };
@@ -509,14 +537,14 @@ fn terminal_codex_refuses_wrong_or_missing_identity_without_replacing_a_binding(
     for reported in [Some("another@example.test"), None] {
         let tmp = tmp_dir("codex-identity-refusal");
         let env = env_at(&tmp);
-        let (code, _, err) = run_line(
-            "accounts add account --cli codex --email owner@example.test",
+        listed_by_hand(
             &env,
+            Cli::Codex,
+            by_hand("account", Some("owner@example.test")),
         );
-        assert_eq!(code, exit(0), "{err}");
         let good = TerminalCodex::new(Some("owner@example.test"));
         assert_eq!(
-            command("accounts login account --cli codex", &env, &good).0,
+            command("accounts login owner@example.test --cli codex", &env, &good).0,
             exit(0)
         );
         let store = env.accounts_store_for(Cli::Codex).unwrap();
@@ -528,7 +556,7 @@ fn terminal_codex_refuses_wrong_or_missing_identity_without_replacing_a_binding(
             .unwrap()
             .clone();
         let bad = TerminalCodex::new(reported);
-        let (code, _, err) = command("accounts login account --cli codex", &env, &bad);
+        let (code, _, err) = command("accounts login owner@example.test --cli codex", &env, &bad);
         assert_eq!(code, exit(1), "{err}");
         let after = store
             .load_logins(bad.now())
@@ -555,18 +583,15 @@ fn a_credential_lost_during_the_identity_probe_cannot_publish() {
             for replace_with_directory in [false, true] {
                 let tmp = tmp_dir("codex-lost-credential-publication");
                 let env = env_at(&tmp);
-                assert_eq!(
-                    run_line(
-                        "accounts add account --cli codex --email owner@example.test",
-                        &env
-                    )
-                    .0,
-                    exit(0)
+                listed_by_hand(
+                    &env,
+                    Cli::Codex,
+                    by_hand("account", Some("owner@example.test")),
                 );
                 if prior {
                     let good = TerminalCodex::new(Some("owner@example.test"));
                     assert_eq!(
-                        command("accounts login account --cli codex", &env, &good).0,
+                        command("accounts login owner@example.test --cli codex", &env, &good).0,
                         exit(0)
                     );
                 }
@@ -575,8 +600,11 @@ fn a_credential_lost_during_the_identity_probe_cannot_publish() {
                 let mut host = TerminalCodex::new(Some("owner@example.test"));
                 host.snapshot_store = Some((store.clone(), env.now));
                 host.credential_fault = Some(replace_with_directory);
-                let (code, out, err) =
-                    command(&format!("accounts {verb} account --cli codex"), &env, &host);
+                let (code, out, err) = command(
+                    &format!("accounts {verb} owner@example.test --cli codex"),
+                    &env,
+                    &host,
+                );
                 assert_eq!(host.probes.borrow().len(), 1);
                 assert_eq!(code, exit(1), "{verb}, prior={prior}: {out}{err}");
                 let admitted = host.admitted.borrow();
@@ -602,7 +630,8 @@ fn plain_claude_login_refuses_stale_policy_and_binding_for_every_auth_outcome() 
         for outcome in ["signed-in", "signed-out", "failed", "during-status"] {
             let tmp = tmp_dir("plain-login-policy");
             let env = env_at(&tmp);
-            assert_eq!(acc_quiet(add("work", Class::Preferred), &env).0, exit(0));
+            // A row with no address, as `login` signs in only such a row; `add` lists none.
+            listed_by_hand(&env, Cli::Claude, by_hand("work", None));
             let store = env.accounts_store();
             let path = env.accounts_roster().unwrap();
             let original = std::fs::read_to_string(&path).unwrap();
@@ -660,7 +689,7 @@ fn plain_claude_login_refuses_stale_policy_and_binding_for_every_auth_outcome() 
             host.after_login = (outcome != "during-status").then_some(&mutate);
             let (code, out, err) = acc(
                 AccountsCmd::Login {
-                    label: "work".into(),
+                    account: "work".into(),
                 },
                 &env,
                 &host,
@@ -709,7 +738,7 @@ fn plain_claude_login_preserves_the_bound_directory_and_adopts_only_staging() {
     host.writes_home = true;
     let (code, _, err) = acc(
         AccountsCmd::Login {
-            label: "work-2".into(),
+            account: "work-2".into(),
         },
         &env,
         &host,
@@ -745,7 +774,7 @@ fn a_claude_identity_expectation_cannot_use_unchecked_plain_login() {
     host.tty = true;
     let (code, _, err) = acc(
         AccountsCmd::Login {
-            label: "account".into(),
+            account: "owner@example.test".into(),
         },
         &env,
         &host,
@@ -761,15 +790,27 @@ fn duplicate_canonical_identities_and_unsupported_alias_options_refuse() {
     let text = "[[account]]\nlabel='one'\nclass='dedicated'\ndir='/one'\nemail='alias@example.test'\nidentity_email='owner@example.test'\n\n[[account]]\nlabel='two'\nclass='dedicated'\ndir='/two'\nemail='OWNER@example.test'\n";
     assert!(Roster::parse_for(Cli::Codex, text).is_err());
     assert!(Roster::parse_for(Cli::Claude, text).is_err());
+    // `--identity-email` is gone: the account named is the identity. Grok Build's rows take no
+    // alias, so its `add` of an account through another address is refused and writes nothing;
+    // Kimi Code's adoption of one parses.
     assert!(
-        parsed(
-            "accounts add account --cli grok --email alias@example.test --identity-email owner@example.test"
-        )
-        .is_err()
+        parsed("accounts add account --cli codex --identity-email owner@example.test").is_err()
     );
+    let tmp = tmp_dir("grok-alias-refused");
+    let env = env_at(&tmp);
+    let (code, _, err) = run_line(
+        "accounts add xai owner@example.test --cli grok --email alias@example.test",
+        &env,
+    );
+    assert_eq!(code, exit(1), "{err}");
+    assert!(
+        err.contains("rows sign in with the account's own address, and --email names another"),
+        "{err}"
+    );
+    assert!(!env.accounts_roster_for(Cli::Grok).unwrap().exists());
     assert!(
         parsed(
-            "accounts adopt-default account --cli kimi --email alias@example.test --identity-email owner@example.test --region global"
+            "accounts adopt-default kimi owner@example.test --cli kimi --email alias@example.test --region global"
         )
         .is_ok()
     );
@@ -791,17 +832,14 @@ fn changed_or_removed_policy_cannot_publish_a_completed_login() {
             ] {
                 let tmp = tmp_dir("codex-policy-changed");
                 let env = env_at(&tmp);
-                assert_eq!(
-                    run_line(
-                        "accounts add account --cli codex --email owner@example.test",
-                        &env
-                    )
-                    .0,
-                    exit(0)
+                listed_by_hand(
+                    &env,
+                    Cli::Codex,
+                    by_hand("account", Some("owner@example.test")),
                 );
                 let good = TerminalCodex::new(Some("owner@example.test"));
                 assert_eq!(
-                    command("accounts login account --cli codex", &env, &good).0,
+                    command("accounts login owner@example.test --cli codex", &env, &good).0,
                     exit(0)
                 );
                 let store = env.accounts_store_for(Cli::Codex).unwrap();
@@ -814,7 +852,7 @@ fn changed_or_removed_policy_cannot_publish_a_completed_login() {
                 ));
                 assert_eq!(
                     command(
-                        &format!("accounts {verb} account --cli codex"),
+                        &format!("accounts {verb} owner@example.test --cli codex"),
                         &env,
                         &changed
                     )
@@ -836,15 +874,11 @@ fn invalid_adoption_identity_is_rejected_before_a_provider_probe() {
     let env = env_at(&tmp);
     let host = TerminalCodex::new(Some("owner@example.test"));
     assert_eq!(
-        command(
-            "accounts adopt-default account --cli codex --identity-email invalid",
-            &env,
-            &host
-        )
-        .0,
+        command("accounts adopt-default invalid --cli codex", &env, &host).0,
         exit(1)
     );
     assert!(host.probes.borrow().is_empty());
+    assert!(!tmp.path().join("accounts-codex.toml").exists());
 }
 
 #[cfg(unix)]
@@ -858,13 +892,13 @@ fn codex_recovery_requires_scoped_identity_and_a_status_check() {
     ] {
         let tmp = tmp_dir("codex-identity-recovery");
         let env = env_at(&tmp);
-        assert_eq!(
-            run_line(
-                "accounts add account --cli codex --identity-email owner@example.test",
-                &env
-            )
-            .0,
-            exit(0)
+        listed_by_hand(
+            &env,
+            Cli::Codex,
+            accounts::Row {
+                identity_email: Some("owner@example.test".to_owned()),
+                ..by_hand("account", None)
+            },
         );
         let store = env.accounts_store_for(Cli::Codex).unwrap();
         let staging = store.claim_staging_dir("account").unwrap();
@@ -918,26 +952,44 @@ pub(crate) fn identity_transition(
 ) -> aterm_spec::interp::State {
     let tmp = tmp_dir("codex-identity-model");
     let env = env_at(&tmp);
-    let (options, reported) = match action {
-        "Exact" | "ChangedIdentity" | "ChangedDirectory" | "PolicyChanged" => {
-            ("--email owner@example.test", Some("owner@example.test"))
-        }
-        "Alias" => (
-            "--email alias@example.test --identity-email owner@example.test",
+    // The row `account`, as an older Mac labelled it: its login address and the identity it must
+    // report, where they differ.
+    let ((email, identity), reported) = match action {
+        "Exact" | "ChangedIdentity" | "ChangedDirectory" | "PolicyChanged" => (
+            (Some("owner@example.test"), None),
             Some("owner@example.test"),
         ),
-        "Wrong" => ("--email owner@example.test", Some("another@example.test")),
-        "Missing" => ("--email owner@example.test", None),
-        "Anonymous" => ("", None),
+        "Alias" => (
+            (Some("alias@example.test"), Some("owner@example.test")),
+            Some("owner@example.test"),
+        ),
+        "Wrong" => (
+            (Some("owner@example.test"), None),
+            Some("another@example.test"),
+        ),
+        "Missing" => ((Some("owner@example.test"), None), None),
+        "Anonymous" => ((None, None), None),
         _ => panic!("unknown identity action"),
     };
-    let (code, _, err) = run_line(&format!("accounts add account --cli codex {options}"), &env);
-    assert_eq!(code, exit(0), "{err}");
+    listed_by_hand(
+        &env,
+        Cli::Codex,
+        accounts::Row {
+            identity_email: identity.map(str::to_owned),
+            ..by_hand("account", email)
+        },
+    );
     let mut host = TerminalCodex::new(reported);
     if action == "PolicyChanged" {
         host.mutation = Some((tmp.path().join("accounts-codex.toml"), String::new(), true));
     }
-    let _ = command("accounts login account --cli codex", &env, &host);
+    // The account's address names the row; a row with none, by its label.
+    let word = if action == "Anonymous" {
+        "account"
+    } else {
+        "owner@example.test"
+    };
+    let _ = command(&format!("accounts login {word} --cli codex"), &env, &host);
     let store = env.accounts_store_for(Cli::Codex).unwrap();
     let (mut logins, _) = store.load_logins(host.now()).unwrap();
     let roster = Roster::load_for(Cli::Codex, &tmp.path().join("accounts-codex.toml")).unwrap();

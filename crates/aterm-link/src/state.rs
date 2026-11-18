@@ -176,8 +176,10 @@ pub struct LogWitness {
 /// kept, on a log astream reminted keeping its records, lies below `head`, so since
 /// ATERM-KI-1114-1414 a read back on a log that continues none starts anywhere
 /// ([`Head::Anywhere`]), but for a keyed re-post's entry, whose key's sequence every re-post of
-/// it shares, which still starts here ([`Met::floor`]; its pin keeps the attach's head,
-/// `StateDir::forget_log_offsets`), as `Mutant::ReadBackFromTheAttachHead` starts every one.
+/// it shares, which still starts here ([`Met::floor`], a head that is not the post's own,
+/// [`Head::own`]; its pin keeps the attach's head, `StateDir::forget_log_offsets`), as
+/// `Mutant::ReadBackFromTheAttachHead` starts every one; one whose own head a proved step
+/// ([`Proved`]) left above its fork reads from that head instead ([`Head::OwnFrom`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Met {
     /// The log met.
@@ -264,9 +266,11 @@ impl Met {
         let now = now?;
         Some(match (met, replaced) {
             (Some(met), None) => met,
+            // A move astream's lineage carries stays on the line met; a proved step to another
+            // id (`Proved`) meets that id's line, as far down as the fork.
             (Some(met), Some(Some(fork))) => Self {
+                log: if met.log.id == now.id { met.log } else { now },
                 head: met.head.min(fork),
-                ..met
             },
             _ => Self { log: now, head },
         })
@@ -293,6 +297,321 @@ impl Met {
         let since = was.id == self.log.id && was.generation >= self.log.generation;
         (now.id == self.log.id && !since).then_some(self.head)
     }
+}
+
+/// ONE PROVED STEP (ATERM-KI-1116-7314): `now`, another id than `was`, holds `was`'s records below
+/// `fork`, as this node proved by reading back the records it told its endpoint, the newest of
+/// each subject ([`ToldSamples`]), at their offsets on `now` with their bytes. astream gives a log
+/// whose identity sidecar does not read a fresh id at generation 0 with no lineage, keeping every
+/// record (`logid::settle`'s `Prior::Unreadable`; one derived from its records where the sidecar
+/// is gone, `Prior::Absent`): only a reader that kept evidence of its own can say it continues.
+/// The newest [`Proved::MAX`] are kept ([`StateDir::proved_steps`]), so a head kept on `was` reads
+/// back from the fork on `now` (`Bridge::read_back_from`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Proved {
+    /// The log before.
+    pub was: astream_broker::LogIdentity,
+    /// The log proved to hold it.
+    pub now: astream_broker::LogIdentity,
+    /// One past the newest record proved: `now`'s offsets below it name `was`'s records.
+    pub fork: u64,
+    /// `now`'s head when the step was proved, at or above `fork`: a remint keeps every record
+    /// at its offset, but a log a power loss cut short before astream reminted it stands below
+    /// the head this node knew on `was`, and at or above this head `now`'s offsets name records
+    /// published since, as past a move's fork, so a keyed re-post's own head above it comes
+    /// down to it ([`Head::OwnFrom`], [`Proved::reach`]; the third review of the own head,
+    /// confirmed: kept above it, the read missed an attempt published since the remint). A line
+    /// a build before it wrote names none, and reads with `fork` here, the most its proof read.
+    pub head: u64,
+}
+
+impl Proved {
+    /// How many proved steps the state dir keeps.
+    pub const MAX: usize = 4;
+
+    /// The line this is stored as, exactly as every build before [`Proved::head`] reads it:
+    /// `was~now@fork`. The head goes on a line of its own ([`Proved::render_head`]).
+    #[must_use]
+    pub fn render(&self) -> String {
+        format!("{}~{}@{}", self.was, self.now, self.fork)
+    }
+
+    /// The head's own line, `^was~now@fork^head`, where it stands above the fork: a build before
+    /// [`Proved::head`] parses no step of it (`^was` names no log and `fork^head` no number) and
+    /// passes it, so a rollback or a dev bundle sharing the state dir still reads every step
+    /// (the third review of the own head, confirmed: one line `was~now@fork^head` read as no
+    /// step there, and that build's next [`StateDir::add_proved_step`] rewrote the file without
+    /// it).
+    #[must_use]
+    pub fn render_head(&self) -> Option<String> {
+        (self.head > self.fork).then(|| format!("^{}^{}", self.render(), self.head))
+    }
+
+    /// Every step stored as `text`, in its order: each step line ([`Proved::render`]), its head
+    /// where a head line of the same step names one ([`Proved::render_head`]), else its fork,
+    /// the most its proof read. A line neither of them, a torn one among them, is passed.
+    #[must_use]
+    pub fn parse_all(text: &str) -> Vec<Self> {
+        let mut steps: Vec<Self> = text.lines().filter_map(Self::parse).collect();
+        for (step, head) in text.lines().filter_map(Self::parse_head) {
+            for s in steps.iter_mut().filter(|s| {
+                **s == Self {
+                    head: s.head,
+                    ..step
+                }
+            }) {
+                s.head = head.max(s.fork);
+            }
+        }
+        steps
+    }
+
+    /// Every step of `steps` as the text [`Proved::parse_all`] reads.
+    #[must_use]
+    pub fn render_all(steps: &[Self]) -> String {
+        steps
+            .iter()
+            .flat_map(|s| std::iter::once(s.render()).chain(s.render_head()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Parse one step line back, its head at its fork ([`Proved::parse_all`] reads the head).
+    #[must_use]
+    pub fn parse(line: &str) -> Option<Self> {
+        let (logs, fork) = line.trim().split_once('@')?;
+        let (was, now) = logs.split_once('~')?;
+        let fork = crate::parse_uint(fork)?;
+        Some(Self {
+            was: astream_broker::LogIdentity::parse(was)?,
+            now: astream_broker::LogIdentity::parse(now)?,
+            fork,
+            head: fork,
+        })
+    }
+
+    /// One head line back: its step (head at the fork) and the head it names.
+    fn parse_head(line: &str) -> Option<(Self, u64)> {
+        let (step, head) = line.trim().strip_prefix('^')?.rsplit_once('^')?;
+        Some((Self::parse(step)?, crate::parse_uint(head)?))
+    }
+
+    /// Where a head kept on `was` continues on `now`, by these proved `steps` and astream's
+    /// `lineage` of `now`: the fork of the newest step from `was`, brought down by the lineage
+    /// from that step's log to `now` where `now` is a later generation of it. `None` where no
+    /// step leaves `was`, or none reaches `now`.
+    #[must_use]
+    pub fn continues(
+        steps: &[Self],
+        was: astream_broker::LogIdentity,
+        now: astream_broker::LogIdentity,
+        lineage: Option<&astream_broker::Lineage>,
+    ) -> Option<u64> {
+        Self::reach(steps, was, now, lineage).map(|(fork, moved)| fork.min(moved))
+    }
+
+    /// [`Proved::continues`] in its two parts: the newest step's fork from `was`, and where
+    /// `now` stops holding what that step's log held: the head the step was proved at
+    /// ([`Proved::head`]), brought down to where `now` continues the step's log by astream's
+    /// lineage where it is a later generation of it. Past that second part the offsets of `now`
+    /// name records published since the remint or a move, which a keyed re-post's own head
+    /// comes down to ([`Head::min`]), as on any move; the step's fork says what the remint kept
+    /// and moves no head (`Bridge::read_back_from`).
+    #[must_use]
+    pub fn reach(
+        steps: &[Self],
+        was: astream_broker::LogIdentity,
+        now: astream_broker::LogIdentity,
+        lineage: Option<&astream_broker::Lineage>,
+    ) -> Option<(u64, u64)> {
+        let step = steps.iter().rev().find(|s| s.was == was)?;
+        if step.now == now {
+            return Some((step.fork, step.head));
+        }
+        Some((step.fork, step.head.min(now.continues(step.now, lineage?)?)))
+    }
+}
+
+/// THE RECORDS THIS NODE TOLD ITS ENDPOINT (ATERM-KI-1116-7314): for each subject, the offset and
+/// the digest ([`told_digest`]) of the newest record of it the bridge offered aterm, recorded
+/// before the line that offers it goes (`Bridge::flush_told`). An attach that finds a log of
+/// another id continuing none of the one before reads each back at its offset; where one is
+/// there with its bytes and none is another record, the new log holds the old one's records
+/// below the newest proved, astream having given a log that kept its records another id
+/// ([`Proved`]). Above every offset the endpoint holds, the proof keeps them all, so nothing it
+/// was shown is offered as new. A sample recorded for a record never offered says only what the
+/// log holds; one that lags a record offered lowers the fork, and the endpoint forgets more.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToldSamples {
+    /// The log the samples are records of now.
+    pub log: Option<astream_broker::LogIdentity>,
+    /// Where a lineage move took the samples to `log` ([`ToldSamples::moved`]): the log they
+    /// were read on and the fork below which the move continues it, so each is a record of that
+    /// log as well. `None` for samples read on `log`. An attach refused after the move leaves its
+    /// witness on that log, and the next attach proves from them as from that log's own.
+    pub moved_from: Option<(astream_broker::LogIdentity, u64)>,
+    /// For each subject, the newest record of it told: its offset and digest.
+    pub rows: BTreeMap<String, (u64, u64)>,
+}
+
+impl ToldSamples {
+    /// At most this many subjects are kept, the lowest offsets dropped first.
+    pub const MAX: usize = 64;
+
+    /// The text this is stored as: `log=<id>`, then `from=<id> <fork>` where a move took them
+    /// ([`ToldSamples::moved_from`]), then `<off> <digest> <subject>` per subject, then
+    /// `end <seal>` ([`ToldSamples::seal`] of the text before it). The file is written
+    /// undurably, so a power cut can leave any prefix of it, or other bytes: the seal makes each
+    /// read as none.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut out = match self.log {
+            Some(log) => format!("log={log}"),
+            None => "log=-".to_string(),
+        };
+        if let Some((from, fork)) = self.moved_from {
+            out.push_str(&format!("\nfrom={from} {fork}"));
+        }
+        for (subject, (off, digest)) in &self.rows {
+            out.push_str(&format!("\n{off} {digest:016x} {subject}"));
+        }
+        let seal = Self::seal(&out);
+        out.push_str(&format!("\nend {seal:016x}"));
+        out
+    }
+
+    /// The seal of the text above a samples file's `end` line: the first eight bytes of its
+    /// SHA-256.
+    fn seal(body: &str) -> u64 {
+        let mut hash = aterm_digest::Sha256::new();
+        hash.update(b"aterm-link-told-samples-v1\0");
+        hash.update(body.as_bytes());
+        let digest = hash.finalize();
+        let mut first = [0u8; 8];
+        first.copy_from_slice(&digest[..8]);
+        u64::from_be_bytes(first)
+    }
+
+    /// Parse one back: `None` for a text with no `end` line sealing what is above it, or any of
+    /// whose lines does not read, which proves nothing.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let (body, end) = text.trim_end_matches('\n').rsplit_once('\n')?;
+        let seal = end.strip_prefix("end ").filter(|s| s.len() == 16)?;
+        if u64::from_str_radix(seal, 16).ok()? != Self::seal(body) {
+            return None;
+        }
+        let mut lines = body.lines().peekable();
+        let log = match lines.next()?.strip_prefix("log=")? {
+            "-" => None,
+            id => Some(astream_broker::LogIdentity::parse(id)?),
+        };
+        let moved_from = match lines.peek().copied().and_then(|l| l.strip_prefix("from=")) {
+            Some(from) => {
+                let (id, fork) = from.split_once(' ')?;
+                lines.next();
+                Some((
+                    astream_broker::LogIdentity::parse(id)?,
+                    crate::parse_uint(fork)?,
+                ))
+            }
+            None => None,
+        };
+        let mut rows = BTreeMap::new();
+        for line in lines {
+            let mut toks = line.split_whitespace();
+            let off = crate::parse_uint(toks.next()?)?;
+            let digest = toks.next().filter(|d| d.len() == 16)?;
+            let digest = u64::from_str_radix(digest, 16).ok()?;
+            let subject = toks.next()?;
+            if toks.next().is_some() || rows.insert(subject.to_string(), (off, digest)).is_some() {
+                return None;
+            }
+        }
+        Some(Self {
+            log,
+            moved_from,
+            rows,
+        })
+    }
+
+    /// Note the record at `off` of `subject` on `log`, whose raw body is `raw`, as told: whether
+    /// the samples changed. Samples of another log are dropped first.
+    pub fn note(
+        &mut self,
+        log: astream_broker::LogIdentity,
+        subject: &str,
+        off: u64,
+        raw: &[u8],
+    ) -> bool {
+        let mut changed = false;
+        if self.log != Some(log) {
+            *self = Self {
+                log: Some(log),
+                ..Self::default()
+            };
+            changed = true;
+        }
+        if self.rows.get(subject).is_some_and(|&(have, _)| have >= off) {
+            return changed;
+        }
+        self.rows
+            .insert(subject.to_string(), (off, told_digest(raw)));
+        while self.rows.len() > Self::MAX {
+            let lowest = self
+                .rows
+                .iter()
+                .min_by_key(|(_, (off, _))| *off)
+                .map(|(subject, _)| subject.clone());
+            if let Some(subject) = lowest {
+                self.rows.remove(&subject);
+            }
+        }
+        true
+    }
+
+    /// The samples a move from `was` to `now` that continues it below `fork` keeps: those below
+    /// it, now of `now` and still of `was` ([`ToldSamples::moved_from`]), where they are records
+    /// of `was`, read on it or taken from it by a move before (an attach refused after that move
+    /// left its witness on `was`, and this one meets the move again, or the next one on), and
+    /// then below that move's fork as well; none where they are another log's (a file a refused
+    /// or lost write left), whose records the move says nothing of.
+    pub fn moved(
+        &mut self,
+        was: Option<astream_broker::LogIdentity>,
+        now: astream_broker::LogIdentity,
+        fork: u64,
+    ) {
+        let Some(was) = was.filter(|was| {
+            self.log == Some(*was) || self.moved_from.is_some_and(|(from, _)| from == *was)
+        }) else {
+            *self = Self {
+                log: Some(now),
+                ..Self::default()
+            };
+            return;
+        };
+        let cut = match self.moved_from {
+            Some((from, cut)) if from == was && self.log != Some(was) => fork.min(cut),
+            _ => fork,
+        };
+        self.rows.retain(|_, (off, _)| *off < cut);
+        self.moved_from = Some((was, cut));
+        self.log = Some(now);
+    }
+}
+
+/// The digest a told sample keeps of a record's raw body ([`ToldSamples`]): the first eight bytes
+/// of its SHA-256.
+#[must_use]
+pub fn told_digest(raw: &[u8]) -> u64 {
+    let mut hash = aterm_digest::Sha256::new();
+    hash.update(b"aterm-link-told-v1\0");
+    hash.update(raw);
+    let digest = hash.finalize();
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(first)
 }
 
 /// One fleet halt this node holds in force ([`StateDir::standing_halts`]).
@@ -841,6 +1160,14 @@ pub struct StateDir {
     #[cfg(test)]
     rewitness_keeps_the_head: std::sync::atomic::AtomicBool,
     #[cfg(test)]
+    heads_to_a_proved_fork: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    proved_keyed_heads_at_the_attach: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    plain_from_heads_own: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    own_heads_above_the_proved_head: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     lease_names_no_boot_off_the_boot_volume: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     keep_acked_across_its_replace: std::sync::atomic::AtomicBool,
@@ -904,21 +1231,63 @@ pub(crate) struct PublishIdentity {
 /// hold the attempt's record at any offset, since astream gives a log that kept its records
 /// another id where its identity sidecar does not read. A read from there pages the post's face
 /// from 0 and takes a row only where its words and its origin are the post's
-/// (`Bridge::found_since`).
+/// (`Bridge::found_since`). `OwnFrom(n)` (ATERM-KI-1114-1414): a KEYED RE-POST'S OWN HEAD `n`,
+/// the bus's head as the drain knew it when it made the re-post's pin, before its first attempt,
+/// or when it journaled an attempt (its entry's), marked so where it is written: a sender's posts
+/// drain one at a time, so every earlier post of the key was published below `n`, and a record
+/// of the key's sequence under this node's producers at or above it is this post's own attempt.
+/// A move brings it down to its fork ([`Head::min`]), past which every record landed since the
+/// move, and across a proved step ([`Proved`]) one above the fork stays itself below the head
+/// the step was proved at ([`Proved::head`]): a remint keeps every record at its offset, so `n`
+/// names the same point on the proved log there, and above that head, on a log a power loss cut
+/// short before its remint, it comes down to it ([`Proved::reach`]), past which every record
+/// landed since. A read from it
+/// pages the face from `n` and takes a row only where its words and its origin are the post's,
+/// as from anywhere: claims are a log's and a proved step starts with none, so by words alone it
+/// would take a record of the same words to the same face under another origin for this post's
+/// (by its words where the broker cannot say origins, `Bridge::found_since`). A keyed re-post's
+/// `From(n)` is NOT its own head: an older build wrote every keyed head so, the one it made the
+/// pin at and the head an attach read where the log continued none of the pin's alike
+/// (`StateDir::publication_offset_resets`), as this build writes the latter and the head the node
+/// met the log's line at for an entry (`Bridge::keyed_floor`): its attempts may lie below it,
+/// where a carried cut kept one, so it bounds none of them, and no proved step makes it an own
+/// head.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Head {
     From(u64),
     Anywhere,
+    OwnFrom(u64),
 }
 
 impl Head {
     /// This head on a log that continues the one it was kept on up to `cap`: an offset comes
-    /// down to `cap`, and `Anywhere` stays anywhere.
+    /// down to `cap`, an own head still its own, and `Anywhere` stays anywhere. Past `cap` a
+    /// move cut the records an own head lay above, and every record at or above `cap` landed
+    /// since the move, after the post's pin, so the read from `cap` by words and origin still
+    /// meets only this post's own attempts.
     #[must_use]
     pub(crate) fn min(self, cap: u64) -> Self {
         match self {
             Self::From(at) => Self::From(at.min(cap)),
             Self::Anywhere => Self::Anywhere,
+            Self::OwnFrom(at) => Self::OwnFrom(at.min(cap)),
+        }
+    }
+
+    /// This head on a log a proved step says holds the one it was kept on below `fork`
+    /// ([`Proved`], ATERM-KI-1116-7314): itself where it reads from at or below the fork, and
+    /// `None` where it lies above. A move astream's lineage names cuts the old log's records
+    /// past its fork, so a head comes down to it ([`Head::min`]); a remint keeps every record at
+    /// its offset, so the records past the fork stand from before the attempt, and a read from
+    /// the fork by words alone would take a sender's earlier post of the same words for it.
+    /// Such a head reads as on a log that continues none ([`Head::Anywhere`]), but a keyed
+    /// re-post's own head from itself by its words and its origin ([`Head::OwnFrom`]).
+    #[must_use]
+    pub(crate) const fn below_a_proved_fork(self, fork: u64) -> Option<Self> {
+        if self.start() <= fork {
+            Some(self)
+        } else {
+            None
         }
     }
 
@@ -926,16 +1295,28 @@ impl Head {
     #[must_use]
     pub(crate) const fn start(self) -> u64 {
         match self {
-            Self::From(at) => at,
+            Self::From(at) | Self::OwnFrom(at) => at,
             Self::Anywhere => 0,
         }
     }
 
-    /// Its word in a journal record's tail ([`journal`]'s A RECORD'S TAIL): the offset, or `any`.
+    /// Where a keyed re-post's own attempts lie at or above: an own head's offset
+    /// ([`Head::OwnFrom`]), and `None` for every other head, which bounds none of them.
+    #[must_use]
+    pub(crate) const fn own(self) -> Option<u64> {
+        match self {
+            Self::OwnFrom(at) => Some(at),
+            Self::From(_) | Self::Anywhere => None,
+        }
+    }
+
+    /// Its word in a journal record's tail ([`journal`]'s A RECORD'S TAIL): the offset, `any`,
+    /// or `own<n>`.
     pub(crate) fn word(self) -> String {
         match self {
             Self::From(at) => at.to_string(),
             Self::Anywhere => "any".to_string(),
+            Self::OwnFrom(at) => format!("own{at}"),
         }
     }
 
@@ -943,6 +1324,9 @@ impl Head {
     pub(crate) fn of_word(word: &str) -> Option<Self> {
         if word == "any" {
             return Some(Self::Anywhere);
+        }
+        if let Some(at) = word.strip_prefix("own") {
+            return journal::number(at).map(Self::OwnFrom);
         }
         journal::number(word).map(Self::From)
     }
@@ -968,8 +1352,10 @@ pub(crate) struct PublishPin {
     /// earlier build skips), and a stop's hand-off beside the files
     /// ([`StateDir::hand_posts_to_files`]); a receipt's is kept in a file beside its pin's,
     /// with its pin's sequence and the log it is an offset of ([`ACK_HEADS`]), and a key's pin
-    /// file holds none. [`Head::Anywhere`] once a change of log met one that continues none of
-    /// the pin's ([`StateDir::publication_offset_resets`]).
+    /// file holds none. A keyed re-post's is its own head ([`Head::OwnFrom`]), which a proved
+    /// step leaves itself above the fork. [`Head::Anywhere`] once a change of log met one that
+    /// continues none of the pin's, a keyed re-post's the head the attach read there, `From`,
+    /// no own head ([`StateDir::publication_offset_resets`]).
     pub at: Option<Head>,
 }
 
@@ -1847,6 +2233,14 @@ impl StateDir {
             #[cfg(test)]
             rewitness_keeps_the_head: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
+            heads_to_a_proved_fork: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            proved_keyed_heads_at_the_attach: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            plain_from_heads_own: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            own_heads_above_the_proved_head: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
             lease_names_no_boot_off_the_boot_volume: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             keep_acked_across_its_replace: std::sync::atomic::AtomicBool::new(false),
@@ -1971,6 +2365,96 @@ impl StateDir {
     pub(crate) fn rewitness_keeps_the_head(&self, on: bool) {
         self.rewitness_keeps_the_head
             .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The negative control of a head above a proved fork, which comes down to the fork as on a
+    /// move astream's lineage names, as the first cut of ATERM-KI-1116-7314 brought it
+    /// ([`Head::below_a_proved_fork`], [`crate::sim::world::Mutant::ProvedHeadToTheFork`]).
+    #[cfg(test)]
+    pub(crate) fn heads_to_a_proved_fork(&self, on: bool) {
+        self.heads_to_a_proved_fork
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a head above a proved fork comes down to it ([`StateDir::heads_to_a_proved_fork`]).
+    fn to_a_proved_fork(&self) -> bool {
+        #[cfg(test)]
+        return self
+            .heads_to_a_proved_fork
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        false
+    }
+
+    /// The negative control of a keyed re-post's head above a proved fork, which goes where a
+    /// head on a log that continues none goes, as every build before ATERM-KI-1114-1414's own
+    /// head took it: a pin's to the head the attach read, a reply's in flight anywhere, not to
+    /// its own head ([`Head::OwnFrom`],
+    /// [`crate::sim::world::Mutant::ProvedKeyedHeadAtTheMeeting`]).
+    #[cfg(test)]
+    pub(crate) fn proved_keyed_heads_at_the_attach(&self, on: bool) {
+        self.proved_keyed_heads_at_the_attach
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a keyed head above a proved fork keeps its own head
+    /// ([`StateDir::proved_keyed_heads_at_the_attach`]).
+    fn keyed_own_heads(&self) -> bool {
+        #[cfg(test)]
+        return !self
+            .proved_keyed_heads_at_the_attach
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        true
+    }
+
+    /// The negative control of a keyed re-post's own head marked where it is written: a plain
+    /// `From` reads as its own head too ([`Head::own`]), as the own head's second cut read it,
+    /// so a head an older build wrote at the head an attach read, where the log continued none,
+    /// becomes [`Head::OwnFrom`] across a later proved step whose fork lies below it, which
+    /// bounds none of the post's attempts ([`crate::sim::world::Mutant::PlainFromHeadReadAsOwn`]).
+    #[cfg(test)]
+    pub(crate) fn plain_from_heads_own(&self, on: bool) {
+        self.plain_from_heads_own
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The negative control of a keyed re-post's own head across a proved step from a log
+    /// astream reminted shorter than the one before: the head stays above the head the step was
+    /// proved at, where the records published since stand
+    /// ([`crate::sim::world::Mutant::OwnHeadAboveAShorterLog`]).
+    #[cfg(test)]
+    pub(crate) fn own_heads_above_the_proved_head(&self, on: bool) {
+        self.own_heads_above_the_proved_head
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The highest a keyed re-post's own head stands across a proved step at `head`
+    /// ([`Proved::head`]; [`StateDir::own_heads_above_the_proved_head`]).
+    fn own_head_ceiling(&self, head: u64) -> u64 {
+        #[cfg(test)]
+        if self
+            .own_heads_above_the_proved_head
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return u64::MAX;
+        }
+        head
+    }
+
+    /// Where a keyed re-post's head says its own attempts lie at or above ([`Head::own`];
+    /// [`StateDir::plain_from_heads_own`]).
+    fn own_head(&self, at: Head) -> Option<u64> {
+        #[cfg(test)]
+        if let Head::From(from) = at {
+            if self
+                .plain_from_heads_own
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Some(from);
+            }
+        }
+        at.own()
     }
 
     /// Every write from now on through `disk`: a unit test moves a live bridge's dir onto a
@@ -3454,6 +3938,13 @@ impl StateDir {
         (asks.index().asked_rows(), asks.index().deadline_rows())
     }
 
+    /// The verdict of each `expired` of this node's the settles name ([`asks::Verdict`],
+    /// ATERM-KI-1115-7889), oldest ask first, `(ask, asker, verdict)`: what the bridge's verdict
+    /// cache starts from.
+    pub(crate) fn asks_verdicts(&self) -> Vec<(u64, String, asks::Verdict)> {
+        self.asks().index().verdict_rows()
+    }
+
     /// Whether the deadline of `sid`'s ask at `off` is settled, as this open holds the journal:
     /// a settle written, or one this open noted that no write has taken yet.
     pub(crate) fn deadline_settled(&self, off: u64, sid: &str) -> bool {
@@ -3818,33 +4309,49 @@ impl StateDir {
         self.write(&format!("keys/{sid}"), &lines.join("\n"))
     }
 
-    /// What a change of log resets in the reservations: each `original-off` the new log does
-    /// not vouch for (at or above `keep_below`, or any where it is `None`), taken out; and each
-    /// head ([`PublishPin::at`]; not a receipt's, kept with its log, [`ACK_HEADS`]) brought to
-    /// where it stands on the new log. A head is an offset of the log the pin was made on, or
-    /// [`Head::Anywhere`]. Past the fork `keep_below` where the new log continues the old, the
-    /// new log's offsets name records published since, a copy a retry published there among
-    /// them, so an offset comes down to the fork (aterm-link B05 review), and `Anywhere` stays.
-    /// On a log that continues none (another id, the same id continuing nothing, a lineage
-    /// unknown) it goes ANYWHERE (ATERM-KI-1114-1414): astream gives a log that kept its records
-    /// another id too (a fresh one where its identity sidecar does not read, one derived from
-    /// its records where the sidecar is gone), so an attempt's record may stand at any offset of
-    /// it, below the head the attach read among them, where a cut carried it and dropped its
-    /// dedup key; the retry's read pages the face from 0 and takes a row only where its words
-    /// and its origin are the post's, so a sender's earlier post of the same words is not taken
-    /// for it (critic review F1, 2026-11-13). Not to `head`, the head the attach read, as every
-    /// build from F1 to ATERM-KI-1114-1414 took it: a carried copy below it went unread and the
-    /// post landed a second one. Nor taken out, as every build before ATERM-KI-1111-4 took it:
-    /// the retry read nothing back, and an attempt the attach's replay published on the new log,
-    /// its answer unknown (a poisoned broker's), its dedup key cut, was published a second time
-    /// (the lossy-log sim's seed 2201). A KEYED RE-POST'S PIN (`via_key`) still goes to `head`:
-    /// every re-post of a key takes the key's sequence, so an earlier re-post of its words
-    /// stands under the same origin, and a read from anywhere would take it for this one's
-    /// attempt (ATERM-KI-1114-1414's step S3 reads the key's newest record instead).
+    /// What a change of log resets in the reservations: each `original-off` the new log does not
+    /// vouch for (at or above `keep_below`, or any where it is `None`), taken out; and each head
+    /// ([`PublishPin::at`]; not a receipt's, kept with its log, [`ACK_HEADS`]) brought to where it
+    /// stands on the new log. A head is an offset of the log the pin was made on, or
+    /// [`Head::Anywhere`]. Past the fork `keep_below` where the new log continues the old, the new
+    /// log's offsets name records published since, a copy a retry published there among them, so an
+    /// offset comes down to the fork (aterm-link B05 review), and `Anywhere` stays. On a log that
+    /// continues none (another id, the same id continuing nothing, a lineage unknown) it goes
+    /// ANYWHERE (ATERM-KI-1114-1414): astream gives a log that kept its records another id too (a
+    /// fresh one where its identity sidecar does not read, one derived from its records where the
+    /// sidecar is gone), so an attempt's record may stand at any offset of it, below the head the
+    /// attach read among them, where a cut carried it and dropped its dedup key; the retry's read
+    /// pages the face from 0 and takes a row only where its words and its origin are the post's, so
+    /// a sender's earlier post of the same words is not taken for it (critic review F1,
+    /// 2026-11-13). Not to `head`, the head the attach read, as every build from F1 to
+    /// ATERM-KI-1114-1414 took it: a carried copy below it went unread and the post landed a second
+    /// one. Nor taken out, as every build before ATERM-KI-1111-4 took it: the retry read nothing
+    /// back, and an attempt the attach's replay published on the new log, its answer unknown (a
+    /// poisoned broker's), its dedup key cut, was published a second time (the lossy-log sim's seed
+    /// 2201). A KEYED RE-POST'S PIN (`via_key`) still goes to `head` on a log that continues none,
+    /// `From`, no own head of the post's ([`Head::own`]): every re-post of a key takes the key's
+    /// sequence, so an earlier re-post of its words stands under the same origin, and a read from
+    /// anywhere would take it for this one's attempt (ATERM-KI-1114-1414); and its attempts may lie
+    /// below `head`, where a carried cut kept one. Across a PROVED STEP (`proved`, the head it was
+    /// proved at, [`Proved::head`], ATERM-KI-1116-7314) a head above the fork goes as on a log that
+    /// continues none ([`Head::below_a_proved_fork`]), but a keyed re-post's own head
+    /// ([`Head::OwnFrom`], the drain's mark on the head it made the pin at) stays itself: a remint
+    /// keeps every record at its offset, so the pin's head names the same point on the proved log,
+    /// below which every earlier post of its key was published, and at or above which a carried cut
+    /// may have kept its own attempt below `head` (at `head`, the retry's read missed it, and the
+    /// key's winner answered it or the publish landed the key's second record). It comes down to
+    /// `proved` where it stands above: a log a power loss cut short before astream reminted it lost
+    /// the records above that head, and records published since stand there. A keyed head that is
+    /// not its own (`From`: the head an attach read where the log continued none, or any keyed head
+    /// an older build wrote, which marked none) goes to `head` again, never to an own head: it
+    /// bounds none of the post's attempts, and split there an attempt a cut kept below it would be
+    /// read as its key's winner's (`Bridge::keyed_records_split_at`; the review of the own head,
+    /// confirmed: retired `dup=1`). One at or below the fork stays.
     fn publication_offset_resets(
         &self,
         keep_below: Option<u64>,
         head: u64,
+        proved: Option<u64>,
     ) -> io::Result<OffsetResets> {
         #[cfg(test)]
         let (head_gone, at_the_attach) = (
@@ -3855,16 +4362,23 @@ impl StateDir {
         );
         #[cfg(not(test))]
         let (head_gone, at_the_attach) = (false, false);
+        let to_the_fork = proved.is_none() || self.to_a_proved_fork();
+        let own_heads = proved.is_some() && self.keyed_own_heads();
+        let ceiling = proved.map_or(u64::MAX, |at| self.own_head_ceiling(at));
         let reset = |pin: &mut PublishPin| -> bool {
             let stale = pin
                 .original_off
                 .is_some_and(|off| keep_below.is_none_or(|f| off >= f));
             let off_reset = stale && pin.original_off.take().is_some();
             let at = pin.at.and_then(|at| match keep_below {
-                Some(fork) => Some(at.min(fork)),
-                None if head_gone => None,
-                None if at_the_attach || pin.via_key => Some(Head::From(head)),
-                None => Some(Head::Anywhere),
+                Some(fork) if to_the_fork => Some(at.min(fork)),
+                Some(fork) if at.below_a_proved_fork(fork).is_some() => Some(at),
+                _ if head_gone => None,
+                Some(_) if pin.via_key && own_heads && self.own_head(at).is_some() => {
+                    self.own_head(at).map(|own| Head::OwnFrom(own.min(ceiling)))
+                }
+                _ if at_the_attach || pin.via_key => Some(Head::From(head)),
+                _ => Some(Head::Anywhere),
             });
             let moved = at != pin.at;
             pin.at = at;
@@ -5886,7 +6400,14 @@ impl StateDir {
         }
     }
 
-    /// Forget every offset this dir holds that the log this node reads now does not vouch for ([`LogWitness::replaced_by`]), and put each back where a reader of this log, whose head is `head`, resumes. A post pin's head ([`PublishPin::at`]) goes where it stands on this log ([`StateDir::publication_offset_resets`]); a record in flight's and a receipt's stay with the log they name, which the read back maps (`Bridge::read_back_from`), but a reply in flight this re-witnesses onto `log`, its `re=` below its fork, takes its head down to that fork here (`Head::min`): on its new log the read back reads it from its own head (ATERM-KI-1116-2615).
+    /// Forget every offset this dir holds that the log this node reads now does not vouch for
+    /// ([`LogWitness::replaced_by`]), and put each back where a reader of this log, whose head is
+    /// `head`, resumes. A post pin's head ([`PublishPin::at`]) goes where it stands on this log
+    /// ([`StateDir::publication_offset_resets`]); a record in flight's and a receipt's stay with
+    /// the log they name, which the read back maps (`Bridge::read_back_from`), but a reply in
+    /// flight this re-witnesses onto `log`, its `re=` below its fork, takes its head and its pin's
+    /// down to that fork here (`Head::min`): on its new log the read back reads it from its own
+    /// head (ATERM-KI-1116-2615).
     pub fn forget_log_offsets(
         &self,
         head: u64,
@@ -5894,6 +6415,23 @@ impl StateDir {
         keep_below: Option<u64>,
         lineage: Option<&astream_broker::Lineage>,
     ) -> io::Result<Vec<(u64, String)>> {
+        self.forget_log_offsets_proved(head, log, keep_below, lineage, None)
+    }
+
+    /// [`StateDir::forget_log_offsets`] at an attach whose `keep_below` is the fork of the proved
+    /// step `proved` ([`Proved`], ATERM-KI-1116-7314): a reply kept on its log before takes the
+    /// step's fork as a reply on a move astream's lineage names takes the lineage's, which names
+    /// generations of one id and says nothing of the step.
+    pub fn forget_log_offsets_proved(
+        &self,
+        head: u64,
+        log: Option<astream_broker::LogIdentity>,
+        keep_below: Option<u64>,
+        lineage: Option<&astream_broker::Lineage>,
+        proved: Option<Proved>,
+    ) -> io::Result<Vec<(u64, String)>> {
+        let proved_was = proved.map(|step| step.was);
+        let ceiling = proved.map(|step| step.head.min(head));
         let keep_below = keep_below.map(|f| f.min(head));
         let kept = |off: u64| keep_below.is_some_and(|f| off < f);
         let entries = |name: &str| -> io::Result<Vec<std::fs::DirEntry>> {
@@ -5980,7 +6518,7 @@ impl StateDir {
                 posts: Vec::new(),
             }
         } else {
-            self.publication_offset_resets(keep_below, head)?
+            self.publication_offset_resets(keep_below, head, ceiling)?
         };
         let in_flight = self.in_flight()?;
         let owed = self.owed_entries();
@@ -6028,6 +6566,7 @@ impl StateDir {
                 continue;
             }
             let fork = match lineage {
+                _ if proved_was == Some(was) => keep_below,
                 Some(lineage) => keep_below.and_then(|f| Some(f.min(now.continues(was, lineage)?))),
                 None => keep_below,
             };
@@ -6036,7 +6575,14 @@ impl StateDir {
             // continuing read of an entry kept on the old log does (`Bridge::read_back_from`,
             // the aterm-link B05 review): past the fork the new log's offsets name records
             // published since, a copy the replay published there among them, which a read from
-            // the old head would miss (ATERM-KI-1116-2615).
+            // the old head would miss (ATERM-KI-1116-2615). Across a proved step a head above
+            // the fork reads as on a log that continues none (`Head::below_a_proved_fork`), a
+            // keyed reply's own head from itself by its words and its origin (`Head::OwnFrom`),
+            // down to the head the step was proved at, and a keyed reply's head that is not its
+            // own from the head the attach read, `From`, as a keyed pin's goes
+            // ([`StateDir::publication_offset_resets`]). Its pin's head goes
+            // the same way: it is a head of the log the entry names, which the replay reads it on
+            // (`Bridge::replay_in_flight`'s keyed read of its key's records).
             if let Some(f) = fork.filter(|&f| re.is_some_and(|off| off < f)) {
                 #[cfg(test)]
                 let keeps = self
@@ -6044,10 +6590,30 @@ impl StateDir {
                     .load(std::sync::atomic::Ordering::SeqCst);
                 #[cfg(not(test))]
                 let keeps = false;
-                let at = entry.at.map(|at| if keeps { at } else { at.min(f) });
+                let proved = proved_was == Some(was) && !self.to_a_proved_fork();
+                let own = proved && entry.pin.via_key && self.keyed_own_heads();
+                let below = ceiling.map_or(u64::MAX, |at| self.own_head_ceiling(at));
+                let rewitness = |at: Head| match at.below_a_proved_fork(f) {
+                    _ if keeps => at,
+                    None if own => self
+                        .own_head(at)
+                        .map_or(Head::From(head), |own| Head::OwnFrom(own.min(below))),
+                    None if proved => Head::Anywhere,
+                    _ => at.min(f),
+                };
+                let at = entry.at.map(rewitness);
+                let pin = PublishPin {
+                    at: entry.pin.at.map(rewitness),
+                    ..entry.pin
+                };
                 self.append_post_frame(
                     &mut posts,
-                    journal::Frame::InFlight(InFlight { log, at, ..entry }),
+                    journal::Frame::InFlight(InFlight {
+                        log,
+                        at,
+                        pin,
+                        ..entry
+                    }),
                 )?;
                 continue;
             }
@@ -6070,6 +6636,49 @@ impl StateDir {
     /// back ([`StateDir::rebase_log_witness`] is the write that survives one).
     pub fn set_log_witness(&self, witness: &LogWitness) -> io::Result<()> {
         self.write("bus-log", &witness.render())
+    }
+
+    /// The records this node told its endpoint ([`ToldSamples`]): none where none were recorded,
+    /// or what is there does not read.
+    #[must_use]
+    pub fn told_samples(&self) -> ToldSamples {
+        self.read("told-samples")
+            .and_then(|text| ToldSamples::parse(&text))
+            .unwrap_or_default()
+    }
+
+    /// Record the records this node told its endpoint, as written: a power cut that takes it back
+    /// ends the endpoint's sessions too.
+    pub fn set_told_samples(&self, samples: &ToldSamples) -> io::Result<()> {
+        self.write("told-samples", &samples.render())
+    }
+
+    /// Record that no record is told, on the media: before aterm is told a log that continues
+    /// none, which forgets what it holds (`Bridge::attach_broker`), so samples of the log before
+    /// never prove a later attach a step aterm no longer holds.
+    pub fn reset_told_samples(&self) -> io::Result<()> {
+        self.write_durable("told-samples", &ToldSamples::default().render())
+    }
+
+    /// The proved steps this node took ([`Proved`]), oldest first; a line that does not read is
+    /// passed.
+    #[must_use]
+    pub fn proved_steps(&self) -> Vec<Proved> {
+        self.read("proved-logs")
+            .map(|text| Proved::parse_all(&text))
+            .unwrap_or_default()
+    }
+
+    /// Record `step` after the proved steps there, the newest [`Proved::MAX`] kept, on the media
+    /// before this returns: the attach that proved it forgets by its fork next.
+    pub fn add_proved_step(&self, step: Proved) -> io::Result<Vec<Proved>> {
+        let mut steps = self.proved_steps();
+        steps.retain(|s| *s != step);
+        steps.push(step);
+        let drop = steps.len().saturating_sub(Proved::MAX);
+        steps.drain(..drop);
+        self.write_durable("proved-logs", &Proved::render_all(&steps))?;
+        Ok(steps)
     }
 
     /// Record the witness of a log the attach judged to replace the one before it, on the media

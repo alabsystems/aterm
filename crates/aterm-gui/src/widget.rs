@@ -34,10 +34,12 @@ pub(crate) enum TextFace {
     UiBold,
     Display(u8),
     /// The setup screen lockup's words, set alike whatever terminal font the person chose: SF
-    /// Mono as the design sets them, its static Semibold for [`TextWeight::Bold`] (the terminal
-    /// face's bold sibling, which [`Self::Mono`] draws from, is missing for a variable face such
-    /// as SF Mono, whose weights are instances of the one file), else the bundled Iosevka Term
-    /// and its Bold where SF Mono's faces are missing.
+    /// Mono's static Medium for [`TextWeight::Regular`] and its static Bold for
+    /// [`TextWeight::Bold`], each a step heavier than the design's weights so this unsmoothed
+    /// raster matches its smoothed render (the terminal face's bold sibling, which
+    /// [`Self::Mono`] draws from, is missing for a variable face such as SF Mono, whose weights
+    /// are instances of the one file), else the bundled Iosevka Term Regular and Bold where SF
+    /// Mono's faces are missing.
     Brand(TextWeight),
 }
 

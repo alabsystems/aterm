@@ -13,9 +13,8 @@ fn default_adoption_is_kept_in_the_local_fleet_source() {
     std::fs::write(&fleet, "opt_in='named'\n[[account]]\nlabel='work'\nemail='work@example.test'\nclass='dedicated'\nmachines=['m3']\n").unwrap();
     let (code, out, err) = acc_quiet(
         AccountsCmd::AdoptDefault {
-            label: "m3.1".into(),
+            account: None,
             email: Some("owner@example.test".into()),
-            identity_email: None,
             browser: None,
         },
         &env,
@@ -23,8 +22,10 @@ fn default_adoption_is_kept_in_the_local_fleet_source() {
     assert_eq!(code, exit(0), "{out}{err}");
     let text = std::fs::read_to_string(&fleet).unwrap();
     let source = FleetRoster::from_toml(&text, "fixture").unwrap();
+    let label =
+        crate::harness::account_names::tests::added_label(Cli::Claude, "owner@example.test");
     assert!(
-        source.accounts.iter().any(|row| row.label == "m3.1"),
+        source.accounts.iter().any(|row| row.label == label),
         "adoption would be dropped at the next sync: {text}"
     );
 }
@@ -53,8 +54,12 @@ fn source_case(case: i64) -> (i64, i64, i64, i64) {
             .text()
             .map(str::to_owned)
     };
-    let label = "m3.1";
-    let email = if case == 11 {
+    // The default login's row is the account's, under its reserved slug; in cases 9 and 11 the
+    // login signs in through an alias, so its provider must report the account's address.
+    let label =
+        crate::harness::account_names::tests::added_label(Cli::Claude, "owner@example.test");
+    let label = label.as_str();
+    let email = if matches!(case, 9 | 11) {
         "alias@example.test"
     } else {
         "owner@example.test"
@@ -152,9 +157,8 @@ fn source_case(case: i64) -> (i64, i64, i64, i64) {
     let host = FakeHost::new(&status);
     let (code, out, err) = acc(
         AccountsCmd::AdoptDefault {
-            label: label.into(),
+            account: matches!(case, 9 | 11).then(|| "claude owner@example.test".into()),
             email: Some(email.into()),
-            identity_email: matches!(case, 9 | 11).then(|| "owner@example.test".into()),
             browser: Some("Profile".into()),
         },
         &env,

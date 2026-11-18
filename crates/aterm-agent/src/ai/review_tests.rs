@@ -295,6 +295,7 @@ fn claude_account(login: Option<&str>) -> ClaudeAccounts {
         store: None,
         roster: None,
         label: "main".into(),
+        sign_in_word: None,
         listed: false,
         refused: None,
         unread: None,
@@ -1689,7 +1690,9 @@ fn a_pooled_codex_review_on_a_row_of_its_own_needs_a_build_that_reads_codex_auth
 
     let b = machine(&["codex"]);
     let store = Store::at(&b.state);
-    let serves = DefaultRow::Serves("main".into());
+    let main_word = codex_word("owner@example.com");
+    let main_pin = crate::harness::codex_alab::unread_fix(Some(&main_word));
+    let serves = DefaultRow::Serves("main".into(), Some(main_word.clone()));
     let on_with = |login: Option<&str>, default: &DefaultRow| {
         let mut f = facts_of(&CODEX, b.twin("codex"));
         f.pool = Some(CliAccounts {
@@ -1753,7 +1756,7 @@ fn a_pooled_codex_review_on_a_row_of_its_own_needs_a_build_that_reads_codex_auth
         assert_eq!(answers[0].verdict, Verdict::Failed, "{what}");
         assert_eq!(
             answers[0].fix.as_deref(),
-            Some("aterm harness accounts use main --cli codex"),
+            Some(main_pin.as_str()),
             "{what}: {:?}",
             answers[0].why
         );
@@ -1761,6 +1764,7 @@ fn a_pooled_codex_review_on_a_row_of_its_own_needs_a_build_that_reads_codex_auth
     }
     let walled = DefaultRow::Walled {
         label: "main".into(),
+        word: Some(main_word.clone()),
         window: "five_hour".into(),
         reset: Some(1_800_003_600),
         until: 1_800_003_750,
@@ -1788,8 +1792,7 @@ fn a_pooled_codex_review_on_a_row_of_its_own_needs_a_build_that_reads_codex_auth
         "no pin of a walled row before its wall ends: {why}"
     );
     assert!(
-        why.contains(&crate::harness::codex_alab::unread_fix(Some("main")))
-            && why.contains(&crate::harness::usage::rfc3339_utc(1_800_003_750)),
+        why.contains(&main_pin) && why.contains(&crate::harness::usage::rfc3339_utc(1_800_003_750)),
         "{why}"
     );
     assert!(runner.calls().is_empty(), "nothing runs");
@@ -3918,16 +3921,14 @@ fn a_discovered_codex_roster_keeps_current_recovery_advice() {
         assert_eq!(answer.verdict, Verdict::Failed);
         assert!(outcome.is_none());
         assert!(runner.calls().is_empty());
-        assert_eq!(
-            answer.fix.as_deref(),
-            (!walled).then_some("aterm harness accounts use main --cli codex")
-        );
+        let pin = crate::harness::codex_alab::unread_fix(Some(&codex_word("owner@example.com")));
+        assert_eq!(answer.fix.as_deref(), (!walled).then_some(pin.as_str()));
         let selected = prepared.fact.pool.as_ref().unwrap();
         assert_eq!(selected.pinned.as_deref(), Some("work"));
         assert!(
             matches!(
                 selected.default_row.as_ref(),
-                Some(DefaultRow::Serves(label)) if !walled && label == "main"
+                Some(DefaultRow::Serves(label, _)) if !walled && label == "main"
             ) || matches!(selected.default_row.as_ref(), Some(DefaultRow::Walled { label, .. }) if walled && label == "main")
         );
     }
@@ -5144,4 +5145,14 @@ fn a_lone_default_row_launch_takes_no_row_and_the_facts_refuse_none() {
     }
     assert!(run.write("prompt.txt", "ok").is_ok());
     assert!(run.subdir("work").is_ok());
+}
+
+/// The word the pin of the Codex account `email` types where no lab names it: its account key.
+fn codex_word(email: &str) -> crate::harness::account_names::Word {
+    crate::harness::account_names::Named {
+        pk: aterm_db::typed::keys::account_pk("codex", email).expect("an account key"),
+        row: None,
+        names: aterm_file::AccountNames::default(),
+    }
+    .word()
 }

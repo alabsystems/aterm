@@ -133,7 +133,7 @@ fn ladder(f: &Facts) -> bool {
             p.refused.is_none()
                 && crate::harness::accounts::Cli::parse(f.connector.id)
                     .and_then(|cli| p.sign_in_target(cli))
-                    .is_some_and(|(_, verb)| verb == "renew")
+                    .is_some_and(|target| target.verb == "renew")
         })
     }
 }
@@ -155,7 +155,7 @@ pub struct Bar {
 /// here, for which the step is the person's own `aterm ai login <id>` (which may still run that
 /// renewal at a terminal); a Claude row no route signs in
 /// unattended ([`super::facts::ClaudeAccounts::unattended`]), for which it is the row's own
-/// browser profile signed in once (`aterm harness accounts browser <label>`), after which its
+/// browser profile signed in once (`aterm harness accounts browser <account>`), after which its
 /// renewals run headless; or a pool row whose last renewal stopped for a person
 /// ([`super::facts::CliAccounts::person_task`]), for which it is the step that stop named.
 #[must_use]
@@ -181,7 +181,7 @@ pub fn bar(f: &Facts) -> Option<Bar> {
         if a.tried.as_ref().is_some_and(|t| t.outcome == "blocked") {
             return Some(Bar {
                 why: format!("a page stopped aterm's sign-in of `{label}`"),
-                step: Step::Renew(Cli::Claude, label.to_owned()).to_string(),
+                step: Step::renew(Cli::Claude, a.sign_in_word_or(label)).to_string(),
             });
         }
         if a.unattended {
@@ -192,20 +192,19 @@ pub fn bar(f: &Facts) -> Option<Bar> {
                 "no route signs `{label}` in with nobody at this Mac: no mailbox answers its \
                  email, and no browser profile of its own is signed in for a headless browser"
             ),
-            step: Step::Browser(Cli::Claude, label.to_owned()).to_string(),
+            step: Step::Browser(Cli::Claude, a.sign_in_word_or(label)).to_string(),
         });
     }
     let p = f.login_pool()?;
     let cli = crate::harness::accounts::Cli::parse(id)?;
-    let (label, _) = p.sign_in_target(cli)?;
+    let target = p.sign_in_target(cli)?;
+    let label = target.label;
     let step = match p.person_task? {
         crate::harness::accounts::SignInAction::Browser if cli.renews_headlessly() => {
-            Step::Browser(cli, label.to_owned()).to_string()
+            Step::Browser(cli, target.word).to_string()
         }
-        crate::harness::accounts::SignInAction::Renew => {
-            Step::Renew(cli, label.to_owned()).to_string()
-        }
-        _ => Step::Login(cli, label.to_owned()).to_string(),
+        crate::harness::accounts::SignInAction::Renew => Step::renew(cli, target.word).to_string(),
+        _ => Step::Login(cli, target.word).to_string(),
     };
     Some(Bar {
         why: format!("`{label}`'s last renewal stopped for a person"),
@@ -226,14 +225,14 @@ pub fn held(f: &Facts, now: i64) -> Option<String> {
     if let Some(p) = f.login_pool()
         && let Some(at) = p.check_at
         && let Some(cli) = crate::harness::accounts::Cli::parse(f.connector.id)
-        && let Some((label, _)) = p.sign_in_target(cli)
+        && let Some(target) = p.sign_in_target(cli)
     {
         return Some(format!(
             "its last sign-in met a bot protection {} ago, which aterm never tries to pass; \
              nothing signs it in again with nobody at this Mac: a person runs `{}` in a terminal \
              on this Mac",
             span(now.saturating_sub(at)),
-            crate::harness::cli::left_step(cli, label)
+            crate::harness::cli::left_step(cli, target.word)
         ));
     }
     let tried = f
@@ -252,7 +251,7 @@ pub fn held(f: &Facts, now: i64) -> Option<String> {
         return Some(format!(
             "{words}; nothing signs it in again with nobody at this Mac: a person runs `{}` in a \
              terminal on this Mac",
-            Step::Renew(Cli::Claude, label.to_owned())
+            Step::renew(Cli::Claude, a.sign_in_word_or(label))
         ));
     }
     Some(format!(
@@ -758,7 +757,14 @@ fn rate_login(f: &Facts, mut row: Row, unmeasured: &str, now: i64) -> Row {
     // signed in here, the CLI is signed out as aterm runs it, whatever the pinned row's records
     // and login file say, and the way back is two steps, that row's sign-in and then its pin.
     if let Some((label, stored)) = sign_in_then_pin(f) {
-        use crate::harness::codex_alab::{default_sign_in, signed_out_says, unread_fix};
+        use crate::harness::codex_alab::{
+            DefaultRow, default_sign_in, no_pin_words, signed_out_says, unread_fix,
+        };
+        // The word its pin types: none for a row with no address, which no step pins.
+        let word = match f.login_pool().and_then(|p| p.default_row.as_ref()) {
+            Some(DefaultRow::SignedOut { word, .. }) => word.as_ref(),
+            _ => None,
+        };
         let refused = launch_refused
             .map(|why| format!(" \u{b7} a launch aterm makes of it now is refused: {why}"))
             .unwrap_or_default();
@@ -770,11 +776,18 @@ fn rate_login(f: &Facts, mut row: Row, unmeasured: &str, now: i64) -> Row {
             ),
         );
         row.fix = None;
-        row.mend = Some(format!(
-            "sign `{label}` in at a terminal (`{}`), then pin it (`{}`)",
-            default_sign_in(),
-            unread_fix(Some(label))
-        ));
+        row.mend = Some(match word {
+            Some(word) => format!(
+                "sign `{label}` in at a terminal (`{}`), then pin it (`{}`)",
+                default_sign_in(),
+                unread_fix(Some(word))
+            ),
+            None => format!(
+                "sign `{label}` in at a terminal (`{}`); {}",
+                default_sign_in(),
+                no_pin_words(label)
+            ),
+        });
         row.actor = Some(Actor::Person);
         return row;
     }
@@ -1098,7 +1111,7 @@ fn serves_default_row(pool: &crate::ai::facts::CliAccounts) -> bool {
 pub fn sign_in_then_pin(f: &Facts) -> Option<(&str, bool)> {
     use crate::harness::codex_alab::DefaultRow;
     let p = f.login_pool()?;
-    let Some(DefaultRow::SignedOut { label, stored }) = &p.default_row else {
+    let Some(DefaultRow::SignedOut { label, stored, .. }) = &p.default_row else {
         return None;
     };
     (p.unread
@@ -1254,7 +1267,7 @@ impl Health {
     }
 
     /// The command that starts each sign-in only a person makes ([`Health::person_steps`]):
-    /// `` `aterm ai login muse` ``, `` `aterm harness accounts browser m2-2` ``.
+    /// `` `aterm ai login muse` ``, `` `aterm harness accounts browser <account>` ``.
     fn logins(&self) -> String {
         self.person_steps
             .iter()

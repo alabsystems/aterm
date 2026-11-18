@@ -136,8 +136,14 @@ fn native_budget() -> io::Result<usize> {
     Ok(usize::try_from(available).unwrap_or(usize::MAX))
 }
 fn room(directories: usize, files: usize, budget: usize) -> io::Result<()> {
-    if directories.checked_add(files).and_then(|n| n.checked_add(1)).is_none_or(|n| n > budget) {
-        return Err(refused("complete target sysroot descriptor capacity unavailable"));
+    if directories
+        .checked_add(files)
+        .and_then(|n| n.checked_add(1))
+        .is_none_or(|n| n > budget)
+    {
+        return Err(refused(
+            "complete target sysroot descriptor capacity unavailable",
+        ));
     }
     Ok(())
 }
@@ -164,7 +170,9 @@ pub(super) fn directory_entry(parent: &File, name: &OsStr) -> io::Result<bool> {
     } else if kind == libc::S_IFREG {
         Ok(false)
     } else {
-        Err(refused("target namespace contains a symlink or special file"))
+        Err(refused(
+            "target namespace contains a symlink or special file",
+        ))
     }
 }
 
@@ -199,11 +207,11 @@ unsafe fn errno() -> *mut libc::c_int {
     }
 }
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn names(_: &File, _: Instant) -> io::Result<Vec<OsString>> {
+pub(super) fn names(_: &File, _: Instant) -> io::Result<Vec<OsString>> {
     Err(io::ErrorKind::Unsupported.into())
 }
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn names(file: &File, deadline: Instant) -> io::Result<Vec<OsString>> {
+pub(super) fn names(file: &File, deadline: Instant) -> io::Result<Vec<OsString>> {
     time(deadline)?;
     let before = owned(file, true, false)?;
     // A fresh descriptor-relative listing never changes the original cursor.
@@ -339,12 +347,22 @@ impl NamespacePlan {
             let parent = if current.as_os_str().is_empty() {
                 root
             } else {
-                &directories.get(&current).ok_or_else(|| refused("target parent missing"))?.file
+                &directories
+                    .get(&current)
+                    .ok_or_else(|| refused("target parent missing"))?
+                    .file
             };
             let file = openat(parent.as_raw_fd(), name, true)?;
             let before = owned(&file, true, false)?;
             current.push(name);
-            directories.insert(current.clone(), Directory { file, before, names: None });
+            directories.insert(
+                current.clone(),
+                Directory {
+                    file,
+                    before,
+                    names: None,
+                },
+            );
         }
         let mut pending = vec![target.clone()];
         let mut planned = BTreeMap::new();
@@ -393,7 +411,14 @@ impl NamespacePlan {
                     if !identities.insert((before.dev(), before.ino())) {
                         return Err(refused("target directory aliases an original directory"));
                     }
-                    directories.insert(selected.clone(), Directory { file, before, names: None });
+                    directories.insert(
+                        selected.clone(),
+                        Directory {
+                            file,
+                            before,
+                            names: None,
+                        },
+                    );
                     pending.push(selected);
                 } else {
                     if before.len() > profile.file_bytes {
@@ -489,7 +514,15 @@ impl NamespacePlan {
     ) -> io::Result<Namespace> {
         let deadline = deadline.min(self.deadline);
         self.validate(root, deadline)?;
-        let Self { directories, planned, root_before, root_path, selected, profile, .. } = self;
+        let Self {
+            directories,
+            planned,
+            root_before,
+            root_path,
+            selected,
+            profile,
+            ..
+        } = self;
         // Every target entry is counted BEFORE keeping every data-file FD.
         // At NOFILE=256 a 507-file SDK refuses; it is never truncated to128/96.
         room(directories.len(), planned.len(), capacity)?;
@@ -510,7 +543,10 @@ impl NamespacePlan {
                 return Err(refused("target input replaced during capture"));
             }
             if let Some(hash) = package_hash.as_mut() {
-                while directory_headers.peek().is_some_and(|(name, _)| *name < &path) {
+                while directory_headers
+                    .peek()
+                    .is_some_and(|(name, _)| *name < &path)
+                {
                     time(deadline)?;
                     let (name, directory) = directory_headers.next().unwrap();
                     package_header(hash, name, &selected, &directory.before, true)?;
@@ -545,7 +581,14 @@ impl NamespacePlan {
                 device: before.dev(),
                 inode: before.ino(),
             };
-            files.insert(path, HeldFile { file, before, observation });
+            files.insert(
+                path,
+                HeldFile {
+                    file,
+                    before,
+                    observation,
+                },
+            );
         }
         if let Some(hash) = package_hash.as_mut() {
             for (name, directory) in directory_headers {
@@ -607,7 +650,9 @@ impl Namespace {
         }
         // A simultaneous failed bookend cannot be cleared by this success.
         if result.is_ok() && self.invalid.load(Ordering::Acquire) {
-            return Err(refused("original target sysroot failed a concurrent bookend"));
+            return Err(refused(
+                "original target sysroot failed a concurrent bookend",
+            ));
         }
         result
     }
@@ -693,11 +738,14 @@ impl Namespace {
         entries
     }
     pub(super) fn package_digest(&self) -> io::Result<[u8; 32]> {
-        self.package_digest.ok_or_else(|| refused("namespace has no package content scope"))
+        self.package_digest
+            .ok_or_else(|| refused("namespace has no package content scope"))
     }
     pub(super) fn read_package_file(&self, path: &Path, deadline: Instant) -> io::Result<Vec<u8>> {
-        let held =
-            self.files.get(path).ok_or_else(|| refused("unselected original package file"))?;
+        let held = self
+            .files
+            .get(path)
+            .ok_or_else(|| refused("unselected original package file"))?;
         let length = usize::try_from(held.before.len())
             .map_err(|_| refused("package input length overflow"))?;
         let mut bytes = vec![0; length];
@@ -738,7 +786,10 @@ impl HeldRustTargetSysroot {
             .file;
         let namespace = NamespacePlan::capture(root, compiler.root(), deadline, budget()?, |_| {})?;
         compiler.validate(deadline)?;
-        Ok(RustTargetSysrootPlan { compiler, namespace })
+        Ok(RustTargetSysrootPlan {
+            compiler,
+            namespace,
+        })
     }
     /// Captured byte observations only, not current validity or SDK authority.
     pub fn file_observations(&self) -> impl Iterator<Item = &FileObservation> {
@@ -795,7 +846,9 @@ impl HeldRustTargetSysroot {
                 matches!(name.as_slice(), b"RUSTC" | b"CARGO_BUILD_RUSTC")
                     && value.as_slice() != program
             }) {
-                return Err(refused("effective environment selects another SDK compiler"));
+                return Err(refused(
+                    "effective environment selects another SDK compiler",
+                ));
             }
             let explicit = selection(self.compiler.root(), args, environment)?;
             // filesearch::default_sysroot derives this from the actual driver
@@ -809,13 +862,19 @@ impl HeldRustTargetSysroot {
                         && name.as_bytes().ends_with(b".dylib")
                 }) && [
                     self.compiler.root().join("lib"),
-                    self.compiler.root().join("lib/rustlib").join(TARGET).join("lib"),
+                    self.compiler
+                        .root()
+                        .join("lib/rustlib")
+                        .join(TARGET)
+                        .join("lib"),
                 ]
                 .iter()
                 .any(|parent| image.path.parent() == Some(parent.as_path()))
             });
             if !explicit && !default_bound {
-                return Err(refused("implicit sysroot is not bound to the original SDK driver"));
+                return Err(refused(
+                    "implicit sysroot is not bound to the original SDK driver",
+                ));
             }
             self.validate(deadline)
         })
@@ -860,7 +919,10 @@ impl RustTargetSysrootPlan {
             .file;
         let namespace = self.namespace.materialize(root, deadline, budget()?)?;
         self.compiler.validate(deadline)?;
-        Ok(HeldRustTargetSysroot { compiler: self.compiler, namespace })
+        Ok(HeldRustTargetSysroot {
+            compiler: self.compiler,
+            namespace,
+        })
     }
 }
 
@@ -877,9 +939,13 @@ fn selection(
         .ok_or_else(|| refused("target command size overflow"))?;
     if bytes > 16 * 1024 * 1024
         || args.len() > 16384
-        || args.iter().any(|arg| arg.first() == Some(&b'@') || arg == b"--")
+        || args
+            .iter()
+            .any(|arg| arg.first() == Some(&b'@') || arg == b"--")
     {
-        return Err(refused("target command has unsupported argfile/opaque syntax or size"));
+        return Err(refused(
+            "target command has unsupported argfile/opaque syntax or size",
+        ));
     }
     let mut at = 0;
     while at < args.len() {
@@ -892,7 +958,9 @@ fn selection(
                     .map(|value| Some(value.as_slice()))
                     .ok_or_else(|| refused("target selection option has no value"));
             }
-            Ok(arg.strip_prefix(name).and_then(|rest| rest.strip_prefix(b"=")))
+            Ok(arg
+                .strip_prefix(name)
+                .and_then(|rest| rest.strip_prefix(b"=")))
         };
         if let Some(value) = option(b"--sysroot")? {
             if sysroot || value != root.as_os_str().as_bytes() {
@@ -911,7 +979,9 @@ fn selection(
             let value = if arg == b"-Z" || arg == b"-C" || arg == b"--codegen" {
                 at += 1;
                 Some(
-                    args.get(at).ok_or_else(|| refused("compiler option has no value"))?.as_slice(),
+                    args.get(at)
+                        .ok_or_else(|| refused("compiler option has no value"))?
+                        .as_slice(),
                 )
             } else if let Some(value) = arg.strip_prefix(b"--codegen=") {
                 Some(value)
@@ -929,7 +999,10 @@ fn selection(
                     .iter()
                     .map(|byte| if *byte == b'_' { b'-' } else { *byte })
                     .collect::<Vec<_>>();
-                matches!(normalized.as_slice(), b"codegen-backend" | b"llvm-plugins" | b"llvm-args")
+                matches!(
+                    normalized.as_slice(),
+                    b"codegen-backend" | b"llvm-plugins" | b"llvm-args"
+                )
             } else {
                 false
             };

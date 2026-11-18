@@ -671,7 +671,7 @@ impl ClosedDriver for HostClosed {
             Ok(snapshot) => {
                 aterm_agent::harness::upgrade_drive::renewal_hand_back(opts, &snapshot, resume).step
             }
-            Err(why) => unsnapped_step(why),
+            Err(why) => self_claimed::unsnapped_step(why),
         }
     }
 
@@ -681,20 +681,6 @@ impl ClosedDriver for HostClosed {
         resume: &self_claimed::Resume,
     ) -> bool {
         aterm_agent::harness::upgrade_drive::renewal_conversation_taken(source, resume)
-    }
-}
-
-/// The hand-back's step where the tab could not be read as the shell's ([`HostClosed`]). The
-/// shell holds the tab again once the last launcher is gone, and a read of the roster, the
-/// shell's terminal or its arguments can fail for now: each waits. Only a tab this relaunch can
-/// never name is refused: no tab to name, a shell another tab started, or one whose arguments
-/// the kernel withholds from aterm for as long as it runs (another user's shell, LS-72).
-fn unsnapped_step(why: &str) -> String {
-    match why {
-        "no-tab" | "tab-identity-conflict" | aterm_agent::harness::relaunch::ARGV_WITHHELD => {
-            format!("refused:{why}")
-        }
-        _ => format!("wait:{why}"),
     }
 }
 

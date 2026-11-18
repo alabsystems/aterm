@@ -174,6 +174,48 @@ pub fn shim_target(
     shim_target_with(baked, cwd, &unpublished_in, install)
 }
 
+/// Select the locked compiler from the directory Targo works in. Placement prefixes are
+/// removed before reading global `-C`; tippy's `-C` is a compiler option, not a directory.
+/// Resolve the directory as the kernel does, without changing this process's directory.
+///
+/// # Errors
+/// An invalid placement claim, malformed or inaccessible directory, or [`shim_target`]'s refusal.
+pub(crate) fn shim_target_for_call(
+    baked: &Path,
+    cwd: &Path,
+    tool: crate::build_cache::Tool,
+    placed: &str,
+    args: &[String],
+    install: &mut dyn FnMut(&Path, &TrustLock) -> Result<(), String>,
+) -> Result<Option<PathBuf>, String> {
+    let (typed, _) = crate::build_cache::registered::typed_call(args, placed)
+        .ok_or_else(|| "the compiler shim's placement claim is invalid".to_owned())?;
+    let directory = if tool == crate::build_cache::Tool::Targo {
+        crate::build_cache::directory_arg(typed)
+    } else {
+        None
+    };
+    let worked = match directory {
+        None => cwd.to_path_buf(),
+        Some(Some(value)) if !value.is_empty() => {
+            let directory = Path::new(value);
+            let directory = if directory.is_absolute() {
+                directory.to_path_buf()
+            } else {
+                cwd.join(directory)
+            };
+            crate::build_cache::changed_into(&directory).ok_or_else(|| {
+                format!(
+                    "the compiler shim cannot resolve -C directory {}",
+                    directory.display()
+                )
+            })?
+        }
+        Some(_) => return Err("the compiler shim's -C directory is missing or repeated".to_owned()),
+    };
+    shim_target(baked, &worked, install)
+}
+
 /// [`shim_target`] with the store's word on whether the lock's build is published for this
 /// machine read through `unpublished` (`prefix`, lock).
 fn shim_target_with(

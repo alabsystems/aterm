@@ -9,7 +9,7 @@ use super::command::{print, print_schema, sources_line};
 use super::fixture;
 use super::fold::{AGENTS_KEEP_MS, FleetTables, Inputs, REACH_KEEP_MS, Source, fold};
 use super::read::{
-    AccountWord, AgentSeen, Answer, Answered, At, Harness, Latest, Look, MachineSeen,
+    AccountWord, AgentSeen, Answer, Answered, At, Harness, Latest, Limits, Load, Look, MachineSeen,
     OUTPUT_KEEP_MS, OWN_ID, OutSrc, Rate, Read, SIGHTED_KEEP_MS, State, Tally, TurnFacts, Work,
     word,
 };
@@ -27,9 +27,11 @@ use crate::alab::view::{Account, LabView, Machine, MachineNickname, Preference};
 use crate::relation::{Cell, Row};
 use crate::typed::{cell, grid, keys};
 use aterm_json::Value;
+use aterm_types::needs::NeedWord;
 use aterm_types::network_state::{
     HistoryState, NetworkObservation, NetworkStateSnapshot, Visibility,
 };
+use aterm_types::update_standing::{StandingWord, UpdateFact, UpdateStanding};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -59,13 +61,15 @@ const OBSERVED: &[&str] = &[
     "agents_at",
     "disk_free_mb",
 ];
-/// The machines columns of the measures nothing carries yet. Memory's capacity is not among
-/// them: the registry carries it ([`MEM_CAPACITY`]).
+/// The machines columns a machine's own look and its updater's standing carry: unread for a
+/// machine no read heard, and for one whose aterm sends neither.
 const MEASURES: &[&str] = &[
     "cpu_used_x100",
     "cpu_cores",
     "cpu_at",
     "mem_used_mb",
+    "mem_total_mb",
+    "mem_at",
     "gpu_used_x100",
     "gpu_cores",
     "gpu_at",
@@ -75,10 +79,16 @@ const MEASURES: &[&str] = &[
     "net_used_kbps",
     "net_link_kbps",
     "net_at",
+    "cpu_limit",
+    "mem_limit",
+    "gpu_limit",
+    "disk_limit",
+    "load_x100",
+    "load_over_x100",
+    "look_at",
+    "update",
+    "update_to",
 ];
-
-/// The machines columns of the memory pair's capacity: read where the registry has `ram_gb`.
-const MEM_CAPACITY: &[&str] = &["mem_total_mb", "mem_at"];
 
 fn machine(label: &str) -> Machine {
     Machine {
@@ -154,6 +164,8 @@ fn agent(sid: &str, harness: Harness, state: State, account: Option<&str>) -> Ag
         tok_for_ms: None,
         turns: None,
         tools: None,
+        need: None,
+        activity: None,
         work: Work::of(state, &turn),
         answer_at_ms: None,
         rate: None,
@@ -173,6 +185,7 @@ fn answered(sessions: u32, agents: Vec<AgentSeen>) -> Answer {
         look: Look::UNREAD,
         access: None,
         drive: None,
+        update: None,
         sessions: Some(sessions),
         tally: Some(tally),
         work: None,
@@ -367,7 +380,7 @@ fn every_registry_machine_and_account_is_a_row_in_order_and_nothing_unread_is_ze
     for (n, row) in tables.machines.iter().enumerate() {
         let heard = row.sessions.is_some();
         unheard += usize::from(!heard);
-        let unread = OBSERVED.iter().filter(|_| !heard).chain(MEASURES).copied();
+        let unread = OBSERVED.iter().chain(MEASURES).filter(|_| !heard).copied();
         for column in unread {
             let at = rows::MACHINES.position(column).expect("a machines column");
             assert_eq!(row.cells()[at], Cell::Unread, "{column} of row {n}");
@@ -377,13 +390,6 @@ fn every_registry_machine_and_account_is_a_row_in_order_and_nothing_unread_is_ze
                 Some(&Value::Null),
                 "{column} of row {n} is null"
             );
-        }
-        // Capacity the registry carries is read, whether or not the machine was ever heard, in
-        // the measure's own unit; where the registry has none it is unread, not zero.
-        let total = rows::MACHINES.position("mem_total_mb").expect("a column");
-        match row.ram_gb {
-            Some(gb) => assert_eq!(grid[n + 1][total], (gb * 1_024).to_string()),
-            None => assert_eq!(grid[n + 1][total], "?"),
         }
     }
     assert!(
@@ -436,12 +442,10 @@ fn a_value_nobody_read_prints_unread_and_a_counted_zero_prints_zero() {
     };
     let unheard = tables(&inputs);
     let row = &unheard.machines[0];
-    for column in
-        OBSERVED
-            .iter()
-            .chain(MEASURES)
-            .chain(MEM_CAPACITY)
-            .chain(&["build", "last_seen", "proven"])
+    for column in OBSERVED
+        .iter()
+        .chain(MEASURES)
+        .chain(&["build", "last_seen", "proven", "old"])
     {
         assert_eq!(cell_of(row, column), Cell::Unread, "{column}");
         assert_eq!(shown_of(row, column), "?", "{column}");
@@ -465,12 +469,12 @@ fn a_value_nobody_read_prints_unread_and_a_counted_zero_prints_zero() {
         assert_eq!(shown_of(row, column), "0", "{column}");
     }
     assert_eq!(shown_of(row, "disk_free_mb"), "50000");
-    for column in MEASURES.iter().chain(MEM_CAPACITY) {
+    for column in MEASURES {
         assert_eq!(shown_of(row, column), "?", "{column} is still unread");
     }
 
-    // Capacity is read apart from use: the registry's memory is the pair's capacity, in MiB and
-    // dated by the registry's read, while the memory in use stays unread.
+    // The registry's memory is its own column: the memory pair is the machine's own look, so a
+    // machine no read heard has neither side of it, whatever the registry says it holds.
     let mut sized = machine("m3");
     sized.ram_gb = Some(128);
     let mut lab = LabView::default();
@@ -481,8 +485,8 @@ fn a_value_nobody_read_prints_unread_and_a_counted_zero_prints_zero() {
     });
     let row = &sized.machines[0];
     assert_eq!(shown_of(row, "ram_gb"), "128");
-    assert_eq!(shown_of(row, "mem_total_mb"), "131072");
-    assert_eq!(cell_of(row, "mem_at"), Cell::Value(Value::from(NOW - 7)));
+    assert_eq!(shown_of(row, "mem_total_mb"), "?");
+    assert_eq!(cell_of(row, "mem_at"), Cell::Unread);
     assert_eq!(shown_of(row, "mem_used_mb"), "?");
     let json = print(&heard, "machines", &[], true)
         .expect("machines print")
@@ -3712,5 +3716,509 @@ fn no_account_fact_or_its_provenance_holds_an_address() {
                 assert!(!value.to_string().contains('@'), "{name}");
             }
         }
+    }
+}
+
+/// An answer of [`answered`]'s that runs `build` and says `update` of its updater and `look` of
+/// its resources.
+fn answered_with(build: &str, update: Option<UpdateFact>, look: Look) -> Answer {
+    let mut answer = match answered(0, Vec::new()) {
+        Answer::Answered(answer) => answer,
+        Answer::Silent { .. } => panic!("an answer"),
+    };
+    answer.build = Some(build.to_owned());
+    answer.update = update;
+    answer.look = look;
+    Answer::Answered(answer)
+}
+
+/// The row of the machine labelled `label`.
+fn machine_row<'a>(tables: &'a FleetTables, label: &str) -> &'a rows::MachineRow {
+    tables
+        .machines
+        .iter()
+        .find(|row| row.label.as_deref() == Some(label))
+        .unwrap_or_else(|| panic!("a row for {label}"))
+}
+
+/// A whole look: 12 cores 11.4 busy, 40000 of 65536 MiB in use, 97% of 38 GPU cores busy, a
+/// 953000 MiB home volume, 81234 and 2345 kbit/s on a 10 Gbit/s link.
+fn whole_look() -> Look {
+    Look {
+        age_ms: Some(1_500),
+        cores: Some(12),
+        cpu_busy_x100: Some(1_140),
+        mem_total_mb: Some(65_536),
+        mem_used_mb: Some(40_000),
+        disk_total_mb: Some(953_000),
+        gpu_cores: Some(38),
+        gpu_busy_pct: Some(97),
+        net_link_kbps: Some(10_000_000),
+        net_rx_kbps: Some(81_234),
+        net_tx_kbps: Some(2_345),
+        limits: Limits {
+            cpu: Some(false),
+            mem: Some(false),
+            disk: Some(false),
+            gpu: Some(true),
+        },
+        load: Some(Load {
+            level_x100: 97,
+            over_x100: Some(0),
+        }),
+        ..Look::UNREAD
+    }
+}
+
+#[test]
+fn a_machines_pairs_are_its_own_look_and_an_older_machines_are_unread() {
+    // m3 sends a whole look; m4 sends one with a side of each pair missing; m5 runs an aterm
+    // before the look. Each answered with 50000 MiB free (`answered`).
+    let half = Look {
+        cores: None,
+        mem_used_mb: None,
+        gpu_cores: None,
+        disk_total_mb: None,
+        net_tx_kbps: None,
+        ..whole_look()
+    };
+    let inputs = Inputs {
+        lab: live(lab_of(&["m3", "m4", "m5"]), NOW),
+        read: read_of(vec![
+            peer("m3", answered_with("0.206.0", None, whole_look())),
+            peer("m4", answered_with("0.206.0", None, half)),
+            peer("m5", answered_with("0.141.0", None, Look::UNREAD)),
+        ]),
+        ..Inputs::default()
+    };
+    let tables = tables(&inputs);
+    let at = (NOW - 1_000).to_string();
+    let m3 = machine_row(&tables, "m3");
+    for (column, want) in [
+        ("cpu_used_x100", "1140"),
+        ("cpu_cores", "12"),
+        ("cpu_at", at.as_str()),
+        ("mem_used_mb", "40000"),
+        ("mem_total_mb", "65536"),
+        ("mem_at", at.as_str()),
+        // 97% of 38 cores: 36.86 cores busy.
+        ("gpu_used_x100", "3686"),
+        ("gpu_cores", "38"),
+        ("gpu_at", at.as_str()),
+        // The volume's size less its free space.
+        ("disk_used_mb", "903000"),
+        ("disk_total_mb", "953000"),
+        ("disk_at", at.as_str()),
+        // The busier direction of its link.
+        ("net_used_kbps", "81234"),
+        ("net_link_kbps", "10000000"),
+        ("net_at", at.as_str()),
+    ] {
+        assert_eq!(shown_of(m3, column), want, "m3 {column}");
+    }
+    // Each side is read or not on its own: a capacity unread leaves its use unread where the
+    // use is a share of it (the GPU) or a part of it (the disk), and nothing else.
+    let m4 = machine_row(&tables, "m4");
+    for (column, want) in [
+        ("cpu_used_x100", "1140"),
+        ("cpu_cores", "?"),
+        ("mem_used_mb", "?"),
+        ("mem_total_mb", "65536"),
+        ("gpu_used_x100", "?"),
+        ("gpu_cores", "?"),
+        ("disk_used_mb", "?"),
+        ("disk_total_mb", "?"),
+        ("net_used_kbps", "?"),
+        ("net_link_kbps", "10000000"),
+        ("net_at", at.as_str()),
+    ] {
+        assert_eq!(shown_of(m4, column), want, "m4 {column}");
+    }
+    // An older aterm says nothing of its resources: every pair unread, never 0, while what it
+    // did say (its free space) is read.
+    let m5 = machine_row(&tables, "m5");
+    for column in MEASURES {
+        assert_eq!(cell_of(m5, column), Cell::Unread, "m5 {column}");
+    }
+    assert_eq!(shown_of(m5, "disk_free_mb"), "50000");
+}
+
+#[test]
+fn a_machines_load_is_its_own_dial_and_an_unsent_one_is_unread() {
+    // m3's CPU is idle and its own verdict says it is at its limit: the row says what the machine
+    // said, and the fold decides no verdict. m4 judged no disk verdict and no load depth, and m5
+    // sends no load at all; m6 runs an aterm before the look.
+    let idle_at_limit = Look {
+        cpu_busy_x100: Some(0),
+        limits: Limits {
+            cpu: Some(true),
+            ..whole_look().limits
+        },
+        load: Some(Load {
+            level_x100: 88,
+            over_x100: Some(21),
+        }),
+        ..whole_look()
+    };
+    let partial = Look {
+        limits: Limits {
+            disk: None,
+            ..whole_look().limits
+        },
+        load: Some(Load {
+            level_x100: 40,
+            over_x100: None,
+        }),
+        ..whole_look()
+    };
+    let no_load = Look {
+        load: None,
+        ..whole_look()
+    };
+    let inputs = Inputs {
+        lab: live(lab_of(&["m3", "m4", "m5", "m6"]), NOW),
+        read: read_of(vec![
+            peer("m3", answered_with("0.206.0", None, idle_at_limit)),
+            peer("m4", answered_with("0.206.0", None, partial)),
+            peer("m5", answered_with("0.206.0", None, no_load)),
+            peer("m6", answered_with("0.141.0", None, Look::UNREAD)),
+        ]),
+        ..Inputs::default()
+    };
+    let tables = tables(&inputs);
+    let at = (NOW - 1_000).to_string();
+    let shown = |label: &str, columns: &[&str]| -> Vec<String> {
+        let row = machine_row(&tables, label);
+        columns.iter().map(|column| shown_of(row, column)).collect()
+    };
+    const DIAL: &[&str] = &[
+        "cpu_limit",
+        "mem_limit",
+        "gpu_limit",
+        "disk_limit",
+        "load_x100",
+        "load_over_x100",
+        "look_at",
+    ];
+    assert_eq!(
+        shown("m3", DIAL),
+        ["true", "false", "true", "false", "88", "21", at.as_str()],
+        "its own verdicts and its own dial, a CPU at 0 at its limit included"
+    );
+    assert_eq!(
+        shown("m4", DIAL),
+        ["false", "false", "true", "?", "40", "?", at.as_str()],
+        "a verdict it did not judge and a depth it could not read are unread"
+    );
+    assert_eq!(
+        shown("m5", DIAL),
+        ["false", "false", "true", "false", "?", "?", at.as_str()],
+        "a look with no load score has no load"
+    );
+    assert_eq!(
+        shown("m6", DIAL),
+        ["?", "?", "?", "?", "?", "?", "?"],
+        "an aterm before the look says no verdict and no load"
+    );
+}
+
+#[test]
+fn a_machine_behind_and_not_installing_is_old_and_not_updating() {
+    // Twelve machines answer on 0.206.0 (m1 to m12, m12 a dev build of it); ten are behind on
+    // 0.204.0, each standing where its updater stands.
+    let on = |standing: UpdateStanding| Some(UpdateFact::of(standing));
+    let at = |label: &str, build: &str, standing: UpdateStanding| {
+        peer(label, answered_with(build, on(standing), whole_look()))
+    };
+    let mut machines: Vec<MachineSeen> = (1..=11)
+        .map(|n| at(&format!("m{n}"), "0.206.0", UpdateStanding::Current))
+        .collect();
+    machines.push(at("m12", "0.206.0+gabc1234", UpdateStanding::Off));
+    let behind = [
+        ("m20", on(UpdateStanding::NotInstalling), "true"),
+        ("m21", on(UpdateStanding::Off), "true"),
+        ("m22", on(UpdateStanding::Failing), "true"),
+        // Installing: downloaded, offered, or installed and waiting for a start.
+        ("m23", on(UpdateStanding::Downloaded), "false"),
+        ("m24", on(UpdateStanding::Behind), "false"),
+        ("m25", on(UpdateStanding::Installed), "false"),
+        // Up to date is its installed bundle's, which may be past the window that answered, as
+        // of a check a release may have overtaken; no check yet says nothing either. A standing
+        // nobody read, a word this build does not know, and none sent: unread, never current.
+        ("m26", on(UpdateStanding::Current), "?"),
+        ("m27", on(UpdateStanding::Unchecked), "?"),
+        ("m28", on(UpdateStanding::Unread), "?"),
+        (
+            "m29",
+            Some(UpdateFact {
+                standing: StandingWord::of("rebuilding").expect("a word of the grammar"),
+                ..UpdateFact::of(UpdateStanding::Current)
+            }),
+            "?",
+        ),
+        ("m30", None, "?"),
+    ];
+    for (label, update, _) in &behind {
+        machines.push(peer(
+            label,
+            answered_with("0.204.0", update.clone(), whole_look()),
+        ));
+    }
+    let mut labels: Vec<String> = (1..=12).map(|n| format!("m{n}")).collect();
+    labels.extend(behind.iter().map(|(label, _, _)| (*label).to_owned()));
+    let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let folded = tables(&Inputs {
+        lab: live(lab_of(&labels), NOW),
+        read: read_of(machines),
+        ..Inputs::default()
+    });
+    let old = |tables: &FleetTables, label: &str| shown_of(machine_row(tables, label), "old");
+    for label in &labels[..12] {
+        assert_eq!(
+            old(&folded, label),
+            "false",
+            "{label} runs the fleet's build"
+        );
+    }
+    assert_eq!(shown_of(machine_row(&folded, "m12"), "update"), "off");
+    for (label, _, want) in &behind {
+        assert_eq!(old(&folded, label), *want, "{label}");
+    }
+    assert_eq!(
+        shown_of(machine_row(&folded, "m23"), "update"),
+        "downloaded"
+    );
+    assert_eq!(cell_of(machine_row(&folded, "m30"), "update"), Cell::Unread);
+
+    // The fleet's build is the one most run, not the newest: three on 0.204.0 and one on
+    // 0.206.0, and nobody is behind. A tie goes to the newer build.
+    for (builds, want) in [
+        (
+            &["0.204.0", "0.204.0", "0.204.0", "0.206.0"][..],
+            ["false"; 4],
+        ),
+        (
+            &["0.206.0", "0.205.0", "0.206.0", "0.205.0"][..],
+            ["false", "true", "false", "true"],
+        ),
+    ] {
+        let labels = ["m1", "m2", "m3", "m4"];
+        let machines = labels
+            .iter()
+            .zip(builds)
+            .map(|(label, build)| at(label, build, UpdateStanding::NotInstalling))
+            .collect();
+        let folded = tables(&Inputs {
+            lab: live(lab_of(&labels), NOW),
+            read: read_of(machines),
+            ..Inputs::default()
+        });
+        let got: Vec<String> = labels.iter().map(|label| old(&folded, label)).collect();
+        assert_eq!(got, want, "{builds:?}");
+    }
+
+    // Only an answer of now votes and is judged. m1 to m3 last answered 400 s ago on 0.204.0
+    // and sleep; m4 and m6 answer now on 0.206.0, m5 on 0.204.0; m7 and m8 answer now on
+    // 0.204.0 as claims, which cast no vote. Counted, the sleepers or the claims would make
+    // 0.204.0 the fleet's build.
+    let stale = whole(
+        NOW - 400_000,
+        ["m1", "m2", "m3"]
+            .iter()
+            .map(|label| at(label, "0.204.0", UpdateStanding::NotInstalling))
+            .collect(),
+    );
+    let now = whole(
+        NOW - 1_000,
+        vec![
+            at("m4", "0.206.0", UpdateStanding::Current),
+            at("m5", "0.204.0", UpdateStanding::NotInstalling),
+            at("m6", "0.206.0", UpdateStanding::Current),
+            at("m7", "0.204.0", UpdateStanding::NotInstalling).unproven(),
+            at("m8", "0.204.0", UpdateStanding::NotInstalling).unproven(),
+        ],
+    );
+    let labels = ["m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8"];
+    let folded = tables(&Inputs {
+        lab: live(lab_of(&labels), NOW),
+        read: live(Latest::default().with(stale).with(now), NOW - 1_000),
+        ..Inputs::default()
+    });
+    let got: Vec<String> = labels.iter().map(|label| old(&folded, label)).collect();
+    assert_eq!(
+        got,
+        ["?", "?", "?", "false", "true", "false", "true", "true"],
+        "a sleeping machine's last answer is unread; a claim is judged and casts no vote"
+    );
+    // Their builds are kept, as every last-seen fact is.
+    assert_eq!(shown_of(machine_row(&folded, "m1"), "build"), "0.204.0");
+}
+
+/// The agents row of session `sid`.
+fn agent_row<'a>(tables: &'a FleetTables, sid: &str) -> &'a rows::AgentRow {
+    tables
+        .agents
+        .iter()
+        .find(|row| row.sid == sid)
+        .unwrap_or_else(|| panic!("a row for {sid}"))
+}
+
+/// The agents columns FP-12 adds, the facts an agent's mark is drawn from.
+const AGENT_FACTS: &[&str] = &[
+    "turn_open",
+    "turn_since",
+    "step_since",
+    "out_at",
+    "out_src",
+    "jobs",
+    "tools",
+    "need",
+    "activity",
+    "tok_in",
+    "tok_out",
+    "tok_in_per_min",
+    "tok_out_per_min",
+    "rate_over_ms",
+];
+
+#[test]
+fn an_agents_row_carries_its_output_age_its_open_turn_its_job_and_its_word_and_an_unsent_one_is_unread()
+ {
+    // m1 answers twice, a minute apart. s1 is writing: a turn open 40 s, a tool step open 5 s,
+    // output 3 s ago in its transcript, two shells running, 17 tool steps, no need, and its
+    // machine sends the activity word `busy`. s2 has no turn open and no shell running, last
+    // moved its screen 30 s ago and asks a question; its machine sends no activity word. s3 runs
+    // an aterm before the turn, which sends none of these.
+    let writing_turn = TurnFacts {
+        turn_open: Some(true),
+        turn_age_ms: Some(40_000),
+        turn_end_age_ms: Some(900_000),
+        step_age_ms: Some(5_000),
+        out_age_ms: Some(3_000),
+        out_src: Some(OutSrc::Transcript),
+        bg: Some(2),
+        older: false,
+        word_turn: true,
+    };
+    let writing = |tokens: (u64, u64)| AgentSeen {
+        turn: writing_turn,
+        tools: Some(17),
+        need: Some(None),
+        activity: Some("busy".to_owned()),
+        work: Work::of(State::Busy, &writing_turn),
+        ..counting("s1", tokens, 600_000)
+    };
+    let asking_turn = TurnFacts {
+        turn_open: Some(false),
+        turn_age_ms: None,
+        turn_end_age_ms: Some(30_000),
+        step_age_ms: None,
+        out_age_ms: Some(30_000),
+        out_src: Some(OutSrc::Screen),
+        bg: Some(0),
+        older: false,
+        word_turn: false,
+    };
+    let asking = AgentSeen {
+        turn: asking_turn,
+        tools: Some(0),
+        need: Some(Some(NeedWord::Question)),
+        work: Work::of(State::Waiting, &asking_turn),
+        ..agent("s2", Harness::Claude, State::Waiting, None)
+    };
+    let older = agent("s3", Harness::Claude, State::Busy, None);
+    let read = |at: u64, agents: Vec<AgentSeen>| {
+        whole(at, vec![peer("m1", answered_at(Some(at), agents))])
+    };
+    let at = NOW - 1_000;
+    let latest = Latest::default()
+        .with(read(
+            at - 60_000,
+            vec![writing((100_000, 4_000)), asking.clone(), older.clone()],
+        ))
+        .with(read(
+            at,
+            vec![writing((1_000_000, 64_000)), asking.clone(), older.clone()],
+        ));
+    let folded = tables(&Inputs {
+        lab: live(lab_of(&["m1"]), NOW),
+        read: live(latest, at),
+        ..Inputs::default()
+    });
+    let since = |age: u64| (at - age).to_string();
+    let shown = |sid: &str| -> Vec<String> {
+        let row = agent_row(&folded, sid);
+        AGENT_FACTS
+            .iter()
+            .map(|column| shown_of(row, column))
+            .collect()
+    };
+    assert_eq!(
+        shown("s1"),
+        [
+            "true",
+            &since(40_000),
+            &since(5_000),
+            &since(3_000),
+            "transcript",
+            "2",
+            "17",
+            "",
+            "busy",
+            "1000000",
+            "64000",
+            // What its counters gained between the two reads, a minute apart.
+            "900000",
+            "60000",
+            "60000",
+        ],
+        "a writing agent's facts, each as its row sent it"
+    );
+    assert_eq!(
+        shown("s2"),
+        [
+            "false",
+            "",
+            "",
+            &since(30_000),
+            "screen",
+            "0",
+            "0",
+            "question",
+            "?",
+            "?",
+            "?",
+            "?",
+            "?",
+            "?",
+        ],
+        "no turn open and no step is known empty; a word its machine did not send is unread"
+    );
+    let s2 = agent_row(&folded, "s2");
+    for column in ["turn_since", "step_since"] {
+        assert_eq!(cell_of(s2, column), Cell::Empty, "s2 {column}");
+    }
+    // `needs=-` is no need, known empty, never unread.
+    assert_eq!(cell_of(agent_row(&folded, "s1"), "need"), Cell::Empty);
+    // An aterm before the turn sent none of them: every one unread, its output age never 0 (an
+    // output written as it was read, which would draw it writing).
+    let s3 = agent_row(&folded, "s3");
+    for column in AGENT_FACTS {
+        assert_eq!(cell_of(s3, column), Cell::Unread, "s3 {column}");
+    }
+
+    // One read alone has counters and no rate.
+    let once = tables(&Inputs {
+        lab: live(lab_of(&["m1"]), NOW),
+        read: live(
+            Latest::default().with(read(at, vec![writing((1_000_000, 64_000))])),
+            at,
+        ),
+        ..Inputs::default()
+    });
+    let s1 = agent_row(&once, "s1");
+    assert_eq!(shown_of(s1, "tok_in"), "1000000");
+    for column in ["tok_in_per_min", "tok_out_per_min", "rate_over_ms"] {
+        assert_eq!(cell_of(s1, column), Cell::Unread, "one read: {column}");
     }
 }

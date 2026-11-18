@@ -10,6 +10,81 @@ const AWAY: Routes = [Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9))), None, Non
 const MINUTE: u64 = 60 * 1000;
 
 #[test]
+fn a_standing_row_is_not_rearmed_by_an_unchanged_shared_retry_receipt() {
+    let scope = RefreshScope::new([1; 32]);
+    let request = RefreshRequest::inputs(scope, RefreshVersion::default());
+    let mut due = Due::default();
+    assert!(due.after_request(RepositoryRequest::Refresh(request), 0, HOME, Last::None));
+    let observed = RefreshObservation {
+        version: RefreshVersion {
+            input: 1,
+            attempt: 1,
+            fulfilled: 0,
+        },
+        scope: Some(scope),
+        pending: Some(request),
+        retry_ms: Some(FIRST_RETRY_MS),
+        ..RefreshObservation::default()
+    };
+    assert!(
+        observed.retry_for(request).is_some(),
+        "the receipt actually covers this request"
+    );
+    due.observe(observed);
+    for (at, last) in [
+        (1, Last::Standing),
+        (FIRST_RETRY_MS + 1, Last::None),
+        (60 * MINUTE, Last::None),
+    ] {
+        assert!(
+            !due.poll(at, HOME, last),
+            "an unchanged shared receipt is not an input transition"
+        );
+        assert_eq!(due.next_at(), None);
+    }
+    let changed = RefreshRequest::inputs(RefreshScope::new([2; 32]), observed.version);
+    assert!(due.after_request(
+        RepositoryRequest::Refresh(changed),
+        60 * MINUTE + 1,
+        HOME,
+        Last::None
+    ));
+    assert_eq!(
+        due.repository_request(),
+        RepositoryRequest::Refresh(changed)
+    );
+}
+
+#[test]
+fn a_standing_row_does_not_turn_maintenance_queued_during_its_pass_into_input() {
+    let mut due = Due::default();
+    assert!(due.at_start(0, HOME, Last::None));
+    assert!(!due.poll(RECHECK_MS, HOME, Last::Running));
+    assert!(
+        !due.poll(RECHECK_MS + 1, HOME, Last::Standing),
+        "elapsed maintenance time is not a changed input"
+    );
+    assert_eq!(due.next_at(), None);
+    due.request(RepositoryRequest::Repair);
+    assert!(due.poll(RECHECK_MS + 2, HOME, Last::None));
+    assert_eq!(due.repository_work(), RepositoryWork::Refresh);
+    assert!(!due.poll(RECHECK_MS + 3, HOME, Last::Standing));
+    assert_eq!(due.next_at(), None);
+}
+
+#[test]
+fn a_standing_row_keeps_real_input_coalesced_with_queued_maintenance() {
+    let mut due = Due::default();
+    assert!(due.at_start(0, HOME, Last::None));
+    assert!(!due.poll(RECHECK_MS, HOME, Last::Running));
+    due.request(RepositoryRequest::Repair);
+    assert!(due.poll(RECHECK_MS + 1, HOME, Last::Standing));
+    assert_eq!(due.repository_work(), RepositoryWork::Refresh);
+    assert!(!due.poll(RECHECK_MS + 2, HOME, Last::Standing));
+    assert_eq!(due.next_at(), None);
+}
+
+#[test]
 fn a_standing_row_arms_no_retry_and_preserves_its_work_until_inputs_move() {
     let mut due = Due::default();
     assert!(due.at_start(MINUTE, HOME, Last::None));
@@ -385,6 +460,57 @@ fn next_at_names_identitys_own_retry() {
         due.poll(retry, HOME, Last::None),
         "identity's retry starts one"
     );
+}
+
+#[test]
+fn completed_identity_does_not_inherit_another_rows_retry_or_standing_debt() {
+    for last in [Last::Failed, Last::Unfinished, Last::Standing] {
+        for reported_complete in [false, true] {
+            let mut due = Due::default();
+            due.identity_changed();
+            assert!(due.at_start(0, HOME, Last::None));
+            assert!(due.identity_running);
+            if reported_complete {
+                due.identity_completed();
+            }
+            due.reaped(last, 1);
+            assert!(!due.identity_running);
+            assert_eq!(
+                due.parked_identity,
+                !reported_complete && last == Last::Standing
+            );
+            if last == Last::Standing {
+                assert_eq!(due.next_at(), None);
+                due.request(RepositoryRequest::Repair);
+                assert!(due.poll(2, HOME, Last::None));
+            } else {
+                assert_eq!(due.retry.at, Some(1 + FIRST_RETRY_MS));
+                assert_eq!(
+                    due.identity_retry.at,
+                    (!reported_complete).then_some(1 + FIRST_RETRY_MS)
+                );
+                assert!(!due.poll(FIRST_RETRY_MS, HOME, Last::None));
+                assert!(due.poll(1 + FIRST_RETRY_MS, HOME, Last::None));
+            }
+            assert_eq!(due.identity_running, !reported_complete);
+            assert_eq!(due.repository_work(), RepositoryWork::Refresh);
+        }
+    }
+}
+
+#[test]
+fn completed_identity_cannot_consume_a_newer_identity_input() {
+    let mut due = Due::default();
+    due.identity_changed();
+    assert!(due.at_start(0, HOME, Last::None));
+    due.identity_changed();
+    due.identity_completed();
+    assert!(due.identity_pending);
+    assert!(due.poll(1, HOME, Last::Failed));
+    assert!(due.identity_running);
+    assert!(!due.identity_pending);
+    assert_eq!(due.repository_work(), RepositoryWork::Repair);
+    assert!(due.retry_request.is_some());
 }
 
 /// A HELD END IS RETRIED AS A FAILED ONE, NEVER ON A FLAT CLOCK: no runner's exit reads as held
@@ -932,6 +1058,10 @@ fn the_runner_is_init_converge_the_subscribers_out_of_the_band_never_disclaiming
     for trigger in [SUBSCRIBER, WINDOW, SETUP] {
         for work in [RepositoryWork::Repair, RepositoryWork::Refresh] {
             let command = runner(exe, trigger, work);
+            assert!(command.get_envs().any(|(key, value)| {
+                key == RESULT_PROTOCOL_ENV
+                    && value == Some(std::ffi::OsStr::new(IDENTITY_RESULT_PROTOCOL))
+            }));
             assert_eq!(command.get_program(), exe);
             let args: Vec<_> = command.get_args().collect();
             assert_eq!(
@@ -964,6 +1094,10 @@ fn the_runner_is_init_converge_the_subscribers_out_of_the_band_never_disclaiming
             },
         ));
         let command = runner_requested(exe, trigger, request);
+        assert!(command.get_envs().any(|(key, value)| {
+            key == RESULT_PROTOCOL_ENV
+                && value == Some(std::ffi::OsStr::new(IDENTITY_RESULT_PROTOCOL))
+        }));
         let args: Vec<_> = command.get_args().collect();
         assert_eq!(args[4], "--repository-request");
         assert_eq!(
@@ -1016,18 +1150,31 @@ fn starting_a_runner_never_waits_for_it_and_gives_it_its_own_session() {
         Last::None,
         "a signal is consumed once"
     );
-    for (code, expected) in [
-        (0, Last::Ended),
-        (1, Last::Failed),
-        (HELD, Last::Failed),
-        (UNFINISHED, Last::Unfinished),
-        (STANDING, Last::Standing),
+    for (code, expected, identity_complete) in [
+        (0, Last::Ended, false),
+        (1, Last::Failed, false),
+        (HELD, Last::Failed, false),
+        (UNFINISHED, Last::Unfinished, false),
+        (STANDING, Last::Standing, false),
+        (runner_exit_code(1, true), Last::Failed, true),
+        (runner_exit_code(UNFINISHED, true), Last::Unfinished, true),
+        (runner_exit_code(STANDING, true), Last::Standing, true),
+        (128, Last::Failed, false),
+        (203, Last::Failed, false),
+        (255, Last::Failed, false),
     ] {
-        let exe = script(&format!("exit-{code}"), format!("exit {code}"));
+        let exe = script(
+            &format!("exit-{code}"),
+            format!(
+                "test \"${RESULT_PROTOCOL_ENV}\" = '{IDENTITY_RESULT_PROTOCOL}' || exit 254\nexit {code}"
+            ),
+        );
         let mut runner =
             Some(start(&exe, "subscriber", RepositoryWork::Refresh).expect("start a runner"));
         runner.as_mut().unwrap().wait().expect("reap it");
-        assert_eq!(Last::of(&mut runner), expected);
+        let result = RunnerResult::of(&mut runner);
+        assert_eq!(result.last, expected);
+        assert_eq!(result.identity_complete, identity_complete);
         assert_eq!(
             Last::of(&mut runner),
             Last::None,

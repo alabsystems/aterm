@@ -22,7 +22,7 @@ type Admission<'a> = Option<&'a mut dyn FnMut() -> Result<()>>;
 /// as bytes or descendant CPU/I/O keep advancing, but one minute without that evidence ends the
 /// attempt and lets the shared idempotent-read policy decide whether another attempt is allowed.
 #[cfg(unix)]
-const ANONYMOUS_READ_PROGRESS_WINDOW: Duration = Duration::from_secs(60);
+const NETWORK_READ_PROGRESS_WINDOW: Duration = Duration::from_secs(60);
 
 /// The exact object-closure contract of a fetch.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,6 +70,11 @@ pub enum GitOp {
         dest: PathBuf,
         /// `--depth`.
         depth: Option<u32>,
+        /// A local repository whose objects the clone borrows (`--reference <cache>
+        /// --dissociate`): the network transfer offers its ref tips as haves and receives only
+        /// what it lacks, and the clone keeps a copy of what it borrowed. Screened as a
+        /// repository agh only reads objects from.
+        cache: Option<PathBuf>,
     },
     /// `git clone --quiet --mirror -- <url> <private-stage>`: a bare snapshot of all refs,
     /// atomically published at `<dest>` after success.
@@ -141,9 +146,9 @@ pub enum GitOp {
     /// `git push --porcelain --force-with-lease=<ref>:<expect> <url> :<ref>`, from an empty
     /// scratch repository (`git init --quiet --bare` in the run's private scratch), so no
     /// local ref or hook is near it. It speaks as the owner's writer. The runner refuses it
-    /// (Usage, before anything runs) when `reference` fails the reference rule or `expect` is
-    /// not 40 lowercase hex, because `GitRun` is public and both go into the argv:
-    /// `Refs::delete_expect` checks them first, and the runner checks again.
+    /// (Usage, before anything runs) when `reference` is not a full name under `refs/` git
+    /// accepts, or `expect` is not 40 lowercase hex, because `GitRun` is public and both go
+    /// into the argv. `Refs::delete_expect` separately limits its API to heads and tags.
     PushDelete {
         /// The ref.
         reference: String,
@@ -181,9 +186,12 @@ pub struct GitRun {
     pub op: GitOp,
     /// How the destination was named: a release-tier owner needs `Named::Literal`.
     pub named: Named,
-    /// The local, authenticated or mutating run's wall bound (`GIT_BUDGET` by default), and the
-    /// upper lifetime supplied to a credential grant. [`Self::progress_window`] replaces it as
-    /// the execution bound; anonymous network children always use a progress bound.
+    /// The local or mutating run's wall bound (`GIT_BUDGET` by default), and the upper lifetime
+    /// supplied to a credential grant. [`Self::progress_window`] replaces it as the execution
+    /// bound; an anonymous network read, and an authenticated object transfer (clone, mirror,
+    /// fetch), always use a progress bound, so a transfer that keeps receiving outlives it. A grant
+    /// still ends at its lifetime: the connection it authenticated goes on, and a new request
+    /// after that is refused.
     pub budget: Duration,
     /// An inactivity window for native progress. When set, child execution is bounded by
     /// output and descendant CPU/I/O progress instead of [`Self::budget`]'s wall clock.
@@ -273,6 +281,7 @@ impl GitRun {
             GitOp::Clone {
                 dest: dest.to_path_buf(),
                 depth: None,
+                cache: None,
             },
         )
     }
@@ -436,6 +445,16 @@ impl GitRun {
     #[must_use]
     pub fn with_progress_window(mut self, window: Duration) -> GitRun {
         self.progress_window = Some(window);
+        self
+    }
+
+    /// The same ordinary clone, taking the objects it can from the local repository `cache`.
+    /// Any other op, including a mirror, is unchanged.
+    #[must_use]
+    pub fn with_source_object_cache(mut self, cache: &Path) -> GitRun {
+        if let GitOp::Clone { cache: lent, .. } = &mut self.op {
+            *lent = Some(cache.to_path_buf());
+        }
         self
     }
 
@@ -708,7 +727,7 @@ mod unix {
     use std::path::{Path, PathBuf};
 
     use super::{
-        ANONYMOUS_READ_PROGRESS_WINDOW, Admission, ConfigAccess, GitOp, GitOut, GitRun,
+        Admission, ConfigAccess, GitOp, GitOut, GitRun, NETWORK_READ_PROGRESS_WINDOW,
         OBJECT_SOURCE_WORDS,
     };
     use crate::client::Github;
@@ -728,7 +747,9 @@ mod unix {
 
     mod ancestry;
     mod cache_ancestor;
+    mod checkout_pack;
     mod commit_config;
+    mod local_tags;
     mod object_view;
 
     /// The route door's fact naming where a profile's token lives (`Fx::fact`).
@@ -858,8 +879,11 @@ mod unix {
     fn check_op(run: &GitRun) -> Result<()> {
         match &run.op {
             GitOp::PushDelete { reference, expect } => {
-                if !crate::path::reference_ok(reference) {
-                    return Err(Error::usage(crate::path::reference_refusal(reference)));
+                if !crate::path::ref_name_ok(reference) {
+                    return Err(Error::usage(format!(
+                        "{}: a native delete needs a full ref name under refs/ accepted by git",
+                        Redactor::shapes(reference)
+                    )));
                 }
                 if !crate::path::is_sha(expect) {
                     return Err(Error::usage(crate::path::sha_refusal(expect)));
@@ -1086,7 +1110,12 @@ mod unix {
     enum ChildNetwork<'a> {
         Ordinary,
         Admitted(&'a mut dyn FnMut() -> Result<()>),
-        AnonymousHttp { trace: Option<&'a Path> },
+        /// An object transfer (clone, mirror, fetch) that carries a credential: bounded by
+        /// progress, as an anonymous read is.
+        AuthenticatedRead,
+        AnonymousHttp {
+            trace: Option<&'a Path>,
+        },
     }
 
     /// A credential-free name for the canonical native operation, narrowed to its internal
@@ -1246,10 +1275,14 @@ mod unix {
             let (curl_trace, progress_window, admission) = match network {
                 ChildNetwork::Ordinary => (None, self.progress_window, None),
                 ChildNetwork::Admitted(admit) => (None, self.progress_window, Some(admit)),
+                ChildNetwork::AuthenticatedRead => (
+                    None,
+                    self.progress_window.or(Some(NETWORK_READ_PROGRESS_WINDOW)),
+                    None,
+                ),
                 ChildNetwork::AnonymousHttp { trace } => (
                     trace,
-                    self.progress_window
-                        .or(Some(ANONYMOUS_READ_PROGRESS_WINDOW)),
+                    self.progress_window.or(Some(NETWORK_READ_PROGRESS_WINDOW)),
                     None,
                 ),
             };
@@ -1313,14 +1346,14 @@ mod unix {
             input: Option<&[u8]>,
         ) -> Result<ChildOut> {
             if !self.anonymous_read {
-                return self.git_supplied(
-                    args,
-                    cwd,
-                    canonical,
-                    input,
-                    None,
-                    ChildNetwork::Ordinary,
-                );
+                // An object transfer runs as long as it receives; a ref listing is small and
+                // keeps the run's wall bound.
+                let network = if matches!(run.op, GitOp::LsRemote { .. }) {
+                    ChildNetwork::Ordinary
+                } else {
+                    ChildNetwork::AuthenticatedRead
+                };
+                return self.git_supplied(args, cwd, canonical, input, None, network);
             }
             let mut budget = self.gh.retry_policy().for_anonymous_http().budget();
             let mut attempt = 1u32;
@@ -3348,6 +3381,83 @@ mod unix {
         Ok(())
     }
 
+    /// The common directory of the local repository a clone borrows objects from, admitted as
+    /// a fetch's source object cache is: screened config, complete history, and no route to
+    /// objects elsewhere (alternates, grafts, replace refs).
+    fn clone_source_cache(children: &Children<'_>, run: &GitRun, cache: &Path) -> Result<PathBuf> {
+        let cache = screened_source(children, run, cache)?;
+        let key = [
+            crate::fx::canon::git_request(run).as_slice(),
+            b"\nstep source-cache",
+        ]
+        .concat();
+        let view = children.git(&source_view_args(&cache), None, &key)?;
+        if view.code != Some(0) {
+            return Err(failed(
+                &run.op,
+                &view,
+                children.gh.redactor(),
+                &run.slug,
+                false,
+            ));
+        }
+        let (common, shallow) = source_view(&view.stdout)?;
+        if shallow {
+            return Err(Error::refused("source object cache must not be shallow"));
+        }
+        let common = PathBuf::from(common);
+        for suffix in [
+            "objects/info/alternates",
+            "objects/info/http-alternates",
+            "info/grafts",
+            "refs/replace",
+        ] {
+            match std::fs::symlink_metadata(common.join(suffix)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Error::local(error.to_string())),
+                Ok(_) => {
+                    return Err(Error::refused(
+                        "source object cache has an external or rewritten object route",
+                    ));
+                }
+            }
+        }
+        Ok(common)
+    }
+
+    /// After a clone that borrowed a local cache's objects (and, dissociated, copied them),
+    /// hash every object its refs reach: a borrowed object is trusted by its name alone,
+    /// so a damaged or substituted one would otherwise enter the clone unchecked.
+    fn verify_borrowed_objects(children: &Children<'_>, run: &GitRun, stage: &Path) -> Result<()> {
+        let key = [
+            crate::fx::canon::git_request(run).as_slice(),
+            b"\nstep verify borrowed objects",
+        ]
+        .concat();
+        let mut checker = children.clone();
+        if checker.progress_window.is_none() {
+            checker.progress_window = Some(NETWORK_READ_PROGRESS_WINDOW);
+        }
+        let out = checker.git(
+            &[
+                os("-C"),
+                stage.as_os_str().to_os_string(),
+                os("fsck"),
+                os("--strict"),
+                os("--no-dangling"),
+                os("--no-progress"),
+            ],
+            None,
+            &key,
+        )?;
+        if out.code != Some(0) {
+            return Err(Error::refused(
+                "an object the clone borrowed from its source cache failed its check; nothing was published",
+            ));
+        }
+        Ok(())
+    }
+
     fn source_cache_stamp(
         root: &Path,
         children: &Children<'_>,
@@ -4605,13 +4715,8 @@ mod unix {
                         input.as_bytes(),
                     )
                     .map_err(unsent)?;
-                let hash = std::str::from_utf8(&packed.stdout)
-                    .ok()
-                    .and_then(|value| value.strip_suffix('\n'))
-                    .filter(|value| packed.code == Some(0) && crate::path::is_sha(value))
-                    .ok_or_else(|| {
-                        Error::protocol("could not pack the complete checkout blob batch")
-                    })?;
+                let hash =
+                    checkout_pack::hash(&packed, run, children.gh.redactor(), index, batch.len())?;
                 step(
                     "checkout-verify",
                     vec![
@@ -4697,7 +4802,7 @@ mod unix {
         Ok((updated, oid.to_owned()))
     }
 
-    /// A complete requested commit closure, with its physical stores held through publication.
+    /// A complete requested original closure, with its physical stores held through publication.
     struct LocalBatch {
         observed: ChildOut,
         stores: Vec<(PathBuf, std::fs::File)>,
@@ -4709,8 +4814,8 @@ mod unix {
         }
     }
 
-    /// Literal commit roots can already be complete in the caller. Ref names still need a
-    /// remote observation, and a missing object or a noncommit keeps the existing transfer.
+    /// Literal commits and validated raw tags can already be complete in the caller.
+    /// Ref names still need a remote observation; missing or unsupported objects keep the transfer.
     /// No local ref, shallow boundary, graft or accelerator establishes the closure.
     fn local_batch(
         children: &Children<'_>,
@@ -4786,7 +4891,8 @@ mod unix {
                 "local batch object inventory count differs",
             ));
         }
-        let mut commits = true;
+        let mut supported = true;
+        let mut tags = Vec::new();
         for ((source, _), row) in sources.iter().zip(rows) {
             let kind = row
                 .strip_prefix(*source)
@@ -4794,13 +4900,15 @@ mod unix {
                 .ok_or_else(|| Error::protocol("local batch object identity differs"))?;
             match kind {
                 "commit" => {}
-                "missing" | "blob" | "tree" | "tag" => commits = false,
+                "tag" => tags.push(*source),
+                "missing" | "blob" | "tree" => supported = false,
                 _ => return Err(Error::protocol("invalid local batch object kind")),
             }
         }
-        if !commits {
+        if !supported || !local_tags::resident(&original, run, common, &tags)? {
             return Ok(None);
         }
+        check_object_intake_directories(&stores)?;
         let roots = sources
             .iter()
             .map(|(source, _)| *source)
@@ -4814,7 +4922,7 @@ mod unix {
         Ok(Some(LocalBatch { observed, stores }))
     }
 
-    /// Fetch one explicit snapshot into scratch, unless every literal commit's full original
+    /// Fetch one explicit snapshot into scratch, unless every literal root's full original
     /// closure is already present. Ref-publishing batches atomically compare/update the caller's
     /// cache refs under the same checks on either path.
     fn fetch_batch(
@@ -6233,7 +6341,7 @@ mod unix {
                     None,
                 )
             }
-            GitOp::Clone { dest, depth } => {
+            GitOp::Clone { dest, depth, cache } => {
                 let dest = match children.clone_stage.as_ref() {
                     Some(stage) => stage.clone(),
                     None => std::path::absolute(dest)
@@ -6242,6 +6350,14 @@ mod unix {
                 let mut args = vec![os("clone"), os("--quiet")];
                 if let Some(depth) = depth {
                     args.push(os(format!("--depth={depth}")));
+                }
+                if let Some(cache) = cache {
+                    let cache = clone_source_cache(children, run, cache)?;
+                    args.extend([
+                        os("--reference"),
+                        cache.into_os_string(),
+                        os("--dissociate"),
+                    ]);
                 }
                 args.extend([os("--"), url, dest.into_os_string()]);
                 (args, None)
@@ -6487,6 +6603,11 @@ mod unix {
             children.gh.fx().sleep(pause)?;
             pause = (pause * 2).min(std::time::Duration::from_secs(30));
         };
+        if let (GitOp::Clone { cache: Some(_), .. }, Some(stage)) =
+            (&run.op, children.clone_stage.as_deref())
+        {
+            verify_borrowed_objects(children, run, stage)?;
+        }
         if matches!(
             run.op,
             GitOp::LsRemote {

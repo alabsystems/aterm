@@ -93,6 +93,144 @@ fn equal_fresh_membership_bytes_need_no_repeated_digest() {
     assert_eq!(cache.hashes.load(Ordering::Relaxed), 1);
 }
 
+#[cfg(unix)]
+fn head_query(
+    cache: &Cache,
+    paths: &Paths,
+    owner: &Identity,
+    publication: HeadPublication,
+) -> Store {
+    let identity = || Some(owner);
+    cache
+        .read_moving(
+            paths,
+            "fixture".into(),
+            base(&SIGNER),
+            Query {
+                identity: &identity,
+                publication,
+            },
+            |_| {},
+        )
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn resolve_head(store: &Store, owner: &Identity) {
+    let _ = store.log().unwrap().open_audience_entries(owner).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_cold_and_warm_queries_do_not_publish_heads_or_consume_later_publication() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(home.path());
+    fsx::ensure_private_dir(&paths.dir).unwrap();
+    let wire = signed(&SIGNER, 1);
+    fsx::write_atomic(&paths.records_file(), &wire, 0o600).unwrap();
+    let owner = Identity::from_secret_bytes([1 ^ 0x55; 32]);
+    let head = crate::records_storage::head_path(&paths.records_file()).unwrap();
+    let cache = Cache::new();
+    fsx::as_if_later(2 * fsx::SETTLED, || {
+        let namespace = fsx::stamp(&paths.dir).unwrap();
+        for _ in 0..2 {
+            let store = head_query(&cache, &paths, &owner, HeadPublication::ReadOnly);
+            assert_eq!(store.encode(), wire);
+            resolve_head(&store, &owner);
+            assert!(!head.exists());
+            assert_eq!(fsx::stamp(&paths.dir), Some(namespace));
+        }
+        assert_eq!(cache.observations.load(Ordering::Relaxed), 1);
+        // The ordinary policy is the negative control: the same cached store still has
+        // its publication capability, and its resolve moves the physical namespace.
+        let store = head_query(&cache, &paths, &owner, HeadPublication::Allowed);
+        resolve_head(&store, &owner);
+        assert!(head.exists());
+        assert_ne!(fsx::stamp(&paths.dir), Some(namespace));
+        assert_eq!(cache.observations.load(Ordering::Relaxed), 1);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_head_reuse_cannot_restamp_but_later_ordinary_queries_can() {
+    for warm_later in [false, true] {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(home.path());
+        fsx::ensure_private_dir(&paths.dir).unwrap();
+        let wire = signed(&SIGNER, 1);
+        fsx::write_atomic(&paths.records_file(), &wire, 0o600).unwrap();
+        let owner = Identity::from_secret_bytes([1 ^ 0x55; 32]);
+        let head = crate::records_storage::head_path(&paths.records_file()).unwrap();
+        fsx::as_if_later(2 * fsx::SETTLED, || {
+            let ordinary = head_query(&Cache::new(), &paths, &owner, HeadPublication::Allowed);
+            resolve_head(&ordinary, &owner);
+            let before_head = std::fs::read(&head).unwrap();
+            let before_data = fsx::stamp(&paths.records_file()).unwrap();
+            // Same authenticated bytes under a new physical identity: a head open must
+            // hash them and may ordinarily restamp, independently of a later resolve.
+            fsx::write_atomic(&paths.records_file(), &wire, 0o600).unwrap();
+            assert_ne!(fsx::stamp(&paths.records_file()), Some(before_data));
+            let namespace = fsx::stamp(&paths.dir).unwrap();
+            let cache = Cache::new();
+            let macs = head::MACS.get();
+            for _ in 0..2 {
+                let store = head_query(&cache, &paths, &owner, HeadPublication::ReadOnly);
+                assert_eq!(store.encode(), wire);
+                resolve_head(&store, &owner);
+                assert_eq!(std::fs::read(&head).unwrap(), before_head);
+                assert_eq!(fsx::stamp(&paths.dir), Some(namespace));
+            }
+            assert_eq!(
+                head::MACS.get(),
+                macs + 1,
+                "the authenticated head was reused"
+            );
+            assert_eq!(cache.observations.load(Ordering::Relaxed), 0);
+            let later = Cache::new();
+            let store = head_query(
+                if warm_later { &cache } else { &later },
+                &paths,
+                &owner,
+                HeadPublication::Allowed,
+            );
+            if warm_later {
+                // A cache hit must not have consumed the shared origin's later write.
+                resolve_head(&store, &owner);
+            }
+            assert!(
+                std::fs::read(&head).unwrap() != before_head,
+                "warm_later={warm_later}"
+            );
+            assert_ne!(fsx::stamp(&paths.dir), Some(namespace));
+            assert_eq!(store.encode(), wire);
+        });
+    }
+}
+
+#[test]
+fn cold_cache_scope_restores_nested_and_panicking_readers() {
+    assert!(TEST_CACHE.with(|slot| slot.borrow().is_none()));
+    with_cold_cache(|| {
+        let outer = TEST_CACHE.with(|slot| slot.borrow().clone().unwrap());
+        with_cold_cache(|| {
+            let inner = TEST_CACHE.with(|slot| slot.borrow().clone().unwrap());
+            assert!(!std::sync::Arc::ptr_eq(&outer, &inner));
+        });
+        assert!(
+            TEST_CACHE
+                .with(|slot| std::sync::Arc::ptr_eq(&outer, slot.borrow().as_ref().unwrap(),))
+        );
+        let panic = std::panic::catch_unwind(|| with_cold_cache(|| panic!("cache scope control")));
+        assert!(panic.is_err());
+        assert!(
+            TEST_CACHE
+                .with(|slot| std::sync::Arc::ptr_eq(&outer, slot.borrow().as_ref().unwrap(),))
+        );
+    });
+    assert!(TEST_CACHE.with(|slot| slot.borrow().is_none()));
+}
+
 #[test]
 fn a_retained_genesis_pin_cannot_reuse_an_unpinned_cached_root() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -756,12 +894,21 @@ fn a_read_that_brackets_an_append_reads_the_file_again() {
         assert!(alone.is_err(), "warm={warm}: one read refuses the append");
 
         let tries = std::cell::Cell::new(0);
-        let read = cache.read_moving(&paths, String::new(), empty(), &|| None, |attempt| {
-            tries.set(tries.get() + 1);
-            if attempt == 0 {
-                append(&paths, c.admit.bytes());
-            }
-        });
+        let read = cache.read_moving(
+            &paths,
+            String::new(),
+            empty(),
+            Query {
+                identity: &|| None,
+                publication: HeadPublication::Allowed,
+            },
+            |attempt| {
+                tries.set(tries.get() + 1);
+                if attempt == 0 {
+                    append(&paths, c.admit.bytes());
+                }
+            },
+        );
         let read = read.expect("read again after the append");
         assert_eq!(tries.get(), 2, "warm={warm}");
         assert_eq!(
@@ -771,10 +918,19 @@ fn a_read_that_brackets_an_append_reads_the_file_again() {
         );
 
         tries.set(0);
-        let moving = cache.read_moving(&paths, String::new(), empty(), &|| None, |_| {
-            tries.set(tries.get() + 1);
-            append(&paths, b"\0");
-        });
+        let moving = cache.read_moving(
+            &paths,
+            String::new(),
+            empty(),
+            Query {
+                identity: &|| None,
+                publication: HeadPublication::Allowed,
+            },
+            |_| {
+                tries.set(tries.get() + 1);
+                append(&paths, b"\0");
+            },
+        );
         assert!(moving.is_err(), "warm={warm}: it never stood still");
         assert_eq!(tries.get(), MOVED_READS + 1, "warm={warm}");
     }

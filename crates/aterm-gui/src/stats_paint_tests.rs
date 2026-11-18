@@ -44,7 +44,7 @@ pub(crate) fn job_row(
     }
 }
 
-/// Zombies unreaped by `ppid`, in tab `tab` (or outside aterm).
+/// Zombies unreaped by `ppid`, in tab `tab` (or without a tab assignment).
 pub(crate) fn zombies(ppid: u32, count: u32, tab: Option<u64>) -> ZombieParent {
     ZombieParent {
         ppid,
@@ -62,10 +62,6 @@ fn the_marks_count_the_engines_verdicts_worst_first() {
             job_row("j1", Verdict::Fine, None, None),
             job_row("j2", Verdict::Busy, Some(1_000), Some(4_000)),
         ],
-        findings: aterm_vitals::jobs::Findings {
-            zombies: vec![zombies(1, 4, None)],
-            ..Default::default()
-        },
         ..Default::default()
     };
     assert!(marks_of(&calm).is_empty(), "a calm machine has no marks");
@@ -89,13 +85,38 @@ fn the_marks_count_the_engines_verdicts_worst_first() {
         marks,
         [
             (WellMark::Stuck, 2),
-            (WellMark::Zombies, 3),
+            (WellMark::Zombies, 7),
             (WellMark::Quiet, 1),
             (WellMark::Waiting, 1),
             (WellMark::Stopped, 1),
         ],
-        "only the zombies a tab's process holds count"
+        "machine marks count every known zombie pile"
     );
+}
+
+#[test]
+fn zombies_light_the_deck_well_machine_wide() {
+    let mut view = JobsView {
+        rows: vec![job_row("j1", Verdict::Fine, None, None)],
+        ..Default::default()
+    };
+    assert!(marks_of(&view).is_empty());
+    let expected = vec![StatsMark {
+        kind: WellMark::Zombies,
+        count: 14,
+        frac: 1.0,
+    }];
+    for tab in [None, Some(7)] {
+        view.findings.zombies = vec![zombies(300, 14, tab)];
+        assert_eq!(marks_of(&view), expected, "tab={tab:?}");
+        assert_eq!(view.rows[0].verdict, Verdict::Fine);
+        assert!(view.rows[0].zombies.is_none());
+
+        view.findings.zombies[0].count = 0;
+        assert!(marks_of(&view).is_empty(), "an empty pile has no mark");
+    }
+    view.findings.zombies.clear();
+    assert!(marks_of(&view).is_empty(), "an absent finding has no mark");
 }
 
 #[test]

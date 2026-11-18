@@ -79,8 +79,7 @@ fn native_google_retry_recovers_its_encrypted_completion_before_starting_another
     for attempt in 0..3 {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let result =
-            run_accounts_login_for(Cli::Agy, &world.env, &host, "main", &mut out, &mut err);
+        let result = run_accounts_login_for(Cli::Agy, &world.env, &host, OWNER, &mut out, &mut err);
         assert_eq!(
             result == ExitCode::SUCCESS,
             attempt != 0,
@@ -213,8 +212,7 @@ fn native_google_publication_retains_and_rechecks_its_typed_proof() {
             .and_then(|binding| binding.dir.clone());
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let result =
-            run_accounts_login_for(Cli::Agy, &world.env, &host, "main", &mut out, &mut err);
+        let result = run_accounts_login_for(Cli::Agy, &world.env, &host, OWNER, &mut out, &mut err);
         assert!(host.called.get(), "{}", String::from_utf8_lossy(&err));
         assert_eq!(
             result == ExitCode::SUCCESS,
@@ -304,7 +302,7 @@ fn a_native_google_check_holds_the_row_as_one() {
         b"[[identities]]\nid='one'\nemail='owner@example.test'\n[[bindings]]\nprovider='agy'\naccount='main'\nidentity='one'\nexpected_email='owner@example.test'\n", 0o600).unwrap();
     let mut out = Vec::new();
     let mut err = Vec::new();
-    let result = run_accounts_login_for(Cli::Agy, &world.env, &Checked, "main", &mut out, &mut err);
+    let result = run_accounts_login_for(Cli::Agy, &world.env, &Checked, OWNER, &mut out, &mut err);
     let said = format!(
         "{}{}",
         String::from_utf8_lossy(&out),
@@ -486,7 +484,7 @@ impl<'a> PolicyHost<'a> {
                 self.world.cli,
                 &self.world.env,
                 self,
-                "main",
+                OWNER,
                 &mut out,
                 &mut err,
             )
@@ -495,7 +493,7 @@ impl<'a> PolicyHost<'a> {
                 self.world.cli,
                 &self.world.env,
                 self,
-                (&["main".into()], false, None),
+                (&[OWNER.into()], false, None),
                 &mut out,
                 &mut err,
             )

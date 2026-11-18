@@ -1129,6 +1129,126 @@ fn a_lapsed_claim_moves_the_ab_arm_as_a_released_one_does() {
     host.shutdown_and_join();
 }
 
+/// THE GRACE'S END RELEASES THE CLAIM AND WAKES THE WINDOW (D28): a contract 4 claim whose
+/// connection closed carries the re-exec grace's end as its expiry, so the Desk's own lapse
+/// timer, the one a `ttl=` claim runs out on, is what ends it. The timer learns the deadline
+/// from the refresh the close wakes; a tick inside the grace changes nothing; the tick at the
+/// deadline removes the claim, writes `meta-change field=supervisor value=-` and republishes
+/// the harness page.
+/// NEGATIVE HALF: while its connection is open the same claim has no deadline at all, and
+/// before the deadline no row is written and no page republished.
+#[cfg(unix)]
+#[test]
+fn the_grace_end_releases_the_claim_and_wakes_the_window() {
+    use aterm_messages::presence::drive::{self, Desk as _};
+    use std::time::{Duration, Instant};
+    struct Clock;
+    impl Drop for Clock {
+        fn drop(&mut self) {
+            crate::app_presence::set_presence_clock_for_test(None);
+        }
+    }
+    let _clock = Clock;
+    let grace = Duration::from_millis(alab_wire::record::REEXEC_GRACE_MS);
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let session = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session(session));
+    run_claude(&app, session);
+    let host = idle_host();
+    app.harness = Some(host.clone());
+    let ctx = app.pool.get(session).unwrap().ctx.clone();
+    let t0 = Instant::now();
+    crate::app_presence::set_presence_clock_for_test(Some(t0));
+    let now_us = crate::metrics::us_at(t0);
+    let mut scoped = crate::session_timeline::scoped_input_tests::scoped(&[
+        aterm_agent::harness::contract::Scope::Relaunch,
+    ]);
+    scoped.claim.contract = aterm_agent::harness::contract::UNIVERSAL;
+    crate::session_timeline::claim_supervisor_scoped(
+        &ctx,
+        "grok-alab@4242",
+        Some(7),
+        scoped,
+        now_us,
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("a contract 4 claim");
+    app.on_meta_changed(session);
+    assert_eq!(
+        app.supervisor_lapse(session, t0),
+        None,
+        "NEGATIVE HALF: a claim on an open connection has no deadline"
+    );
+    assert!(app.open_harness_settings(wid, crate::harness_screen::HarnessFocus::Top));
+    app.publish_native_harness_state();
+    let released = |app: &App| {
+        app.pool
+            .get(session)
+            .unwrap()
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .since(None)
+            .filter(|e| {
+                e.kind == "meta-change" && e.payload.to_string() == "field=supervisor value=-"
+            })
+            .count()
+    };
+
+    // The connection closes: the grace is armed, and the wake it sends refreshes the timer.
+    assert!(
+        crate::session_timeline::release_closed_connection(
+            &ctx,
+            7,
+            now_us,
+            crate::control::reexec_grace_us()
+        ),
+        "arming the grace is a move the window is woken for"
+    );
+    app.on_meta_changed(session);
+    let deadline = app
+        .supervisor_lapse(session, t0)
+        .expect("the grace's end is a deadline");
+    assert_eq!(deadline, t0 + grace + Duration::from_millis(1));
+    assert!(
+        drive::deadline(&app, t0).is_some_and(|next| next <= deadline),
+        "the Desk's timer holds it"
+    );
+
+    // Inside the grace the timer's tick changes nothing.
+    let revision = app.harness_screen.revision;
+    let inside = t0 + grace - Duration::from_secs(1);
+    crate::app_presence::set_presence_clock_for_test(Some(inside));
+    drive::tick(&mut app, inside);
+    assert!(
+        ctx.meta
+            .lock()
+            .unwrap()
+            .live_scoped(crate::metrics::us_at(inside))
+            .is_some(),
+        "NEGATIVE HALF: the claim stands to the grace's end"
+    );
+    assert_eq!(released(&app), 0, "no release row yet");
+    assert_eq!(app.harness_screen.revision, revision, "no republish yet");
+
+    // At the deadline the timer releases it, records it and wakes the page.
+    crate::app_presence::set_presence_clock_for_test(Some(deadline));
+    drive::tick(&mut app, deadline);
+    assert!(
+        ctx.meta.lock().unwrap().supervisor.is_none(),
+        "the grace's end released the claim"
+    );
+    assert_eq!(released(&app), 1, "the release is recorded once");
+    assert!(
+        app.harness_screen.revision > revision,
+        "the lapse republished the page"
+    );
+    assert_eq!(app.supervisor_lapse(session, deadline), None);
+    host.shutdown_and_join();
+}
+
 #[test]
 fn a_closed_tab_leaves_the_harness_page_in_the_publish_its_close_makes() {
     let mut app = App::headless_for_test();

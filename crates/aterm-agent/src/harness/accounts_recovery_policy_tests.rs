@@ -82,7 +82,7 @@ fn google_checkpoint_recovery_requires_its_original_binding_and_root() {
             store.wake_path(),
         ];
         let before = files.each_ref().map(|path| fs::read(path).ok());
-        let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         let mut admitted = false;
         let recovered = recover_interrupted_staging_renewals_checked(
             Cli::Agy,
@@ -127,7 +127,7 @@ fn google_checkpoint_recovery_requires_its_original_binding_and_root() {
 }
 
 pub(super) fn hold_retry(
-    guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    guard: &std::sync::Arc<Watched<AutoRenewGuard>>,
     store: &accounts::Store,
     cli: Cli,
     key: &str,
@@ -441,7 +441,7 @@ fn lifetime_checkpoint_case(
     let before = images();
     let proof_path = staging.join(accounts::RENEWAL_CHECKPOINT_FILE);
     let proof_before = fs::read(&proof_path).unwrap();
-    let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     hold_retry(&guard, &store, cli, "local", "account");
     hold_retry(&guard, &store, cli, "foreign", "another-account");
     let recovered = recover_interrupted_staging_renewals_for(
@@ -783,7 +783,7 @@ pub(crate) fn recovery_transition(
             let before = files.each_ref().map(|path| fs::read(path).ok());
             let proof_path = staging.join(accounts::RENEWAL_CHECKPOINT_FILE);
             let proof_before = fs::read(&proof_path).unwrap();
-            let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+            let guard = AutoRenewGuard::default().shared();
             hold_retry(&guard, &store, cli, "local", "account");
             hold_retry(&guard, &store, cli, "foreign", "another-account");
             let recovered = recover_interrupted_staging_renewals_for(

@@ -239,7 +239,7 @@ fn token_command() -> RestartCommand {
             "harness",
             "accounts",
             "token-run",
-            "work",
+            "ac-0123456789abcdef",
             "--",
             "/image-11",
             "--resume",

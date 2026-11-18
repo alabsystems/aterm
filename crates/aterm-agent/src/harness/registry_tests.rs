@@ -321,9 +321,13 @@ fn a_row_comes_only_from_a_record_whose_signed_manifest_and_tree_root_verify() {
     let exe = layout
         .build_dir("claude-code-alab", 3)
         .join(bin("claude-alab"));
-    assert!(
+    assert_eq!(
         r.admits_image(&layout, entry.row, &exe),
-        "its own build runs as it"
+        Some(atpkg::harness_record::Admitted::Build {
+            build: 3,
+            version: Some("1.0.0".to_string())
+        }),
+        "its own build runs as it, and is admitted under its verified manifest's version"
     );
 
     let revoked = registry(&layout, &[], &trust(&["m7"]));
@@ -331,7 +335,7 @@ fn a_row_comes_only_from_a_record_whose_signed_manifest_and_tree_root_verify() {
         revoked.entry("claude-code-alab").is_none(),
         "a revoked signer makes no row, and the id's seed goes with its refused record"
     );
-    assert!(!revoked.admits_image(&layout, entry.row, &exe));
+    assert!(revoked.admits_image(&layout, entry.row, &exe).is_none());
     let yanked = registry(&layout, &[], &trust(&[]).yanking(&["claude-code-alab@3"]));
     assert!(
         yanked
@@ -345,16 +349,18 @@ fn a_row_comes_only_from_a_record_whose_signed_manifest_and_tree_root_verify() {
     // THE CHECK IS MADE AGAIN AT EACH PROOF, whatever the registry read: a signer revoked since
     // refuses the claimant, and so does its tool swapped with its length and mtime kept.
     assert!(
-        !r.admits_image_under(&layout, entry.row, &exe, &trust(&["m7"])),
+        r.admits_image_under(&layout, entry.row, &exe, &trust(&["m7"]))
+            .is_none(),
         "a signer revoked after the read is refused at the next proof"
     );
     assert!(
-        !r.admits_image_under(
+        r.admits_image_under(
             &layout,
             entry.row,
             &exe,
             &trust(&[]).yanking(&["claude-code-alab@3"])
-        ),
+        )
+        .is_none(),
         "a build yanked after the read is refused at the next proof"
     );
     // An update makes build 4 current while build 3's process still runs: 3 keeps its proof.
@@ -372,7 +378,7 @@ fn a_row_comes_only_from_a_record_whose_signed_manifest_and_tree_root_verify() {
         .expect("build 4's row")
         .row;
     assert!(
-        updated.admits_image(&layout, row, &exe),
+        updated.admits_image(&layout, row, &exe).is_some(),
         "the retained signed build 3 still proves its claim"
     );
     let swapped = std::fs::read(&exe).expect("the tool");
@@ -383,7 +389,7 @@ fn a_row_comes_only_from_a_record_whose_signed_manifest_and_tree_root_verify() {
     assert_ne!(forged, swapped);
     swap_keeping_length_and_mtime(&exe, &forged);
     assert!(
-        !updated.admits_image(&layout, row, &exe),
+        updated.admits_image(&layout, row, &exe).is_none(),
         "a tool swapped with its length and mtime kept is refused at the next proof"
     );
 
@@ -437,7 +443,7 @@ fn a_row_comes_only_from_a_record_whose_signed_manifest_and_tree_root_verify() {
     let kimi_row = seed.entry("kimi-alab").expect("the seed").row;
     let swapped = layout.build_dir("kimi-alab", 9).join(bin("kimi-alab"));
     assert!(
-        !seed.admits_image(&layout, kimi_row, &swapped),
+        seed.admits_image(&layout, kimi_row, &swapped).is_none(),
         "a seed's image rule refuses a build whose record fails"
     );
 }
@@ -613,9 +619,14 @@ fn a_linked_build_needs_a_verified_row_or_the_persons_dev_list() {
     );
     assert!(agy.leads.is_empty(), "it leads nothing");
     assert_eq!(agy.images, [Image::Checkout(checkout.clone())]);
-    assert!(
+    assert_eq!(
         listed.admits_image(&layout, agy.row, &checkout.join(bin("agy-alab"))),
-        "its checkout claims"
+        Some(atpkg::harness_record::Admitted::Checkout),
+        "its checkout claims, as a link and under no version"
+    );
+    assert_eq!(
+        atpkg::harness_record::Admitted::Checkout.version(),
+        Some("link")
     );
     let grok = listed
         .entry("grok-alab")
@@ -627,7 +638,7 @@ fn a_linked_build_needs_a_verified_row_or_the_persons_dev_list() {
     );
     let claimant = grok_checkout.join(bin("grok-alab"));
     assert!(
-        listed.admits_image(&layout, grok.row, &claimant),
+        listed.admits_image(&layout, grok.row, &claimant).is_some(),
         "its checkout claims"
     );
     assert!(
@@ -676,11 +687,15 @@ fn a_linked_build_needs_a_verified_row_or_the_persons_dev_list() {
     );
     assert_eq!(entry.leads, ["claude"], "the signed record's words");
     assert_eq!(entry.name, "Claude Dev", "the checkout's name");
-    assert!(linked.admits_image(
-        &layout,
-        entry.row,
-        &claude_checkout.join(bin("claude-alab"))
-    ));
+    assert!(
+        linked
+            .admits_image(
+                &layout,
+                entry.row,
+                &claude_checkout.join(bin("claude-alab"))
+            )
+            .is_some()
+    );
 
     // A dev-listed link leading an installed row's word loses it, unless aterm.toml names it.
     let aaa = checkout_at(
@@ -1096,41 +1111,40 @@ fn a_seed_ids_contract_3_claim_stands_over_a_link_or_a_record_and_falls_with_its
     );
     let built = claude_checkout.join(bin("claude-alab"));
     assert!(
-        atpkg::harness_record::admits_seed_image(&layout, "claude-code-alab", &built),
+        atpkg::harness_record::admits_seed_image(&layout, "claude-code-alab", &built).is_some(),
         "its checkout's build proves its contract 3 claim"
     );
     assert!(
-        r.admits_image(&layout, claude.row, &built),
+        r.admits_image(&layout, claude.row, &built).is_some(),
         "and contract 4's"
     );
     let stray = layout.prefix.join("stray-claude-alab");
     std::fs::write(&stray, "x").expect("a stray file");
-    assert!(!atpkg::harness_record::admits_seed_image(
-        &layout,
-        "claude-code-alab",
-        &stray
-    ));
+    assert!(
+        atpkg::harness_record::admits_seed_image(&layout, "claude-code-alab", &stray).is_none()
+    );
 
     let signed = r.entry("kimi-alab").expect("the verified record's row");
     assert_eq!(signed.row.source, Source::Signed);
     assert_eq!(contract_of(read(&r, "kimi-alab@4242", &v3)), Some(SCOPED));
     assert!(
-        atpkg::harness_record::admits_seed_image(&layout, "kimi-alab", &old_exe),
+        atpkg::harness_record::admits_seed_image(&layout, "kimi-alab", &old_exe).is_some(),
         "build 8, older than the first record, proves contract 3 as it always did"
     );
     assert!(
-        !r.admits_image(&layout, signed.row, &old_exe),
+        r.admits_image(&layout, signed.row, &old_exe).is_none(),
         "the signed row's contract 4 rule refuses a build with no record"
     );
     let unready = layout.build_dir("kimi-alab", 7);
     std::fs::create_dir_all(unready.join("bin")).expect("build 7");
     std::fs::write(unready.join(bin("kimi-alab")), "x").expect("build 7's tool");
     assert!(
-        !atpkg::harness_record::admits_seed_image(
+        atpkg::harness_record::admits_seed_image(
             &layout,
             "kimi-alab",
             &unready.join(bin("kimi-alab"))
-        ),
+        )
+        .is_none(),
         "a build that is not ready"
     );
 
@@ -1139,11 +1153,12 @@ fn a_seed_ids_contract_3_claim_stands_over_a_link_or_a_record_and_falls_with_its
     assert!(matches!(read(&r, "agy-alab@4242", &v3), Words::Refused(_)));
     assert_eq!(contract_of(read(&r, "agy-alab@4242", &v4)), Some(UNIVERSAL));
     assert!(
-        !atpkg::harness_record::admits_seed_image(
+        atpkg::harness_record::admits_seed_image(
             &layout,
             "agy-alab",
             &agy_checkout.join(bin("agy-alab"))
-        ),
+        )
+        .is_none(),
         "contract 3's rule admits nothing for an id that is no seed id"
     );
 
@@ -1228,7 +1243,7 @@ fn each_harness_declaration_makes_its_row_with_the_agent_the_name_table_reads() 
         );
         let exe = layout.build_dir(id, build).join(bin(id));
         assert!(
-            r.admits_image(&layout, entry.row, &exe),
+            r.admits_image(&layout, entry.row, &exe).is_some(),
             "{id} runs from its own build"
         );
     }
@@ -1284,7 +1299,7 @@ fn each_harness_declaration_makes_its_row_with_the_agent_the_name_table_reads() 
         .expect("leading nothing is allowed, whatever its id reads as");
     assert_eq!(quiet.row.program, Program::Generic);
     let exe = more.build_dir("quiet-alab", 1).join(bin("quiet-alab"));
-    assert!(r.admits_image(&more, quiet.row, &exe));
+    assert!(r.admits_image(&more, quiet.row, &exe).is_some());
     assert!(
         matches!(read_in(r.rows(), "quiet-alab@4242", &v4), Words::Scoped(_)),
         "a generic row's claim is read as any row's"
@@ -1387,4 +1402,52 @@ fn a_read_and_the_generation_it_was_installed_as_are_one_value() {
         );
         assert_eq!(installed.load(Ordering::SeqCst), 3, "installed once more");
     }
+}
+
+/// A SEED ROW'S BUILD WITH NO RECORD IS ADMITTED UNDER THE VERSION RECORDED WHEN IT WAS STAGED,
+/// through the registry's own image rule: the arm a seed harness on a build older than its
+/// first record takes. A build that records none is admitted with none.
+#[test]
+fn a_seed_rows_unrecorded_build_is_admitted_under_its_recorded_version() {
+    let dir = aterm_tempfile::TempDir::new().expect("dir");
+    let layout = atpkg::store::Layout {
+        prefix: std::fs::canonicalize(dir.path())
+            .expect("canonical")
+            .join("pkg"),
+    };
+    let stage = |build: u64, version: Option<&str>| {
+        let dir = layout.build_dir("kimi-alab", build);
+        let exe = dir.join(bin("kimi-alab"));
+        std::fs::create_dir_all(exe.parent().expect("bin")).expect("build dir");
+        std::fs::write(&exe, b"#!/bin/sh\n").expect("exe");
+        atpkg::store::mark_build_ready(&dir).expect("ready");
+        if let Some(version) = version {
+            // The record a stage writes beside the build (`<build>.version`).
+            std::fs::write(
+                dir.with_file_name(format!("{build}.version")),
+                format!("version v1\n{version}\n"),
+            )
+            .expect("version record");
+        }
+        exe
+    };
+    let versioned = stage(21, Some("0.6.0"));
+    let bare = stage(22, None);
+    let r = registry(&layout, &[], &trust(&[]));
+    let entry = r.entry("kimi-alab").expect("the seed row");
+    assert_eq!(entry.origin, Origin::Seed);
+    assert_eq!(
+        r.admits_image(&layout, entry.row, &versioned),
+        Some(atpkg::harness_record::Admitted::Build {
+            build: 21,
+            version: Some("0.6.0".to_string())
+        })
+    );
+    assert_eq!(
+        r.admits_image(&layout, entry.row, &bare),
+        Some(atpkg::harness_record::Admitted::Build {
+            build: 22,
+            version: None
+        })
+    );
 }

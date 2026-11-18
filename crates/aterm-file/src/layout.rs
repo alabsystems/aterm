@@ -5,6 +5,8 @@
 //!
 //! ```text
 //! <root>/<set>/<leaf>.<ext>                         face (0600; folder 0700)
+//! <root>/<set>/<leaf>.problems                      where a commit found bad values
+//! <root>/<set>/<leaf>.rejected[-<n>].<ext>          bytes a commit refused, kept
 //! <root>/.ubd/state.noindex/<set>/<leaf>.snap       snapshot
 //!                                 <leaf>.state.json status
 //!                                 <leaf>.frontier   what the snapshot was projected from
@@ -14,6 +16,7 @@
 //!                                 <leaf>.history.jsonl    newest 4,096 operations
 //!                                 <leaf>.lock       held while a pass records
 //!                                 <leaf>.looking    shared by each pass from its look to its record
+//!                                 <leaf>.commit.lock  held while a commit reads the face
 //! ```
 //!
 //! The root is `~/.aterm/files`, and every caller hands it in ([`Root`]), so a test names a
@@ -141,6 +144,13 @@ impl Root {
         self.sidecar(name, "history.jsonl")
     }
 
+    /// The lock a commit of `name`'s face holds from its read of the face to its answer, so two
+    /// commits of one save (an Editor tab's and `aterm file edit`'s) never both queue its cells.
+    #[must_use]
+    pub fn commit_lock(&self, name: &Name) -> PathBuf {
+        self.sidecar(name, "commit.lock")
+    }
+
     /// The lock a pass holds while it records `name`.
     #[must_use]
     pub fn lock(&self, name: &Name) -> PathBuf {
@@ -154,19 +164,38 @@ impl Root {
         self.sidecar(name, "looking")
     }
 
-    /// The shared file whose face `path` is, by its path alone: `<root>/<set>/<leaf>.<ext>`.
+    /// The shared file whose face `path` is, by its path alone: `<root>/<set>/<leaf>.<ext>`, a
+    /// face's extension ([`aterm_types::shared_file::name_in`]).
     #[must_use]
     pub fn name_of(&self, path: &Path) -> Option<Name> {
-        let rest = path.strip_prefix(&self.0).ok()?;
-        let mut parts = rest.components();
-        let set = parts.next()?.as_os_str().to_str()?;
-        let file = Path::new(parts.next()?.as_os_str());
-        if parts.next().is_some() {
-            return None;
-        }
-        file.extension()?;
-        let leaf = file.file_stem()?.to_str()?;
-        Name::parse(&format!("{set}/{leaf}")).ok()
+        aterm_types::shared_file::name_in(&self.0, path).and_then(|name| Name::parse(&name).ok())
+    }
+
+    /// Where a commit that refused `name`'s face keeps the person's bytes:
+    /// `<root>/<set>/<leaf>.rejected.<ext>`, beside the face; the `n`th copy kept while the
+    /// earlier ones are still there is `<leaf>.rejected-<n>.<ext>` ([`Self::rejected_at`]).
+    #[must_use]
+    pub fn rejected(&self, name: &Name, ext: &str) -> PathBuf {
+        self.rejected_at(name, ext, 1)
+    }
+
+    /// The `n`th path a person's refused bytes are kept at (`n` from 1).
+    #[must_use]
+    pub fn rejected_at(&self, name: &Name, ext: &str, n: u32) -> PathBuf {
+        let leaf = name.leaf();
+        self.face_dir(name).join(if n <= 1 {
+            format!("{leaf}.rejected.{ext}")
+        } else {
+            format!("{leaf}.rejected-{n}.{ext}")
+        })
+    }
+
+    /// Where a commit of `name`'s face that found bad values says where, one `line:column: why`
+    /// each: `<root>/<set>/<leaf>.problems`, beside the face.
+    #[must_use]
+    pub fn problems(&self, name: &Name) -> PathBuf {
+        self.face_dir(name)
+            .join(format!("{}.problems", name.leaf()))
     }
 
     /// Every file a pass has recorded here, by name: the status files under the state folder.

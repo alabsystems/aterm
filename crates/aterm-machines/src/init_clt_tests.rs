@@ -2957,7 +2957,7 @@ fn only_a_persons_run_owes_a_new_folder_in_a_scoped_home() {
     crate::init_spotlight::tests::home(&sys);
     sys.logged_in(&alice()).on(
         "/usr/bin/mdutil -s /System/Volumes/Data",
-        Ran::ok("Indexing enabled."),
+        Ran::ok("/System/Volumes/Data:\n\tIndexing enabled.\n"),
     );
     sys.file(
         crate::init_spotlight::SCOPE_RECEIPT,

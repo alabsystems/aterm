@@ -478,3 +478,92 @@ fn repeated_backsteps_shift_free_history_and_extreme_window_does_not_overflow() 
     assert_eq!(h.window(i64::MIN).len(), FREE_BUCKETS);
     assert_eq!(h.window(i64::MAX).len(), FREE_BUCKETS);
 }
+
+/// A Spotlight split reading of `cpu_mc`, `read_bps` and `footprint` over the 5 s window ending
+/// at `at_ms`.
+fn family(at_ms: i64, cpu_mc: i64, read_bps: u64, footprint: u64) -> crate::spotlight::Reading {
+    crate::spotlight::Reading {
+        at_unix_ms: at_ms,
+        window_ms: 5_000,
+        cpu_mc,
+        read_bps,
+        footprint: crate::model::MemoryCharge {
+            bytes: footprint,
+            members: 1,
+            unread: 0,
+        },
+        shares: Vec::new(),
+        volumes: None,
+        volumes_age_ms: None,
+        state: crate::spotlight::State::Idle,
+    }
+}
+
+/// The family's CPU and reads are kept as each 10-minute bucket's mean and its footprint as the
+/// bucket's largest, over the day; the kept form restores the same day.
+/// NEGATIVE CONTROL: the footprint's mean (what a fold of the mean alone would keep) is not its
+/// largest, and a restore a day later holds nothing.
+#[test]
+fn the_spotlight_familys_cost_is_kept_in_the_history() {
+    let mut h = SpotlightHistory::default();
+    assert!(h.is_empty() && h.saved().is_none());
+    let bucket = FREE_BUCKET_S * 1000;
+    // Three buckets: two readings in the first, one in the second, two in the third.
+    h.note(&family(T0 + 10_000, 100, 1_000_000, 500 << 20));
+    h.note(&family(T0 + 15_000, 300, 3_000_000, 700 << 20));
+    h.note(&family(T0 + bucket + 10_000, 250, 0, 800 << 20));
+    h.note(&family(T0 + 2 * bucket + 10_000, 0, 10_000_000, 600 << 20));
+    h.note(&family(T0 + 2 * bucket + 15_000, 50, 0, 900 << 20));
+    let now = T0 + 2 * bucket + 20_000;
+    let day = h.day(now);
+    assert_eq!(day.len(), FREE_BUCKETS);
+    let last3: Vec<SpotlightBucket> = day[FREE_BUCKETS - 3..]
+        .iter()
+        .map(|b| b.expect("each bucket read"))
+        .collect();
+    assert_eq!(
+        last3,
+        [
+            SpotlightBucket {
+                cpu_mc: 200.0,
+                read_bps: 2_000_000.0,
+                footprint_max: Some(f64::from(700u32 << 20)),
+            },
+            SpotlightBucket {
+                cpu_mc: 250.0,
+                read_bps: 0.0,
+                footprint_max: Some(f64::from(800u32 << 20)),
+            },
+            SpotlightBucket {
+                cpu_mc: 25.0,
+                read_bps: 5_000_000.0,
+                footprint_max: Some(f64::from(900u32 << 20)),
+            },
+        ]
+    );
+    assert!(day[..FREE_BUCKETS - 3].iter().all(Option::is_none));
+    assert_ne!(
+        h.footprint.buckets(now)[FREE_BUCKETS - 1].and_then(|b| b.value()),
+        last3[2].footprint_max,
+        "the control: the mean is not the largest"
+    );
+
+    // A reading whose footprint was not read keeps its CPU and reads, and no footprint.
+    let mut unread = SpotlightHistory::default();
+    let mut r = family(T0 + 10_000, 100, 0, 0);
+    r.footprint.unread = 1;
+    unread.note(&r);
+    let b = unread.day(T0 + 20_000)[FREE_BUCKETS - 1].expect("the CPU is read");
+    assert_eq!((b.cpu_mc, b.footprint_max), (100.0, None));
+
+    let saved = h.saved().expect("read");
+    let back = SpotlightHistory::restored(&saved, now);
+    assert_eq!(back.day(now), day, "the kept form restores the day");
+    assert!(
+        SpotlightHistory::restored(&saved, now + FREE_BUCKETS as i64 * bucket)
+            .day(now + FREE_BUCKETS as i64 * bucket)
+            .iter()
+            .all(Option::is_none),
+        "a day on, nothing"
+    );
+}

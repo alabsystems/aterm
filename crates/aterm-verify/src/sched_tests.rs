@@ -485,11 +485,12 @@ fn managed_plans_spend_their_share_on_one_stage_without_losing_checks() {
             crate::Scope::crate_only("aterm-grid"),
             crate::Scope::changed("main", vec![], true),
         ] {
-            let plain = crate::plan::plan(&ctx(&checks, scope.clone()));
+            let plain =
+                crate::plan::plan(&ctx(&checks, scope.clone())).expect("complete graph and plan");
             let mut managed = ctx(&checks, scope);
             managed.env.build_slot_held = Some("1".into());
             managed.env.cargo_build_jobs = Some("6".into());
-            let managed = crate::plan::plan(&managed);
+            let managed = crate::plan::plan(&managed).expect("complete graph and plan");
             assert_eq!(plain.len(), managed.len());
             for (old, new) in plain.iter().zip(&managed) {
                 assert_eq!(
@@ -516,8 +517,8 @@ fn pooled_tree_checks_overlap_without_losing_the_compile_dependency() {
         .with_pool(Some(pool));
     c.env.build_slot_held = Some("1".into());
     c.env.cargo_build_jobs = Some("4".into());
-    let specs = crate::plan::plan(&c);
-    assert_eq!(specs[0].id, StageId::Formatting);
+    let specs = crate::plan::plan(&c).expect("complete graph and plan");
+    assert_eq!(specs[0].id, StageId::Census);
     assert!(specs.iter().all(|s| !s.exclusive));
     let at = |id| specs.iter().position(|s| s.id == id).unwrap();
     let title = |id| specs[at(id)].title.as_str();
@@ -552,7 +553,7 @@ fn no_starvation_and_no_deadlock() {
             crate::Scope::crate_only("aterm-grid"),
             crate::Scope::changed("main", vec![], true),
         ] {
-            shapes.push(crate::plan::plan(&ctx(&checks, scope)));
+            shapes.push(crate::plan::plan(&ctx(&checks, scope)).expect("complete graph and plan"));
         }
     }
     for specs in &shapes {
@@ -881,7 +882,7 @@ fn sampled_plans_keep_the_budget_and_finish() {
             crate::Scope::crate_only("aterm-grid"),
             crate::Scope::changed("main", vec![], true),
         ] {
-            let p = crate::plan::plan(&ctx(&checks, scope));
+            let p = crate::plan::plan(&ctx(&checks, scope)).expect("complete graph and plan");
             for p in [shaped(&p, 2), shaped(&p, 3), p] {
                 if !shapes.contains(&p) {
                     shapes.push(p);

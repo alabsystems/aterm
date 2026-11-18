@@ -58,7 +58,7 @@ fn sids_of<'a>(ctx: &'a Ctx<'_>, keys: &[u64]) -> Vec<&'a str> {
 /// rows whose source is one of its sessions (W-session's tie, a held row's job or session-mate,
 /// a waiting row's job) or a run that rode in one, and those runs. A closed tab's rows are no
 /// live session's, so only `aterm` shows them.
-fn shown<'a>(ctx: &Ctx<'_>, view: &'a LeftView, scope: ScopeArg) -> Shown<'a> {
+fn scoped<'a>(ctx: &Ctx<'_>, view: &'a LeftView, scope: ScopeArg) -> Shown<'a> {
     if scope == ScopeArg::Aterm {
         return Shown {
             rows: view.rows.iter().collect(),
@@ -90,6 +90,15 @@ fn shown<'a>(ctx: &Ctx<'_>, view: &'a LeftView, scope: ScopeArg) -> Shown<'a> {
             .collect(),
         links: &[],
     }
+}
+
+/// Keep endable processes and other leftovers visible before live orphans when `top` caps a reply.
+fn shown<'a>(ctx: &Ctx<'_>, view: &'a LeftView, scope: ScopeArg) -> Shown<'a> {
+    let mut shown = scoped(ctx, view, scope);
+    shown
+        .rows
+        .sort_by_key(|row| (row.token.is_none(), row.state == State::Orphaned, row.pid));
+    shown
 }
 
 /// The session key a run rode in, where this instance hosts it.

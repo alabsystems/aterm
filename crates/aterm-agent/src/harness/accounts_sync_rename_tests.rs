@@ -478,7 +478,7 @@ fn rename_sync_resumes_after_wake_failure_without_repeating_the_move() {
             bed.store.dir.parent().unwrap(),
             (&bed.path, &bed.root.path().join("aterm.toml")),
             NOW,
-            &std::sync::Mutex::new(Rediscovery::default()),
+            &Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
         ),
         "an interrupted commit schedules recovery even when sources did not change"
     );

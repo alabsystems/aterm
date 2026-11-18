@@ -203,6 +203,7 @@ fn an_oversized_record_reply_is_rejected_before_any_header() {
         crate::membership_log::store::Missing {
             records: vec![large; 65],
             more: false,
+            served: None,
         },
         false,
         None,
@@ -220,6 +221,7 @@ fn the_header_and_every_record_chunk_share_one_absolute_deadline() {
         crate::membership_log::store::Missing {
             records: vec![large_record(WRITE_CHUNK); 3],
             more: false,
+            served: None,
         },
         false,
         None,
@@ -348,6 +350,7 @@ fn a_selected_reply_survives_concurrent_store_replacement_without_holding_state(
             query: None,
             subscriber: None,
             no_wait: true,
+            served: false,
             local: true,
             stated: Some(crate::crossing::RecordsBound::uncrossed()),
         },
@@ -384,6 +387,7 @@ fn a_selected_reply_survives_concurrent_store_replacement_without_holding_state(
             query: None,
             subscriber: None,
             no_wait: true,
+            served: false,
             local: true,
             stated: Some(crate::crossing::RecordsBound::uncrossed()),
         },
@@ -406,7 +410,7 @@ fn a_selected_reply_survives_concurrent_store_replacement_without_holding_state(
             .contains(&format!("Content-Length: {}\r\n", initial.len()))
     );
     assert_eq!(&sink.bytes[split..], initial);
-    let Body::Records(current) = current.body else {
+    let Body::Records(current, None) = current.body else {
         panic!("the next GET has current records");
     };
     assert_eq!(current.len(), 4);

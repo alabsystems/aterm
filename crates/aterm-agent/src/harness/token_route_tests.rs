@@ -279,7 +279,7 @@ fn the_judgment_runs_its_steps_in_order() {
     let fake = Fake::on_work(TokenFact::InUse);
     assert!(matches!(
         judge(&facts, &fake),
-        Decision::Token { entry: e, ref account } if e == entry(WORK) && account.named() == "work"
+        Decision::Token { entry: e, ref account } if e == entry(WORK) && account.label.as_deref() == Some("work")
     ));
     for (facts, word) in [
         (
@@ -495,8 +495,9 @@ fn a_reason_names_the_variable_or_the_document_never_a_value() {
     );
 }
 
-/// TODAY'S JUDGMENT OF THE ACCOUNT (§5.3, step 4): the row the login resolves, a label naming
-/// that row and an email that account; a row-less login's account by its login record.
+/// TODAY'S JUDGMENT OF THE ACCOUNT (§5.3, step 4): the row the login resolves, with its token
+/// entry; a row-less login's account by its login record. (A wrapper line that names its account
+/// holds this account to its word: `accounts_token_run`'s tests.)
 #[test]
 fn the_account_is_the_one_the_launchs_login_resolves() {
     crate::harness::journal::with_keyer(keyer, || {
@@ -508,54 +509,41 @@ fn the_account_is_the_one_the_launchs_login_resolves() {
             default_home: true,
             route: AuthRoute::Stored,
         };
-        let (account, found) =
-            account_of(&stored(None), Some(&r), Named::Auto, &none, &nothing).unwrap();
-        assert_eq!(account.named(), "main");
+        let (account, found) = account_of(&stored(None), Some(&r), &none, &nothing).unwrap();
+        assert_eq!(account.label.as_deref(), Some("main"));
         assert_eq!(found, Some(entry(MAIN)));
         let work = stored(Some(at!("/logins/work")));
-        assert!(account_of(&work, Some(&r), Named::Label("work"), &none, &nothing).is_ok());
-        assert!(
-            account_of(
-                &work,
-                Some(&r),
-                Named::Label("work@example.com"),
-                &none,
-                &nothing
-            )
-            .is_ok()
-        );
-        let refused = account_of(&work, Some(&r), Named::Label("main"), &none, &nothing)
-            .expect_err("work's login is not main's");
-        assert!(refused.contains("another row's login"), "{refused}");
+        let (account, found) = account_of(&work, Some(&r), &none, &nothing).unwrap();
+        assert_eq!(account.label.as_deref(), Some("work"));
+        assert_eq!(found, Some(entry(WORK)));
         // A row-less login: the login record names the account.
         let record = |_: Option<&str>| Some("work@example.com".to_owned());
         let (account, found) = account_of(
             &stored(Some(at!("/logins/elsewhere"))),
             Some(&r),
-            Named::Auto,
             &record,
             &nothing,
         )
         .unwrap();
         assert_eq!(account.label, None);
-        assert_eq!(account.named(), "work@example.com");
+        assert_eq!(account.email, "work@example.com");
         assert_eq!(found, Some(entry(WORK)));
         // A token session whose marker names its row's entry is on its account's own route.
         let token = ProcessLogin {
             route: AuthRoute::VaultToken { entry: entry(WORK) },
             ..work.clone()
         };
-        assert!(account_of(&token, Some(&r), Named::Auto, &none, &nothing).is_ok());
+        assert!(account_of(&token, Some(&r), &none, &nothing).is_ok());
         let foreign = ProcessLogin {
             route: AuthRoute::VaultToken { entry: entry(MAIN) },
             ..work.clone()
         };
-        assert!(account_of(&foreign, Some(&r), Named::Auto, &none, &nothing).is_err());
+        assert!(account_of(&foreign, Some(&r), &none, &nothing).is_err());
         let elsewhere = ProcessLogin {
             default_home: false,
             ..work
         };
-        assert!(account_of(&elsewhere, Some(&r), Named::Auto, &none, &nothing).is_err());
+        assert!(account_of(&elsewhere, Some(&r), &none, &nothing).is_err());
     });
 }
 
@@ -778,11 +766,11 @@ fn a_running_sessions_account_is_its_logins_row_or_its_records() {
             route: AuthRoute::Stored,
         };
         let (account, found) = session_account(&who(None), Some(&r), None).expect("main");
-        assert_eq!(account.named(), "main");
+        assert_eq!(account.label.as_deref(), Some("main"));
         assert_eq!(found, entry(MAIN));
         let (account, found) =
             session_account(&who(Some(at!("/logins/work"))), Some(&r), None).expect("work");
-        assert_eq!(account.named(), "work");
+        assert_eq!(account.label.as_deref(), Some("work"));
         assert_eq!(found, entry(WORK));
         let (account, found) = session_account(
             &who(Some(at!("/logins/elsewhere"))),

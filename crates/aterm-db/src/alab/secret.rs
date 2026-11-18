@@ -5,7 +5,8 @@
 //! (the sealed token in its cell, or the secret-store entry a `SecretRef` cell names,
 //! [`crate::typed::secret::Store`]) and handed to its one consumer. Each
 //! successful reveal first durably records only its coordinates, surface and time in a local
-//! journal, never in Commons.
+//! journal, never in Commons. The journal keeps the newest records in two files of a fixed
+//! size ([`Journal`]).
 
 use crate::{
     Error, Result,
@@ -29,9 +30,23 @@ impl Surface {
     }
 }
 
+/// What the journal's file holds before a reveal retires it: about 8,000 records. With the one
+/// retired file kept beside it ([`RETIRED`]) the journal's folder holds about twice this: a
+/// file passes the bound by the records appended while another reveal held the journal's lock
+/// or had the file open across its retirement, and the next reveal that takes the lock retires
+/// it.
+const CAP: u64 = 1 << 20;
+
+/// The retired file's name beside the journal's: the records before the newest [`CAP`] bytes,
+/// replaced at each retirement.
+#[cfg(unix)]
+const RETIRED: &str = "reveals.earlier.jsonl";
+
 /// A local-only reveal journal. Explicit paths allow isolated tests and lab instances.
 pub struct Journal {
     path: PathBuf,
+    /// [`CAP`]; a test's own bound.
+    cap: u64,
 }
 
 impl Journal {
@@ -39,6 +54,7 @@ impl Journal {
     pub fn at(directory: &Path) -> Self {
         Self {
             path: directory.join("reveals.jsonl"),
+            cap: CAP,
         }
     }
 
@@ -91,18 +107,6 @@ impl Journal {
             .ok_or_else(|| Error::new("invalid reveal journal"))?;
         aterm_journal::create_private_dir_durable(directory)
             .map_err(|_| Error::new("cannot create local reveal journal"))?;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
-            .open(&self.path)
-            .map_err(|_| Error::new("cannot open local reveal journal"))?;
-        let meta = file
-            .metadata()
-            .map_err(|_| Error::new("cannot inspect reveal journal"))?;
-        private_regular(&meta)?;
         #[derive(serde::Serialize)]
         struct RevealRecord<'a> {
             collection: &'a str,
@@ -122,15 +126,75 @@ impl Journal {
         })
         .map_err(|_| Error::new("cannot encode local reveal record"))?;
         line.push(b'\n');
+        let (mut file, held) = self.open_private()?;
+        if held.saturating_add(line.len() as u64) > self.cap {
+            self.retire(directory, &file)?;
+            file = self.open_private()?.0;
+        }
         file.write_all(&line)
             .and_then(|()| aterm_durable::durable(&file))
             .and_then(|()| aterm_durable::durable_dir(directory))
             .map_err(|_| Error::new("cannot commit local reveal record"))
     }
 
+    /// The journal's file, made where there is none, open to append, with the bytes it holds:
+    /// this user's private regular file ([`private_regular`]) or an error.
+    #[cfg(unix)]
+    fn open_private(&self) -> Result<(std::fs::File, u64)> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+            .open(&self.path)
+            .map_err(|_| Error::new("cannot open local reveal journal"))?;
+        let meta = file
+            .metadata()
+            .map_err(|_| Error::new("cannot inspect reveal journal"))?;
+        private_regular(&meta)?;
+        Ok((file, meta.len()))
+    }
+
+    /// Retire the journal's file, which holds its bound: it takes the retired file's name
+    /// ([`RETIRED`]), replacing the file retired before it, and the caller's next open makes the
+    /// journal anew, so the folder keeps the newest records and never more than two files of
+    /// them. Every process of this account that reveals appends to the one file, so the move is
+    /// made under the journal's lock (`aterm_uds::line_log::lock`) and only of the file `held`
+    /// is: where another process retired that file first, the path names the file it made, and
+    /// that one stays. A lock another reveal still holds after the lock's wait retires nothing:
+    /// this record goes in over the bound and a later reveal retires the file. A process that
+    /// opened the file before it was retired appends its record to the retired file.
+    ///
+    /// # Errors
+    /// The lock cannot be taken for another reason than its holder, or the file cannot be read
+    /// or moved: a reveal that cannot keep the journal bounded fails, as one that cannot append
+    /// does.
+    #[cfg(unix)]
+    fn retire(&self, directory: &Path, held: &std::fs::File) -> Result<()> {
+        use aterm_uds::line_log;
+        let bound = |_| Error::new("cannot bound local reveal journal");
+        let _lock = match line_log::lock(&self.path) {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(bound(error)),
+        };
+        let ours = line_log::identity_of(held).map_err(bound)?;
+        match line_log::identity_at(&self.path) {
+            Ok(at) if (at.dev, at.ino) == (ours.dev, ours.ino) => {
+                std::fs::rename(&self.path, self.path.with_file_name(RETIRED))
+                    .and_then(|()| aterm_durable::durable_dir(directory))
+                    .map_err(bound)
+            }
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(bound(error)),
+        }
+    }
+
     #[cfg(not(unix))]
     fn record(&self, _: Cell<'_>, _: Surface, _: u64) -> Result<()> {
-        let _ = &self.path;
+        let _ = (&self.path, self.cap);
         Err(Error::new(
             "local reveal journal is unavailable on this platform",
         ))

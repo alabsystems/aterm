@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::accounts::{HOME_ENV, ProcessLogin};
 use crate::supervise::policy::login::LoginShared;
+use aterm_uds::trace;
 
 /// Stored-login key (`config:<dir>` or `service:<name>`) from a process's `KEY=value` env.
 #[must_use]
@@ -36,10 +37,33 @@ fn login_key_of(who: ProcessLogin, env: &[String]) -> Option<String> {
         .map(|(_, home)| format!("dir:{home}"))
 }
 
-/// Per-host table of shared login sign-ins, keyed by [`login_key`].
-#[derive(Debug, Default)]
+/// Per-host table of shared login sign-ins, keyed by [`login_key`]. The roster rows it carries
+/// ([`Self::carried_rows`]) have a generation: a change that leaves another set of rows carried
+/// moves it and rings the trace's bell, on whichever thread a tab carries, releases or closes,
+/// and a read of the rows records it in the trace armed on the reading thread.
+#[derive(Debug)]
 pub struct LoginLatches {
     logins: Mutex<BTreeMap<String, Latch>>,
+    /// The generation of [`Self::carried_rows`].
+    carried: trace::Generation,
+}
+
+impl Default for LoginLatches {
+    fn default() -> Self {
+        Self {
+            logins: Mutex::default(),
+            carried: trace::Generation::new("login_latch/carried_rows"),
+        }
+    }
+}
+
+/// The roster rows `logins` carries ([`LoginLatches::carried_rows`]).
+fn carried_in(logins: &BTreeMap<String, Latch>) -> BTreeSet<String> {
+    logins
+        .values()
+        .filter(|latch| latch.carrier.is_some())
+        .filter_map(|latch| latch.row.clone())
+        .collect()
 }
 
 /// One login's sign-in.
@@ -73,7 +97,21 @@ impl LoginLatches {
         self.logins.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Run `change` over the table, and move the rows' generation where it left another set of
+    /// rows carried. The move is made under the table's lock, so a reader that recorded a
+    /// generation read the rows of that generation.
+    fn change<R>(&self, change: impl FnOnce(&mut BTreeMap<String, Latch>) -> R) -> R {
+        let mut logins = self.lock();
+        let before = carried_in(&logins);
+        let out = change(&mut logins);
+        if carried_in(&logins) != before {
+            self.carried.bump();
+        }
+        out
+    }
+
     /// Shared sign-in state for tab `sid` on login `key` (`Carried` by another tab or `Back`).
+    /// It records `sid` waiting, never a carrier, so the rows carried keep their generation.
     pub fn shared(&self, key: &str, sid: &str) -> Option<LoginShared> {
         let mut logins = self.lock();
         let latch = logins.get_mut(key)?;
@@ -110,14 +148,13 @@ impl LoginLatches {
         self.carry_owned(key, sid, Some(Arc::clone(owner)), row)
     }
 
-    /// Roster rows whose login a tab's sign-in currently carries.
+    /// Roster rows whose login a tab's sign-in currently carries, with their generation recorded
+    /// in the armed trace.
     #[must_use]
     pub fn carried_rows(&self) -> BTreeSet<String> {
-        self.lock()
-            .values()
-            .filter(|latch| latch.carrier.is_some())
-            .filter_map(|latch| latch.row.clone())
-            .collect()
+        let logins = self.lock();
+        self.carried.record();
+        carried_in(&logins)
     }
 
     fn carry_owned(
@@ -127,91 +164,95 @@ impl LoginLatches {
         owner: Option<Arc<AtomicBool>>,
         row: Option<&str>,
     ) -> Result<(), String> {
-        let mut logins = self.lock();
-        for (other, latch) in logins.iter_mut() {
-            if other != key && latch.carrier.as_deref() == Some(sid) {
-                latch.carrier = None;
-                latch.carrier_owner = None;
-                latch.row = None;
+        self.change(|logins| {
+            for (other, latch) in logins.iter_mut() {
+                if other != key && latch.carrier.as_deref() == Some(sid) {
+                    latch.carrier = None;
+                    latch.carrier_owner = None;
+                    latch.row = None;
+                }
             }
-        }
-        logins.retain(|_, latch| !latch.idle());
-        let latch = logins.entry(key.to_string()).or_default();
-        if let Some(by) = latch.carrier.clone().filter(|by| by != sid) {
-            latch.waiting.insert(sid.to_string());
-            return Err(by);
-        }
-        latch.carrier = Some(sid.to_string());
-        latch.carrier_owner = owner;
-        latch.row = row.map(str::to_string);
-        latch.waiting.remove(sid);
-        latch.back.remove(sid);
-        Ok(())
+            logins.retain(|_, latch| !latch.idle());
+            let latch = logins.entry(key.to_string()).or_default();
+            if let Some(by) = latch.carrier.clone().filter(|by| by != sid) {
+                latch.waiting.insert(sid.to_string());
+                return Err(by);
+            }
+            latch.carrier = Some(sid.to_string());
+            latch.carrier_owner = owner;
+            latch.row = row.map(str::to_string);
+            latch.waiting.remove(sid);
+            latch.back.remove(sid);
+            Ok(())
+        })
     }
 
     /// Release any sign-in or wait held by `sid` when `owner` matches the current carrier owner.
     pub fn abandon_for(&self, sid: &str, owner: &Arc<AtomicBool>) -> bool {
-        let mut logins = self.lock();
-        let mut row = false;
-        for latch in logins.values_mut() {
-            if latch.carrier.as_deref() == Some(sid)
-                && latch
-                    .carrier_owner
-                    .as_ref()
-                    .is_some_and(|held| Arc::ptr_eq(held, owner))
-            {
-                latch.carrier = None;
-                latch.carrier_owner = None;
-                row |= latch.row.take().is_some();
+        self.change(|logins| {
+            let mut row = false;
+            for latch in logins.values_mut() {
+                if latch.carrier.as_deref() == Some(sid)
+                    && latch
+                        .carrier_owner
+                        .as_ref()
+                        .is_some_and(|held| Arc::ptr_eq(held, owner))
+                {
+                    latch.carrier = None;
+                    latch.carrier_owner = None;
+                    row |= latch.row.take().is_some();
+                }
             }
-        }
-        logins.retain(|_, latch| !latch.idle());
-        row
+            logins.retain(|_, latch| !latch.idle());
+            row
+        })
     }
 
     /// Mark login `key` restored in tab `sid` and notify waiting tabs via [`LoginShared::Back`].
     pub fn back(&self, key: &str, sid: &str) {
-        let mut logins = self.lock();
-        for (other, latch) in logins.iter_mut() {
-            if other != key && latch.carrier.as_deref() == Some(sid) {
-                latch.carrier = None;
-                latch.carrier_owner = None;
-                latch.row = None;
+        self.change(|logins| {
+            for (other, latch) in logins.iter_mut() {
+                if other != key && latch.carrier.as_deref() == Some(sid) {
+                    latch.carrier = None;
+                    latch.carrier_owner = None;
+                    latch.row = None;
+                }
             }
-        }
-        logins.retain(|_, latch| !latch.idle());
-        let Some(latch) = logins.get_mut(key) else {
-            return;
-        };
-        if let Some(carrier) = latch.carrier.take().filter(|c| c != sid) {
-            latch.back.insert(carrier, sid.to_string());
-        }
-        latch.carrier_owner = None;
-        latch.row = None;
-        for waited in std::mem::take(&mut latch.waiting) {
-            if waited != sid {
-                latch.back.insert(waited, sid.to_string());
+            logins.retain(|_, latch| !latch.idle());
+            let Some(latch) = logins.get_mut(key) else {
+                return;
+            };
+            if let Some(carrier) = latch.carrier.take().filter(|c| c != sid) {
+                latch.back.insert(carrier, sid.to_string());
             }
-        }
-        latch.back.remove(sid);
-        if latch.idle() {
-            logins.remove(key);
-        }
+            latch.carrier_owner = None;
+            latch.row = None;
+            for waited in std::mem::take(&mut latch.waiting) {
+                if waited != sid {
+                    latch.back.insert(waited, sid.to_string());
+                }
+            }
+            latch.back.remove(sid);
+            if latch.idle() {
+                logins.remove(key);
+            }
+        });
     }
 
     /// Release any sign-in or wait held by closed tab `sid`.
     pub fn gone(&self, sid: &str) {
-        let mut logins = self.lock();
-        for latch in logins.values_mut() {
-            if latch.carrier.as_deref() == Some(sid) {
-                latch.carrier = None;
-                latch.carrier_owner = None;
-                latch.row = None;
+        self.change(|logins| {
+            for latch in logins.values_mut() {
+                if latch.carrier.as_deref() == Some(sid) {
+                    latch.carrier = None;
+                    latch.carrier_owner = None;
+                    latch.row = None;
+                }
+                latch.waiting.remove(sid);
+                latch.back.remove(sid);
             }
-            latch.waiting.remove(sid);
-            latch.back.remove(sid);
-        }
-        logins.retain(|_, latch| !latch.idle());
+            logins.retain(|_, latch| !latch.idle());
+        });
     }
 }
 

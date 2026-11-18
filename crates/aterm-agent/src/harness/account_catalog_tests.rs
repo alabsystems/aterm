@@ -62,10 +62,12 @@ fn a_shared_description_never_grants_login_authority() {
         Here {
             roster: Some(&Roster::default()),
             own: None,
+            names: None,
         },
     );
     assert_eq!(value["accounts"][0]["key"].as_str(), Some("account-one"));
-    assert_eq!(value["accounts"][0]["local_label"], Value::Null);
+    assert_eq!(value["accounts"][0]["local"], Value::Null);
+    assert_eq!(value["accounts"][0]["local_own"], Value::from(false));
     assert_eq!(
         value["accounts"][0]["login_authority"].as_str(),
         Some("none")
@@ -134,6 +136,7 @@ fn a_report_lists_this_macs_rows_and_counts_the_rest() {
     let listed = Here {
         roster: Some(&roster),
         own: None,
+        names: None,
     };
     let here = text_here(&catalog, Cli::Claude, listed);
     assert!(
@@ -141,7 +144,10 @@ fn a_report_lists_this_macs_rows_and_counts_the_rest() {
         "{here}"
     );
     assert!(here.contains("<mine@example.test>"), "{here}");
-    assert!(here.contains("local local"), "{here}");
+    assert!(
+        here.contains("local claude mine@example.test\n"),
+        "the local row by its account's name, never its label: {here}"
+    );
     assert!(here.contains("<questioned@example.test>"), "{here}");
     assert!(
         !here.contains("theirs@") && !here.contains("further@"),
@@ -163,6 +169,7 @@ fn a_report_lists_this_macs_rows_and_counts_the_rest() {
     let own = Here {
         roster: None,
         own: Some("mine@example.test"),
+        names: None,
     };
     let here = text_here(&catalog, Cli::Claude, own);
     assert!(here.contains("2 of its 4 rows"), "{here}");
@@ -174,6 +181,101 @@ fn a_report_lists_this_macs_rows_and_counts_the_rest() {
     assert_eq!(
         text_here(&unavailable, Cli::Claude, Here::default()),
         text(&unavailable, Cli::Claude, Here::default())
+    );
+}
+
+/// A ROW THIS MAC HOLDS IS NAMED AS THE REPORT NAMES IT. Under a listing of the roster, which the
+/// report and `accounts table` pass once they read one, the JSON's `local` is the row's account
+/// key and `local_own` is false, and the text's `local` cell names the row's account by its name
+/// and slug ([`Listing::shown`]); the row's label is printed nowhere. This Mac's own login, which
+/// no row lists, has `local: null`, `local_own: true` and `local this Mac's own login`.
+/// NEGATIVE CONTROLS, each its own run: with `Local::id`'s listed arm giving the row's label,
+/// the JSON's `local` is `m2-2`; with `Local::words`' listed arm giving the label, the text
+/// reads `local m2-2`; with `local_own` always false, the own login's is false; each fails this
+/// (2026-11-16, mutation runs on SF-07H S7b's review settle, then restored from HEAD).
+#[test]
+fn a_local_row_is_named_by_its_account_in_the_json_and_the_text() {
+    use crate::harness::account_names::Listing;
+    use crate::harness::alab_roster::Lab;
+    let email = "mine@example.test";
+    let pk = aterm_db::typed::keys::account_pk("claude", email).expect("a key");
+    let lab = Lab {
+        names: [(
+            pk.clone(),
+            aterm_file::AccountNames {
+                realm: "claude".into(),
+                slug: "claude-mine-e".into(),
+                name: Some(format!("claude {email}")),
+                email: Some(email.into()),
+                login: Some(email.into()),
+                live: true,
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Lab::default()
+    };
+    let roster = Roster {
+        rows: vec![accounts::Row {
+            label: "m2-2".into(),
+            email: Some(email.into()),
+            ..Default::default()
+        }],
+    };
+    let names = Listing::of(Cli::Claude, &roster.rows, Some(&lab));
+    let catalog = Ok(Catalog {
+        table: "table".into(),
+        history_complete: true,
+        rows: vec![Account {
+            label: "Mine".into(),
+            email: Some(email.into()),
+            ..account()
+        }],
+        ..Default::default()
+    });
+    let here = Here {
+        roster: Some(&roster),
+        own: None,
+        names: Some(&names),
+    };
+    let value = report(&catalog, Cli::Claude, here);
+    let row = &value["accounts"][0];
+    assert_eq!(
+        (row.get("local"), row.get("local_own")),
+        (Some(&Value::from(pk.as_str())), Some(&Value::from(false))),
+        "the row here by its account's key: {row}"
+    );
+    let shown = names.shown("m2-2").into_owned();
+    assert_eq!(shown, "claude mine@example.test (claude-mine-e)");
+    let listed = text_here(&catalog, Cli::Claude, here);
+    assert!(listed.contains(&format!("; local {shown}\n")), "{listed}");
+    let every = text(&catalog, Cli::Claude, here);
+    assert!(every.contains(&format!("; local {shown}\n")), "{every}");
+    for printed in [value.to_string(), listed, every] {
+        assert!(
+            !printed
+                .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+                .any(|word| word == "m2-2"),
+            "the row's label is printed: {printed}"
+        );
+    }
+    let none = Listing::of(Cli::Claude, &[], Some(&lab));
+    let own = Here {
+        roster: Some(&Roster::default()),
+        own: Some(email),
+        names: Some(&none),
+    };
+    let value = report(&catalog, Cli::Claude, own);
+    let row = &value["accounts"][0];
+    assert_eq!(
+        (row.get("local"), row.get("local_own")),
+        (Some(&Value::Null), Some(&Value::from(true))),
+        "this Mac's own login, which no row lists: {row}"
+    );
+    let listed = text_here(&catalog, Cli::Claude, own);
+    assert!(
+        listed.contains("; local this Mac's own login\n"),
+        "{listed}"
     );
 }
 

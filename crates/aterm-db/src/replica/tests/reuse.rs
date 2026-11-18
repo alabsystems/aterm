@@ -7,7 +7,6 @@
 
 use super::*;
 use crate::crypto::Causal;
-use std::time::Instant;
 
 /// How many opens on this thread replayed a store's whole journal while `run` ran
 /// ([`crate::table::store::journal_replays`]).
@@ -190,12 +189,25 @@ fn a_kept_store_rejudges_eligibility_at_each_boundary_and_a_quiet_round_replays_
     assert_eq!(replayed, 0, "a quiet round reopens what it kept");
 }
 
-/// A table of `held + moved` records by four writers on Mac 0, of which Mac 1 holds the first
-/// `held`: a round moves the other `moved`.
+/// The rows above each Mac's floor once it holds the whole table: under the table's operation
+/// quota, with room for the two checkpoints.
+const ABOVE_FLOOR: usize = 8_000;
+const _: () = assert!(ABOVE_FLOOR + 2 <= crate::table::store::MAX_RECORDS);
+
+/// A table of `held + moved` records on Mac 0, of which Mac 1 holds the first `held`: a round
+/// moves the other `moved`. Four writers other than the two Macs write the rows, and each Mac
+/// stands on a floor (tracker LT-B10C1): a checkpoint it signed at a cut of the rows both hold,
+/// reached before the table's operation quota (`table::store::MAX_RECORDS`) and leaving
+/// [`ABOVE_FLOOR`] rows above it, so its quotas count only those and the table may hold more than
+/// the quota by LT-B10C2. Each Mac holds the other's checkpoint too, so the two differ by the
+/// `moved` rows alone.
 fn large_pair(held: usize, moved: usize) -> Pair {
+    use crate::checkpoint::{self, History, Tip};
+    use crate::documents::log::Log;
+    const MACS: usize = 2;
     const WRITERS: usize = 4;
-    let lab = Lab::new(&[Role::Writer; WRITERS]);
-    let bootstraps: Vec<_> = (0..WRITERS).map(|n| lab.bootstrap(n)).collect();
+    let lab = Lab::new(&[Role::Writer; MACS + WRITERS]);
+    let bootstraps: Vec<_> = (0..MACS + WRITERS).map(|n| lab.bootstrap(n)).collect();
     let sessions: Vec<_> = bootstraps
         .iter()
         .map(|bootstrap| Session::open(bootstrap).unwrap())
@@ -206,22 +218,36 @@ fn large_pair(held: usize, moved: usize) -> Pair {
     ];
     let mut a = Store::create(&sessions[0], &paths[0]).unwrap();
     let scope = a.scope();
+    // The rows both Macs hold; with the two checkpoints, `held` records.
+    let rows = held - MACS;
+    // The rows at or below the floor.
+    let floor = (rows + moved)
+        .checked_sub(ABOVE_FLOOR)
+        .filter(|floor| *floor <= rows)
+        .expect("the floor is a cut of the rows both Macs hold");
     let mut previous = [None; WRITERS];
-    let wires: Vec<_> = (0..held + moved)
+    let mut frontier = BTreeMap::new();
+    let wires: Vec<_> = (0..rows + moved)
         .map(|row| {
             let writer = row % WRITERS;
+            let session = &sessions[MACS + writer];
+            let sequence = u64::try_from(row / WRITERS + 1).unwrap();
             let wire = crate::table::tests::seal(
-                &sessions[writer],
+                session,
                 scope,
                 Causal {
-                    sequence: u64::try_from(row / WRITERS + 1).unwrap(),
+                    sequence,
                     previous: previous[writer],
                     parents: previous[writer].as_slice(),
                 },
                 b"row",
             )
             .unwrap();
-            previous[writer] = Some(Sha256::digest(&wire));
+            let digest = Sha256::digest(&wire);
+            previous[writer] = Some(digest);
+            if row < floor {
+                frontier.insert(session.actor(), Tip { sequence, digest });
+            }
             wire
         })
         .collect();
@@ -231,49 +257,112 @@ fn large_pair(held: usize, moved: usize) -> Pair {
             store.ingest_batch(session, &borrowed).unwrap();
         }
     };
-    ingest(&mut a, &sessions[0], &wires);
-    drop(a);
+    // Sign the checkpoint at the cut of the first `floor` rows, stand on it, and return its wire.
+    // The rows are no typed table's, whose state a checkpoint digests: the store judges no
+    // state, so every Mac computes the same constant one.
+    let stand = |store: &mut Store, session: &Session<'_>| {
+        let log = Log::read_with(session, store, scope, |_| {
+            Err(Error::new("a row is no document command"))
+        })
+        .unwrap();
+        let authored = |id: &Digest| log.authored_ms(id);
+        let state = |_: &BTreeSet<Digest>| Ok([0; 32]);
+        let history = History {
+            scope: scope.digest(),
+            generation: scope.generation(),
+            index: log.causal_index(),
+            projection: log.projection(),
+            authored: &authored,
+            state: &state,
+        };
+        let body = checkpoint::cut_at(&history, &frontier).unwrap();
+        let computed = checkpoint::second(&history, &body).unwrap();
+        let id = store.sign_checkpoint(session, &computed, &[]).unwrap().id;
+        store.set_floor(session, &body).unwrap();
+        store.wire(session, &id).unwrap().unwrap().to_vec()
+    };
+    ingest(&mut a, &sessions[0], &wires[..floor]);
+    let a_checkpoint = stand(&mut a, &sessions[0]);
+    ingest(&mut a, &sessions[0], &wires[floor..]);
     let mut b = Store::join(&sessions[1], &paths[1], scope).unwrap();
-    ingest(&mut b, &sessions[1], &wires[..held]);
-    drop((b, sessions));
+    ingest(&mut b, &sessions[1], &wires[..floor]);
+    let b_checkpoint = stand(&mut b, &sessions[1]);
+    ingest(&mut b, &sessions[1], &wires[floor..rows]);
+    b.ingest(&sessions[1], &a_checkpoint).unwrap();
+    a.ingest(&sessions[0], &b_checkpoint).unwrap();
+    drop((a, b, sessions));
     Pair { lab, scope, paths }
 }
 
-/// One repair session on `atdb/7`, over TLS and under the exchange's own deadline (`EXCHANGE`, 60
-/// s in tests), moves 2,000 operations into a table of 8,192, the most records a table store
-/// holds (`table::store::MAX_RECORDS`): each of its 125 batches reopens the store each side keeps
-/// and commits its records as one group, where each batch replayed every record the table holds,
-/// on both sides, and 2,000 operations into a table of 6,000 took 70.7 s. Kept and grouped, that
-/// session took 8.5 s; what each batch still pays in proportion to the table is the receiving
-/// writer's journal open, which LT-B5R2 takes on with a table of 15,000 once LT-B10C2 lifts the
-/// record bound.
-/// NEGATIVE CONTROL: with `KEPT_STORES` 0 (each batch opens the store afresh, replaying the
-/// table on both sides), the responder passes the deadline and drops the link mid-session:
-/// `` application_error: Some(Failure { cause: Io, … peer closed connection ``.
+/// One application session on `atdb/7` moves 5,000 operations into a table of 15,000,
+/// using each Mac's checkpoint floor to stay within the above-floor operation quota.
+/// Cold inventories demonstrate that the counter sees a real journal replay. The session
+/// must open each side's store for every transfer batch, with fewer full replays than batches:
+/// periodic security revalidation may replay, but dropping the kept store after every batch
+/// fails this law. Socket waits are hang detectors, not a total-session throughput budget;
+/// authenticated TLS and its absolute deadline have separate controls.
 #[test]
-fn one_session_moves_2000_operations_into_a_full_table_within_the_exchange_deadline() {
-    const MOVED: usize = 2_000;
-    const HELD: usize = crate::table::store::MAX_RECORDS - MOVED;
+fn one_session_moves_5000_operations_into_a_table_of_15000_and_reuses_kept_stores() {
+    const MOVED: usize = 5_000;
+    const TABLE: usize = 15_000;
+    const HELD: usize = TABLE - MOVED;
+    const _: () = assert!(TABLE > crate::table::store::MAX_RECORDS);
     let pair = large_pair(HELD, MOVED);
-    let (a, b) = (pair.endpoint(0, true), pair.endpoint(1, true));
-    let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
-    let started = Instant::now();
-    pair.round(&a, &b, &mut ra, &mut rb);
-    let took = started.elapsed();
-    for repair in [&ra, &rb] {
-        assert!(repair.application_error().is_none(), "{repair:?}");
+    assert_eq!(pair.count(0), TABLE);
+    let (sender, receiver) = (pair.replica(0), pair.replica(1));
+    for (replica, peer, held) in [
+        (&sender, receiver.actor, HELD + MOVED),
+        (&receiver, sender.actor, HELD),
+    ] {
+        let (inventory, replayed) = replays(|| {
+            let round = replica.round(peer).unwrap();
+            round
+                .inventory(peer, pair.scope.digest(), &mut None, &mut None)
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(inventory.known.len(), held);
+        assert!(
+            replayed > 0,
+            "the cold inventory must exercise a real replay"
+        );
     }
-    let sent = ra
-        .application()
-        .expect("the initiator's application round completed");
-    let received = rb
-        .application()
-        .expect("the responder's application round completed");
+    let mut repairs = std::array::from_fn(|_| Repair {
+        reconcile: true,
+        ..Repair::default()
+    });
+    let transfer_batches = MOVED.div_ceil(BATCH);
+    let [sent, received] = rbsr_round_observed(&sender, &receiver, &mut repairs, || {
+        (
+            crate::table::store::journal_replays(),
+            crate::table::store::test_opens_and_checks().0,
+        )
+    })
+    .map(
+        |(result, ((before_replays, before_opens), (after_replays, after_opens)))| {
+            let report = result.unwrap();
+            let replayed = after_replays - before_replays;
+            let opened = after_opens - before_opens;
+            assert!(
+                opened >= transfer_batches,
+                "each transfer batch must open its store: {opened} opens, {report:?}"
+            );
+            assert!(
+                replayed < transfer_batches,
+                "not every transfer batch may replay the table: {replayed} replays, {report:?}"
+            );
+            assert!(
+                opened > replayed,
+                "the session must actually reopen kept stores: {opened} opens, {replayed} replays"
+            );
+            println!(
+                "one application exchange: sent={}, received={}, store_opens={opened}, full_replays={replayed}",
+                report.sent, report.received
+            );
+            report
+        },
+    );
     assert_eq!((sent.sent, received.received), (MOVED, MOVED));
     assert!(sent.caught_up, "{sent:?}");
-    assert_eq!(pair.count(1), HELD + MOVED);
-    println!(
-        "{MOVED} operations into a table of {}: one session in {took:?}",
-        HELD + MOVED
-    );
+    assert_eq!(pair.count(1), TABLE);
 }

@@ -795,6 +795,23 @@ impl Witnesses {
     }
 }
 
+/// The renewal hand-back's step where the tab could not be read as the shell's: `why` is
+/// [`super::relaunch::self_claimed_snapshot`]'s refusal. The shell holds the tab again once the
+/// last launcher is gone, and a read of the roster, the shell's terminal or its arguments can
+/// fail for now: each waits. Only a tab this relaunch can never name is refused: no tab to name,
+/// a shell another tab started, or one whose arguments the kernel withholds from aterm for as
+/// long as it runs (another user's shell, LS-72). aterm-gui's host (`HostClosed::hand_back`) and
+/// the renewal's pty test both take this step, so the test waits wherever the host waits.
+#[must_use]
+pub fn unsnapped_step(why: &str) -> String {
+    match why {
+        "no-tab" | "tab-identity-conflict" | super::relaunch::ARGV_WITHHELD => {
+            format!("refused:{why}")
+        }
+        _ => format!("wait:{why}"),
+    }
+}
+
 #[cfg(test)]
 #[path = "self_claimed_tests.rs"]
 mod tests;

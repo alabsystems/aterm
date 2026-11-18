@@ -100,19 +100,25 @@ pub trait Reads {
     fn volume_status(&self) -> Result<Vec<u8>, String>;
 }
 
-/// Read the data volume's indexing state. Unknown or failed output never means disabled.
+/// Read the data volume's indexing state from its block of `mdutil -s`, by the one parser
+/// System State's Spotlight reading uses ([`aterm_vitals::spotlight::volumes`]). Unknown or
+/// failed output never means disabled.
 ///
 /// # Errors
-/// The command failed or did not report exactly one recognized state.
+/// The command failed, its output could not be read, it named no [`DATA_VOLUME`] block, or that
+/// block reported no recognized state.
 pub fn indexing(reads: &dyn Reads) -> Result<bool, String> {
+    use aterm_vitals::spotlight::Indexing;
     let printed = reads.volume_status()?;
     let text = std::str::from_utf8(&printed).map_err(|error| error.to_string())?;
-    match (
-        text.lines().any(|line| line.trim() == "Indexing enabled."),
-        text.lines().any(|line| line.trim() == "Indexing disabled."),
-    ) {
-        (true, false) => Ok(true),
-        (false, true) => Ok(false),
+    let volumes = aterm_vitals::spotlight::volumes(text)?;
+    match volumes
+        .iter()
+        .find(|v| v.path == DATA_VOLUME)
+        .map(|v| &v.indexing)
+    {
+        Some(Indexing::Enabled) => Ok(true),
+        Some(Indexing::Disabled) => Ok(false),
         _ => Err("Spotlight indexing status is unrecognized".into()),
     }
 }

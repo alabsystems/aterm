@@ -123,6 +123,58 @@ pub struct Jobserver {
     turn: Condvar,
 }
 
+/// A retained physical FIFO for a narrowly scoped child permission. It exposes no token I/O;
+/// token accounting stays with the owning `Jobserver` and its clients.
+#[derive(Debug)]
+pub struct HeldJobserverFifo {
+    path: PathBuf,
+    physical: PathBuf,
+    file: File,
+}
+
+impl HeldJobserverFifo {
+    /// The physical permission path, only while it and the original advertised name still
+    /// identify the held FIFO owned by this user. Sandbox literals use the physical spelling;
+    /// a parent alias such as macOS's `/var` must not make an exact permission ineffective.
+    ///
+    /// # Errors
+    /// The name disappeared, became a symlink or another object, or no longer names the held FIFO.
+    pub fn path(&self) -> io::Result<&Path> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+            let held = self.file.metadata()?;
+            // SAFETY: getuid has no preconditions.
+            let me = unsafe { libc::getuid() };
+            for path in [&self.path, &self.physical] {
+                // Check the original name too: canonicalization must not hide a final
+                // symlink or a parent alias retargeted to another FIFO after capture.
+                let named = std::fs::symlink_metadata(path)?;
+                if !held.file_type().is_fifo()
+                    || !named.file_type().is_fifo()
+                    || held.dev() != named.dev()
+                    || held.ino() != named.ino()
+                    || held.uid() != me
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "jobserver name no longer identifies its held FIFO",
+                    ));
+                }
+            }
+            Ok(&self.physical)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (&self.path, &self.physical, &self.file);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "FIFO permissions require Unix",
+            ))
+        }
+    }
+}
+
 /// The custody files beside a FIFO ([`Jobserver::count_alone`]).
 #[cfg(unix)]
 #[derive(Debug)]
@@ -549,6 +601,20 @@ impl Jobserver {
         &self.path
     }
 
+    /// Hold the exact physical FIFO for a child permission without reading or writing a token.
+    ///
+    /// # Errors
+    /// The descriptor cannot be retained, or the pool's name no longer identifies its FIFO.
+    pub fn held_fifo(&self) -> io::Result<HeldJobserverFifo> {
+        let fifo = HeldJobserverFifo {
+            path: self.path.clone(),
+            physical: self.path.canonicalize()?,
+            file: aterm_uds::kept_out(|| self.file.try_clone())?,
+        };
+        fifo.path()?;
+        Ok(fifo)
+    }
+
     /// [`POOL_ENV`]'s value for this pool: `<slots>:<absolute FIFO path>`.
     #[must_use]
     pub fn handed(&self) -> OsString {
@@ -614,6 +680,9 @@ impl Jobserver {
     }
 
     /// Attach Cargo to this pool and charge its implicit job before it is spawned.
+    /// The full grant remains Cargo's scalar job count, including `NUM_JOBS`, while the
+    /// external FIFO governs dispatch. A numeric CLI override is needed only where the
+    /// caller already supplied a jobs option, which takes precedence over configuration.
     /// # Errors
     /// Acquiring the implicit token fails or the caller ends the wait.
     pub fn attach_cargo(
@@ -622,13 +691,27 @@ impl Jobserver {
         stopped: &dyn Fn() -> bool,
     ) -> io::Result<Token<'_>> {
         let token = self.acquire(stopped)?;
-        let flags = self.flags();
-        command
-            .env("MAKEFLAGS", &flags)
-            .env("CARGO_MAKEFLAGS", flags)
-            .arg("-j")
-            .arg(self.grant().to_string());
-        Ok(token)
+        #[cfg(unix)]
+        {
+            let flags = self.flags();
+            let grant = self.grant();
+            let args =
+                cargo_args_with_grant(command.get_args().map(OsStr::to_owned).collect(), grant);
+            command
+                .env("MAKEFLAGS", &flags)
+                .env("CARGO_MAKEFLAGS", flags)
+                .env("CARGO_BUILD_JOBS", grant.to_string())
+                .set_args(args);
+            Ok(token)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (command, token);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "FIFO jobservers require Unix",
+            ))
+        }
     }
 
     /// Reserve a client's implicit token. The caller must retain the guard until that
@@ -1768,6 +1851,50 @@ impl Drop for Jobserver {
 pub struct Token<'a> {
     pool: &'a Jobserver,
     byte: u8,
+}
+
+/// Cargo's CLI config files override environment values. Keep the grant after the last
+/// config in that same argument scope: moving a global config across the subcommand can
+/// discard its earlier config list. Everything after `--` belongs to the child program.
+#[cfg(unix)]
+fn cargo_args_with_grant(mut args: Vec<OsString>, grant: u32) -> Vec<OsString> {
+    let end = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let cli_jobs = args[..end].iter().any(|arg| {
+        let bytes = arg.as_encoded_bytes();
+        bytes == b"--jobs"
+            || bytes.starts_with(b"--jobs=")
+            // Short-option clusters can contain jobs, e.g. `-vvj3`. An ambiguous
+            // short option retains the existing numeric bound rather than losing it.
+            || bytes.starts_with(b"-") && !bytes.starts_with(b"--") && bytes.contains(&b'j')
+    });
+    let mut config_at = end;
+    let mut at = 0;
+    while at < end {
+        let bytes = args[at].as_encoded_bytes();
+        if bytes == b"--config" {
+            // A missing value stays missing; do not repair malformed caller input.
+            config_at = if at + 1 < end { at + 2 } else { at };
+            at += 2;
+        } else {
+            if bytes.starts_with(b"--config=") {
+                config_at = at + 1;
+            }
+            at += 1;
+        }
+    }
+    args.splice(
+        config_at..config_at,
+        ["--config".into(), format!("build.jobs={grant}").into()],
+    );
+    if cli_jobs {
+        // Preserve the previous scalar bound where a CLI jobs flag outranks config,
+        // without turning the override into arguments of a forwarded test/program.
+        args.splice(end + 2..end + 2, ["-j".into(), grant.to_string().into()]);
+    }
+    args
 }
 
 impl Drop for Token<'_> {

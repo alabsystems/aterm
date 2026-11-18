@@ -20,9 +20,10 @@
 //!   recorder in place of aterm's opener); the lane's sign-in then stops it at the prompt (no code
 //!   is entered) and records what the child wrote by then in its scratch folder and secure
 //!   storage.
-//! - **B, the stand-in end to end.** `aterm harness accounts token lab-t` runs in a tab of the lab,
-//!   its setup-token the stand-in ([`crate::local_signins::setup_token_main`]) showing 2.1.318's
-//!   frames with the sentinel; then `token-run lab-t` serves the stored token to the stand-in,
+//! - **B, the stand-in end to end.** `aterm harness accounts token lab-t@example.test` (the
+//!   row's address: a label names no account) runs in a tab of the lab, its setup-token the
+//!   stand-in ([`crate::local_signins::setup_token_main`]) showing 2.1.318's frames with the
+//!   sentinel; then `token-run lab-t@example.test` serves the stored token to the stand-in,
 //!   which compares its descriptor with the sentinel. Every place is scanned for the sentinel: the
 //!   tab's scrollback and cast, the lab's whole run and socket folders (the journal, the fabric
 //!   stores, aterm's logs, the scratch config folder and `~/.secrets` among them), `$TMPDIR`, and
@@ -1440,7 +1441,7 @@ fn lane_b(run: &Run, door: &Door<'_>, world: &World, rec: &mut Record) -> Result
         door,
         &sid,
         &format!(
-            "{}; {aterm} harness accounts token {LABEL}; echo \"st-verb-exit=$?\"",
+            "{}; {aterm} harness accounts token {EMAIL}; echo \"st-verb-exit=$?\"",
             exports(run)
         ),
     );
@@ -1472,7 +1473,7 @@ fn lane_b(run: &Run, door: &Door<'_>, world: &World, rec: &mut Record) -> Result
         door,
         &sid,
         &format!(
-            "{}; {aterm} harness accounts token-run {LABEL} -- {}; echo \"st-run-exit=$?\"",
+            "{}; {aterm} harness accounts token-run {EMAIL} -- {}; echo \"st-run-exit=$?\"",
             exports(run),
             shell_quote(&world.build.to_string_lossy())
         ),
@@ -1870,7 +1871,7 @@ fn launch_c(
         door,
         &sid,
         &format!(
-            "{}{spare_word}; {} harness accounts token-run {LABEL} -- {}{}; echo \"token-run-exit=$?\"",
+            "{}{spare_word}; {} harness accounts token-run {EMAIL} -- {}{}; echo \"token-run-exit=$?\"",
             exports(run),
             shell_quote(&run.aterm),
             shell_quote(&run.claude_bin),
@@ -2390,7 +2391,7 @@ fn launch_d(
         door,
         &sid,
         &format!(
-            "{} {}={}; {} harness accounts token-run {BORROWED} -- {}; echo \"token-run-exit=$?\"",
+            "{} {}={}; {} harness accounts token-run {BORROWED_EMAIL} -- {}; echo \"token-run-exit=$?\"",
             exports(run),
             aterm_agent::harness::accounts::LOGIN_ENV,
             shell_quote(&dir.to_string_lossy()),

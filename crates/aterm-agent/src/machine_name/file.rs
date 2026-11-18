@@ -2,10 +2,12 @@
 // Copyright 2026 Andrew Yates
 
 //! `<state>/machine-name.toml` (`docs/DESIGN-machine-names-2026-11-04.md` §3.3): this machine's
-//! NAME, its claim's fields, the nickname, `was`, `by`, a pending migration, the claim it last
-//! held in each of its newest four fleets, and its History: the newest sixteen changes, which
-//! **Undo** reads. It is the title's only source (`m8 Heron`, or `unnumbered Otter` while
-//! unnumbered), so the menu, the ❯ item and Settings read it.
+//! NAME, its claim's fields, the nickname, `was`, a pending migration and the claim it last held
+//! in each of its newest four fleets. It is the local mirror the title reads (`m8 Heron`, or
+//! `unnumbered Otter` while unnumbered), so the menu, the ❯ item and Settings read it. Who
+//! renamed this Mac, when, and every earlier name are its lab registry row's, which the registry
+//! keeps ([`super::history`]); this file keeps none of them. A file an earlier build wrote with
+//! `by` and `[[history]]` tables reads as the same name, and its next write drops them.
 //!
 //! The first reader to find none creates it under its own `machine-name.lock` from what the
 //! caller computes from the bound registry row, roster or older `fleet-name`, else a drawn
@@ -16,7 +18,7 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use aterm_net::fleet_member::name_record::{By, ByKind, NickClass, node_of, node_word};
+use aterm_net::fleet_member::name_record::{NickClass, node_of, node_word};
 use aterm_types::machine_name::{
     Cap, Class, Nickname, NodeId, Number, UNNUMBERED, WAS_MAX, Was, nouns,
 };
@@ -34,9 +36,6 @@ pub const FLEETS_MAX: usize = 4;
 
 /// The most bytes a well-formed file takes, with room to spare.
 pub const FILE_MAX: usize = 16 * 1024;
-
-/// The most changes [`MachineName::history`] keeps.
-pub const HISTORY_MAX: usize = 16;
 
 /// Hang detector for required name creation or replacement behind a native writer.
 pub const LOCK_HANG: Duration = Duration::from_secs(60);
@@ -83,24 +82,6 @@ pub struct FleetClaim {
     pub synced: bool,
 }
 
-/// Why the name changed, as History says it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Why {
-    /// The name a first read made ([`crate::machine_name::ensure`]).
-    First,
-    /// A number chosen, with or without a nickname ([`crate::machine_name::set_name`]).
-    Named,
-    /// A nickname typed ([`crate::machine_name::set_nick`]).
-    Nickname,
-    /// A nickname drawn again ([`crate::machine_name::set_nick`]).
-    Drawn,
-    /// The change before it taken back ([`crate::machine_name::undo_last`]).
-    Undone,
-    /// This Mac's own registry row's nickname, written by a person or a program from any Mac,
-    /// renamed it ([`crate::machine_name::follow_registry`]).
-    Registry,
-}
-
 /// What a name file last saw of this Mac's own lab registry row's nickname
 /// ([`MachineName::row`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -114,98 +95,9 @@ pub enum RowSeen {
     Saw(Option<Nickname>),
 }
 
-/// One change to the name, as History lists it: when, what it was and became, who made it and
-/// why.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Change {
-    /// When it was made (ms).
-    pub at_ms: u64,
-    /// The NAME before it; `None` while unnumbered and for the first name.
-    pub from: Option<Number>,
-    /// The NAME after it; `None` while unnumbered.
-    pub to: Option<Number>,
-    /// The nickname before it as the title showed it ([`MachineName::shown_nick`]); `None` for
-    /// the first name.
-    pub nick_from: Option<Nickname>,
-    /// The nickname after it, as the title showed it.
-    pub nick_to: Nickname,
-    /// Who made it; `None` for the first name and for a change this Mac's registry row made
-    /// ([`Why::Registry`]), whose author the registry keeps.
-    pub by: Option<By>,
-    /// Why.
-    pub why: Why,
-    /// A later change took it back ([`Why::Undone`]).
-    pub undone: bool,
-}
-
-impl Change {
-    /// The first name's entry: `name` as a first read made it at `at_ms`.
-    #[must_use]
-    pub fn first(name: &MachineName, at_ms: u64) -> Self {
-        Self {
-            at_ms,
-            from: None,
-            to: name.num,
-            nick_from: None,
-            nick_to: name.shown_nick(),
-            by: None,
-            why: Why::First,
-            undone: false,
-        }
-    }
-
-    /// The change from `held` to `next`, made at `at_ms` by `next.by` for `why`.
-    #[must_use]
-    pub fn between(held: &MachineName, next: &MachineName, at_ms: u64, why: Why) -> Self {
-        Self {
-            at_ms,
-            from: held.num,
-            to: next.num,
-            nick_from: Some(held.shown_nick()),
-            nick_to: next.shown_nick(),
-            by: next.by,
-            why,
-            undone: false,
-        }
-    }
-
-    /// The change as `aterm name history` and Settings ▸ This Mac's History list it, one line
-    /// with no line end, such as
-    /// `2026-11-13T10:22:01Z  named  m7 Otter -> m86 MissBunny  by person <node>`, with
-    /// `  (undone)` once an undo took it back. The time is UTC, to the second; each side is a
-    /// title ([`title_of`]); the first name has no `->` side and no author.
-    #[must_use]
-    pub fn line(&self) -> String {
-        let at = aterm_types::rfc3339::format_rfc3339(self.at_ms / 1_000);
-        let to = title_of(self.to, self.nick_to.as_str());
-        let mut line = match &self.nick_from {
-            Some(nick) => format!(
-                "{at}  {}  {} -> {to}",
-                why_word(self.why),
-                title_of(self.from, nick.as_str())
-            ),
-            None => format!("{at}  {}  {to}", why_word(self.why)),
-        };
-        if let Some(by) = self.by {
-            line.push_str("  by ");
-            line.push_str(by_kind_word(by.kind));
-            line.push(' ');
-            line.push_str(&node_word(by.node));
-        }
-        if self.undone {
-            line.push_str("  (undone)");
-        }
-        line
-    }
-}
-
-/// What History says where it keeps no change (a file an older build wrote): `aterm name
-/// history`'s words, which Settings ▸ This Mac shows as a sentence.
-pub const NO_HISTORY: &str = "no change to this machine's name is kept";
-
 /// `num` and the nickname `nick` as a title spells them: `m8 Heron`, or `unnumbered Heron`
-/// ([`UNNUMBERED`]) while unnumbered. [`MachineName::title`], each side of a [`Change::line`] and
-/// the name an undo leaves are this one spelling.
+/// ([`UNNUMBERED`]) while unnumbered. [`MachineName::title`] and the name an undo leaves are
+/// this one spelling.
 #[must_use]
 pub fn title_of(num: Option<Number>, nick: &str) -> String {
     match num {
@@ -239,9 +131,6 @@ pub struct MachineName {
     pub cap: Option<Cap>,
     /// Up to [`WAS_MAX`] earlier NAMEs, newest first.
     pub was: Vec<Was>,
-    /// Who made the last change; `None` for the file's first write and after a change this
-    /// Mac's registry row made ([`Why::Registry`]), whose author the registry keeps.
-    pub by: Option<By>,
     /// The nickname.
     pub nick: Nickname,
     /// How it was set.
@@ -254,8 +143,6 @@ pub struct MachineName {
     pub migration: Option<Migration>,
     /// The newest [`FLEETS_MAX`] fleets' kept claims, newest first.
     pub fleets: Vec<FleetClaim>,
-    /// History: up to [`HISTORY_MAX`] changes, newest first ([`MachineName::record`]).
-    pub history: Vec<Change>,
 }
 
 impl MachineName {
@@ -274,20 +161,12 @@ impl MachineName {
             act: now_ms,
             cap: None,
             was: Vec::new(),
-            by: None,
             nick,
             nick_class: NickClass::Auto,
             row: RowSeen::Never,
             migration: None,
             fleets: Vec::new(),
-            history: Vec::new(),
         }
-    }
-
-    /// Record `change` as History's newest, keeping the newest [`HISTORY_MAX`].
-    pub fn record(&mut self, change: Change) {
-        self.history.insert(0, change);
-        self.history.truncate(HISTORY_MAX);
     }
 
     /// The NAME: `m8`, or `unnumbered` while unnumbered.
@@ -311,14 +190,6 @@ impl MachineName {
             NickClass::Chosen => self.nick.as_str().to_owned(),
             NickClass::Auto => self.nick.display(),
         }
-    }
-
-    /// The nickname as the title shows it ([`Self::display_nick`]), which History records, so
-    /// an undo returns the spelling a person saw (a drawn `heron` as `Heron`); the stored
-    /// spelling where that shown one is no nickname.
-    #[must_use]
-    pub fn shown_nick(&self) -> Nickname {
-        Nickname::parse(&self.display_nick()).unwrap_or_else(|_| self.nick.clone())
     }
 
     /// The file's text.
@@ -541,26 +412,16 @@ struct Wire {
     migration: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cap: Option<WireCap>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    by: Option<WireBy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     was: Vec<WireWas>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     fleets: Vec<WireFleet>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    history: Vec<WireChange>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct WireCap {
     value: u32,
     since: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-struct WireBy {
-    node: String,
-    kind: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -584,23 +445,6 @@ struct WireWas {
     retired: bool,
     #[serde(default)]
     lost: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-struct WireChange {
-    at_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    from: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    to: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    nick_from: Option<String>,
-    nick_to: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    by: Option<WireBy>,
-    why: String,
-    #[serde(default)]
-    undone: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -633,43 +477,6 @@ pub const fn nick_class_word(class: NickClass) -> &'static str {
     }
 }
 
-/// How the file spells a change's `why`, as `aterm name history` prints it.
-#[must_use]
-pub const fn why_word(why: Why) -> &'static str {
-    match why {
-        Why::First => "first",
-        Why::Named => "named",
-        Why::Nickname => "nickname",
-        Why::Drawn => "drawn",
-        Why::Undone => "undone",
-        Why::Registry => "registry",
-    }
-}
-
-fn why_of(word: &str) -> Result<Why, String> {
-    match word {
-        "first" => Ok(Why::First),
-        "named" => Ok(Why::Named),
-        "nickname" => Ok(Why::Nickname),
-        "drawn" => Ok(Why::Drawn),
-        "undone" => Ok(Why::Undone),
-        "registry" => Ok(Why::Registry),
-        _ => Err(format!(
-            "why `{word}` is none of first, named, nickname, drawn, undone, registry"
-        )),
-    }
-}
-
-/// How the file spells who made a change: `person`, `agent` or `auto`.
-#[must_use]
-pub const fn by_kind_word(kind: ByKind) -> &'static str {
-    match kind {
-        ByKind::Person => "person",
-        ByKind::Agent => "agent",
-        ByKind::Auto => "auto",
-    }
-}
-
 /// How the file spells `migration`.
 #[must_use]
 pub const fn migration_word(migration: Migration) -> &'static str {
@@ -694,65 +501,6 @@ fn number(n: u32, field: &str) -> Result<Number, String> {
 
 fn node(word: &str, field: &str) -> Result<NodeId, String> {
     node_of(word).ok_or_else(|| format!("{field} `{word}` is no node id"))
-}
-
-impl WireBy {
-    fn of(by: By) -> Self {
-        Self {
-            node: node_word(by.node),
-            kind: by_kind_word(by.kind).to_owned(),
-        }
-    }
-
-    fn into_by(self, field: &str) -> Result<By, String> {
-        Ok(By {
-            node: node(&self.node, field)?,
-            kind: match self.kind.as_str() {
-                "person" => ByKind::Person,
-                "agent" => ByKind::Agent,
-                "auto" => ByKind::Auto,
-                other => return Err(format!("{field} kind `{other}` is unknown")),
-            },
-        })
-    }
-}
-
-impl WireChange {
-    fn of(change: &Change) -> Self {
-        Self {
-            at_ms: change.at_ms,
-            from: change.from.map(Number::get),
-            to: change.to.map(Number::get),
-            nick_from: change
-                .nick_from
-                .as_ref()
-                .map(|nick| nick.as_str().to_owned()),
-            nick_to: change.nick_to.as_str().to_owned(),
-            by: change.by.map(WireBy::of),
-            why: why_word(change.why).to_owned(),
-            undone: change.undone,
-        }
-    }
-
-    fn into_change(self) -> Result<Change, String> {
-        let nick = |word: &str, field: &str| {
-            Nickname::parse(word).map_err(|e| format!("history {field}: {e}"))
-        };
-        Ok(Change {
-            at_ms: self.at_ms,
-            from: self.from.map(|n| number(n, "history from")).transpose()?,
-            to: self.to.map(|n| number(n, "history to")).transpose()?,
-            nick_from: self
-                .nick_from
-                .as_deref()
-                .map(|word| nick(word, "nick_from"))
-                .transpose()?,
-            nick_to: nick(&self.nick_to, "nick_to")?,
-            by: self.by.map(|by| by.into_by("history by")).transpose()?,
-            why: why_of(&self.why)?,
-            undone: self.undone,
-        })
-    }
 }
 
 impl WireHeld {
@@ -809,7 +557,6 @@ impl Wire {
                 value: cap.value,
                 since: cap.since,
             }),
-            by: name.by.map(WireBy::of),
             was: name
                 .was
                 .iter()
@@ -830,7 +577,6 @@ impl Wire {
                     synced: fleet.synced,
                 })
                 .collect(),
-            history: name.history.iter().map(WireChange::of).collect(),
         }
     }
 
@@ -840,9 +586,6 @@ impl Wire {
         }
         if self.fleets.len() > FLEETS_MAX {
             return Err(format!("more than {FLEETS_MAX} fleets"));
-        }
-        if self.history.len() > HISTORY_MAX {
-            return Err(format!("more than {HISTORY_MAX} history entries"));
         }
         let fleets = self
             .fleets
@@ -896,7 +639,6 @@ impl Wire {
                     })
                 })
                 .collect::<Result<_, String>>()?,
-            by: self.by.map(|by| by.into_by("by")).transpose()?,
             nick: Nickname::parse(&self.nick).map_err(|e| format!("nick: {e}"))?,
             nick_class: match self.nick_class.as_str() {
                 "auto" => NickClass::Auto,
@@ -920,11 +662,6 @@ impl Wire {
                 })
                 .transpose()?,
             fleets,
-            history: self
-                .history
-                .into_iter()
-                .map(WireChange::into_change)
-                .collect::<Result<_, String>>()?,
         })
     }
 }

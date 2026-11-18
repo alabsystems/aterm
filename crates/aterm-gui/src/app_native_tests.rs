@@ -15746,16 +15746,15 @@ fn tab_reaches_every_control_of_a_settings_list_at_220x12() {
 /// Read-state twin of [`tab_reaches_every_control_of_a_settings_list_at_220x12`], whose sweep
 /// draws Settings ▸ This Mac only while it reads: at 220x12 with 2x text, over a read holding
 /// the widest nickname on the largest number, renamed once so Undo Last Rename is available
-/// under LAST CHANGE and HISTORY lists two renames, Page Down by Page Down draws every control
-/// of the page, and Tab and Shift-Tab from the search field each reach every one drawn.
+/// under LAST CHANGE and HISTORY lists the two writes the registry row holds, Page Down by Page
+/// Down draws every control of the page, and Tab and Shift-Tab from the search field each reach
+/// every one drawn.
 #[cfg(target_os = "macos")]
 #[test]
 fn page_down_walks_the_read_page() {
-    use crate::machine_title::page::fixture::{Names, WIDEST_NICK, found, named, rename};
+    use crate::machine_title::page::fixture::{Names, WIDEST_NICK, found_with_history, renamed};
     use crate::native_settings::SettingsRoute;
-    use aterm_types::machine_name::Class;
-    let scratch = named(Class::Chosen, 999_999, WIDEST_NICK);
-    rename(&scratch, Class::Chosen, 999_998, WIDEST_NICK);
+    let (scratch, shown) = renamed(&[(999_999, WIDEST_NICK), (999_998, WIDEST_NICK)]);
     let names = Names::authorized(Err("not readable here".to_owned()));
     let preferences = crate::native_appearance::current_preferences();
     crate::native_appearance::install_preferences(
@@ -15779,7 +15778,10 @@ fn page_down_walks_the_read_page() {
         }
         assert!(app.open_settings_tab(SettingsRoute::Machine));
         let seq = app.machine_page.reads;
-        app.machine_page_read(seq, found(&scratch, &[], &names));
+        app.machine_page_read(
+            seq,
+            found_with_history(&scratch, &[], &names, Ok(shown.clone())),
+        );
         app
     };
     let mut app = fresh();

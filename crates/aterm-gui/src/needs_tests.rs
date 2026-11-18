@@ -2221,14 +2221,27 @@ fn two_grok_auth_walls_give_one_need() {
         }
     }
     // ... while the leader's own session carries the one need: the once-ever setup first where
-    // there is one, and still the code within the row, for every setup of the label
-    // `adopt-default` gives and for none (Grok's page blocks the headless browser).
-    {
-        use aterm_agent::harness::grok_signin::{ADOPT_LABEL, Setup, need_words};
-        let label = || ADOPT_LABEL.to_owned();
+    // there is one, and still the code within the row, for every setup, the window's account
+    // named by the widest word a step types for it (an account key, the word of an account no lab
+    // has slugged, such as the row `adopt-default` just made, and a slug of the most bytes a slug
+    // holds), and for none (Grok's page blocks the headless browser).
+    let slug = format!("grok-{}", "a".repeat(aterm_file::account::MAX_SLUG - 5));
+    assert!(aterm_file::account::is_slug(&slug) && slug.len() == aterm_file::account::MAX_SLUG);
+    for account in ["ac-0123456789abcdef", slug.as_str()] {
+        use aterm_agent::harness::account_names::Named;
+        use aterm_agent::harness::grok_signin::{Setup, need_words};
+        let label = || aterm_agent::harness::cli::ACCOUNTS_OWN_LABEL.to_owned();
+        let word = || {
+            Named {
+                pk: account.to_owned(),
+                row: None,
+                names: aterm_file::AccountNames::default(),
+            }
+            .word()
+        };
         for setup in [
-            Some(Setup::Window(label())),
-            Some(Setup::Chromium(label())),
+            Some(Setup::Window(word())),
+            Some(Setup::Chromium(word())),
             Some(Setup::Email {
                 label: label(),
                 window: true,
@@ -2237,14 +2250,8 @@ fn two_grok_auth_walls_give_one_need() {
                 label: label(),
                 window: false,
             }),
-            Some(Setup::Adopt {
-                label: label(),
-                window: true,
-            }),
-            Some(Setup::Adopt {
-                label: label(),
-                window: false,
-            }),
+            Some(Setup::Adopt { window: true }),
+            Some(Setup::Adopt { window: false }),
             None,
         ] {
             let leader = NeedFacts {

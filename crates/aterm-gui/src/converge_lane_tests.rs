@@ -159,6 +159,23 @@ fn the_window_pass_starts_its_runner_under_its_note() {
         std::fs::read_to_string(&said).unwrap(),
         "c=input-repair,m=index,n=1"
     );
+    for (status, expected) in [
+        (1, Ended::Failed(Some(129))),
+        (aterm_secrets::converge::UNFINISHED, Ended::Unfinished),
+        (aterm_secrets::converge::STANDING, Ended::Standing),
+    ] {
+        let code = aterm_secrets::converge::runner_exit_code(status, true);
+        std::fs::write(&runner, format!("#!{}\nexit {code}\n", sh.display())).unwrap();
+        assert_eq!(
+            window_pass(&runner)(
+                aterm_secrets::converge::WINDOW,
+                RepositoryWork::Refresh,
+                &note,
+            ),
+            expected,
+            "independent identity evidence preserves whole-pass pacing"
+        );
+    }
 }
 
 /// A WINDOW PASS THAT MEETS THE LOCK ANOTHER PROCESS HOLDS WAITS FOR IT AND RUNS ONCE IT IS LET

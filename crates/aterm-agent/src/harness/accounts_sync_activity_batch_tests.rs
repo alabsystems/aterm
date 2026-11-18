@@ -13,7 +13,7 @@ fn row(label: &str, email: &str) -> accounts::Row {
 
 #[test]
 fn one_batch_keeps_same_label_work_and_retries_in_their_actual_namespaces() {
-    let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let a = accounts::Store::at(Path::new("/synthetic/activity-batch-a"));
     let b = accounts::Store::at(Path::new("/synthetic/activity-batch-b"));
     let unrelated = accounts::Store::at(Path::new("/synthetic/activity-batch-other"));
@@ -83,7 +83,7 @@ fn one_batch_keeps_same_label_work_and_retries_in_their_actual_namespaces() {
 
 #[test]
 fn even_identical_rows_cannot_carry_activity_into_another_store_or_cli() {
-    let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let a = accounts::Store::at(Path::new("/synthetic/activity-batch-a"));
     let b = accounts::Store::at(Path::new("/synthetic/activity-batch-b"));
     let same_row = row("shared-label", "same@example.test");
@@ -111,7 +111,7 @@ fn even_identical_rows_cannot_carry_activity_into_another_store_or_cli() {
 
 #[test]
 fn a_busy_batch_is_unavailable_as_a_whole_and_both_scopes_share_one_clock() {
-    let guard = std::sync::Mutex::new(AutoRenewGuard::default());
+    let guard = Watched::new("accounts_sync/renew_guard", AutoRenewGuard::default());
     let a = accounts::Store::at(Path::new("/synthetic/activity-batch-a"));
     let b = accounts::Store::at(Path::new("/synthetic/activity-batch-b"));
     let clock = Instant::now();

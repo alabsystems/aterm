@@ -92,6 +92,7 @@ fn supervised(
             |mut stream| {
                 let _ = stream.write_all(b"OK served\n");
             },
+            crate::control::turn_away_at_limit,
             &stopping,
         );
     });
@@ -239,6 +240,326 @@ fn a_listener_stuck_inside_accept_is_detected_and_rebound() {
 
     stop.set();
     thread.join().expect("supervisor thread");
+}
+
+/// How far past the count of `/dev/fd`'s entries (the descriptors this process holds, the one
+/// reading the directory included) [`AtLimit::hold`] sets the soft limit, where that is below the
+/// limit it had. However many descriptors that leaves free below the limit, it then fills them.
+const SPARE_DESCRIPTORS: usize = 16;
+
+/// This process held at its descriptor limit: its soft limit lowered to a few past the count of
+/// descriptors it holds, and every descriptor free below it filled with `/dev/null`, so whatever
+/// opens one next is refused `EMFILE` until a filler is given up. Dropping it frees the fillers
+/// and restores the limit. Only a test run alone in its own process ([`crate::test_alone::alone`])
+/// holds it: every thread of the process is held at the limit with the test's.
+struct AtLimit {
+    fillers: Vec<std::fs::File>,
+    restore: libc::rlimit,
+}
+
+impl AtLimit {
+    fn hold() -> Self {
+        let mut restore = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: a valid resource id and a writable out-parameter.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut restore) },
+            0
+        );
+        let open = std::fs::read_dir("/dev/fd")
+            .expect("the descriptor directory")
+            .count();
+        let lowered = libc::rlimit {
+            rlim_cur: libc::rlim_t::try_from(open + SPARE_DESCRIPTORS)
+                .expect("a descriptor limit")
+                .min(restore.rlim_cur),
+            rlim_max: restore.rlim_max,
+        };
+        // SAFETY: a change to this process alone (the test runs alone in it) that keeps its hard
+        // limit.
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const lowered) },
+            0
+        );
+        let mut fillers = Vec::new();
+        let refused = loop {
+            match std::fs::File::open("/dev/null") {
+                Ok(filler) => fillers.push(filler),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(
+            refused.raw_os_error(),
+            Some(libc::EMFILE),
+            "the fill ends at the descriptor limit: {refused}"
+        );
+        assert!(
+            !fillers.is_empty(),
+            "no descriptor was free below the lowered limit"
+        );
+        Self { fillers, restore }
+    }
+
+    /// Give up one filler, connect a client to `path` in its place and send its request line,
+    /// which no one reads: the process is at its limit again. A listener serving meanwhile may
+    /// turn the client away and close the connection before the line is written: the write then
+    /// fails as one to a peer gone does (with one of the kinds aterm-ctl's `is_peer_drop` takes
+    /// for a peer's drop), and what the listener said is still there to read, as aterm-ctl reads
+    /// it.
+    fn connect(&mut self, path: &std::path::Path) -> CtlStream {
+        drop(self.fillers.pop().expect("a filler to give up"));
+        let client = CtlStream::connect(path).expect("a client in the descriptor given up");
+        let mut out = &client;
+        if let Err(error) = out.write_all(b"AUTH -\n") {
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::NotConnected
+                ),
+                "the client's request line fails only where its peer closed first: {error}"
+            );
+        }
+        client
+    }
+}
+
+impl Drop for AtLimit {
+    fn drop(&mut self) {
+        self.fillers.clear();
+        // SAFETY: a valid resource id and the limit this process had, as read.
+        let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const self.restore) };
+    }
+}
+
+/// What `stream` reads to the end of its connection, and how it ended: `Ok` at EOF, else the
+/// read's error. The read waits a hang detector, never a latency budget.
+fn told(stream: &CtlStream) -> (String, std::io::Result<()>) {
+    arm(stream, aterm_spec::wait::MUST_HAPPEN).expect("a read deadline");
+    let mut bytes = Vec::new();
+    let mut reader = stream;
+    let end = reader.read_to_end(&mut bytes).map(drop);
+    (String::from_utf8_lossy(&bytes).into_owned(), end)
+}
+
+/// Whether a connection's end is the peer's close: EOF, or the reset a close over unread bytes
+/// can raise.
+fn closed(end: &std::io::Result<()>) -> bool {
+    end.as_ref()
+        .err()
+        .is_none_or(|error| error.kind() == std::io::ErrorKind::ConnectionReset)
+}
+
+/// Held at its descriptor limit, the supervised listener gives its reserve up to accept a client
+/// below any cap, has the control server's turn-away tell it busy (not hang it up unanswered),
+/// closes it, and takes the reserve again, so the next client at the limit is told busy too;
+/// with descriptors free again it serves. The test runs alone in a child of the test binary,
+/// which it holds at the limit by lowering its soft limit and filling every descriptor free
+/// below it, so the count of descriptors the process holds otherwise does not matter.
+#[test]
+fn a_listener_out_of_descriptors_tells_a_client_busy_from_its_reserve() {
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let dir = scratch();
+    let path = dir.path().join("r.sock");
+    let (stop, seams, thread) = supervised(
+        &path,
+        Pace {
+            tick: Duration::from_millis(50),
+            wedge_after: Duration::from_secs(3600),
+            rest_look: None,
+        },
+        Hearing::Both,
+    );
+    until_resting(&seams, 0, "the listener to come to rest");
+    assert_eq!(
+        ask(&path, aterm_spec::wait::MUST_HAPPEN).expect("an ask with descriptors free"),
+        "OK served\n"
+    );
+    until_resting(&seams, 0, "the listener to rest after serving");
+    let busy = HEALTH.busy_replies.load(Ordering::Relaxed);
+    let accepts = HEALTH.accepts.load(Ordering::Relaxed);
+
+    let mut limit = AtLimit::hold();
+    let mut clients = Vec::new();
+    for client in 0..2 {
+        let stream = limit.connect(&path);
+        let (said, end) = told(&stream);
+        assert_eq!(
+            said,
+            aterm_types::control_verbs::CONTROL_BUSY_LINE,
+            "client {client} at the descriptor limit is told busy, not hung up unanswered \
+             (its connection then ended {end:?})"
+        );
+        assert!(
+            closed(&end),
+            "client {client}, told busy, is closed: {end:?}"
+        );
+        // Held, so its descriptor stays taken and the process stays at its limit.
+        clients.push(stream);
+        until_resting(
+            &seams,
+            0,
+            "the listener to rest after turning a client away",
+        );
+    }
+    assert_eq!(
+        HEALTH.busy_replies.load(Ordering::Relaxed) - busy,
+        2,
+        "each client turned away is a busy reply"
+    );
+    assert_eq!(
+        HEALTH.accepts.load(Ordering::Relaxed) - accepts,
+        2,
+        "each client turned away is an accept"
+    );
+
+    drop(clients);
+    drop(limit);
+    assert_eq!(
+        ask(&path, aterm_spec::wait::MUST_HAPPEN).expect("an ask with descriptors free again"),
+        "OK served\n",
+        "with descriptors free again the listener serves"
+    );
+    stop.set();
+    thread.join().expect("supervisor thread");
+}
+
+/// A reserve lost (here its descriptor taken by a filler, as another thread's open would take
+/// it) while no descriptor is free makes no accept: the client waits queued, where an accept with
+/// no descriptor for it would have closed it unanswered on macOS. Once a descriptor is free the
+/// reserve is taken again before the accept, and the client is told busy.
+#[test]
+fn a_lost_reserve_makes_no_accept_until_a_descriptor_is_free() {
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let dir = scratch();
+    let path = dir.path().join("l.sock");
+    let listener = CtlListener::bind(&path).expect("bind");
+    let reserve = Reserve::take();
+    assert!(held(&reserve), "the reserve is taken with descriptors free");
+
+    let mut limit = AtLimit::hold();
+    let client = limit.connect(&path);
+    drop(
+        reserve
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .file
+            .take(),
+    );
+    limit
+        .fillers
+        .push(std::fs::File::open("/dev/null").expect("the filler in the reserve's descriptor"));
+    let turn_away = crate::control::turn_away_at_limit;
+    match reserve.accept(&listener, &turn_away) {
+        Ok(Accepted::Deferred(error)) => assert_eq!(
+            error.raw_os_error(),
+            Some(libc::EMFILE),
+            "deferred for want of a descriptor: {error}"
+        ),
+        other => panic!("a lost reserve with no descriptor free made an accept: {other:?}"),
+    }
+    assert!(!held(&reserve), "no descriptor was free for the reserve");
+    assert_eq!(
+        queue_pending(&listener),
+        Some(1),
+        "the client waits queued, not closed"
+    );
+
+    drop(limit.fillers.pop());
+    match reserve.accept(&listener, &turn_away) {
+        Ok(Accepted::TurnedAway) => {}
+        other => panic!(
+            "one descriptor free takes the reserve, and the client is turned away: {other:?}"
+        ),
+    }
+    let (said, end) = told(&client);
+    assert_eq!(
+        said,
+        aterm_types::control_verbs::CONTROL_BUSY_LINE,
+        "the client that waited is told busy (its connection then ended {end:?})"
+    );
+    assert!(closed(&end), "the client told busy is closed: {end:?}");
+    assert!(held(&reserve), "the reserve is held again");
+    drop(limit);
+}
+
+/// Whether `reserve` holds its descriptor now.
+fn held(reserve: &Reserve) -> bool {
+    reserve
+        .held
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .file
+        .is_some()
+}
+
+/// An accept that waits for the spawn lock (here behind the test's own hold of
+/// [`aterm_uds::spawn_lock::spawning`], as behind a `posix_spawn` in flight) still holds the
+/// reserve while it waits: the reserve is given up only under the lock's exclusive hold, so a
+/// descriptor opened meanwhile at the limit is refused `EMFILE` and cannot take the reserve's
+/// place. With the spawn done the queued client is accepted into the reserve's descriptor, told
+/// busy, and the reserve is held again. A reserve given up before the wait would have let that
+/// open take its descriptor, and the accept after the wait would have found none (macOS then
+/// drops the client unanswered).
+#[cfg(target_vendor = "apple")]
+#[test]
+fn an_accept_waiting_out_a_spawn_keeps_its_reserve_until_it_holds_the_lock() {
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let dir = scratch();
+    let path = dir.path().join("w.sock");
+    let listener = CtlListener::bind(&path).expect("bind");
+    let reserve = Reserve::take();
+    assert!(held(&reserve), "the reserve is taken with descriptors free");
+
+    let mut limit = AtLimit::hold();
+    let client = limit.connect(&path);
+    let waiting = aterm_uds::spawn_lock::seam::exclusive_waiters();
+    let spawn = aterm_uds::spawn_lock::spawning();
+    let (opened, accepted) = std::thread::scope(|scope| {
+        let accepting =
+            scope.spawn(|| reserve.accept(&listener, &crate::control::turn_away_at_limit));
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the accept to wait for the spawn lock",
+            || (aterm_uds::spawn_lock::seam::exclusive_waiters() > waiting).then_some(()),
+        );
+        let opened = std::fs::File::open("/dev/null");
+        drop(spawn);
+        (opened, accepting.join().expect("the accepting thread"))
+    });
+    assert_eq!(
+        opened.as_ref().err().and_then(std::io::Error::raw_os_error),
+        Some(libc::EMFILE),
+        "an accept waiting for the spawn lock still holds its reserve, so an open meanwhile \
+         finds no descriptor: {opened:?}"
+    );
+    match accepted {
+        Ok(Accepted::TurnedAway) => {}
+        other => panic!(
+            "with the spawn done the client is accepted into the reserve and turned away: \
+             {other:?}"
+        ),
+    }
+    let (said, end) = told(&client);
+    assert_eq!(
+        said,
+        aterm_types::control_verbs::CONTROL_BUSY_LINE,
+        "the client queued behind the spawn is told busy (its connection then ended {end:?})"
+    );
+    assert!(closed(&end), "the client told busy is closed: {end:?}");
+    assert!(held(&reserve), "the reserve is held again");
+    drop(limit);
 }
 
 /// Both threads rest: the accept thread of `generation` in its park with no deadline and the

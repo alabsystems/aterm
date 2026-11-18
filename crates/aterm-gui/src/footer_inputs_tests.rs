@@ -19,6 +19,18 @@ fn scratch() -> aterm_tempfile::TempDir {
         .expect("temp dir")
 }
 
+/// The login directory `name` under `/logins` (`C:\logins` on Windows), as a binding or a roster
+/// row names it: the accounts store and the roster refuse a relative one, and a path with no
+/// drive is relative on Windows. Its `{:?}` is a TOML string of it.
+fn login_dir(name: &str) -> String {
+    let logins = if cfg!(windows) {
+        r"C:\logins"
+    } else {
+        "/logins"
+    };
+    format!("{logins}{}{name}", std::path::MAIN_SEPARATOR)
+}
+
 /// Set `path`'s modification time to `at`.
 fn set_modified(path: &Path, at: SystemTime) {
     std::fs::File::options()
@@ -123,7 +135,7 @@ fn a_configured_roster_is_read_once_and_bound_again_when_its_bindings_move() {
         );
         store.save_logins(&logins).unwrap();
     };
-    bind("/logins/main-2");
+    bind(&login_dir("main-2"));
     let path = dir.path().join(accounts::ACCOUNTS_FILE);
     std::fs::write(
         &path,
@@ -141,7 +153,7 @@ fn a_configured_roster_is_read_once_and_bound_again_when_its_bindings_move() {
     for _ in 0..100 {
         assert_eq!(
             bound_dir(&mut roster, &mut stores),
-            Some((1, Some("/logins/main-2".into())))
+            Some((1, Some(login_dir("main-2"))))
         );
     }
     assert_eq!(
@@ -150,18 +162,21 @@ fn a_configured_roster_is_read_once_and_bound_again_when_its_bindings_move() {
         "one read while it stands"
     );
 
-    bind("/logins/main-renewed");
+    bind(&login_dir("main-renewed"));
     assert_eq!(
         bound_dir(&mut roster, &mut stores).and_then(|(_, dir)| dir),
-        Some("/logins/main-renewed".into()),
+        Some(login_dir("main-renewed")),
         "the new binding"
     );
     assert_eq!(take_footer_work().roster_loads, 0, "the roster file stood");
 
     std::fs::write(
         &path,
-        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
-         [[account]]\nlabel = \"spare\"\nclass = \"dedicated\"\ndir = \"/logins/spare\"\n",
+        format!(
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
+             [[account]]\nlabel = \"spare\"\nclass = \"dedicated\"\ndir = {:?}\n",
+            login_dir("spare")
+        ),
     )
     .unwrap();
     assert_eq!(bound_dir(&mut roster, &mut stores).map(|(n, _)| n), Some(2));

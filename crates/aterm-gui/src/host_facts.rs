@@ -35,7 +35,7 @@ pub(crate) enum Bell {
 /// Every host accessor a footer read takes, by the name its read notes ([`noted`]), with the
 /// bell that rings when what it answers moves; `None` for one fixed for the process's life (the
 /// harness state's folder, of the environment it started in).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) const MEMBERS: [(&str, Option<Bell>); 9] = [
     ("usage_tap_on", Some(Bell::Config)),
     ("accounts_mode", Some(Bell::Config)),
@@ -85,13 +85,13 @@ pub(crate) fn noted(accessor: &'static str) {
 }
 
 /// The host accessors read on this thread since the last take, with their counts.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn take_noted() -> std::collections::BTreeMap<&'static str, usize> {
     NOTED.with(|noted| std::mem::take(&mut *noted.borrow_mut()))
 }
 
 /// Of `noted`, the accessors no member names: reads no bell answers for.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn unbelled(
     noted: &std::collections::BTreeMap<&'static str, usize>,
 ) -> Vec<&'static str> {

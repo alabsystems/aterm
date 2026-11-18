@@ -226,10 +226,20 @@ impl<const BUCKET_MS: i64, const BUCKETS: usize> FreeSeries<BUCKET_MS, BUCKETS> 
     /// at `now_unix_ms`; its first reading keeps it only on the same volume ([`Self::note_on`]).
     #[must_use]
     pub fn restored(saved: &SavedFree, now_unix_ms: i64) -> Self {
+        let mut series = Self::restored_rows(&saved.rows, now_unix_ms);
+        if !series.is_empty() {
+            series.volume = Some(saved.volume.clone());
+        }
+        series
+    }
+
+    /// A series of no volume from [`Self::saved_rows`], holding only the rows in its span ending
+    /// at `now_unix_ms`.
+    #[must_use]
+    pub fn restored_rows(saved: &[FreeRow], now_unix_ms: i64) -> Self {
         let now_k = now_unix_ms.div_euclid(BUCKET_MS);
         let oldest = now_k.saturating_sub(BUCKETS as i64 - 1);
         let mut rows: Vec<(i64, Agg)> = saved
-            .rows
             .iter()
             .filter(|(_, b)| b.is_sound())
             .map(|&(at, b)| (at.div_euclid(BUCKET_MS), b))
@@ -248,7 +258,7 @@ impl<const BUCKET_MS: i64, const BUCKETS: usize> FreeSeries<BUCKET_MS, BUCKETS> 
             b,
             newest_ms: None,
             covered_to: i64::MIN,
-            volume: Some(saved.volume.clone()),
+            volume: None,
             restored: true,
         }
     }
@@ -277,6 +287,107 @@ impl<const BUCKET_MS: i64, const BUCKETS: usize> FreeSeries<BUCKET_MS, BUCKETS> 
                     .copied()
             })
             .collect()
+    }
+}
+
+/// The Spotlight family's cost over the last 24 hours, in 10-minute buckets of time-weighted
+/// split readings ([`crate::spotlight::Reading`]): its CPU and reads, each bucket's mean, and its
+/// footprint, each bucket's largest. One [`FreeHistory`] span a figure, keyed to no volume.
+///
+/// It holds only the windows the host split by coalition ([`crate::spotlight::Family::absorb`]):
+/// while no window in view shows the bars and no query or spotlight wait asks for a split, it
+/// takes nothing, and those buckets read unread, never idle. A page that draws the day draws
+/// them as gaps.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SpotlightHistory {
+    cpu_mc: FreeHistory,
+    read_bps: FreeHistory,
+    footprint: FreeHistory,
+}
+
+/// One bucket of [`SpotlightHistory`]: what the family cost in it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpotlightBucket {
+    /// Its mean CPU, millicores.
+    pub cpu_mc: f64,
+    /// Its mean reads, bytes per second.
+    pub read_bps: f64,
+    /// Its largest footprint, bytes; `None` where no reading in it read every share's.
+    pub footprint_max: Option<f64>,
+}
+
+/// A Spotlight history as the host writes it ([`SpotlightHistory::saved`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SavedSpotlight {
+    /// The CPU buckets, oldest first, millicores.
+    pub cpu_mc: Vec<FreeRow>,
+    /// The read buckets, bytes per second.
+    pub read_bps: Vec<FreeRow>,
+    /// The footprint buckets, bytes.
+    pub footprint: Vec<FreeRow>,
+}
+
+impl SpotlightHistory {
+    /// Record `r`: a split reading stands for its window, which ends at its wall clock. Its
+    /// footprint is kept only where every share's was read: a lower bound is no bucket's max.
+    pub fn note(&mut self, r: &crate::spotlight::Reading) {
+        let window = i64::try_from(r.window_ms).unwrap_or(i64::MAX);
+        let t = Taken::at(
+            r.at_unix_ms.saturating_sub(window / 2),
+            u32::try_from(r.window_ms).unwrap_or(u32::MAX),
+        );
+        self.cpu_mc
+            .note(t, u64::try_from(r.cpu_mc.max(0)).unwrap_or(0));
+        self.read_bps.note(t, r.read_bps);
+        if let Some(bytes) = r.footprint_bytes() {
+            self.footprint.note(t, bytes);
+        }
+    }
+
+    /// Whether nothing was read yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.cpu_mc.is_empty()
+    }
+
+    /// The day ending at `now_unix_ms`, a bucket each 10 minutes, oldest first.
+    #[must_use]
+    pub fn day(&self, now_unix_ms: i64) -> Vec<Option<SpotlightBucket>> {
+        let cpu = self.cpu_mc.buckets(now_unix_ms);
+        let read = self.read_bps.buckets(now_unix_ms);
+        let foot = self.footprint.buckets(now_unix_ms);
+        cpu.into_iter()
+            .zip(read)
+            .zip(foot)
+            .map(|((c, r), f)| {
+                Some(SpotlightBucket {
+                    cpu_mc: c?.value()?,
+                    read_bps: r?.value()?,
+                    footprint_max: f.map(|f| f.max),
+                })
+            })
+            .collect()
+    }
+
+    /// Its read buckets, for the host to write; `None` with nothing read.
+    #[must_use]
+    pub fn saved(&self) -> Option<SavedSpotlight> {
+        let saved = SavedSpotlight {
+            cpu_mc: self.cpu_mc.saved_rows(),
+            read_bps: self.read_bps.saved_rows(),
+            footprint: self.footprint.saved_rows(),
+        };
+        (!saved.cpu_mc.is_empty()).then_some(saved)
+    }
+
+    /// A history from what [`Self::saved`] gave, holding only the day ending at `now_unix_ms`.
+    #[must_use]
+    pub fn restored(saved: &SavedSpotlight, now_unix_ms: i64) -> Self {
+        Self {
+            cpu_mc: FreeHistory::restored_rows(&saved.cpu_mc, now_unix_ms),
+            read_bps: FreeHistory::restored_rows(&saved.read_bps, now_unix_ms),
+            footprint: FreeHistory::restored_rows(&saved.footprint, now_unix_ms),
+        }
     }
 }
 

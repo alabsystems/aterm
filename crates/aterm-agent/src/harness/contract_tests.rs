@@ -133,6 +133,112 @@ fn a_rostered_claim_is_read_with_its_scope_and_versions() {
     assert_eq!(bare.versions(), "grok-alab unknown (grok unknown)");
 }
 
+#[test]
+fn reordered_requested_scope_words_are_the_same_claim_under_both_contracts() {
+    static ROWS: [Row; 1] = [Row {
+        id: "grok-alab",
+        program: Program::Grok,
+        package: "grok-alab",
+        vendor: "grok",
+        allows: &[Scope::Relaunch, Scope::Upgrade],
+        source: Source::Seed,
+    }];
+    for contract in ["contract=3", "contract=4"] {
+        let parse = |scope: &str| {
+            let scope = format!("scope={scope}");
+            match read_in(&ROWS, "grok-alab@500", &[contract, &scope, "version=0.3.0"]) {
+                Words::Scoped(claim) => claim,
+                other => panic!("expected a scoped claim: {other:?}"),
+            }
+        };
+        let first = parse("upgrade,relaunch");
+        let reordered = parse("relaunch,upgrade");
+        assert_eq!(first, reordered, "{contract}: only word order changed");
+        assert!(first.scopes.contains(Scope::Relaunch) && first.scopes.contains(Scope::Upgrade));
+        assert_ne!(
+            first,
+            parse("relaunch"),
+            "{contract}: a changed set is new authority"
+        );
+        assert!(
+            matches!(
+                read_in(
+                    &ROWS,
+                    "grok-alab@500",
+                    &[contract, "scope=upgrade,relaunch,upgrade", "version=0.3.0"]
+                ),
+                Words::Refused("a scope word is named twice")
+            ),
+            "{contract}: canonicalization must not admit duplicate words"
+        );
+    }
+}
+
+#[test]
+fn requested_unknown_and_ungranted_words_remain_distinct_from_the_grant() {
+    static ROWS: [Row; 1] = [Row {
+        id: "grok-alab",
+        program: Program::Grok,
+        package: "grok-alab",
+        vendor: "grok",
+        allows: &[Scope::Relaunch, Scope::Upgrade],
+        source: Source::Seed,
+    }];
+    let parse = |scope: &str| {
+        let scope = format!("scope={scope}");
+        match read_in(
+            &ROWS,
+            "grok-alab@500",
+            &["contract=4", &scope, "version=0.3.0"],
+        ) {
+            Words::Scoped(claim) => claim,
+            other => panic!("expected a scoped claim: {other:?}"),
+        }
+    };
+    let first = parse("walls,future-alpha,relaunch,upgrade");
+    assert_eq!(first, parse("upgrade,relaunch,future-alpha,walls"));
+    assert_eq!(
+        first
+            .claimed
+            .split(',')
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["walls", "future-alpha", "relaunch", "upgrade"])
+    );
+    assert!(
+        !first.scopes.contains(Scope::Walls),
+        "the seed row did not grant walls"
+    );
+    for different in [
+        "walls,future-beta,relaunch,upgrade",
+        "future-alpha,relaunch,upgrade",
+    ] {
+        let next = parse(different);
+        assert_eq!(
+            first.scopes, next.scopes,
+            "the effective grant did not change"
+        );
+        assert_ne!(
+            first, next,
+            "different requests must survive for later regranting"
+        );
+    }
+    assert!(
+        matches!(
+            read_in(
+                &ROWS,
+                "grok-alab@500",
+                &[
+                    "contract=4",
+                    "scope=future-alpha,future-alpha",
+                    "version=0.3.0"
+                ]
+            ),
+            Words::Refused("a scope word is named twice")
+        ),
+        "an unknown word repeated is still refused"
+    );
+}
+
 /// Every malformed or over-reaching v3 claim is refused whole; a rostered holder never claims
 /// under v2; an unrostered holder's v3 claim is an ordinary foreign claim.
 #[test]

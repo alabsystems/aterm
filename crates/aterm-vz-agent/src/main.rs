@@ -6,6 +6,7 @@
 
 use std::process::ExitCode;
 
+#[cfg(unix)]
 fn main() -> ExitCode {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     #[cfg(any(test, debug_assertions))]
@@ -13,4 +14,14 @@ fn main() -> ExitCode {
         return aterm_vz_agent::stand_in::run(&args[1..]);
     }
     aterm_vz_agent::main(&args)
+}
+
+/// Off Unix there is no agent: the library is Unix's ([`aterm_vz_agent`]).
+#[cfg(not(unix))]
+fn main() -> ExitCode {
+    eprintln!(
+        "aterm-vz-agent: the Linux lane's guest agent runs in its Linux guest (and its test seam \
+         on macOS), never on Windows"
+    );
+    ExitCode::from(2)
 }

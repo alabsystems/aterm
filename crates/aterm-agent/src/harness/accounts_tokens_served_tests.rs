@@ -805,22 +805,23 @@ fn unequal_windows_leave_unverified_windows_differ() {
         TokenFact::Differ
     );
     let refusal = state
-        .bare_refusal(EMAIL, None, false)
+        .bare_refusal(SHOWN, None, false)
         .expect("a bare run is refused");
     assert!(
         refusal.contains("this Mac starts no session on it") && refusal.contains("`--replace`"),
         "{refusal}"
     );
+    let work = word_of("claude-work-x");
     assert_eq!(
-        state.offer("work", false),
+        state.offer(&work, false),
         Some(Step::Token {
-            label: "work".to_owned(),
+            word: work.clone(),
             replace: true,
         }),
         "a surface offers its replacement"
     );
     assert_eq!(
-        state.offer("work", true),
+        state.offer(&work, true),
         None,
         "not while one is on its way"
     );
@@ -875,16 +876,17 @@ fn windows_another_account_shares_leave_unverified_windows_shared() {
     let state = TokenState::of(&Lookup::Found(token.clone()), table.rows.get(KEY), NOW);
     assert_eq!(state.words(), "unverified (windows shared)");
     assert!(state.in_use(), "it serves the minting Mac");
+    let work = word_of("claude-work-x");
     assert_eq!(
-        state.offer("work", false),
+        state.offer(&work, false),
         Some(Step::Token {
-            label: "work".to_owned(),
+            word: work.clone(),
             replace: true,
         }),
         "a token no route proved, never verified, is offered its replacement"
     );
     let refusal = state
-        .bare_refusal(EMAIL, None, false)
+        .bare_refusal(SHOWN, None, false)
         .expect("a bare run is refused");
     assert!(
         refusal.contains("could not tell the accounts apart") && refusal.contains("`--replace`"),
@@ -909,7 +911,7 @@ fn windows_another_account_shares_leave_unverified_windows_shared() {
     assert_eq!(state.words(), "unverified (windows shared)");
     assert!(state.in_use(), "CONTROL: a window token serves every Mac");
     assert_eq!(
-        state.offer("work", false),
+        state.offer(&work, false),
         None,
         "CONTROL: its mint proved the account, so nothing is offered"
     );
@@ -1207,13 +1209,7 @@ fn a_token_awaiting_its_basis_is_held_while_the_stored_login_works_here() {
 
 /// The account `work` as the verb makes its token.
 fn work() -> super::Account {
-    super::Account {
-        email: EMAIL.to_owned(),
-        label: Some("work".to_owned()),
-        account_id: Some("c-0123456789ab".to_owned()),
-        key: key(),
-        holder: None,
-    }
+    work_account()
 }
 
 /// `token` made `later` seconds after it, not verified: a `--replace` of it.
@@ -2357,6 +2353,7 @@ fn a_row_with_no_login_made_here_runs_on_its_fleet_token_here() {
                     .iter()
                     .map(|(label, end)| (label.clone(), i64::try_from(*end).unwrap()))
                     .collect(),
+                vouched: false,
             }),
             ..accounts::State::default()
         };
@@ -2409,6 +2406,83 @@ fn a_row_with_no_login_made_here_runs_on_its_fleet_token_here() {
     );
 }
 
+/// THE TOKENS-HERE READING TAKES THE READING RAW ONLY TO JUDGE A LISTED STANDING OF A ROW IT
+/// JUDGES ([`rows_on_token_of`]): `away`, whose login was never made here, is judged only where
+/// this Mac's claims cover it (FL-135). With no pool file, its window-minted token's standing is
+/// listed and judged by nobody, so the reading compares no clock and the scope armed around it may
+/// be kept. With `ai-pool.toml`, the claims cover `away`, its standing is judged on the reading as
+/// a number ([`standing_judged`]), and the run is never kept: the window's accounts keeper makes
+/// its tokens-here duty again at each pass while the vault lists that token (ATERM-KI-1116-9216).
+///
+/// NEGATIVE CONTROLS (2026-11-16, at the review of the keeper's merge with FL-135): the reading
+/// taken raw once before `rows_on_token_of`'s loop failed "a listing of no judged row's token
+/// compares no clock", left `Some(Poison("a raw read of now"))`, right `None`; the judgment's
+/// reading taken under `trace::unrecorded` failed "a standing judged is judged at the reading
+/// taken raw: the run is never kept", left `Some(Unsettled { .. })`, right the raw reading's
+/// poison. Each restored, the file touched.
+#[test]
+fn the_tokens_here_reading_takes_the_reading_raw_only_to_judge_a_listed_standing() {
+    use aterm_uds::trace::{self, Now, Unkept};
+    let scratch = Scratch::new("judged-raw");
+    let dir = scratch.path().join("logins").join("away");
+    let roster_file = scratch.path().join("away.toml");
+    std::fs::write(
+        &roster_file,
+        format!(
+            "[[account]]\nlabel = \"away\"\nclass = \"dedicated\"\ndir = \"{}\"\nemail = \
+             \"{EMAIL}\"\n",
+            dir.display()
+        ),
+    )
+    .expect("the roster");
+    let roster = Roster::load_for(Cli::Claude, &roster_file).expect("it loads");
+    let paths = Paths::for_home(&scratch.path().join("home"));
+    let store = scratch.store();
+    let window = unverified_by(false, MintedBy::Window);
+    let traced = || {
+        journal::with_keyer(keyer, || {
+            trace::scope(|| {
+                rows_on_token_of(
+                    &paths,
+                    Lookup::Found(vec![window.clone()]),
+                    &store,
+                    &roster,
+                    Now::at(i64::try_from(NOW).unwrap()),
+                )
+            })
+        })
+    };
+    assert!(!accounts::enrolled(&roster).contains("away"));
+
+    let (read, ran) = traced();
+    assert_eq!(
+        read,
+        Some(BTreeMap::new()),
+        "no claim covers away here: no row is judged"
+    );
+    assert_eq!(
+        ran.unkept(),
+        None,
+        "a listing of no judged row's token compares no clock"
+    );
+
+    crate::vault_entry::put(
+        &paths.home,
+        crate::harness::ai_pool::AI_POOL_FILE,
+        "version = 1\n",
+    );
+    let (read, ran) = traced();
+    assert!(
+        read.expect("the listing was read").contains_key("away"),
+        "the claims cover away: its standing is judged, and its fleet token runs it"
+    );
+    assert_eq!(
+        ran.unkept(),
+        Some(Unkept::Poison("a raw read of now".into())),
+        "a standing judged is judged at the reading taken raw: the run is never kept"
+    );
+}
+
 /// RENEWAL IS OFF FOR A ROW ON ITS VAULT TOKEN, AND `renew` ON ONE SAYS SO (§5.8): with a token
 /// in use here in a scratch seated vault, the row is one of the rows on their token, and
 /// `accounts renew work` says "work runs on its vault token until <date>; renewal is off for
@@ -2458,7 +2532,7 @@ fn renew_on_a_token_row_says_so_and_takes_no_sign_in_lock() {
     let host = Host::new(VaultOf::Real(lab.paths.clone()));
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let form = AccountsCmd::Renew {
-        labels: vec!["work".to_owned()],
+        accounts: vec![EMAIL.to_owned()],
         due: false,
         on: None,
     };
@@ -2474,10 +2548,12 @@ fn renew_on_a_token_row_says_so_and_takes_no_sign_in_lock() {
         format!("{:?}", ExitCode::SUCCESS),
         "{out} {err}"
     );
+    let work = crate::harness::account_names::tests::row_name_of(Cli::Claude, &env, "work").shown;
     assert_eq!(
         out.trim(),
         format!(
-            "work: work runs on its vault token until {}; renewal is off for it; nothing was run",
+            "{work}: {work} runs on its vault token until {}; renewal is off for it; nothing was \
+             run",
             date(meta.expires_at)
         ),
         "{err}"

@@ -9,7 +9,9 @@
 //! unfolds STORED with a press on its stub and takes a frame, stages an edit through `act`, takes a
 //! frame, opens a Mac's role (an enum) on its list of words and takes a frame, stages a word that
 //! is none of them and takes a frame of its refusal, asks `act` to write them (which `act` refuses:
-//! only a person's own press writes) and discards them, turns the fold off from the Columns list,
+//! only a person's own press writes) and discards them, stages a label another Mac already reads
+//! as and takes a frame of what the cell and the cell bar say of it (docs/PLAN.md LT-46) and
+//! discards it, turns the fold off from the Columns list,
 //! selects a Mac's linked count (the cell bar says the count, the line under the grid which rows
 //! name the Mac), takes a frame, selects the grid's last column, takes a frame, sorts the rows by a
 //! header, takes a frame, selects the stated chip (the line under the grid says both what is stated
@@ -494,6 +496,19 @@ fn drive(
     act(inst, &view, "tables/discard", None)?;
     act(inst, &view, location, None)?;
     shots.push(frame(inst, out, "tables-4-unwritten.png")?);
+    // A label another machine already reads as, staged, says so before Write in the note's
+    // ink, with the clash label this row reads as once written (docs/PLAN.md LT-46).
+    let label = "tables/cell/mc-000000000000000b/label";
+    act(inst, &view, label, None)?;
+    act(inst, &view, label, None)?;
+    act(inst, &view, "tables/edit", Some("m9"))?;
+    act(inst, &view, location, None)?;
+    act(inst, &view, label, None)?;
+    until(inst, &view, "a label in use", |text| {
+        text.contains("in use")
+    })?;
+    shots.push(frame(inst, out, "tables-4-in-use.png")?);
+    act(inst, &view, "tables/discard", None)?;
     // The fold turned off draws every column, the empty ones too: the linked count and the
     // schema's last column below are among them, whatever the rows fill.
     act(inst, &view, "tables/columns", None)?;

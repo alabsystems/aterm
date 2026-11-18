@@ -5,8 +5,9 @@
 //! fleet's verb gate and the verb's own gate in the order the request loop runs them
 //! ([`super::super::fleet_refusal`], [`super::super::stream_verb`]), the flip to a stream lane,
 //! and the reader ([`super::serve`]). The service here answers a `claim` line by placing a
-//! fixture claim on the connection that sent it, and leaves every stream decision to the
-//! shipping code. The request loop itself (`serve_request_line`) needs a window's event loop and
+//! fixture claim on the connection that sent it, serves a `claim` record's line through the
+//! shipping `meta set supervisor` with stand-in kernel proofs, and leaves every stream decision
+//! to the shipping code. The request loop itself (`serve_request_line`) needs a window's event loop and
 //! runs in no headless test.
 
 use std::io::{BufRead, BufReader, Write};
@@ -81,12 +82,16 @@ fn place(
     }
     let holder = format!("{row}@{}", proven.pid);
     let contract::Words::Scoped(mut claim) =
-        contract::read(&holder, &["contract=3", "scope=upgrade"])
+        contract::read(&holder, &["contract=3", "scope=upgrade", "version=0.3.0"])
     else {
         panic!("the roster admits {holder}");
     };
     claim.contract = contract_no;
     claim.scopes = contract::Scopes::for_test(duties);
+    if !duties.is_empty() {
+        // What it asked for is what it was granted; a grant of no duty keeps the read's ask.
+        claim.claimed = claim.scopes.words();
+    }
     crate::session_timeline::claim_supervisor_scoped(
         &handle.ctx,
         &holder,
@@ -121,9 +126,71 @@ struct Service {
     clock: AtomicU64,
     released: Mutex<Vec<u64>>,
     entered: Mutex<Vec<Entered>>,
+    /// What the stand-in proof answers a `claim` record's line: the claimant and the version of
+    /// the build it was admitted from; `None` proves nothing.
+    proof: Mutex<Option<crate::harness_claim::ClaimProof>>,
+    /// Every claim line a `claim` record had served, as it was built.
+    lines: Mutex<Vec<String>>,
 }
 
+/// The version the stand-in proof admits: no claim and no record states it.
+const ADMITTED: &str = "9.1.0";
+
 impl Service {
+    /// Serve a `claim` record's line as the shipping `meta set supervisor` on the connection
+    /// the stream lane entered, with the kernel's proof answered by [`Self::proof`] and every
+    /// named child kept as named.
+    fn claim_line(&self, handle: &SessionHandle, rest: &str) -> String {
+        self.lines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(rest.to_string());
+        self.serve_meta(handle, rest)
+    }
+
+    /// `meta <sid> <rest>`, on the connection that sent it: the shipping `meta` verb for that
+    /// session, with the same stand-in proofs a `claim` record's line is served under.
+    fn meta(&self, line: &str) -> String {
+        let (sid, rest) = line["meta ".len()..]
+            .split_once(' ')
+            .expect("meta <sid> <rest>");
+        self.serve_meta(&self.handle(sid), rest)
+            .trim_end()
+            .to_string()
+    }
+
+    fn serve_meta(&self, handle: &SessionHandle, rest: &str) -> String {
+        let proof = self
+            .proof
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        super::super::meta_wakes_admitting_for_test(
+            &self.store,
+            &handle.term,
+            handle.local_id,
+            &handle.ctx,
+            rest,
+            super::super::serving_connection(),
+            &|_, _| proof.clone(),
+            &|_, word| {
+                Some(crate::harness_claim::KeptChild {
+                    pid: word.pid,
+                    claimed_us: word.start_us,
+                    birth: aterm_uds::process::Birth(word.start_us),
+                })
+            },
+        )
+        .0
+    }
+
+    fn lines(&self) -> Vec<String> {
+        self.lines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     fn handle(&self, sid: &str) -> SessionHandle {
         let sid = super::Sid::parse(sid).expect("a session id");
         super::hosted(&self.store, sid).expect("a hosted session")
@@ -220,6 +287,7 @@ impl LaneService for Service {
                 super::super::serving_connection().expect("serving a connection")
             ),
             line if line.starts_with("claim ") => self.claim(line),
+            line if line.starts_with("meta ") => self.meta(line),
             line => format!("OK {line}"),
         };
         out.extend_from_slice(format!("{reply}\n").as_bytes());
@@ -244,9 +312,14 @@ impl LaneService for Service {
                 descriptor: aterm_control::hangup::serving_fd() == Some(stream.as_raw_fd()),
                 direct: super::super::SERVING_DIRECT.with(std::cell::Cell::get),
             });
-        super::serve(&request, &self.store, stream, buffered, &|| {
-            self.clock.load(Ordering::Acquire)
-        });
+        super::serve(
+            &request,
+            &self.store,
+            stream,
+            buffered,
+            &|| self.clock.load(Ordering::Acquire),
+            &|handle, rest| self.claim_line(handle, rest),
+        );
     }
 
     fn release(&self, id: u64) {
@@ -352,6 +425,11 @@ impl Rig {
             clock: AtomicU64::new(1_000),
             released: Mutex::new(Vec::new()),
             entered: Mutex::new(Vec::new()),
+            proof: Mutex::new(Some(crate::harness_claim::ClaimProof {
+                proven: running(),
+                version: Some(ADMITTED.to_string()),
+            })),
+            lines: Mutex::new(Vec::new()),
         });
         lanes.publish(Arc::clone(&service) as Arc<dyn LaneService>);
         started.activate();
@@ -641,7 +719,9 @@ fn a_claim_gone_before_the_ok_closes_with_no_line() {
     let request = Request::parse(format!("stream @{ONE} v=1"));
     // The lane's serial for a connection that holds no claim, as `Serving::enter` sets it.
     super::super::SERVING_CONNECTION.with(|serving| serving.set(Some(u64::MAX - 3)));
-    super::serve(&request, &store, &server, Vec::new(), &|| 0);
+    super::serve(&request, &store, &server, Vec::new(), &|| 0, &|_, _| {
+        String::new()
+    });
     super::super::SERVING_CONNECTION.with(|serving| serving.set(None));
     drop(server);
     let mut reply = String::new();
@@ -1078,8 +1158,8 @@ fn a_seq_gap_or_a_claim_on_another_connection_closes_the_stream() {
     assert_eq!(meta.stream.as_ref().map(|state| state.acked), Some(7));
 }
 
-/// `title`, an unknown kind and the known kinds this aterm does not apply yet (a `claim`
-/// record among them) are each acknowledged with no `dropped`, counted where `meta` prints
+/// `title`, an unknown kind and the known kinds this aterm does not apply yet are each
+/// acknowledged with no `dropped`, counted where `meta` prints
 /// them, and left out of the applied kinds; `beat`, which is applied, is in them.
 #[test]
 fn title_unknown_and_unapplied_records_are_acked_and_counted_in_meta() {
@@ -1096,14 +1176,7 @@ fn title_unknown_and_unapplied_records_are_acked_and_counted_in_meta() {
         (2, None)
     );
     assert_eq!(client.record(3, goal()), (3, None));
-    let claim = Body::Claim {
-        child: None,
-        scope: None,
-        version: None,
-        vendor: None,
-        login: None,
-    };
-    assert_eq!(client.record(4, claim), (4, None));
+    assert_eq!(client.record(4, goal()), (4, None));
     assert_eq!(client.record(5, Body::Beat), (5, None));
 
     let meta = rig.meta(ONE);
@@ -1127,3 +1200,7 @@ fn title_unknown_and_unapplied_records_are_acked_and_counted_in_meta() {
 /// The `state` record and the current-state record it feeds.
 #[path = "control_stream_state_tests.rs"]
 mod state;
+
+/// The `claim` record and the re-exec grace of a stream's claim.
+#[path = "control_stream_claim_tests.rs"]
+mod claim;

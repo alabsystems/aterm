@@ -92,7 +92,7 @@ pub(crate) enum FactAct {
     /// Forget the cached Muse usage reading so the next read mints a fresh one.
     RefreshUsage,
     /// The quiet offer's one step for this tab's account: a tab beside this one that runs
-    /// `aterm harness accounts token <label> [--replace]`
+    /// `aterm harness accounts token <word> [--replace]`
     /// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.9).
     Token,
 }
@@ -131,7 +131,8 @@ pub(crate) struct AccountMenuRow {
     pub(crate) name: String,
     /// What the row stands at, apart from its name: what is left of its week (`61% left`, an
     /// older reading's upper bound `≤61% left`, a wall's `out`), or why it has none (`signed
-    /// out`, `not read`), in line E's words; never a bare percentage and never a mark.
+    /// out`, `not read`), in line E's words, then each model's own week walled on a row that
+    /// runs (`61% left · Fable week out`); never a bare percentage and never a mark.
     pub(crate) trail: String,
     /// What a screen reader is told of it (`m27@example.com, at most 61 percent left, this
     /// tab's account`).
@@ -1106,7 +1107,7 @@ pub(crate) fn account_menu_rows_from(
             matches!(cond, accounts::Condition::Limited { .. }) || week == Some(Figure::Out);
         let login = Figure::login(&cond, row_signing_in)
             .filter(|_| session_label != Some(row.label.as_str()));
-        let (trail, said): (String, String) = match (login, week) {
+        let (mut trail, mut said): (String, String) = match (login, week) {
             _ if walled => ("out".into(), "out".into()),
             (Some(login), _) => (login.words(), login.spoken()),
             (None, Some(figure)) => (figure.words(), figure.spoken()),
@@ -1115,6 +1116,16 @@ pub(crate) fn account_menu_rows_from(
                 (words.clone(), words)
             }
         };
+        // A model's own weekly wall walls that model's sessions alone, so the row runs and says
+        // its week, and names each such wall beside it (`· Fable week out`), as `accounts list`
+        // does (`accounts::model_walls_clause`): a Fable session picked onto it meets that wall.
+        if !walled && let Some(acct) = state.accounts.get(&row.label) {
+            for (bucket, _) in acct.model_walls(now) {
+                let name = accounts::model_week_name(bucket).unwrap_or(bucket);
+                trail.push_str(&format!(" \u{b7} {name} out"));
+                said.push_str(&format!(", {name} out"));
+            }
+        }
         // A choice of a row whose sign-in already runs starts none: it saves the selection.
         let signs_in = has_email
             && !row_signing_in

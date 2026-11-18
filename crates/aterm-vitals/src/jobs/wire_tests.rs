@@ -20,7 +20,7 @@ fn live_verdicts_disclose_missing_progress_observations() {
             .nth(1)
             .expect("live observation limits");
         assert_eq!(limits.split_whitespace().next(), job.progress_limits());
-        let json = crate::sys::jobs_view::row_json(&job, None);
+        let json = crate::sys::jobs_view::row_json(&job, None, &|_| None);
         assert_eq!(
             json.get("progress_limits"),
             Some(&crate::sys::json::Jv::s(job.progress_limits().unwrap()))
@@ -37,7 +37,7 @@ fn live_verdicts_disclose_missing_progress_observations() {
         exited.exit = Some(0);
         assert!(!exited.wire().contains(" progress_limits="));
         assert!(
-            crate::sys::jobs_view::row_json(&exited, None)
+            crate::sys::jobs_view::row_json(&exited, None, &|_| None)
                 .get("progress_limits")
                 .is_none()
         );

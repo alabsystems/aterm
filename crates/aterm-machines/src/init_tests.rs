@@ -1691,7 +1691,10 @@ fn converge_transports_unfinished_repository_work_without_claiming_completion() 
     ports.clone_is(OwedClone::Waiting("Git is installing".into()));
     assert_eq!(
         converge_run(&["--converge", "--trigger", "subscriber", "--json"], &ports),
-        exit(aterm_secrets::converge::UNFINISHED)
+        exit(aterm_secrets::converge::runner_exit_code(
+            aterm_secrets::converge::UNFINISHED,
+            true,
+        ))
     );
     let pass = crate::sync::converge(
         &ports,
@@ -1712,6 +1715,61 @@ fn converge_transports_unfinished_repository_work_without_claiming_completion() 
     assert_eq!(converge_run(&["--converge"], &ports), exit(0));
 }
 
+/// An automatic runner reports a completed identity independently of unrelated admitted work.
+/// The ordinary invocation keeps its whole-pass status; neither report claims that the other
+/// row completed. The high bit is the runner protocol's positive identity completion witness.
+#[cfg(unix)]
+#[test]
+fn an_automatic_runner_reports_completed_identity_beside_other_unfinished_work() {
+    use crate::sync::tests::owed_clone::Hooked;
+    for (owed, status) in [
+        (OwedClone::Due("acquisition is due".into()), 1_u8),
+        (
+            OwedClone::Waiting("Git is installing".into()),
+            aterm_secrets::converge::UNFINISHED,
+        ),
+        (
+            OwedClone::Person("preserved checkout work".into()),
+            aterm_secrets::converge::STANDING,
+        ),
+    ] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let mut ports = Hooked {
+            inner: crate::sync::tests::Inert::new(scratch.path()),
+            held: &|| None,
+            owed: &|_| Ok(owed.clone()),
+            clone: &|_| Err("acquisition has a transient failure".into()),
+            observe: None,
+            control: None,
+            forget: &|| Ok(()),
+        };
+        let automatic = converge_run(&["--converge", "--trigger", "subscriber", "--json"], &ports);
+        let recorded = crate::sync::read_record(scratch.path()).unwrap();
+        assert_eq!(
+            recorded
+                .rows
+                .iter()
+                .find(|row| row.id == "sync.identity")
+                .unwrap()
+                .outcome,
+            Outcome::Ok,
+            "the identity row actually completed"
+        );
+        assert_eq!(
+            automatic,
+            exit(status | 0x80),
+            "a completed identity must be reported independently of the other row"
+        );
+        assert_eq!(converge_run(&["--converge"], &ports), exit(status));
+        ports.inner.identity_result = false;
+        assert_eq!(
+            converge_run(&["--converge", "--trigger", "subscriber"], &ports),
+            exit(status),
+            "a starter that did not negotiate the receipt keeps its whole-pass status"
+        );
+    }
+}
+
 /// A standing repository block is unfinished without asking the starter to repeat it on a
 /// clock. A changed input admits a fresh attempt, and a transient wait keeps its retry status.
 #[test]
@@ -1721,7 +1779,10 @@ fn a_standing_row_transports_an_input_wait_without_a_timed_retry() {
     ports.clone_is(OwedClone::Person("preserved checkout work".into()));
     assert_eq!(
         converge_run(&["--converge", "--trigger", "subscriber", "--json"], &ports),
-        exit(aterm_secrets::converge::STANDING),
+        exit(aterm_secrets::converge::runner_exit_code(
+            aterm_secrets::converge::STANDING,
+            true,
+        )),
         "a standing row must not take the transient unfinished transport"
     );
     assert!(!ports.applies().contains(&"clone"));
@@ -1729,7 +1790,10 @@ fn a_standing_row_transports_an_input_wait_without_a_timed_retry() {
     ports.clone_is(OwedClone::Waiting("Git is installing".into()));
     assert_eq!(
         converge_run(&["--converge", "--trigger", "subscriber"], &ports),
-        exit(aterm_secrets::converge::UNFINISHED)
+        exit(aterm_secrets::converge::runner_exit_code(
+            aterm_secrets::converge::UNFINISHED,
+            true,
+        ))
     );
     assert!(!ports.applies().contains(&"clone"));
 
@@ -9627,7 +9691,7 @@ fn a_clone_the_person_named_is_not_forgotten_by_the_vaults_sync() {
     let owed = |readback: Option<&crate::init_github::RepositoryReadback>| {
         owed_clone(&sys, &state, &holds, readback)
     };
-    let clone = || {
+    let clone = |_| {
         cloned.store(true, Ordering::SeqCst);
         Ok(CloneOwedOutcome {
             said: "cloned".to_owned(),
@@ -9639,6 +9703,7 @@ fn a_clone_the_person_named_is_not_forgotten_by_the_vaults_sync() {
         held: &|| None,
         owed: &owed,
         clone: &clone,
+        observe: None,
         control: None,
         forget: &|| forget_owed_clone(&state),
     };

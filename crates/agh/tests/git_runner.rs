@@ -29,6 +29,7 @@ mod abrupt_stop_tests;
 mod cache_ancestor_tests;
 mod commit_ancestry_tests;
 mod inventory_retry_tests;
+mod local_tag_residency_tests;
 mod object_view_tests;
 mod partial_have_tests;
 mod raw_blob_tests;
@@ -2122,6 +2123,7 @@ fn native_push_receive_failures_reread_before_retrying() {
 
 #[test]
 fn leased_delete_receive_failures_reread_before_retrying() {
+    const REFERENCE: &str = "refs/aterm-release/windows/request";
     for (reason, landed, pushes) in [
         ("failed", false, 2),
         ("failed", true, 1),
@@ -2131,14 +2133,14 @@ fn leased_delete_receive_failures_reread_before_retrying() {
         common::canonical_repos(&world.fake);
         let remote = bare_repo(world.path(), "origin");
         let sha = host_git(&remote, &["rev-parse", "main"]);
-        host_git(&remote, &["update-ref", "refs/tags/v1", &sha]);
-        let run = GitRun::push_delete(&common::slug("fixture-dev/app"), "refs/tags/v1", &sha);
+        host_git(&remote, &["update-ref", REFERENCE, &sha]);
+        let run = GitRun::push_delete(&common::slug("fixture-dev/app"), REFERENCE, &sha);
         let probe = world
             .client(git_env())
             .git_remote_for_tests("fixture-dev/app", &remote)
             .build();
         probe.run_git(&run).unwrap();
-        host_git(&remote, &["update-ref", "refs/tags/v1", &sha]);
+        host_git(&remote, &["update-ref", REFERENCE, &sha]);
         let spec = probe
             .fx()
             .children_run()
@@ -2154,11 +2156,11 @@ fn leased_delete_receive_failures_reread_before_retrying() {
                 let out = result.as_mut().unwrap();
                 assert_eq!(out.code, Some(0));
                 if !landed {
-                    host_git(&origin, &["update-ref", "refs/tags/v1", &sha]);
+                    host_git(&origin, &["update-ref", REFERENCE, &sha]);
                 }
                 out.code = Some(1);
-                out.stdout = format!("!\t(delete):refs/tags/v1\t[remote rejected] ({reason})\n")
-                    .into_bytes();
+                out.stdout =
+                    format!("!\t(delete):{REFERENCE}\t[remote rejected] ({reason})\n").into_bytes();
             },
         );
         let gh = world
@@ -2169,7 +2171,7 @@ fn leased_delete_receive_failures_reread_before_retrying() {
         let result = gh.run_git(&run);
         if reason == "failed" {
             result.unwrap();
-            assert_eq!(host_git(&remote, &["for-each-ref", "refs/tags/v1"]), "");
+            assert_eq!(host_git(&remote, &["for-each-ref", REFERENCE]), "");
         } else {
             assert_eq!(result.unwrap_err().kind, Kind::Refused);
         }
@@ -2631,6 +2633,137 @@ fn a_clone_ignores_the_parent_s_git_environment() {
     let head = host_git(&bare, &["rev-parse", "main"]);
     assert_eq!(host_git(&dest, &["rev-parse", "HEAD"]), head);
     assert!(files(&world.dirs.grants()).is_empty());
+}
+
+/// An authenticated clone is bounded by progress, not by the run's wall budget: with a budget
+/// far shorter than the transfer it still finishes, and its native child carries the network
+/// read's inactivity window.
+#[test]
+fn an_authenticated_clone_that_keeps_receiving_outlives_the_wall_budget() {
+    let world = World::canonical("git-clone-progress");
+    let bare = bare_repo(world.path(), "app");
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &bare)
+        .build();
+    let dest = world.path().join("dest");
+    let wall = Duration::from_millis(1);
+    let out = gh
+        .run_git(&GitRun::new_clone(&common::slug("fixture-dev/app"), &dest).with_budget(wall))
+        .unwrap_or_else(|e| panic!("the clone: {}", e.why));
+    assert_eq!(out.as_.as_deref(), Some("dev"), "an authenticated read");
+    assert_eq!(
+        host_git(&dest, &["rev-parse", "HEAD"]),
+        host_git(&bare, &["rev-parse", "main"])
+    );
+    let clone = gh
+        .fx()
+        .children_run()
+        .into_iter()
+        .find(|child| child.args.iter().any(|arg| arg == "clone"))
+        .expect("the clone child");
+    let progress = clone.progress.expect("a progress-bound clone");
+    assert_eq!(progress.window, Duration::from_secs(60));
+    assert!(progress.waiting_on.starts_with("git clone fixture-dev/app"));
+}
+
+/// `--source-object-cache` lends a local repository's objects to a clone: the remote below has
+/// lost a blob its older commit needs, so a plain clone fails, while a clone that borrows the
+/// cache holding that commit receives only the newer objects and succeeds, keeps its own copy
+/// of what it borrowed (no alternates file) and passes `git fsck`.
+#[test]
+fn a_clone_takes_its_objects_from_a_local_source_cache() {
+    let world = World::canonical("git-clone-source-cache");
+    let work = world.path().join("app-work");
+    std::fs::create_dir_all(&work).expect("the work tree");
+    host_git(&work, &["init", "--quiet", "-b", "main"]);
+    std::fs::write(work.join("old"), "an object only the cache still holds\n").unwrap();
+    host_git(&work, &["add", "old"]);
+    host_git(&work, &["commit", "--quiet", "-m", "one"]);
+    let blob = host_git(&work, &["rev-parse", "HEAD:old"])
+        .trim()
+        .to_owned();
+    let bare = world.path().join("app.git");
+    let bare_text = bare.to_string_lossy().into_owned();
+    let work_text = work.to_string_lossy().into_owned();
+    host_git(
+        world.path(),
+        &[
+            "clone",
+            "--quiet",
+            "--bare",
+            "--no-hardlinks",
+            &work_text,
+            &bare_text,
+        ],
+    );
+    let cache = world.path().join("cache");
+    host_git(
+        world.path(),
+        &[
+            "clone",
+            "--quiet",
+            "--no-hardlinks",
+            &bare_text,
+            &cache.to_string_lossy(),
+        ],
+    );
+    std::fs::write(work.join("new"), "a newer object\n").unwrap();
+    host_git(&work, &["add", "new"]);
+    host_git(&work, &["commit", "--quiet", "-m", "two"]);
+    host_git(&work, &["push", "--quiet", &bare_text, "main"]);
+    std::fs::remove_file(bare.join("objects").join(&blob[..2]).join(&blob[2..]))
+        .expect("the remote loses the old blob");
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &bare)
+        .build();
+    let slug = common::slug("fixture-dev/app");
+
+    let plain = world.path().join("plain");
+    gh.run_git(&GitRun::new_clone(&slug, &plain))
+        .expect_err("the remote alone cannot send the old blob");
+
+    let dest = world.path().join("dest");
+    let out = gh
+        .run_git(&GitRun::new_clone(&slug, &dest).with_source_object_cache(&cache))
+        .unwrap_or_else(|e| panic!("the clone through the cache: {}", e.why));
+    assert_eq!(out.as_.as_deref(), Some("dev"));
+    assert_eq!(
+        host_git(&dest, &["rev-parse", "HEAD"]),
+        host_git(&bare, &["rev-parse", "main"])
+    );
+    assert_eq!(
+        host_git(&dest, &["cat-file", "-p", &blob]).trim_end(),
+        "an object only the cache still holds"
+    );
+    assert!(
+        !dest.join(".git/objects/info/alternates").exists(),
+        "the clone keeps its own copy"
+    );
+    host_git(&dest, &["fsck", "--strict", "--no-dangling"]);
+
+    let borrowing = world.path().join("borrowing");
+    host_git(
+        world.path(),
+        &[
+            "clone",
+            "--quiet",
+            "--shared",
+            &cache.to_string_lossy(),
+            &borrowing.to_string_lossy(),
+        ],
+    );
+    let refused = world.path().join("refused");
+    let error = gh
+        .run_git(&GitRun::new_clone(&slug, &refused).with_source_object_cache(&borrowing))
+        .expect_err("a cache that borrows objects elsewhere is refused");
+    assert!(
+        error.why.contains("external or rewritten object route"),
+        "{}",
+        error.why
+    );
+    assert!(!refused.exists(), "nothing was published");
 }
 
 #[test]
@@ -3315,6 +3448,10 @@ fn a_push_delete_with_a_bad_reference_runs_nothing() {
     for (reference, expect) in [
         ("refs/heads/a:b", common::MAIN_SHA),
         ("refs/tags/*", common::MAIN_SHA),
+        ("--all", common::MAIN_SHA),
+        ("refs/aterm-release/windows/request:other", common::MAIN_SHA),
+        ("refs/aterm-release/windows/../request", common::MAIN_SHA),
+        ("refs/aterm-release/windows/request\n", common::MAIN_SHA),
         ("refs/tags/v1", "main"),
     ] {
         let err = gh
@@ -4535,43 +4672,65 @@ fn every_child_runs_in_the_run_s_scratch() {
     assert!(files(&world.dirs.grants()).is_empty());
 }
 
-/// A leased delete against a local repository: the ref at the expected sha goes, and one at
-/// another sha is Conflict `guard_failed` and stays. The grant the push wrote is gone after
-/// each run.
+/// A leased delete of tags and custom refs against a local repository: the ref at the
+/// expected sha goes, and one at another sha is Conflict `guard_failed` and stays. The grant
+/// the push wrote is gone after each run.
 #[test]
 fn a_leased_delete_of_a_local_repository_is_guarded() {
     let world = World::canonical("git-lease");
     let bare = bare_repo(world.path(), "app");
-    host_git(&bare, &["tag", "v1", "main"]);
-    host_git(&bare, &["tag", "v2", "main"]);
     let sha = host_git(&bare, &["rev-parse", "main"]);
     let gh = world
         .client(git_env())
         .git_remote_for_tests("fixture-dev/app", &bare)
         .build();
     let slug = common::slug("fixture-dev/app");
-    let out = gh
-        .run_git(&GitRun::push_delete(&slug, "refs/tags/v1", &sha))
-        .unwrap_or_else(|e| panic!("the leased delete: {}", e.why));
-    assert_eq!(out.as_.as_deref(), Some("dev"));
-    assert!(out.grant.as_deref().is_some_and(|nonce| nonce.len() == 32));
-    assert_eq!(host_git(&bare, &["tag", "--list"]), "v2");
-    let err = gh
-        .run_git(&GitRun::push_delete(
-            &slug,
-            "refs/tags/v2",
-            common::MAIN_SHA,
-        ))
-        .expect_err("another sha is refused")
-        .into_data();
-    assert_eq!(err.kind, Kind::Conflict, "{}", err.why);
-    assert!(
-        matches!(&err.sub, Sub::GuardFailed { what } if what.contains("stale info")),
-        "{:?}",
-        err.sub
-    );
-    assert_eq!(host_git(&bare, &["tag", "--list"]), "v2");
-    assert!(files(&world.dirs.grants()).is_empty());
+    for (removed, retained) in [
+        ("refs/tags/v1", "refs/tags/v2"),
+        (
+            "refs/aterm-release/windows/request",
+            "refs/aterm-release/windows/retained",
+        ),
+    ] {
+        host_git(&bare, &["update-ref", removed, &sha]);
+        host_git(&bare, &["update-ref", retained, &sha]);
+        let first = gh.fx().children_run().len();
+        let out = gh
+            .run_git(&GitRun::push_delete(&slug, removed, &sha))
+            .unwrap_or_else(|e| panic!("the leased delete: {}", e.why));
+        assert_eq!(out.as_.as_deref(), Some("dev"));
+        assert!(out.grant.as_deref().is_some_and(|nonce| nonce.len() == 32));
+        assert_eq!(
+            host_git(&bare, &["for-each-ref", "--format=%(objectname)", removed]),
+            ""
+        );
+        let children = gh.fx().children_run();
+        let push = children[first..]
+            .iter()
+            .find(|child| child.args.iter().any(|arg| arg == "push"))
+            .unwrap();
+        assert!(push.args.contains(&format!(":{removed}").into()));
+        assert!(
+            push.args
+                .contains(&format!("--force-with-lease={removed}:{sha}").into())
+        );
+        let err = gh
+            .run_git(&GitRun::push_delete(&slug, retained, common::MAIN_SHA))
+            .expect_err("another sha is refused")
+            .into_data();
+        assert_eq!(
+            (err.kind, err.side_effect),
+            (Kind::Conflict, SideEffect::None),
+            "{}",
+            err.why
+        );
+        assert!(matches!(&err.sub, Sub::GuardFailed { .. }), "{:?}", err.sub);
+        assert_eq!(
+            host_git(&bare, &["for-each-ref", "--format=%(objectname)", retained]),
+            sha
+        );
+        assert!(files(&world.dirs.grants()).is_empty());
+    }
 }
 
 /// An inline token, which only its process holds, never answers git: git's credential helper
@@ -4662,7 +4821,7 @@ fn a_client_without_dirs_or_path_runs_no_git() {
     let push = gh
         .run_git(&GitRun::push_delete(
             &slug,
-            "refs/tags/v1",
+            "refs/aterm-release/windows/request",
             common::MAIN_SHA,
         ))
         .expect_err("no state directory")
@@ -4888,10 +5047,10 @@ fn anonymous_clone_retries_in_a_task_owned_stage_then_publishes() {
     assert_eq!(fx.retry_notes().len(), 1);
 }
 
-/// The automatic progress window is confined to credential-free network reads. A routed read
-/// keeps the caller's wall bound, which also remains the credential grant lifetime.
+/// A routed ref listing keeps the caller's wall bound, which also remains the credential grant
+/// lifetime; only an object transfer trades it for a progress bound.
 #[test]
-fn authenticated_git_keeps_its_wall_bound() {
+fn an_authenticated_ref_listing_keeps_its_wall_bound() {
     let world = World::canonical("git-authenticated-wall-bound");
     let fx = Arc::new(
         Fx::simulated(live_start()).with_git_answers_for_tests(vec![git_answer(

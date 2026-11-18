@@ -581,8 +581,8 @@ impl Bed {
         staging
     }
 
-    fn guard(&self) -> std::sync::Arc<std::sync::Mutex<AutoRenewGuard>> {
-        std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()))
+    fn guard(&self) -> std::sync::Arc<Watched<AutoRenewGuard>> {
+        AutoRenewGuard::default().shared()
     }
 }
 

@@ -14,6 +14,7 @@ pub(super) enum Profile {
     NativeJob,
     BootstrapFixed,
     BootstrapGraph,
+    BootstrapPreparation,
     BootstrapArchive,
 }
 impl Profile {
@@ -26,6 +27,7 @@ impl Profile {
             Self::NativeJob => b"__trust_jobroot\0",
             Self::BootstrapFixed => b"__trust_btfix\0\0\0",
             Self::BootstrapGraph => b"__trust_bgraph\0\0",
+            Self::BootstrapPreparation => b"__trust_bprep\0\0\0",
             Self::BootstrapArchive => b"__trust_barch\0\0\0",
         }
     }
@@ -38,6 +40,7 @@ impl Profile {
             Self::NativeJob => b"TRUSTNATIVEJOB01",
             Self::BootstrapFixed => b"TRUSTBTFIX000001",
             Self::BootstrapGraph => b"TRUSTBGRAPH00002",
+            Self::BootstrapPreparation => b"TRUSTBPREP000001",
             Self::BootstrapArchive => b"TRUSTBARCH000002",
         }
     }
@@ -50,6 +53,7 @@ impl Profile {
             Self::NativeJob => [3, 6, 7, 106, 48, 3],
             Self::BootstrapFixed => [1, 1, 1, 1, 0, 0],
             Self::BootstrapGraph => [3, 71, 72, 73, 74, 2],
+            Self::BootstrapPreparation => [1, 19, 3, 114, 115, 1],
             Self::BootstrapArchive => [2, 118, 119, 120, 121, 122],
         }
     }
@@ -548,6 +552,134 @@ mod tests {
         put(&mut bytes, 156, 3);
         bytes[256..320].copy_from_slice(&expected(profile));
         bytes
+    }
+
+    // Read-only inert image DATA, never executed or admitted as an SDK.
+    fn graph_and_preparation_image() -> Vec<u8> {
+        let mut bytes = image(Profile::BootstrapGraph);
+        bytes.resize(512, 0);
+        put(&mut bytes, 20, 232);
+        put(&mut bytes, 36, 232);
+        put64(&mut bytes, 64, 512);
+        put64(&mut bytes, 80, 512);
+        put(&mut bytes, 96, 2);
+        put64(&mut bytes, 136, 0x100000180);
+        put(&mut bytes, 152, 384);
+        let first = bytes[104..184].to_vec();
+        bytes[184..264].copy_from_slice(&first);
+        bytes[184..200].copy_from_slice(Profile::BootstrapPreparation.section());
+        put64(&mut bytes, 216, 0x1000001c0);
+        put(&mut bytes, 232, 448);
+        bytes[264..].fill(0);
+        bytes[384..448].copy_from_slice(&expected(Profile::BootstrapGraph));
+        bytes[448..512].copy_from_slice(&expected(Profile::BootstrapPreparation));
+        bytes
+    }
+
+    #[test]
+    fn distinct_preparation_and_graph_declarations_coexist_without_profile_reinterpretation() {
+        use std::io::Write as _;
+        let end = required_deadline(Instant::now());
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&graph_and_preparation_image()).unwrap();
+        for profile in [Profile::BootstrapGraph, Profile::BootstrapPreparation] {
+            require(&file, profile, &expected(profile), end).unwrap();
+        }
+        assert!(
+            require(
+                &file,
+                Profile::BootstrapGraph,
+                &expected(Profile::BootstrapPreparation),
+                end
+            )
+            .is_err()
+        );
+        assert!(
+            require(
+                &file,
+                Profile::BootstrapPreparation,
+                &expected(Profile::BootstrapGraph),
+                end
+            )
+            .is_err()
+        );
+        for old in [
+            Profile::Resolver,
+            Profile::Workload,
+            Profile::BootstrapFixed,
+            Profile::BootstrapGraph,
+        ] {
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&image(old)).unwrap();
+            assert!(
+                require(
+                    &file,
+                    Profile::BootstrapPreparation,
+                    &expected(Profile::BootstrapPreparation),
+                    end
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn preparation_declaration_refuses_old_byte_fields_mutation_and_expired_original_end() {
+        use std::io::Write as _;
+        let end = required_deadline(Instant::now());
+        for index in 0..64 {
+            let mut bytes = graph_and_preparation_image();
+            bytes[448 + index] ^= 1;
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&bytes).unwrap();
+            require(
+                &file,
+                Profile::BootstrapGraph,
+                &expected(Profile::BootstrapGraph),
+                end,
+            )
+            .unwrap();
+            assert!(
+                require(
+                    &file,
+                    Profile::BootstrapPreparation,
+                    &expected(Profile::BootstrapPreparation),
+                    end
+                )
+                .is_err(),
+                "byte {index}"
+            );
+        }
+        let mut old = expected(Profile::BootstrapPreparation);
+        old[16..].fill(0);
+        old[16] = 1;
+        old[17] = 19;
+        old[18] = 3;
+        let mut bytes = graph_and_preparation_image();
+        bytes[448..512].copy_from_slice(&old);
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&bytes).unwrap();
+        assert!(require(&file, Profile::BootstrapPreparation, &old, end).is_err());
+        assert!(
+            require(
+                &file,
+                Profile::BootstrapPreparation,
+                &expected(Profile::BootstrapPreparation),
+                end
+            )
+            .is_err()
+        );
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&graph_and_preparation_image()).unwrap();
+        assert!(
+            require(
+                &file,
+                Profile::BootstrapPreparation,
+                &expected(Profile::BootstrapPreparation),
+                Instant::now()
+            )
+            .is_err()
+        );
     }
     fn check(bytes: &[u8]) -> io::Result<()> {
         use std::io::Write as _;

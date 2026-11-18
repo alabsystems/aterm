@@ -73,7 +73,7 @@ fn records(desk: &Desk) -> Vec<Option<Vec<u8>>> {
 }
 
 /// [`REDISCOVER_EVERY`] passes: for the source's last attempt and the last failed sync's alike.
-fn expire(rediscovery: &Mutex<Rediscovery>) {
+fn expire(rediscovery: &Watched<Rediscovery>) {
     let mut held = rediscovery.lock().unwrap();
     held.key_attempt.as_mut().unwrap().at = Instant::now() - REDISCOVER_EVERY;
     if let Some(failed) = held.failed.as_mut() {
@@ -89,8 +89,11 @@ fn a_missing_configured_source_reports_failure_and_keeps_the_roster() {
         let (desk, source) = local_source_desk();
         let before = records(&desk);
         let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
-        let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let (cooldown, rediscovery) = (
+            Watched::new("accounts_sync/sync_cooldown", None),
+            Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
+        );
+        let guard = AutoRenewGuard::default().shared();
         let mut fx = upkeep_effects(&fetch_source_text, &spawn, &cooldown, &rediscovery, &guard);
         let logged = Arc::new(Mutex::new(Vec::new()));
         let into = Arc::clone(&logged);
@@ -102,7 +105,7 @@ fn a_missing_configured_source_reports_failure_and_keeps_the_roster() {
             upkeep_claude(
                 &desk.home,
                 &desk.state,
-                (&desk.roster(), NOW, UpkeepStep::Sync),
+                (&desk.roster(), trace::Now::at(NOW), UpkeepStep::Sync),
                 &fx,
             );
             let log = logged.lock().unwrap();
@@ -150,8 +153,11 @@ fn a_transient_refresh_failure_retries_with_unchanged_source_metadata() {
         }
     };
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
-    let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let (cooldown, rediscovery) = (
+        Watched::new("accounts_sync/sync_cooldown", None),
+        Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
+    );
+    let guard = AutoRenewGuard::default().shared();
     let fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
     let pass = |now| resync_with(&desk.home, &desk.state, (&desk.roster(), now, false), &fx);
     assert!(pass(NOW).failed.is_some());
@@ -174,8 +180,11 @@ fn a_transient_refresh_failure_retries_with_unchanged_source_metadata() {
 fn same_stamp_edits_and_repairs_are_eventually_read() {
     let (desk, source) = local_source_desk();
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
-    let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let (cooldown, rediscovery) = (
+        Watched::new("accounts_sync/sync_cooldown", None),
+        Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
+    );
+    let guard = AutoRenewGuard::default().shared();
     let fx = upkeep_effects(&fetch_source_text, &spawn, &cooldown, &rediscovery, &guard);
     let pass = || resync_with(&desk.home, &desk.state, (&desk.roster(), NOW, false), &fx);
     assert!(pass().synced);
@@ -200,7 +209,7 @@ fn same_stamp_edits_and_repairs_are_eventually_read() {
 fn local_observations_track_path_and_length_without_polling_urls() {
     let (desk, source) = local_source_desk();
     let config = desk.config.join("aterm.toml");
-    let rediscovery = Mutex::new(Rediscovery::default());
+    let rediscovery = Watched::new("accounts_sync/rediscovery", Rediscovery::default());
     let due = || key_file_changed(&desk.home, &desk.state, &config, NOW, &rediscovery, None);
     assert!(due());
     assert!(!due());

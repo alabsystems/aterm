@@ -3493,16 +3493,38 @@ pub(crate) fn emit_summary(
 }
 
 /// The accounts' upkeep's counts in this process since it started
-/// (`aterm_agent::harness::accounts_upkeep_counts::counts`), and, on unix, what its receipt
-/// admissions read of the lab registry and the strict reads of it that were no admission
-/// (`aterm_db::alab::admission_counts`): each only rises, so no `reset` clears one and a reader
-/// subtracts two readings.
+/// (`aterm_agent::harness::accounts_upkeep_counts::counts`), its keeper's duty verdicts among
+/// them (`accounts_duty_*`: each duty run, skipped, kept and poisoned), and, on unix, what its
+/// receipt admissions read of the lab registry and the strict reads of it that were no
+/// admission (`aterm_db::alab::admission_counts`): each only rises, so no `reset` clears one and
+/// a reader subtracts two readings.
 fn emit_accounts_upkeep(s: &mut dyn wire::FieldSink) {
     let counts = aterm_agent::harness::accounts_upkeep_counts::counts();
     s.count("accounts_upkeep_passes", counts.passes);
+    s.count("accounts_upkeep_passes_keeper", counts.passes_keeper);
+    s.count("accounts_upkeep_passes_session", counts.passes_session);
+    s.count("accounts_upkeep_passes_moved", counts.passes_moved);
+    let keeper = crate::accounts_keeper::counts();
+    s.count("accounts_keeper_wakes_file", keeper.file);
+    s.count("accounts_keeper_wakes_bell", keeper.bell);
+    s.count("accounts_keeper_wakes_deadline", keeper.deadline);
+    s.count("accounts_keeper_wakes_wall", keeper.wall);
+    s.count("accounts_keeper_wakes_asked", keeper.asked);
+    s.count("accounts_keeper_wakes_forced", keeper.forced);
+    s.count("accounts_keeper_wakes_unwatched", keeper.unwatched);
+    s.count("accounts_keeper_unmoved", keeper.unmoved);
+    s.count("accounts_trace_opened", aterm_uds::trace::fs::opened());
+    s.count(
+        "accounts_store_locks",
+        aterm_agent::harness::accounts_upkeep_counts::store_locks(),
+    );
     s.count("accounts_pool_syncs", counts.pool_syncs);
     s.count("accounts_pool_syncs_guarded", counts.pool_syncs_guarded);
     s.count("accounts_receipt_admissions", counts.receipt_admissions);
+    s.count("accounts_duty_runs", counts.duty_runs);
+    s.count("accounts_duty_skips", counts.duty_skips);
+    s.count("accounts_duty_kept", counts.duty_kept);
+    s.count("accounts_duty_poisoned", counts.duty_poisoned);
     #[cfg(unix)]
     {
         let read = aterm_db::alab::admission_counts();

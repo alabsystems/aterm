@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Every value one cell held, and what one write replaced and had not seen
-//! (docs/DESIGN-tables-app-2026-11-14.md §4 item 4, tracker LT-34).
+//! Every value one cell held, and what one write replaced, had not seen and what has written its
+//! cells since (docs/DESIGN-tables-app-2026-11-14.md §4 item 4 and §3.3, tracker LT-34 and LT-25,
+//! whose History shows a selected record so); and every write to a few
+//! typed cells with both, read at once (tracker FL-258: this Mac's name's History and Undo read
+//! its registry row's `label` and `nickname` so).
 //!
-//! Both reads are one store read, one projection ([`View::of`] what `Resolved::read` resolves:
+//! Each read is one store read, one projection ([`View::of`] what `Resolved::read` resolves:
 //! what stands now, the quota, and the records a roll archived) and one pass over the log's
 //! eligible records in history order, looking only at the changes to the cells asked for.
 //!
@@ -16,7 +19,8 @@
 //! **Whether one write saw another** is the signed graph's answer (`Log::observes`), never a
 //! clock's. Two concurrent writes tie on the derived clock and are ordered by digest, so neither
 //! is "earlier": a write's unseen writes are those with which it is mutually unobserved, and each
-//! side of a conflict names the other. What a write replaced is the candidates the cell held in
+//! side of a conflict names the other; what has written a cell since a write is the writes that
+//! observed it. What a write replaced is the candidates the cell held in
 //! its causal past: the writes it observed that no other write it observed had observed. For an
 //! owned row the same rule names its writer's previous row; which row stands there is by the
 //! row's counter (`typed::owned::read_owned`).
@@ -73,7 +77,7 @@
 //! it). An archived row is in no unseen list: it is its key's own Mac's write of an earlier
 //! generation, which that Mac's later writes followed.
 
-use super::{Handle, Inert, Resolved, View, decode};
+use super::{EntryKind, Handle, Inert, Mac, Macs, Resolved, View, decode};
 use crate::{
     Error, Result,
     alab::{self, registry},
@@ -82,6 +86,7 @@ use crate::{
         application,
         log::{Hlc, Log, Operation},
     },
+    table::{Scope, Session, store::Store},
     typed::{
         self, Kind, Table,
         cell::{self, CellKey, CellValue},
@@ -94,6 +99,7 @@ use std::{
     borrow::Cow,
     cell::OnceCell,
     collections::{BTreeMap, BTreeSet},
+    time::Instant,
 };
 
 /// Where a listed write's record is, and so whose its writer and clocks are.
@@ -184,9 +190,72 @@ pub struct Wrote {
     /// The writes neither it observed nor that observed it: the values that stand, or stood,
     /// beside its own. In history order. A row a roll archived is never one.
     pub unseen: Vec<Held>,
+    /// The writes to the cell that observed it: what has written there since, whether or not it
+    /// stands now. In history order. Like `replaced` and `unseen`, only writes that project
+    /// count, and a write that does not project has none.
+    pub since: Vec<Held>,
+}
+
+/// One write to the typed cells [`Handle::writes`] asked for: the operation once, its writer
+/// named as history names it, its kind, and each of those cells it wrote.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Written {
+    /// The operation that wrote the cells.
+    pub operation: Digest,
+    pub source: Source,
+    pub actor: Actor,
+    /// The writer's Commons machine, from the binding in the roster the record names.
+    pub machine: Option<[u8; 16]>,
+    /// The Mac history names the writer by ([`Macs::name`]).
+    pub mac: Mac,
+    /// The signed writer clock claim.
+    pub authored_ms: u64,
+    /// The causal clock its log derived for it.
+    pub hlc: Hlc,
+    /// The operation it reverted, where it is a revert.
+    pub reverts: Option<Digest>,
+    /// What kind of write it is ([`EntryKind::of`]) over every change it made: a record of this
+    /// log by its own changes; a write a roll carried by the changes its history entry kept, or,
+    /// where no entry names it, by the value the roll restated.
+    pub kind: EntryKind,
+    /// Each cell asked for that it wrote, in the order asked: what it wrote there, what that
+    /// replaced and what it had not seen ([`Wrote`]). A write of an earlier generation replaced
+    /// and missed nothing here: the writes it saw are of another log.
+    pub cells: Vec<Wrote>,
 }
 
 impl Handle {
+    /// Every write to the cells `keys` of the typed collection `collection`, each operation once
+    /// with each of those cells it wrote ([`Written`]), in history order as
+    /// [`Self::cell_values`] lists one cell's: what [`Self::cell_values`] and [`Self::wrote`]
+    /// answer for those cells, read in one observation of the store that gives up at `read_by`,
+    /// so the values, what stands and the Macs that wrote them are of one moment.
+    ///
+    /// # Errors
+    /// As [`Self::view_until`]: the store is busy past `read_by`, among others; `collection` is
+    /// no typed collection of this table; incomplete causal clocks or a logical counter overflow.
+    pub fn writes(
+        &self,
+        collection: &str,
+        keys: &[&str],
+        read_by: Instant,
+    ) -> Result<Vec<Written>> {
+        let table = self.compiled.table;
+        super::reopened(read_by, || {
+            application::observe_store_within(
+                &self.paths,
+                self.descriptor(),
+                read_by,
+                &|| crate::admission::deadline().min(read_by),
+                |session, store, scope| {
+                    over(table, session, store, scope, &|reader| {
+                        reader.writes(collection, keys)
+                    })
+                },
+            )
+        })
+    }
+
     /// Every value the cell `key` of `collection` held, each with the write that put it there:
     /// the writes an earlier generation's roll carried first, by generation, then this log's in
     /// history order (causal clock, then digest), each operation once. A secret is listed with
@@ -212,26 +281,47 @@ impl Handle {
         self.reading(|reader| reader.wrote(&operation))
     }
 
+    /// [`Self::wrote`], with the join that names each listed write's Mac ([`Macs`]) from the same
+    /// read, so a reader that says who wrote each value names them as history does.
+    ///
+    /// # Errors
+    /// As [`Self::wrote`].
+    pub fn wrote_named(&self, operation: Digest) -> Result<(Vec<Wrote>, Macs)> {
+        self.reading(|reader| Ok((reader.wrote(&operation)?, Macs::of(reader.view))))
+    }
+
     fn reading<T>(&self, read: impl Fn(&Reader<'_>) -> Result<T>) -> Result<T> {
         let table = self.compiled.table;
         super::reopened(crate::admission::deadline(), || {
             application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
-                let log = Log::read_with(session, store, scope, decode)?;
-                let resolved = Resolved::read(table, session, &log)?;
-                let view = View::of(table, &log, &resolved);
-                let resolve = owned::commons::historical(session);
-                read(&Reader {
-                    table,
-                    log: &log,
-                    carried: alab::history::carried(&view, &resolve, None),
-                    view: &view,
-                    resolve: &resolve,
-                    archive: &|| super::archived_records(&resolved, &within(&view)),
-                    archived: OnceCell::new(),
-                })
+                over(table, session, store, scope, &read)
             })
         })
     }
+}
+
+/// `read` over one observation of `table`'s store: its log, the head's view and the history its
+/// rolls carried.
+fn over<T>(
+    table: &'static Table,
+    session: &Session<'_>,
+    store: &Store,
+    scope: Scope,
+    read: &impl Fn(&Reader<'_>) -> Result<T>,
+) -> Result<T> {
+    let log = Log::read_with(session, store, scope, decode)?;
+    let resolved = Resolved::read(table, session, &log)?;
+    let view = View::of(table, &log, &resolved);
+    let resolve = owned::commons::historical(session);
+    read(&Reader {
+        table,
+        log: &log,
+        carried: alab::history::carried(&view, &resolve, None),
+        view: &view,
+        resolve: &resolve,
+        archive: &|| super::archived_records(&resolved, &within(&view)),
+        archived: OnceCell::new(),
+    })
 }
 
 /// The operations that stand at each cell asked for.
@@ -415,7 +505,7 @@ fn restored(value: &Value) -> &Value {
 
 /// A listed write's place: an earlier generation's first, by generation, then this log's order,
 /// a restatement's candidates at their record's place.
-fn place(held: &Held) -> (u8, u32, Hlc, Digest, Digest) {
+const fn place(held: &Held) -> (u8, u32, Hlc, Digest, Digest) {
     match held.source {
         Source::Carried { generation, .. } | Source::Stated { generation, .. } => {
             (0, generation, held.hlc, held.operation, held.operation)
@@ -423,6 +513,20 @@ fn place(held: &Held) -> (u8, u32, Hlc, Digest, Digest) {
         Source::Restated { by } => (1, 0, held.hlc, by, held.operation),
         Source::Log => (1, 0, held.hlc, held.operation, held.operation),
     }
+}
+
+/// The kind of the write a roll's carried history `entry` states, by the changes it kept.
+fn carried_kind(table: &Table, entry: &alab::history::Entry) -> EntryKind {
+    let changes: Vec<Change> = entry
+        .changes
+        .iter()
+        .map(|written| Change {
+            collection: written.collection.clone(),
+            key: written.key.clone(),
+            value: written.value.clone(),
+        })
+        .collect();
+    EntryKind::of(table, entry.reverts.is_some(), &changes)
 }
 
 /// `records`' writes, each operation once, without those `own` names.
@@ -612,6 +716,29 @@ impl Reader<'_> {
             }
         }
         tops
+    }
+
+    /// The counting records of one cell's `records` beside `operation`'s write there, in history
+    /// order: those it had not seen, which neither it nor they observed, and those that observed
+    /// it, written there since.
+    fn beside<'r>(
+        &self,
+        operation: &Digest,
+        records: &'r [Record],
+    ) -> (Vec<&'r Record>, Vec<&'r Record>) {
+        let others = records
+            .iter()
+            .filter(|other| other.counts() && other.id != *operation);
+        let unseen = others
+            .clone()
+            .filter(|other| {
+                !self.log.observes(operation, &other.id) && !self.log.observes(&other.id, operation)
+            })
+            .collect();
+        let since = others
+            .filter(|other| self.log.observes(&other.id, operation))
+            .collect();
+        (unseen, since)
     }
 
     /// Marks as standing the writes of `records`, one typed cell's, that a claim's re-entry
@@ -839,6 +966,146 @@ impl Reader<'_> {
         Ok(out)
     }
 
+    /// [`Handle::writes`]: each write to the typed cells `keys` of `collection`, once, in
+    /// history order.
+    fn writes(&self, collection: &str, keys: &[&str]) -> Result<Vec<Written>> {
+        let typed = self
+            .table
+            .collection(collection)
+            .is_some_and(|declared| declared.kind == Kind::Cells);
+        if !typed {
+            return Err(Error::new(&format!(
+                "{} is no typed collection of this table",
+                keys::safe_key(collection)
+            )));
+        }
+        let wanted: Wanted<'_> = keys
+            .iter()
+            .map(|key| ((collection, *key), self.standing(collection, key)))
+            .collect();
+        let found = self.records(&wanted)?;
+        let macs = Macs::of(self.view);
+        let mut writes: BTreeMap<Digest, (Held, EntryKind, Vec<Wrote>)> = BTreeMap::new();
+        let mut cell = |held: &Held, kind: EntryKind, wrote: Wrote| {
+            writes
+                .entry(held.operation)
+                .or_insert_with(|| (held.clone(), kind, Vec::new()))
+                .2
+                .push(wrote);
+        };
+        let at = |key: &str, wrote: Vec<Held>, replaced, unseen, since| Wrote {
+            collection: keys::safe_key(collection).to_owned(),
+            key: keys::safe_key(key).to_owned(),
+            wrote,
+            replaced,
+            unseen,
+            since,
+        };
+        // The kind of a write only a value names: one change of it at the cell.
+        let valued = |key: &str, value: Option<&Value>| {
+            EntryKind::of(
+                self.table,
+                false,
+                &[Change {
+                    collection: collection.to_owned(),
+                    key: key.to_owned(),
+                    value: value.cloned(),
+                }],
+            )
+        };
+        for key in keys {
+            let records = found
+                .get(&(collection.to_owned(), (*key).to_owned()))
+                .map_or(&[][..], Vec::as_slice);
+            let mut seen = BTreeSet::new();
+            for record in records {
+                let own: BTreeSet<Digest> = record.held.iter().map(|held| held.operation).collect();
+                let logged = record.held.iter().any(|held| held.source == Source::Log);
+                if !logged {
+                    // A roll's restatement: each candidate it lists is a write of an earlier
+                    // generation, listed under its own operation.
+                    for held in &record.held {
+                        if seen.insert(held.operation) {
+                            let kind = self.carried.entries.get(&held.operation).map_or_else(
+                                || valued(key, held.value.as_ref()),
+                                |entry| carried_kind(self.table, entry),
+                            );
+                            cell(
+                                held,
+                                kind,
+                                at(key, vec![held.clone()], Vec::new(), Vec::new(), Vec::new()),
+                            );
+                        }
+                    }
+                    continue;
+                }
+                seen.extend(own.iter().copied());
+                let (mut replaced, mut unseen, mut since) = (Vec::new(), Vec::new(), Vec::new());
+                if record.counts() {
+                    replaced = self.tops(&record.id, records);
+                    replaced.reverse();
+                    (unseen, since) = self.beside(&record.id, records);
+                }
+                let kind = self.log.eligible_record(&record.id).map_or_else(
+                    || valued(key, None),
+                    |(operation, command)| {
+                        EntryKind::of(
+                            self.table,
+                            operation.reverts.is_some(),
+                            command.changes().unwrap_or_default(),
+                        )
+                    },
+                );
+                let first = &record.held[0];
+                cell(
+                    first,
+                    kind,
+                    at(
+                        key,
+                        record.held.clone(),
+                        listed(&replaced, &own),
+                        listed(&unseen, &own),
+                        listed(&since, &own),
+                    ),
+                );
+            }
+            let standing = &wanted[&(collection, *key)];
+            for entry in self.carried.entries.values() {
+                if !seen.contains(&entry.operation)
+                    && let Some(held) = self.stated(entry, collection, key, standing)
+                {
+                    seen.insert(held.operation);
+                    let kind = carried_kind(self.table, entry);
+                    cell(
+                        &held,
+                        kind,
+                        at(key, vec![held.clone()], Vec::new(), Vec::new(), Vec::new()),
+                    );
+                }
+            }
+        }
+        let mut out: Vec<(Held, Written)> = writes
+            .into_values()
+            .map(|(held, kind, cells)| {
+                let written = Written {
+                    operation: held.operation,
+                    source: held.source,
+                    actor: held.actor,
+                    machine: held.machine,
+                    mac: macs.name(&held.actor, held.machine.as_ref()),
+                    authored_ms: held.authored_ms,
+                    hlc: held.hlc,
+                    reverts: held.reverts,
+                    kind,
+                    cells,
+                };
+                (held, written)
+            })
+            .collect();
+        out.sort_by_key(|(held, _)| place(held));
+        Ok(out.into_iter().map(|(_, written)| written).collect())
+    }
+
     fn wrote(&self, operation: &Digest) -> Result<Vec<Wrote>> {
         let (_, command) = self.log.eligible_record(operation).ok_or_else(|| {
             Error::new(
@@ -874,19 +1141,11 @@ impl Reader<'_> {
             };
             let cell = (collection.as_str(), key.as_str());
             let own: BTreeSet<Digest> = write.held.iter().map(|held| held.operation).collect();
-            let (mut replaced, mut unseen) = (Vec::new(), Vec::new());
+            let (mut replaced, mut unseen, mut since) = (Vec::new(), Vec::new(), Vec::new());
             if write.counts() {
                 replaced = self.tops(operation, records);
                 replaced.reverse();
-                unseen = records
-                    .iter()
-                    .filter(|other| {
-                        other.counts()
-                            && other.id != *operation
-                            && !self.log.observes(operation, &other.id)
-                            && !self.log.observes(&other.id, operation)
-                    })
-                    .collect();
+                (unseen, since) = self.beside(operation, records);
             }
             let mut replaced = listed(&replaced, &own);
             // No row of this log at the key before it: it replaced the archived row the key
@@ -919,6 +1178,7 @@ impl Reader<'_> {
                 wrote: write.held.clone(),
                 replaced,
                 unseen: listed(&unseen, &own),
+                since: listed(&since, &own),
                 collection: keys::safe_key(collection).to_owned(),
                 key: keys::safe_key(key).to_owned(),
             });

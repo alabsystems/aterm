@@ -1105,18 +1105,18 @@ const fn footer_serves_usage(program: aterm_phase::Program) -> bool {
 /// out_src= tok_in= tok_out= tok_for_ms= turns= tools=`), every one `-` on a row that is no
 /// agent's and each `-` where it is unread, never `0`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Progress {
-    turn: Option<bool>,
-    turn_ms: Option<u64>,
-    turn_end_ms: Option<u64>,
-    step_ms: Option<u64>,
-    out_ms: Option<u64>,
-    out_src: Option<&'static str>,
-    tok_in: Option<u64>,
-    tok_out: Option<u64>,
-    tok_for_ms: Option<u64>,
-    turns: Option<u32>,
-    tools: Option<u32>,
+pub(crate) struct Progress {
+    pub(crate) turn: Option<bool>,
+    pub(crate) turn_ms: Option<u64>,
+    pub(crate) turn_end_ms: Option<u64>,
+    pub(crate) step_ms: Option<u64>,
+    pub(crate) out_ms: Option<u64>,
+    pub(crate) out_src: Option<&'static str>,
+    pub(crate) tok_in: Option<u64>,
+    pub(crate) tok_out: Option<u64>,
+    pub(crate) tok_for_ms: Option<u64>,
+    pub(crate) turns: Option<u32>,
+    pub(crate) tools: Option<u32>,
 }
 
 impl Progress {
@@ -1193,8 +1193,9 @@ impl Progress {
         }
     }
 
-    /// The row's fields, in wire order.
-    fn fields(&self) -> String {
+    /// The row's fields, in wire order: what the fleet's mixed-version wire test sends as this
+    /// build's row (`fleet_glance_tests`).
+    pub(crate) fn fields(&self) -> String {
         let count = |n: Option<u32>| number_token(n.map(u64::from));
         format!(
             "turn={} turn_ms={} turn_end_ms={} step_ms={} out_ms={} out_src={} tok_in={} \

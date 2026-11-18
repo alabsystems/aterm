@@ -984,9 +984,62 @@ fn ensure_local_node_key_in_log_binds_founder_and_retires_rotated_key() {
         &node_4,
         Some(&keys_after_3)
     ));
-    let keys_after_4 = local_log.keys().expect("keys after fenced rotation");
+    // Force the real cold/settled path without sleeping or evicting another test's cache.
+    // Publishing a derived records.head here used to move the authority window's directory
+    // ctime and make the same reader retain node_3's stale verdict under parallel load.
+    let head = paths.records_file().with_extension("head");
+    let before_head = std::fs::read(&head).ok();
+    let keys_after_4 = aterm_secrets::client::test_with_cold_records_cache(|| {
+        aterm_secrets::client::test_as_if_later(
+            2 * aterm_secrets::client::test_settled_after(),
+            || local_log.keys(),
+        )
+    })
+    .expect("keys after a cold, settled fenced rotation");
+    assert_eq!(std::fs::read(&head).ok(), before_head);
     assert!(keys_after_4.admits(&node_4.key()));
     assert!(keys_after_4.holds_out(&node_3.key()));
+
+    // A nested custody query opens its own store. Give it an authenticated head whose
+    // bytes still match, but whose stamp needs refreshing; the outer store's cache hit
+    // must not hide a restamp by that independently cold path.
+    let publishing = aterm_secrets::client::test_with_cold_records_cache(|| {
+        aterm_secrets::client::test_as_if_later(
+            2 * aterm_secrets::client::test_settled_after(),
+            || aterm_secrets::client::load_records(&paths),
+        )
+    })
+    .unwrap();
+    let identity = aterm_secrets::client::machine_identity(&paths).unwrap();
+    let _ = publishing
+        .log()
+        .unwrap()
+        .open_audience_entries(&identity)
+        .unwrap();
+    let before_head = std::fs::read(&head).expect("ordinary resolve publishes the head");
+    let data = paths.records_data_file().unwrap();
+    let bytes = std::fs::read(&data).unwrap();
+    aterm_secrets::fsx::write_atomic(&data, &bytes, 0o600).unwrap();
+    let window = StateRead::of(&paths).unwrap();
+    let roster = aterm_secrets::client::test_with_cold_records_cache(|| {
+        aterm_secrets::client::test_as_if_later(
+            2 * aterm_secrets::client::test_settled_after(),
+            || aterm_secrets::client::local_swarm_roster_for_log(&paths, publishing.log().unwrap()),
+        )
+    })
+    .unwrap()
+    .unwrap();
+    assert!(
+        window.stands(&paths),
+        "nested head reuse must preserve the authority window"
+    );
+    assert_eq!(std::fs::read(&head).unwrap(), before_head);
+    assert_eq!(
+        roster
+            .member_by_label_or_alias("m22")
+            .and_then(|member| member.node_key.as_deref()),
+        Some(node_4.key().hex().as_str()),
+    );
     std::fs::rename(
         paths.records_data_file().unwrap(),
         paths.records_file().join("saved-current"),

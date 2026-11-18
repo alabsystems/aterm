@@ -428,6 +428,54 @@ fn sandbox_only_allows_scratch_and_resource_bookkeeping_writes() {
     }
 }
 
+#[test]
+fn a_pooled_sandbox_opens_only_its_held_fifo_and_cannot_write_the_adjacent_file() {
+    let env = EnvSnapshot::capture();
+    let rig = installed_rig(&env);
+    let outside = aterm_tempfile::tempdir().unwrap();
+    let pool = aterm_capacity::Jobserver::new(&outside.path().join("jobs"), 2).unwrap();
+    let adjacent = outside.path().join("protected");
+    fs::write(&adjacent, b"unchanged").unwrap();
+    crate::compile_width::run(Some(&pool), Some(2), None, &|| false, || {
+        let mut fifo = rig.sandbox().unwrap();
+        fifo.args(["/bin/sh", "-c", "exec 3<> \"$1\"", "fifo"])
+            .arg(pool.path());
+        let opened =
+            aterm_uds::deadline::output_within(&mut fifo, Duration::from_secs(60)).unwrap();
+        assert!(
+            opened.status.success(),
+            "{}",
+            String::from_utf8_lossy(&opened.stderr)
+        );
+        let mut ordinary = rig.sandbox().unwrap();
+        ordinary
+            .args(["/bin/sh", "-c", "printf changed > \"$1\"", "ordinary"])
+            .arg(&adjacent);
+        let denied =
+            aterm_uds::deadline::output_within(&mut ordinary, Duration::from_secs(60)).unwrap();
+        assert!(!denied.status.success());
+        assert_eq!(fs::read(&adjacent).unwrap(), b"unchanged");
+    })
+    .unwrap();
+    let available: Vec<_> = std::iter::from_fn(|| pool.try_acquire().unwrap()).collect();
+    assert_eq!(available.len(), 2);
+}
+
+#[test]
+fn a_real_candidate_first_build_inherits_the_charged_pool_inside_its_sandbox() {
+    let helper = aterm_tempfile::bin_exe("atpkg");
+    let outside = aterm_tempfile::tempdir().unwrap();
+    let pool = aterm_capacity::Jobserver::new(&outside.path().join("jobs"), 2).unwrap();
+    crate::compile_width::run(Some(&pool), Some(2), None, &|| false, || {
+        for (outcome, label) in candidate_rows(&helper) {
+            assert_eq!(outcome, crate::ladder::Outcome::Ok, "{label}");
+        }
+    })
+    .unwrap();
+    let available: Vec<_> = std::iter::from_fn(|| pool.try_acquire().unwrap()).collect();
+    assert_eq!(available.len(), 2);
+}
+
 /// The public tags [`public_tags`] reads: `held` the candidate holds, `beside` fetched outside its
 /// ancestry, oldest first.
 fn tags(held: &[&str], beside: &[&str]) -> Vec<PublicTag> {

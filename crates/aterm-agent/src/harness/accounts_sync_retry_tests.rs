@@ -3,16 +3,12 @@
 
 use super::*;
 use aterm_spec::interp::State;
-use std::sync::Mutex;
 
 #[test]
 fn changed_source_during_a_real_sync_retries_without_a_long_cooldown() {
     use super::login_tests::{Desk, NOW, upkeep_effects};
     use crate::harness::alab_roster::{SourceSnapshot, TestSourceOverride};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let _source = TestSourceOverride::new(SourceSnapshot::Absent);
     let desk = Desk::new("m27");
     desk.default_login("m27@example.test");
@@ -41,9 +37,9 @@ fn changed_source_during_a_real_sync_retries_without_a_long_cooldown() {
         }
         fetch_source_text(env, source)
     };
-    let rediscovery = Mutex::new(Rediscovery::default());
-    let cooldown = Mutex::new(None);
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let rediscovery = Watched::new("accounts_sync/rediscovery", Rediscovery::default());
+    let cooldown = Watched::new("accounts_sync/sync_cooldown", None);
+    let guard = AutoRenewGuard::default().shared();
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
     let fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
     let first = resync_with(&desk.home, &desk.state, (&desk.roster(), NOW, false), &fx);
@@ -87,13 +83,16 @@ pub(crate) fn retry_transition(state: &State, action: &str) -> State {
                 at,
             };
             let login = |at| ("m1@example.test".to_owned(), at);
-            let rediscovery = Mutex::new(Rediscovery {
-                read_at: Some(selected),
-                synced_for: Some(login(selected)),
-                key_attempt: Some(key(selected)),
-                ..Rediscovery::default()
-            });
-            let held_cooldown = Mutex::new(Some(selected));
+            let rediscovery = Watched::new(
+                "accounts_sync/rediscovery",
+                Rediscovery {
+                    read_at: Some(selected),
+                    synced_for: Some(login(selected)),
+                    key_attempt: Some(key(selected)),
+                    ..Rediscovery::default()
+                },
+            );
+            let held_cooldown = Watched::new("accounts_sync/sync_cooldown", Some(selected));
             let mut scheduling = SyncScheduleClaim::new(&rediscovery, None);
             scheduling.changes = vec![
                 SyncScheduleChange::Read(None, Some(own)),
@@ -114,12 +113,10 @@ pub(crate) fn retry_transition(state: &State, action: &str) -> State {
             cooldown.outcome(&result);
             let mut failed = None;
             note_sync_result(&mut failed, [1; 32], result.as_ref().map(|_| ()));
-            let provider = result.map(|()| CliSync::NoSourceDefaultLogin(Box::default()));
             next.insert(
                 "held",
                 i64::from(failed.is_some_and(|failed| failed.holds_back(&[1; 32]))),
             );
-            next.insert("default_held", i64::from(default_sync_settled(&provider)));
             drop(scheduling);
             drop(cooldown);
             let held = rediscovery.into_inner().unwrap();
@@ -164,7 +161,6 @@ fn retry_failures_preserve_scheduling_ownership_and_do_not_hold_inputs() {
     }
     for (key, field, value, invariant) in [
         ((2, 0), "held", 1, "RetryNotHeld"),
-        ((3, 0), "default_held", 1, "RetryNotHeld"),
         ((1, 0), "held", 0, "RejectedHeld"),
         ((4, 0), "key", 1, "OwnRetryRestored"),
         ((3, 1), "read", 0, "NewerClaimRetained"),

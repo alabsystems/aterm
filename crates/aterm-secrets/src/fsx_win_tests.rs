@@ -655,7 +655,7 @@ fn a_private_dir_is_made_owner_only() {
     let root = scratch();
     let dir = root.path().join("a").join("secrets");
     ensure_private_dir(&dir).expect("made");
-    super::private_dir_settled(&dir).expect("settled");
+    crate::fsx::private_dir_settled(&dir).expect("settled");
     let (real, link) = (root.path().join("real"), root.path().join("link"));
     std::fs::create_dir(&real).expect("dir");
     junction(&link, &real);

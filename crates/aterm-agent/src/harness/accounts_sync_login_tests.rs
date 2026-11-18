@@ -673,8 +673,17 @@ fn a_default_row_the_roster_already_named_is_healed_by_one_check() {
     )
     .expect("the check ran");
     assert!(healed, "{line}");
+    // The line names each row by its account, never by its label: the default row, and the row
+    // the default login held before, which the roster still lists.
     assert!(
-        line.contains("the default login checked signed in"),
+        line.starts_with(
+            "account claude proton.m2@example.test: the default login checked signed in"
+        ) && line.ends_with("with the sessions on record under claude fb@example.test"),
+        "{line}"
+    );
+    assert_eq!(
+        crate::harness::account_names::tests::labels_said(&line, &["m2", "m2-2"]),
+        Vec::<&str>::new(),
         "{line}"
     );
     let (state, _) = store.load(NOW + 100).unwrap();
@@ -702,6 +711,35 @@ fn a_default_row_the_roster_already_named_is_healed_by_one_check() {
         ),
         None,
         "once healed nothing is due"
+    );
+}
+
+/// [`a_default_row_the_roster_already_named_is_healed_by_one_check`] once the roster no longer lists
+/// the row the default login held before (m2): the healed line names the default row by its
+/// account and that row, which has no account here to name it by, by its label marked `(no
+/// longer listed)`.
+#[test]
+fn a_heal_marks_the_row_the_default_login_held_before_once_it_is_gone() {
+    let desk = Desk::new("m2");
+    let store = desk.store();
+    let fleet = repointed_with_a_stale_sign_out(&desk, NOW + 20);
+    let mut roster = sync(&desk, &fleet, "m2", "proton.m2@example.test", NOW + 90);
+    roster.rows.retain(|row| row.label != "m2");
+    fs::write(desk.roster(), format_roster_toml(&roster).unwrap()).unwrap();
+    let (healed, line) = heal_default_login_now(
+        &desk.home,
+        &store,
+        &desk.roster(),
+        NOW + 100,
+        checks_signed_in,
+    )
+    .expect("the check ran");
+    assert!(healed, "{line}");
+    assert!(
+        line.starts_with(
+            "account claude proton.m2@example.test: the default login checked signed in"
+        ) && line.ends_with("with the sessions on record under m2 (no longer listed)"),
+        "{line}"
     );
 }
 
@@ -741,8 +779,11 @@ fn a_default_row_the_check_finds_signed_out_stays_signed_out_and_is_checked_once
         work();
         Ok(())
     };
-    let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let (cooldown, rediscovery) = (
+        Watched::new("accounts_sync/sync_cooldown", None),
+        Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
+    );
+    let guard = AutoRenewGuard::default().shared();
     let lines = Arc::new(Mutex::new(Vec::<String>::new()));
     let kept = Arc::clone(&lines);
     let mut fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
@@ -759,6 +800,18 @@ fn a_default_row_the_check_finds_signed_out_stays_signed_out_and_is_checked_once
         "{:?}",
         lines.lock().unwrap()
     );
+    // Its log line names the row by its account's key, never by its label or its address.
+    let logged = crate::harness::account_names::logged_row(
+        Cli::Claude,
+        desk.rows().row("m2-2").expect("the default row"),
+        None,
+    );
+    let logged_line = lines.lock().unwrap()[0].clone();
+    assert!(
+        logged_line.starts_with(&format!("account {logged}: the default login's check")),
+        "{logged_line}"
+    );
+    assert!(!logged_line.contains('@'), "{logged_line}");
     assert_eq!(
         store.load(NOW + 400).unwrap().0.account("m2-2").auth,
         accounts::Auth::SignedOut
@@ -770,7 +823,7 @@ fn default_check_claims_retire_on_unstarted_refused_cancelled_or_unwound_work() 
     for mode in 0..6 {
         let desk = Desk::new("m2");
         repointed_with_a_stale_sign_out(&desk, NOW + 20);
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         let queued = Mutex::new(Vec::<Box<dyn FnOnce() + Send>>::new());
         let spawn = |work: Box<dyn FnOnce() + Send>| match mode {
             1 => {
@@ -792,7 +845,10 @@ fn default_check_claims_retire_on_unstarted_refused_cancelled_or_unwound_work() 
         let renew = |_: Box<dyn FnOnce() + Send>| -> io::Result<()> {
             panic!("default check started a renewal")
         };
-        let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
+        let (cooldown, rediscovery) = (
+            Watched::new("accounts_sync/sync_cooldown", None),
+            Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
+        );
         let mut fx = upkeep_effects(&fetch, &renew, &cooldown, &rediscovery, &guard);
         fx.spawn_vault = &spawn;
         fx.default_check = if mode == 3 {
@@ -979,8 +1035,11 @@ fn the_upkeep_heal_answers_from_the_stored_login_file_and_runs_no_process() {
             work();
             Ok(())
         };
-        let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let (cooldown, rediscovery) = (
+            Watched::new("accounts_sync/sync_cooldown", None),
+            Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
+        );
+        let guard = AutoRenewGuard::default().shared();
         let lines = Arc::new(Mutex::new(Vec::<String>::new()));
         let kept = Arc::clone(&lines);
         let mut fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
@@ -1285,7 +1344,7 @@ fn sync_pass(desk: &Desk, fx: &UpkeepEffects<'_>, now: i64) {
     upkeep(
         &desk.home,
         &desk.state,
-        (&desk.roster(), now, UpkeepStep::Sync),
+        (&desk.roster(), trace::Now::at(now), UpkeepStep::Sync),
         fx,
     );
 }
@@ -1293,9 +1352,9 @@ fn sync_pass(desk: &Desk, fx: &UpkeepEffects<'_>, now: i64) {
 pub(super) fn upkeep_effects<'a>(
     fetch: &'a Fetch<'a>,
     spawn: &'a SpawnRenewal<'a>,
-    cooldown: &'a Mutex<Option<Instant>>,
-    rediscovery: &'a Mutex<Rediscovery>,
-    guard: &'a Arc<Mutex<AutoRenewGuard>>,
+    cooldown: &'a Watched<Option<Instant>>,
+    rediscovery: &'a Watched<Rediscovery>,
+    guard: &'a Arc<Watched<AutoRenewGuard>>,
 ) -> UpkeepEffects<'a> {
     UpkeepEffects {
         scope: None,
@@ -1533,8 +1592,11 @@ fn a_discovered_fleet_takes_the_accounts_this_machine_shows_later() {
         Err(format!("no fetch in a test: {source}"))
     };
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
-    let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let (cooldown, rediscovery) = (
+        Watched::new("accounts_sync/sync_cooldown", None),
+        Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
+    );
+    let guard = AutoRenewGuard::default().shared();
     let fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
     sync_pass(&desk, &fx, NOW + 60);
     let roster = desk.rows();
@@ -1595,8 +1657,11 @@ fn a_named_fleet_of_this_machine_alone_takes_what_discovery_finds() {
         Err(format!("no fetch in a test: {source}"))
     };
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
-    let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let (cooldown, rediscovery) = (
+        Watched::new("accounts_sync/sync_cooldown", None),
+        Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
+    );
+    let guard = AutoRenewGuard::default().shared();
     let fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
     sync_pass(&desk, &fx, NOW + 60);
     let roster = desk.rows();
@@ -1657,8 +1722,11 @@ fn a_named_list_naming_an_account_this_mac_shows_nothing_of_is_never_added_to() 
         Err(format!("no fetch in a test: {source}"))
     };
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
-    let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let (cooldown, rediscovery) = (
+        Watched::new("accounts_sync/sync_cooldown", None),
+        Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
+    );
+    let guard = AutoRenewGuard::default().shared();
     let fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
     sync_pass(&desk, &fx, NOW + 60);
     sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW + 61).expect("sync");
@@ -1771,8 +1839,11 @@ fn a_fleet_a_vault_delivered_is_never_added_to() {
         Err(format!("no fetch in a test: {source}"))
     };
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
-    let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let (cooldown, rediscovery) = (
+        Watched::new("accounts_sync/sync_cooldown", None),
+        Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
+    );
+    let guard = AutoRenewGuard::default().shared();
     let fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
     sync_pass(&desk, &fx, NOW + 60);
     assert_eq!(delivered().as_deref(), Some(vault));
@@ -1806,7 +1877,7 @@ fn a_roster_with_no_source_is_not_synced_for_a_moved_default_login() {
     let hand =
         "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = \"main@example.test\"\n";
     fs::write(desk.roster(), hand).unwrap();
-    let rediscovery = Mutex::new(Rediscovery::default());
+    let rediscovery = Watched::new("accounts_sync/rediscovery", Rediscovery::default());
     assert!(!default_login_unlisted(
         &desk.home,
         &desk.state,

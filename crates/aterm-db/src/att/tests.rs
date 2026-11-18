@@ -159,15 +159,22 @@ fn append_history_at(handle: &Handle, command: Command, authored_ms: u64) -> Dig
 /// another Mac's store does.
 const BULK_OPEN_BATCHES: usize = 4;
 
+/// When an open of this file's bulk fixtures ([`append_bulk_at`], [`copy_registry`]) stops: an hour
+/// from now. The ordinary admission's minute ([`crate::admission::deadline`]) bounds the session's
+/// generation checks too, so it would time the fixture's sealing and replay, which a loaded Mac
+/// stretches without bound: a niced release run spent over a minute on an open that takes 9 s at a
+/// load of 40. No other process holds these homes, so this is a hang detector and no budget.
+fn bulk_open_deadline() -> std::time::Instant {
+    std::time::Instant::now() + std::time::Duration::from_secs(60 * 60)
+}
+
 /// Write up to `count` records to `handle`'s table as this Mac's writer, each authored at
 /// `authored_ms`, one chain in batches of [`aterm_journal::MAX_APPEND_RECORDS`]: how many it
 /// wrote, and the error that stopped it short, if one did. A refused batch is retried a record at
-/// a time, so the count is exact. An open writes at most [`BULK_OPEN_BATCHES`] batches. Its one
-/// admission deadline ([`crate::admission::deadline`], a minute from the open) covers its custody,
-/// its replay of the table and those batches (a refused one with its record-at-a-time retry), not
-/// the whole write; an open that outlasts its minute is still refused out of time. Within an open,
-/// each batch after the first is admitted against the writer counts that the open's earlier batch
-/// commits left in memory, as a repair's batches through a kept store are (`replica`'s `keep`).
+/// a time, so the count is exact. An open writes at most [`BULK_OPEN_BATCHES`] batches, under
+/// [`bulk_open_deadline`]. Within an open, each batch after the first is admitted against the
+/// writer counts that the open's earlier batch commits left in memory, as a repair's batches
+/// through a kept store are (`replica`'s `keep`).
 /// Each open reads the chain head ([`chain_head`]) after `Store::open`, which seals held writes
 /// first, and its batches carry the chain on from there.
 /// NEGATIVE CONTROL: with a batch commit counting none of its records toward their writer in
@@ -178,10 +185,11 @@ const BULK_OPEN_BATCHES: usize = 4;
 fn append_bulk_at(handle: &Handle, count: usize, authored_ms: u64) -> (usize, Option<String>) {
     let mut written = 0;
     loop {
-        let (wrote, refused) = application::with_store(
+        let (wrote, refused) = application::with_store_until(
             &handle.paths,
             false,
             handle.descriptor(),
+            bulk_open_deadline(),
             |session, store, scope| {
                 let (mut sequence, mut last, mut parents) = chain_head(session, store)?;
                 let mut wrote = 0;
@@ -246,9 +254,10 @@ fn append_bulk_at(handle: &Handle, count: usize, authored_ms: u64) -> (usize, Op
 fn copy_registry(lab: &Lab) {
     let handle = |n: usize| Handle::at(lab.paths[n].clone(), &REGISTRY);
     let held = |n: usize| {
-        application::observe_store(
+        application::observe_store_until(
             &lab.paths[n],
             handle(n).descriptor(),
+            bulk_open_deadline(),
             |session, store, _| {
                 let ids: Vec<Digest> = store.inventory(session)?.copied().collect();
                 let ordered = store.causal_order_of(&ids);
@@ -261,10 +270,11 @@ fn copy_registry(lab: &Lab) {
     for from in 0..lab.paths.len() {
         let records = held(from);
         for to in (0..lab.paths.len()).filter(|to| *to != from) {
-            application::with_store(
+            application::with_store_until(
                 &lab.paths[to],
                 false,
                 handle(to).descriptor(),
+                bulk_open_deadline(),
                 |session, store, _| {
                     let have: BTreeSet<Digest> = store.inventory(session)?.copied().collect();
                     let lacking: Vec<&[u8]> = records
@@ -2118,7 +2128,7 @@ fn the_resolved_digest_separates_any_binding() {
 }
 
 /// A table's history reads in pages. Paging with a cursor serves every entry once, in history's
-/// order; the filters keep a page to one collection, row, column, writer or kind; each entry
+/// order, and newest first runs back from history's end the same way; the filters keep a page to one collection, row, column, writer or kind; each entry
 /// carries the kind aterm-db decides (a facts-only record is aterm's, a mixed record the first
 /// kind that holds, a revert explicit whatever it restores) and says when it projects nothing
 /// (an owned row at a key not its signer's, an automatic record past its writer's quota). The
@@ -2126,7 +2136,9 @@ fn the_resolved_digest_separates_any_binding() {
 /// sorts inside the range already served, so the next page asked at the old revision says it
 /// moved and starts again from the top, where a page asked without one would skip that record.
 /// NEGATIVE CONTROL: with `history::page` never setting `moved` (`let moved = false;`), the page
-/// after the cursor resumes past the late record: `` assertion failed: next.moved ``.
+/// after the cursor resumes past the late record: `` assertion failed: next.moved ``. With a page
+/// read newest first served from the front (`order[..end].iter()`, no `.rev()`), the backward
+/// pages hold the oldest entries first: `` newest first, every entry once ``.
 #[test]
 fn history_reads_one_page_after_a_cursor_and_reports_a_moved_revision() {
     use crate::{
@@ -2272,6 +2284,21 @@ fn history_reads_one_page_after_a_cursor_and_reports_a_moved_revision() {
     assert_eq!(served, history);
     let revision = revision.unwrap();
     assert_eq!(handle.revision().unwrap(), revision);
+    // Newest first, pages of two, each before the last one's cursor, serve it backwards, once.
+    let mut ask = Some(Ask::newest(Filter::default(), 2));
+    let mut backwards = Vec::new();
+    while let Some(asked) = ask {
+        let page = handle.history_page(&asked).unwrap();
+        assert!(!page.moved);
+        assert!(page.entries.len() <= 2);
+        backwards.extend(page.entries.iter().cloned());
+        ask = asked.after(&page);
+    }
+    assert_eq!(
+        backwards,
+        history.iter().rev().cloned().collect::<Vec<_>>(),
+        "newest first, every entry once"
+    );
 
     // The filters, applied before a page is cut.
     let only = |filter: Filter| {
@@ -2339,6 +2366,16 @@ fn history_reads_one_page_after_a_cursor_and_reports_a_moved_revision() {
         .unwrap();
     assert_eq!(one.entries, locations[..1]);
     assert_eq!(one.next, Some(locations[0].cursor()));
+    let newest = handle
+        .history_page(&Ask::newest(
+            Filter {
+                column: Some("location".into()),
+                ..Filter::default()
+            },
+            1,
+        ))
+        .unwrap();
+    assert_eq!(newest.entries, locations[3..], "the filter's newest entry");
 
     // A peer's record that sorts inside what was served: it observed only the records the peer
     // held, and its writer's clock runs behind, so it lands before the cursor.
@@ -2407,6 +2444,372 @@ fn history_reads_one_page_after_a_cursor_and_reports_a_moved_revision() {
         .unwrap();
     assert!(!blind.moved);
     assert!(!blind.entries.iter().any(|entry| entry.operation == late));
+}
+
+/// A registry history of every shape a page filters on, as Mac 0 holds it: two Macs' writers,
+/// each kind, two machine rows and their facts (one inert), a revert, and a peer's records whose
+/// clock runs behind, so they sort among Mac 0's. Answers the lab and Mac 0's handle.
+fn paged_history() -> (Lab, Handle) {
+    use crate::{
+        alab::registry::MACHINE_FACTS,
+        typed::cell::{CellKey, CellValue},
+    };
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let registry = Registry::at(lab.paths[0].clone());
+    registry.open().unwrap();
+    let handle = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let facts = |n: usize| Change {
+        collection: MACHINE_FACTS.name.into(),
+        key: keys::uuid32(&lab.machine(n)),
+        value: Some(json!({"r": 1, "n": 1, "mac": MC, "label": "m9"})),
+    };
+    let marked = |col: &str, value: CellValue| {
+        cell::change(
+            &MACHINE,
+            CellKey {
+                pk: MC,
+                col,
+                elem: None,
+            },
+            &value,
+        )
+        .unwrap()
+    };
+    let explicit = vec![put(&MACHINE, MC, "location", json!("rack d"))];
+    registry
+        .write(vec![
+            machine(MC),
+            other_machine(OTHER, "m8"),
+            vec![facts(0)],
+            vec![marked(
+                "location",
+                CellValue::imported(1, json!("rack c"), "sr-0123456789abcdef"),
+            )],
+            vec![marked("note", CellValue::automatic(1, json!("seen")))],
+            vec![facts(1)],
+            explicit.clone(),
+            vec![put(&MACHINE, OTHER, "location", json!("rack b"))],
+        ])
+        .unwrap();
+    let target = handle
+        .history()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.changes == explicit)
+        .unwrap()
+        .operation;
+    handle.revert([91; 16], target).unwrap();
+    repair_new_registry(&lab);
+    let peer = Handle::at(lab.paths[1].clone(), &REGISTRY);
+    for (n, (pk, column, value)) in [
+        (MC, "location", "rack p"),
+        (OTHER, "location", "rack q"),
+        (OTHER, "label", "m7"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        append_history_at(
+            &peer,
+            Command::Write {
+                request: [100 + n as u8; 16],
+                changes: vec![put(&MACHINE, pk, column, json!(value))],
+            },
+            0,
+        );
+    }
+    registry
+        .write(vec![vec![put(&MACHINE, MC, "label", json!("m10"))]])
+        .unwrap();
+    repair_registry(&lab, 2);
+    (lab, handle)
+}
+
+/// The page `ask` names of a table at `revision` whose every entry is `all`, in history's order,
+/// worked out from what a page is: from the top where it was asked at another revision, else
+/// the entries after its cursor (before it, newest first, run backwards) that its filter keeps
+/// (kind, writer, and a change to the place it names), at most `limit` of them, and the last
+/// one's cursor where one more follows.
+fn page_by_definition(all: &[Entry], revision: Revision, ask: &Ask) -> Page {
+    use crate::att::history::Writer;
+    let moved = ask.revision.is_some_and(|asked| asked != revision);
+    let after = ask.after.filter(|_| !moved);
+    let filter = &ask.filter;
+    let mut served: Vec<&Entry> = all
+        .iter()
+        .filter(|entry| {
+            after.is_none_or(|after| {
+                if ask.newest_first {
+                    entry.cursor() < after
+                } else {
+                    entry.cursor() > after
+                }
+            })
+        })
+        .filter(|entry| filter.kind.is_none_or(|kind| entry.kind == kind))
+        .filter(|entry| match filter.writer {
+            None => true,
+            Some(Writer::Actor(actor)) => entry.actor == actor,
+            Some(Writer::Machine(machine)) => entry.machine == Some(machine),
+        })
+        .filter(|entry| {
+            filter.collection.is_none() && filter.row.is_none() && filter.column.is_none()
+                || entry.changes.iter().any(|change| filter.wants(change))
+        })
+        .collect();
+    if ask.newest_first {
+        served.reverse();
+    }
+    let more = served.len() > ask.limit;
+    let entries: Vec<Entry> = served.into_iter().take(ask.limit).cloned().collect();
+    Page {
+        revision,
+        moved,
+        next: more.then(|| entries.last().map(Entry::cursor)).flatten(),
+        entries,
+    }
+}
+
+/// Every page a reader of `all` (a table's every entry, in history's order) can ask at
+/// `revision`: each filter on its own (each kind, each writer and machine, each place) and
+/// combined, each way, at each of several lengths, from the top and after each entry's cursor,
+/// and at the revision, at none and at another.
+fn every_ask(all: &[Entry], revision: Revision) -> Vec<Ask> {
+    use crate::{
+        alab::registry::MACHINE_FACTS,
+        att::history::{Filter, Writer},
+    };
+    let actors: BTreeSet<Actor> = all.iter().map(|entry| entry.actor).collect();
+    let machines: BTreeSet<[u8; 16]> = all.iter().filter_map(|entry| entry.machine).collect();
+    let mut filters = vec![Filter::default()];
+    for kind in [EntryKind::Aterm, EntryKind::Import, EntryKind::Explicit] {
+        filters.push(Filter {
+            kind: Some(kind),
+            ..Filter::default()
+        });
+    }
+    for writer in actors
+        .iter()
+        .map(|actor| Writer::Actor(*actor))
+        .chain(machines.iter().map(|machine| Writer::Machine(*machine)))
+        .chain([Writer::Actor([0xee; 48]), Writer::Machine([0xee; 16])])
+    {
+        filters.push(Filter {
+            writer: Some(writer),
+            ..Filter::default()
+        });
+    }
+    for collection in [MACHINE.name, MACHINE_FACTS.name] {
+        filters.push(Filter {
+            collection: Some(collection.into()),
+            ..Filter::default()
+        });
+    }
+    for row in [MC, OTHER] {
+        filters.push(Filter {
+            row: Some(row.into()),
+            ..Filter::default()
+        });
+    }
+    filters.push(Filter {
+        column: Some("location".into()),
+        ..Filter::default()
+    });
+    filters.push(Filter {
+        collection: Some(MACHINE.name.into()),
+        row: Some(MC.into()),
+        column: Some("location".into()),
+        kind: Some(EntryKind::Explicit),
+        writer: actors.first().copied().map(Writer::Actor),
+    });
+    let elsewhere = Revision([0xee; 32]);
+    let mut asks = Vec::new();
+    for filter in &filters {
+        for newest_first in [false, true] {
+            for limit in [1, 2, 5, usize::MAX] {
+                for after in std::iter::once(None).chain(all.iter().map(|e| Some(e.cursor()))) {
+                    for asked in [Some(revision), None, Some(elsewhere)] {
+                        asks.push(Ask {
+                            filter: filter.clone(),
+                            after,
+                            limit,
+                            revision: asked,
+                            newest_first,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    asks
+}
+
+/// A page at a held revision reads no record again (tracker LT-25B): a reader that keeps its
+/// pages' order ([`Kept`]) reads the table once, and every page it asks at that revision after
+/// the first, of every filter, cursor, length and direction ([`every_ask`]), decodes no record
+/// ([`super::DECODED`]) and is the page its definition names ([`page_by_definition`]) and the
+/// page read with nothing kept. Once a record is written, the next page reads the new revision,
+/// says the table moved where it was asked at the old one, and holds the new record. A handle on
+/// the same table made at another place (another copy of its `const`) is served from the same
+/// kept order, and a page read with nothing kept, which takes its entries out of the order it
+/// read rather than copying them, is the kept page for every ask.
+/// NEGATIVE CONTROL: with the kept order never matched (`Order::of` answering `false`), every
+/// page reads the store again and the sweep fails at its first ask: `a page at the held
+/// revision decoded 13 records: Ask { filter: Filter { collection: None, .. }, after: None,
+/// limit: 1, .. }`. With the order matched whatever the revision (`Order::of` comparing only the
+/// home and the table), the page after the write is cut from the old order: `the new revision
+/// is read: every record and the new one`. With the table compared by address
+/// (`std::ptr::eq`), the handle made elsewhere reads it again: `a handle made at another place
+/// read the table again left: 13 right: 0`. With a page taken newest first left oldest first
+/// (`Cut::taken` turning nothing back), the sweep of cuts fails at its first newest-first page
+/// of two: `Ask { .., limit: 2, .., newest_first: true }` (the entries of the left page in the
+/// other order).
+#[test]
+fn a_history_page_at_a_held_revision_reads_no_record_again() {
+    use super::history::{Ask, Cut, Filter};
+    // The registry as another place names it: a static is an address of its own.
+    static ELSEWHERE: Compiled = REGISTRY;
+    let (_lab, handle) = paged_history();
+    let all = handle.history().unwrap();
+    for kind in [EntryKind::Aterm, EntryKind::Import, EntryKind::Explicit] {
+        assert!(all.iter().any(|entry| entry.kind == kind), "{kind:?}");
+    }
+    let writers: BTreeSet<Actor> = all.iter().map(|entry| entry.actor).collect();
+    assert_eq!(writers.len(), 2, "both Macs wrote");
+    assert!(all.iter().any(|entry| entry.inert.is_some()));
+    assert!(all.iter().any(|entry| entry.reverts.is_some()));
+    let mut kept = Kept::default();
+    assert_eq!(kept.revision(), None);
+    let decoded = super::DECODED.get();
+    let first = handle
+        .history_page_kept(&Ask::newest(Filter::default(), 3), &mut kept)
+        .unwrap();
+    assert!(
+        super::DECODED.get() - decoded >= all.len(),
+        "the first page reads every record"
+    );
+    let revision = first.revision;
+    assert_eq!(kept.revision(), Some(revision));
+    assert_eq!(handle.revision().unwrap(), revision);
+    let asks = every_ask(&all, revision);
+    for ask in &asks {
+        let decoded = super::DECODED.get();
+        let page = handle.history_page_kept(ask, &mut kept).unwrap();
+        assert_eq!(
+            super::DECODED.get() - decoded,
+            0,
+            "a page at the held revision decoded {} records: {ask:?}",
+            super::DECODED.get() - decoded
+        );
+        assert_eq!(page, page_by_definition(&all, revision, ask), "{ask:?}");
+    }
+    // Taken out of the order (a page read with nothing kept) or copied from it (a kept one), a
+    // page is one page.
+    for ask in &asks {
+        let cut = || Cut::of(&all, revision, ask);
+        assert_eq!(cut().taken(all.clone()), cut().copied(&all), "{ask:?}");
+    }
+    // The kept order is the order a read with nothing kept serves, page for page.
+    for ask in asks.iter().step_by(97) {
+        assert_eq!(
+            handle.history_page_kept(ask, &mut kept).unwrap(),
+            handle.history_page(ask).unwrap(),
+            "{ask:?}"
+        );
+    }
+    assert_eq!(kept.revision(), Some(revision));
+    assert_eq!(
+        kept.reads(),
+        1,
+        "one read of the table, at its one revision"
+    );
+    // A handle on the table made at another place is served from the kept order.
+    let elsewhere = Handle::at(handle.paths.clone(), &ELSEWHERE);
+    assert!(!std::ptr::eq(elsewhere.compiled, handle.compiled));
+    let decoded = super::DECODED.get();
+    assert_eq!(
+        elsewhere
+            .history_page_kept(&Ask::newest(Filter::default(), 3), &mut kept)
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        super::DECODED.get() - decoded,
+        0,
+        "a handle made at another place read the table again"
+    );
+    assert_eq!(kept.reads(), 1);
+
+    // A record written: the next page reads the new revision, and from the top where it was
+    // asked at the old one.
+    Registry::at(handle.paths.clone())
+        .write(vec![vec![put(&MACHINE, OTHER, "label", json!("m11"))]])
+        .unwrap();
+    let decoded = super::DECODED.get();
+    let older = Ask {
+        revision: Some(revision),
+        ..Ask::newest(Filter::default(), 3).after(&first).unwrap()
+    };
+    let moved = handle.history_page_kept(&older, &mut kept).unwrap();
+    assert!(
+        super::DECODED.get() - decoded > all.len(),
+        "the new revision is read: every record and the new one"
+    );
+    assert!(moved.moved);
+    assert_ne!(moved.revision, revision);
+    assert_eq!(kept.revision(), Some(moved.revision));
+    assert_eq!(kept.reads(), 2);
+    let now = handle.history().unwrap();
+    assert_eq!(now.len(), all.len() + 1);
+    assert_eq!(moved, page_by_definition(&now, moved.revision, &older));
+    assert_eq!(
+        moved.entries[0].changes,
+        [put(&MACHINE, OTHER, "label", json!("m11"))],
+        "the new record heads the page"
+    );
+    // And that revision is held in its turn.
+    let decoded = super::DECODED.get();
+    let again = handle
+        .history_page_kept(&Ask::newest(Filter::default(), 3), &mut kept)
+        .unwrap();
+    assert_eq!(super::DECODED.get(), decoded);
+    assert_eq!(again.entries, moved.entries);
+}
+
+/// A kept order is of the access it was read under (tracker LT-25B): a membership change moves
+/// the table's revision with no record written (Mac 1 made a Reader, whose records then count
+/// for nothing here), so the next page reads the table again and is the page read with nothing
+/// kept, never one cut from the order the change left behind.
+/// NEGATIVE CONTROL: with the order matched whatever the revision (`Order::of` comparing only the
+/// home and the table), the page after the change is cut from the old order: `the membership
+/// change is read`.
+#[test]
+fn a_kept_history_order_is_read_again_after_a_membership_change() {
+    use super::history::{Ask, Filter};
+    let (lab, handle) = paged_history();
+    let mut kept = Kept::default();
+    let ask = Ask::newest(Filter::default(), usize::MAX);
+    let before = handle.history_page_kept(&ask, &mut kept).unwrap();
+    assert_eq!(kept.reads(), 1);
+
+    lab.admit(&[Role::Writer, Role::Reader]);
+    let decoded = super::DECODED.get();
+    let after = handle.history_page_kept(&ask, &mut kept).unwrap();
+    assert!(
+        super::DECODED.get() > decoded,
+        "the membership change is read"
+    );
+    assert_ne!(
+        after.revision, before.revision,
+        "membership moves the revision"
+    );
+    assert_eq!(kept.revision(), Some(after.revision));
+    assert_eq!(kept.reads(), 2);
+    assert_eq!(after, handle.history_page(&ask).unwrap());
+    assert_ne!(
+        after.entries, before.entries,
+        "the change is one a page shows"
+    );
 }
 
 /// Seal, on Mac `from`, a typed write whose causal parent never arrives anywhere, and give it to
@@ -3172,11 +3575,18 @@ fn a_read_after_a_final_checkpoint_opens_no_body_below_it() {
 /// [`table_outlives_operation_cap_via_checkpoint_writes`] describes; answers the lab, each Mac's
 /// handle and how many operations were written.
 fn twenty_thousand_operations_under_checkpoints() -> (Lab, Vec<Handle>, usize) {
+    operations_under_checkpoints(7, 1_000)
+}
+
+/// Three Macs write `each` operations apiece in each of `rounds` rounds, each round under a final
+/// checkpoint, as [`table_outlives_operation_cap_via_checkpoint_writes`] describes: a round's
+/// `3 * each` records, its acknowledgements and its checkpoint's signatures stay within the
+/// table's 8,192 operations above the floor and each writer's 4,096. Answers the lab, each Mac's
+/// handle and how many operations were written.
+fn operations_under_checkpoints(rounds: u64, each: usize) -> (Lab, Vec<Handle>, usize) {
     use super::checkpoint::Signed;
     use aterm_secrets::commons::hearing::{self, Ledger, Said};
     const DAY: u64 = 24 * 60 * 60 * 1000;
-    const ROUNDS: u64 = 7;
-    const EACH: usize = 1_000;
     let start = aterm_time::unix_millis().unwrap();
     let lab = Lab::new(&[Role::Writer, Role::Writer, Role::Writer]);
     Registry::at(lab.paths[0].clone()).open().unwrap();
@@ -3208,7 +3618,7 @@ fn twenty_thousand_operations_under_checkpoints() -> (Lab, Vec<Handle>, usize) {
         ledger
     };
     let mut written = 1;
-    for round in 0..ROUNDS {
+    for round in 0..rounds {
         // Round 0's records are 20 days old; round r's sit just inside the cut of a pass whose
         // clock is 15 days a round past the start.
         let now = start + 15 * DAY * round;
@@ -3218,9 +3628,9 @@ fn twenty_thousand_operations_under_checkpoints() -> (Lab, Vec<Handle>, usize) {
             now - 15 * DAY + 1_000
         };
         for mac in &macs {
-            let (count, refused) = append_bulk_at(mac, EACH, authored);
+            let (count, refused) = append_bulk_at(mac, each, authored);
             assert_eq!(refused, None, "write refused in round {round}");
-            assert_eq!(count, EACH);
+            assert_eq!(count, each);
             written += count;
         }
         copy_registry(&lab);
@@ -3300,6 +3710,117 @@ fn table_outlives_operation_cap_via_checkpoint_writes() {
             .all(|&count| count == held[0] && count >= written),
         "every Mac holds every record: {held:?} for {written} written"
     );
+}
+
+/// What a page of History costs on a registry of 100,000 records (tracker LT-25B): three Macs
+/// write 2,500 operations apiece in each of 14 rounds under final checkpoints, and Mac 0 serves
+/// the pages the Tables page's History drawer asks: its first page (the newest 100) with nothing
+/// kept, then, keeping their order ([`Kept`]), the first page again, Read older three times, a
+/// filter change (the kind, then a table) and a Find's bounded scan of 2,048, each at the
+/// revision the first page was read at, and the first page after one more record. Each kept
+/// page is the page read with nothing kept. Prints each one's median of three wall times in
+/// this build's profile; asserts nothing about time.
+/// Run it alone: `targo --unverified test -p aterm-db --lib -- --ignored --nocapture
+/// att::tests::history_pages_at_100000_records_cost`.
+#[test]
+#[ignore = "manual measurement of History pages at 100,000 records; no latency budget"]
+fn history_pages_at_100000_records_cost() {
+    use super::history::{Ask, Filter, Page};
+    use std::time::{Duration, Instant};
+    let built = Instant::now();
+    let (_lab, macs, written) = operations_under_checkpoints(14, 2_500);
+    eprintln!(
+        "fixture: {written} operations written in {:?}",
+        built.elapsed()
+    );
+    let here = &macs[0];
+    let median = |mut times: Vec<Duration>| {
+        times.sort_unstable();
+        times[times.len() / 2]
+    };
+    let timed = |what: &str, read: &mut dyn FnMut() -> Page| -> Page {
+        let mut times = Vec::new();
+        let mut served = None;
+        for _ in 0..3 {
+            let at = Instant::now();
+            served = Some(read());
+            times.push(at.elapsed());
+        }
+        let served = served.unwrap();
+        eprintln!(
+            "{what}: {:?} for {} entries (of 3: {times:?})",
+            median(times.clone()),
+            served.entries.len()
+        );
+        served
+    };
+    let revision = median(
+        (0..3)
+            .map(|_| {
+                let at = Instant::now();
+                here.revision().unwrap();
+                at.elapsed()
+            })
+            .collect(),
+    );
+    eprintln!("revision read: {revision:?}");
+    let first_ask = Ask::newest(Filter::default(), 100);
+    let first = timed("first page, nothing kept", &mut || {
+        here.history_page(&first_ask).unwrap()
+    });
+    assert_eq!(first.entries.len(), 100);
+    let mut kept = Kept::default();
+    let at = Instant::now();
+    let filled = here.history_page_kept(&first_ask, &mut kept).unwrap();
+    eprintln!("first page, filling kept: {:?}", at.elapsed());
+    assert_eq!(filled, first);
+    let mut measure = |what: &str, ask: &Ask| -> Page {
+        let served = timed(what, &mut || {
+            here.history_page_kept(ask, &mut kept).unwrap()
+        });
+        assert_eq!(served, here.history_page(ask).unwrap(), "{what}");
+        served
+    };
+    measure("first page again", &first_ask);
+    let mut older = first_ask.after(&first).unwrap();
+    for n in 1..=3 {
+        let served = measure(&format!("read older {n}"), &older);
+        assert!(!served.moved);
+        older = older.after(&served).unwrap();
+    }
+    let at_first = |filter: Filter, limit: usize| Ask {
+        revision: Some(first.revision),
+        ..Ask::newest(filter, limit)
+    };
+    measure(
+        "filter: kind",
+        &at_first(
+            Filter {
+                kind: Some(EntryKind::Explicit),
+                ..Filter::default()
+            },
+            100,
+        ),
+    );
+    measure(
+        "filter: table",
+        &at_first(
+            Filter {
+                collection: Some(MACHINE.name.into()),
+                ..Filter::default()
+            },
+            100,
+        ),
+    );
+    measure("find scan", &at_first(Filter::default(), 2_048));
+    let now = aterm_time::unix_millis().unwrap();
+    assert_eq!(append_bulk_at(here, 1, now), (1, None));
+    let at = Instant::now();
+    let moved = here.history_page_kept(&first_ask, &mut kept).unwrap();
+    eprintln!("first page after a write: {:?}", at.elapsed());
+    assert_ne!(moved.revision, first.revision);
+    assert_eq!(moved, here.history_page(&first_ask).unwrap());
+    eprintln!("history holds {} entries", here.history().unwrap().len());
 }
 
 /// A read from a final checkpoint applies only the records above it and equals the full read, at
@@ -3672,6 +4193,271 @@ fn a_cell_lists_every_value_it_held_and_a_write_lists_what_it_had_not_seen() {
             .is_empty()
     );
     assert!(here.wrote([9; 32]).is_err());
+}
+
+/// A write lists what has written its cells since (tracker LT-25: History shows a selected
+/// record so): the writes to each cell that observed it, in history order, standing or not, and
+/// never one it had not seen. Mac 0 writes a row (`born`); Mac 1 sets its status (`parked`) while
+/// Mac 0, concurrently, sets another and takes a set member out (`lost`); then Mac 0, having seen
+/// both, sets the status again (`later`). Since `born` the status was written by all three; since
+/// either concurrent write only by `later`, the other being unseen; the member `lost` took out by
+/// nothing. [`Handle::wrote_named`] answers the same with each writer's Mac, and a peer the same.
+/// NEGATIVE CONTROL: with `Reader::beside` asking the observation the wrong way round
+/// (`observes(operation, &other.id)` in place of `observes(&other.id, operation)`), what the
+/// born write saw is called written since and what saw it is not: `` left: [] right: ["lost",
+/// "parked", "later"] ``.
+#[test]
+fn a_write_lists_what_has_written_its_cells_since() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    Registry::at(lab.paths[0].clone()).open().unwrap();
+    let here = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let born = append_history_at(
+        &here,
+        Command::Write {
+            request: [85; 16],
+            changes: machine(MC),
+        },
+        2_000,
+    );
+    repair_new_registry(&lab);
+    let there = Handle::at(lab.paths[1].clone(), &REGISTRY);
+    let parked = append_history_at(
+        &there,
+        Command::Write {
+            request: [86; 16],
+            changes: vec![put(&MACHINE, MC, "status", json!("parked"))],
+        },
+        3_000,
+    );
+    let lost = append_history_at(
+        &here,
+        Command::Write {
+            request: [87; 16],
+            changes: vec![
+                put(&MACHINE, MC, "status", json!("lost")),
+                take_out(MC, "clis", "codex"),
+            ],
+        },
+        1_000,
+    );
+    repair_registry(&lab, 2);
+    let later = append_history_at(
+        &here,
+        Command::Write {
+            request: [88; 16],
+            changes: vec![put(&MACHINE, MC, "status", json!("active"))],
+        },
+        4_000,
+    );
+    repair_registry(&lab, 2);
+    let names = [
+        ("born", born),
+        ("parked", parked),
+        ("lost", lost),
+        ("later", later),
+    ];
+    let status = format!("{MC}.status");
+    let codex = format!("{MC}.clis.codex");
+    let since = |handle: &Handle, operation: Digest, key: &str| -> Vec<&'static str> {
+        let wrote = handle.wrote(operation).unwrap();
+        let cell = wrote
+            .iter()
+            .find(|cell| cell.collection == MACHINE.name && cell.key == key)
+            .unwrap_or_else(|| panic!("the operation wrote {key}"));
+        named(&names, &cell.since)
+    };
+    let mut concurrent: Vec<&str> = here
+        .history()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| match entry.operation {
+            id if id == parked => Some("parked"),
+            id if id == lost => Some("lost"),
+            _ => None,
+        })
+        .collect();
+    concurrent.push("later");
+    assert_eq!(since(&here, born, &status), concurrent, "in history order");
+    assert_eq!(since(&here, lost, &status), ["later"]);
+    assert_eq!(since(&here, parked, &status), ["later"]);
+    assert!(since(&here, later, &status).is_empty());
+    assert!(
+        since(&here, lost, &codex).is_empty(),
+        "nothing wrote the member since"
+    );
+    assert_eq!(
+        since(&there, born, &status),
+        concurrent,
+        "a peer answers the same"
+    );
+    // Named: the same cells, and the join that names each writer's Mac.
+    let (wrote, macs) = here.wrote_named(parked).unwrap();
+    assert_eq!(wrote, here.wrote(parked).unwrap());
+    let writer = &wrote[0].wrote[0];
+    assert_eq!(macs, Macs::of(&here.view().unwrap()));
+    assert_eq!(
+        macs.name(&writer.actor, writer.machine.as_ref()),
+        Mac::Machine(writer.machine.unwrap()),
+        "no facts row binds a scratch Mac's machine"
+    );
+}
+
+/// A row's writes to the cells asked for are read at once ([`Handle::writes`], tracker FL-258):
+/// each operation once, in the order history gives, its writer named and kinded as history
+/// names it, and at each cell what [`Handle::wrote`] says it wrote, replaced and had not seen,
+/// in the order the cells were asked for. Mac 0 writes a row (`born`, two of the cells asked
+/// for); Mac 1 then sets its status (`parked`) while Mac 0, concurrently, sets another status
+/// and takes a set member out (`lost`). A peer holding the same operations answers the same; a
+/// cell nothing wrote lists nothing, and a collection of rows is no typed cell's.
+/// NEGATIVE CONTROL: with `Reader::writes` listing a write once per cell (one `Written` for each
+/// cell it wrote), `born` and `lost`, which each wrote two of the cells, are each listed twice,
+/// five operations for three: `` left: [a, a, b, b, c] right: [a, b, c] `` (as digests).
+#[test]
+fn a_rows_writes_are_read_once_in_history_order_with_their_macs() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    Registry::at(lab.paths[0].clone()).open().unwrap();
+    let here = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let born = append_history_at(
+        &here,
+        Command::Write {
+            request: [91; 16],
+            changes: machine(MC),
+        },
+        2_000,
+    );
+    repair_new_registry(&lab);
+    let there = Handle::at(lab.paths[1].clone(), &REGISTRY);
+    let parked = append_history_at(
+        &there,
+        Command::Write {
+            request: [92; 16],
+            changes: vec![put(&MACHINE, MC, "status", json!("parked"))],
+        },
+        3_000,
+    );
+    let lost = append_history_at(
+        &here,
+        Command::Write {
+            request: [93; 16],
+            changes: vec![
+                put(&MACHINE, MC, "status", json!("lost")),
+                take_out(MC, "clis", "codex"),
+            ],
+        },
+        1_000,
+    );
+    repair_registry(&lab, 2);
+    let status = format!("{MC}.status");
+    let codex = format!("{MC}.clis.codex");
+    let asked = [status.as_str(), codex.as_str()];
+    let read_by = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let writes = here.writes(MACHINE.name, &asked, read_by).unwrap();
+
+    let history = here.history().unwrap();
+    let order: Vec<Digest> = history
+        .iter()
+        .map(|entry| entry.operation)
+        .filter(|id| [born, parked, lost].contains(id))
+        .collect();
+    assert_eq!(
+        writes
+            .iter()
+            .map(|written| written.operation)
+            .collect::<Vec<_>>(),
+        order
+    );
+    for written in &writes {
+        let entry = history
+            .iter()
+            .find(|entry| entry.operation == written.operation)
+            .unwrap();
+        assert_eq!(
+            (
+                written.source,
+                written.actor,
+                written.machine,
+                &written.mac,
+                written.authored_ms,
+                written.hlc,
+                written.reverts,
+                written.kind
+            ),
+            (
+                Source::Log,
+                entry.actor,
+                entry.machine,
+                &entry.mac,
+                entry.authored_ms,
+                entry.hlc,
+                entry.reverts,
+                entry.kind
+            )
+        );
+        let mut cells: Vec<Wrote> = here
+            .wrote(written.operation)
+            .unwrap()
+            .into_iter()
+            .filter(|cell| asked.contains(&cell.key.as_str()))
+            .collect();
+        cells.sort_by_key(|cell| cell.key != status);
+        assert_eq!(written.cells, cells);
+    }
+    let cells = |id: Digest| {
+        writes
+            .iter()
+            .find(|written| written.operation == id)
+            .map_or(0, |written| written.cells.len())
+    };
+    assert_eq!((cells(born), cells(parked), cells(lost)), (2, 1, 2));
+    assert_eq!(there.writes(MACHINE.name, &asked, read_by).unwrap(), writes);
+    let nickname = format!("{MC}.nickname");
+    assert!(
+        here.writes(MACHINE.name, &[nickname.as_str()], read_by)
+            .unwrap()
+            .is_empty()
+    );
+    let facts = keys::uuid32(&lab.machine(0));
+    assert!(
+        here.writes(MACHINE_FACTS.name, &[facts.as_str()], read_by)
+            .is_err()
+    );
+}
+
+/// [`Handle::writes`] answers by its bound: a spent one refuses at once, and so does a read of a
+/// store another program holds past it; given time, it reads.
+/// NEGATIVE CONTROL: with `Handle::writes` observing through `reading` (the admission deadline,
+/// with no `read_by`), the spent read reads: `` a spent bound read: Ok([Written { .. }]) ``.
+#[test]
+fn a_rows_writes_answer_by_their_bound() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    Registry::at(lab.paths[0].clone()).open().unwrap();
+    let here = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    append_history_at(
+        &here,
+        Command::Write {
+            request: [94; 16],
+            changes: machine(MC),
+        },
+        2_000,
+    );
+    let status = format!("{MC}.status");
+    let spent = here.writes(MACHINE.name, &[status.as_str()], std::time::Instant::now());
+    assert!(spent.is_err(), "a spent bound read: {spent:?}");
+    let held = aterm_secrets::client::test_hold_state_lock(&lab.paths[0]).unwrap();
+    let busy = here.writes(
+        MACHINE.name,
+        &[status.as_str()],
+        std::time::Instant::now() + std::time::Duration::from_millis(300),
+    );
+    assert!(busy.is_err(), "a read of a held store: {busy:?}");
+    drop(held);
+    let read_by = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    assert_eq!(
+        here.writes(MACHINE.name, &[status.as_str()], read_by)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 /// A secret never leaves a cell's values: a write to a secret column is listed with no value
@@ -4368,6 +5154,141 @@ fn a_cells_values_read_through_a_registry_roll() {
     );
 }
 
+/// [`Handle::writes`] through a registry roll: each write of the earlier generation is listed
+/// once, as carried, with the clocks its log gave it, its kind and value and no replaced or
+/// unseen (the writes it saw are of another log); the first write after the roll replaced the
+/// carried value that stood. Each is what [`Handle::cell_values`] lists for the cell, and the new
+/// write's cell is what [`Handle::wrote`] says. A carried candidate no history row names is
+/// listed under its own operation, at the record that restated it.
+/// NEGATIVE CONTROL: with `Reader::writes` leaving out a roll's restatement (its `!logged` arm
+/// skipped), the candidate no history row names is not listed: `` left: [] right: [([7, 7, …],
+/// Restated { by: … })] ``; the carried writes a history row names are listed still.
+#[test]
+fn a_rolled_rows_writes_are_carried() {
+    use crate::table::tests::repair_commons;
+    let pk = "mc-0000000000000001";
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let macs: Vec<_> = lab.paths.iter().cloned().map(Registry::at).collect();
+    for registry in &macs {
+        registry.open().unwrap();
+    }
+    repair_commons(&lab, 6);
+    let first = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let write = |handle: &Handle, request: u8, changes: Vec<Change>| {
+        append_history_at(
+            handle,
+            Command::Write {
+                request: [request; 16],
+                changes,
+            },
+            u64::from(request) * 1_000,
+        )
+    };
+    let born = write(&first, 1, machine(pk));
+    let moved = write(
+        &first,
+        2,
+        vec![put(&MACHINE, pk, "location", json!("rack b"))],
+    );
+    repair_commons(&lab, 6);
+    let now = || aterm_time::unix_millis().unwrap();
+    macs[0].roll(true, now()).unwrap();
+    repair_commons(&lab, 6);
+    macs[1].release(now()).unwrap();
+    repair_commons(&lab, 6);
+    assert!(macs[0].roll(true, now()).unwrap().sealed);
+    repair_commons(&lab, 6);
+    assert_eq!(macs[0].generation().generation, 2);
+    let rolled = Handle::at(lab.paths[0].clone(), macs[0].generation());
+    let fresh = write(
+        &rolled,
+        5,
+        vec![put(&MACHINE, pk, "location", json!("rack c"))],
+    );
+
+    let location = format!("{pk}.location");
+    let read_by = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let writes = rolled
+        .writes(MACHINE.name, &[location.as_str()], read_by)
+        .unwrap();
+    let names = [("born", born), ("moved", moved), ("fresh", fresh)];
+    let name = |id: Digest| {
+        names
+            .iter()
+            .find(|(_, named)| *named == id)
+            .map_or("?", |(name, _)| *name)
+    };
+    assert_eq!(
+        writes
+            .iter()
+            .map(|written| name(written.operation))
+            .collect::<Vec<_>>(),
+        ["born", "moved", "fresh"]
+    );
+    let carried = Source::Carried {
+        generation: 1,
+        trimmed: false,
+    };
+    for written in &writes[..2] {
+        assert_eq!(
+            (written.source, written.kind, written.cells.len()),
+            (carried, EntryKind::Explicit, 1)
+        );
+        let cell = &written.cells[0];
+        assert!(
+            cell.replaced.is_empty() && cell.unseen.is_empty(),
+            "{cell:?}"
+        );
+    }
+    let values = rolled.cell_values(MACHINE.name, &location).unwrap();
+    assert_eq!(
+        writes
+            .iter()
+            .flat_map(|written| written.cells[0].wrote.clone())
+            .collect::<Vec<_>>(),
+        values
+    );
+    let new = &writes[2];
+    assert_eq!((new.source, new.kind), (Source::Log, EntryKind::Explicit));
+    assert_eq!(
+        named(&names, &new.cells[0].replaced),
+        ["moved"],
+        "the first write after the roll replaced the value that stood"
+    );
+    let wrote = rolled.wrote(fresh).unwrap();
+    assert_eq!(new.cells, wrote);
+
+    let nickname = format!("{pk}.nickname");
+    let spare = put(&MACHINE, pk, "nickname", json!("spare")).value.unwrap();
+    let restating = write(
+        &rolled,
+        6,
+        vec![Change {
+            collection: MACHINE.name.to_owned(),
+            key: nickname.clone(),
+            value: Some(json!({"k": [{"o": hex::encode_lower(&[7; 32]), "v": spare}]})),
+        }],
+    );
+    let restated = rolled
+        .writes(MACHINE.name, &[nickname.as_str()], read_by)
+        .unwrap();
+    assert_eq!(
+        restated
+            .iter()
+            .map(|written| (written.operation, written.source, written.kind))
+            .collect::<Vec<_>>(),
+        [(
+            [7; 32],
+            Source::Restated { by: restating },
+            EntryKind::Explicit
+        )]
+    );
+    assert_eq!(
+        restated[0].cells[0].wrote,
+        rolled.cell_values(MACHINE.name, &nickname).unwrap()
+    );
+}
+
 /// A claim's re-entry is no write to the claim's cell: the writes it re-asserts stand. Mac 0
 /// writes a machine row with a label (`born`), retires the row and makes it live again
 /// (`revived`), each a write of the `row` cell alone. The view then holds the label under
@@ -4891,4 +5812,287 @@ fn an_owned_rows_values_read_through_a_registry_roll() {
     assert_eq!((&stated_token.value, stated_token.withheld), (&None, true));
     shown.push_str(&format!("{locations:?}{:?}", rolled.wrote(fresh).unwrap()));
     assert!(!shown.contains(&token), "a sealed token left the read");
+}
+
+/// A final checkpoint is final (tracker LT-B10D1, design §5, "Nothing above S changes what S's
+/// state holds"): Mac 0 writes a machine row and names it 20 days ago, and its pass signs and
+/// records a checkpoint of both, final at once since it is the only member whose frontier tip is
+/// recent. Both Macs' reads name that checkpoint as the settled floor S, Mac 1's though it signed
+/// nothing. Then, above S, Mac 0 writes a record reusing the naming's request id with another
+/// command, a revert of the naming, a revert of that revert and one more edit:
+///
+/// - the reused request id leaves both records standing, the naming below S and the reuse;
+/// - the revert of an edit below S is refused, with its own refusal, as is the revert of that
+///   revert, and no revert of the edit is written;
+/// - the cells are the cells at S with the two edits above applied, the state at S recomputed
+///   now is the state the checkpoint signed, and the view at S is the view read before;
+/// - the reverts' writer is not held to recovery for them, and the history reads as complete;
+/// - an unavailable (quarantined) record above S holds back its writer's records above S and
+///   leaves those below eligible, and a quarantined record below S makes no writer opaque (it is
+///   still awaited: the read folds records, and its write is not in the cells).
+///
+/// NEGATIVE CONTROLS, each against `documents::log`:
+/// - request identities judged on one side (`Log::judge` grouping without the
+///   `partition(|id| self.is_settled(id))`): `the record below S stands: Some("request identity
+///   reused with different commands")`;
+/// - the settled-revert rule removed (its branch in `Log::judge` never taken): `the revert of an
+///   edit below S is refused: None`;
+/// - a revert of a settled-refused revert judged as an ordinary revert (the `revert_refusals.get
+///   (target)` arm dropped from `Log::judge`): `a revert of that refused revert reaches below S
+///   through it`, left `Some("revert does not name a structurally valid observed edit with the
+///   same keys")`;
+/// - every refused revert counted against its writer (`Log::faulty_reverts` unfiltered): `Err(…
+///   "local proposal writer has withheld, unavailable or refused history; recovery required")`;
+/// - opaque authors judged without the floor (`!self.is_settled(id)` dropped from both filters in
+///   `Log::judge`): `an unavailable record above S leaves those below eligible: [false, false]`.
+#[test]
+fn a_final_checkpoint_is_final_for_requests_reverts_and_opaque_authors() {
+    use super::checkpoint::Signed;
+    use crate::documents::log::{Log, SETTLED_REVERT_REFUSAL};
+    const OPAQUE: &str = "author has unavailable retained request history";
+    use aterm_secrets::commons::hearing::{self, Ledger, Said};
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+    let now = aterm_time::unix_millis().unwrap();
+    let then = now - 20 * DAY;
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    Registry::at(lab.paths[0].clone()).open().unwrap();
+    let here = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let born = append_history_at(
+        &here,
+        Command::Write {
+            request: [91; 16],
+            changes: machine(MC),
+        },
+        then,
+    );
+    let nickname = put(&MACHINE, MC, "nickname", json!("settled"));
+    let named = append_history_at(
+        &here,
+        Command::Write {
+            request: [92; 16],
+            changes: vec![nickname.clone()],
+        },
+        then + 1_000,
+    );
+    let bootstrap = lab.bootstrap(0);
+    let access = bootstrap.access().unwrap().unwrap();
+    let mut ready = Ledger::new(bootstrap.trust());
+    for member in access.members() {
+        ready.record(
+            member.binding().actor(),
+            now,
+            Said::Version(hearing::READS_CHECKPOINTS),
+        );
+    }
+    assert_eq!(
+        here.checkpoint_every(&ready, now, 1).unwrap(),
+        Signed::Proposed
+    );
+    let floor = application::observe_store(&lab.paths[0], here.descriptor(), |_, store, _| {
+        Ok(store.floor().cloned())
+    })
+    .unwrap()
+    .expect("the pass records the final checkpoint as the floor");
+    let at_floor = here.view().unwrap();
+
+    let reused = append_history_at(
+        &here,
+        Command::Write {
+            request: [92; 16],
+            changes: vec![put(&MACHINE, MC, "status", json!("parked"))],
+        },
+        now,
+    );
+    let undo = append_history_at(
+        &here,
+        Command::Revert {
+            request: [93; 16],
+            operation: named,
+            changes: vec![crate::database::Change {
+                value: None,
+                ..nickname.clone()
+            }],
+        },
+        now + 1,
+    );
+    let redo = append_history_at(
+        &here,
+        Command::Revert {
+            request: [96; 16],
+            operation: undo,
+            changes: vec![nickname.clone()],
+        },
+        now + 2,
+    );
+    let later = append_history_at(
+        &here,
+        Command::Write {
+            request: [94; 16],
+            changes: vec![put(&MACHINE, MC, "location", json!("rack b"))],
+        },
+        now + 3,
+    );
+    repair_new_registry(&lab);
+    repair_registry(&lab, 2);
+
+    // Every replica names the same floor: the pass's, on the Mac that signed it and on one that
+    // signed nothing.
+    for paths in &lab.paths {
+        let named_floor =
+            application::observe_store(paths, here.descriptor(), |session, store, scope| {
+                let log = Log::read_with(session, store, scope, super::decode)?;
+                Ok(log.settled_frontier().cloned())
+            })
+            .unwrap();
+        assert_eq!(
+            named_floor.as_ref(),
+            Some(&floor.frontier),
+            "the settled floor"
+        );
+    }
+
+    application::observe_store(&lab.paths[0], here.descriptor(), |session, store, scope| {
+        let log = Log::read_with(session, store, scope, super::decode)?;
+        let snapshot = log.snapshot();
+        let op = |id: &Digest| {
+            snapshot
+                .operations
+                .iter()
+                .find(|op| op.header.id == *id)
+                .unwrap()
+                .clone()
+        };
+        // The request rule.
+        assert_eq!(op(&named).refusal, None, "the record below S stands");
+        assert!(op(&named).eligible && op(&named).duplicate_of.is_none());
+        assert_eq!(
+            op(&reused).refusal,
+            None,
+            "the reuse above S is a new write"
+        );
+        assert!(op(&reused).eligible && op(&reused).duplicate_of.is_none());
+        // The revert rule, read and written.
+        assert_eq!(
+            op(&undo).refusal.as_deref(),
+            Some(SETTLED_REVERT_REFUSAL),
+            "the revert of an edit below S is refused"
+        );
+        assert!(!op(&undo).eligible);
+        assert_eq!(
+            op(&redo).refusal.as_deref(),
+            Some(SETTLED_REVERT_REFUSAL),
+            "a revert of that refused revert reaches below S through it"
+        );
+        let written = log.compensate(
+            [95; 16],
+            named,
+            &BTreeSet::new(),
+            &crate::documents::Unwritten::new(),
+        );
+        assert!(
+            written
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains(SETTLED_REVERT_REFUSAL)),
+            "no revert of an edit below S is written: {written:?}"
+        );
+        // The cells: those at S with the records above applied.
+        let tips: BTreeSet<Digest> = floor.frontier.values().map(|tip| tip.digest).collect();
+        let mut cut = tips.clone();
+        for tip in &tips {
+            cut.extend(log.causal_index().ancestors(tip));
+        }
+        let mut folded = log.as_of_cut(&cut).cells_without(
+            None,
+            &BTreeSet::new(),
+            &crate::documents::Unwritten::new(),
+        );
+        for id in [reused, later] {
+            crate::documents::apply(
+                &|later, earlier| log.observes(later, earlier),
+                &mut folded,
+                id,
+                log.record_changes(&id).unwrap(),
+                true,
+            );
+        }
+        assert_eq!(
+            log.cells_without(None, &BTreeSet::new(), &crate::documents::Unwritten::new()),
+            folded,
+            "the fold from S"
+        );
+        let view = View::read(REGISTRY.table, session, &log)?;
+        let key = (nickname.collection.clone(), nickname.key.clone());
+        assert_eq!(
+            view.cells.get(&key),
+            at_floor.cells.get(&key),
+            "the naming stands"
+        );
+        assert!(view.refused.contains(&undo) && !view.refused.contains(&named));
+        assert_eq!(
+            super::checkpoint::state(REGISTRY.table, session, &log, &cut)?,
+            floor.state,
+            "the state at S is the state the checkpoint signed"
+        );
+        let at_s = View::read(REGISTRY.table, session, &log.as_of_cut(&cut))?;
+        assert_eq!(at_s.cells, at_floor.cells, "the cells at S");
+        assert_eq!(at_s.owned, at_floor.owned, "the owned rows at S");
+
+        // A revert refused for reaching below S is no fault of its writer's: it writes on.
+        let me = session.actor();
+        assert!(log.writable(me).is_ok(), "{:?}", log.writable(me));
+        assert!(
+            log.history_complete(),
+            "a settled refusal is judged history"
+        );
+        assert!(log.snapshot().history_complete(), "in the snapshot too");
+
+        // The opaque rule: the writer's newest record above S quarantined here holds back its
+        // earlier records above S, and none below.
+        let dark = log.with_quarantined(&later);
+        let snapshot = dark.snapshot();
+        let standing = |id: &Digest| {
+            snapshot
+                .operations
+                .iter()
+                .find(|op| op.header.id == *id)
+                .is_some_and(|op| op.eligible && op.refusal.is_none())
+        };
+        assert_eq!(
+            [standing(&born), standing(&named)],
+            [true, true],
+            "an unavailable record above S leaves those below eligible"
+        );
+        assert!(
+            !standing(&reused),
+            "and holds back its writer's records above S"
+        );
+        assert_eq!(
+            dark.cells_without(None, &BTreeSet::new(), &crate::documents::Unwritten::new()),
+            log.as_of_cut(&cut).cells_without(
+                None,
+                &BTreeSet::new(),
+                &crate::documents::Unwritten::new()
+            ),
+            "with everything above S held back, the cells are those at S"
+        );
+        // A record below S quarantined here makes no writer opaque. It is still awaited, as is
+        // what the store's quarantine withholds above S: a read folds the records, and its write
+        // is missing from the cells until a read takes them from S's state (tracker LT-B10D2).
+        let settled_dark = log.with_quarantined(&named);
+        let snapshot = settled_dark.snapshot();
+        assert!(
+            snapshot
+                .operations
+                .iter()
+                .all(|op| op.refusal.as_deref() != Some(OPAQUE)),
+            "an unavailable record below S makes no writer opaque"
+        );
+        let awaited = settled_dark.awaited(me);
+        assert!(
+            awaited.contains(&named) && awaited.contains(&later),
+            "{awaited:?}"
+        );
+        Ok(())
+    })
+    .unwrap();
 }

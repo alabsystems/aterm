@@ -463,6 +463,59 @@ fn every_command_a_step_runs_is_one_aterm_harness_takes() {
     assert!(parse(&unknown).is_err(), "the control");
 }
 
+/// THE PIN A STEP RUNS NAMES AN ACCOUNT `accounts use` REACHES: every notice whose step pins
+/// (`accounts use <account>`) is filled as the policy fills it, with the word that names the ready
+/// row's account (`super::super::turn_end::Ready::word`, from
+/// `crate::harness::account_names::word_of_row`), and the command's account resolves to that
+/// row's account among a roster of rows with addresses, whose labels are machine words. A parse
+/// alone would take any word. CONTROL: filled with the row's roster label, as the step was before
+/// SF-07H, the command's account names nothing.
+#[test]
+fn the_pin_a_step_runs_names_the_ready_rows_account() {
+    use crate::harness::account_names::{Candidates, names_of_row, resolve, word_of_row};
+    use crate::harness::accounts::{Cli, Row};
+    use crate::harness::cli::{AccountsCmd, Cmd, parse};
+    let row = |label: &str, email: &str| Row {
+        label: label.to_owned(),
+        email: Some(email.to_owned()),
+        ..Row::default()
+    };
+    let roster = [row("m2-2", "ada@x.example"), row("m2-3", "bea@y.example")];
+    let candidates = Candidates {
+        roster: &roster,
+        ..Candidates::default()
+    };
+    let pins: Vec<&NoticeText> = ALL
+        .iter()
+        .filter(|n| n.todo.contains("accounts use "))
+        .collect();
+    assert!(!pins.is_empty(), "a notice asks for the pin");
+    // The account the step a notice filled with `filled` runs reaches, or why it reaches none.
+    let reached = |n: &NoticeText, filled: &str| -> Result<String, String> {
+        let f = n.fill(Some(filled), longest_why(n));
+        let args = step_args(&f).ok_or_else(|| format!("no command: {f:?}"))?;
+        match parse(&args) {
+            Ok((Cmd::Accounts(AccountsCmd::Use { account }), _)) => {
+                resolve(Cli::Claude, &account, &candidates).map(|named| named.pk)
+            }
+            other => Err(format!("{args:?} parses as {other:?}")),
+        }
+    };
+    for n in pins {
+        for ready in &roster {
+            let word = word_of_row(Cli::Claude, ready, &roster, None).expect("an address");
+            let (pk, _) = names_of_row(Cli::Claude, ready, None).expect("an address");
+            assert_eq!(reached(n, word.as_str()), Ok(pk), "{}: {word}", n.id);
+            assert_eq!(
+                reached(n, &ready.label),
+                Err(aterm_file::no_account(&ready.label)),
+                "{}: CONTROL",
+                n.id
+            );
+        }
+    }
+}
+
 #[test]
 fn a_notice_closes_in_words_true_of_how_it_ended() {
     let limits: Vec<&str> = LIMITS

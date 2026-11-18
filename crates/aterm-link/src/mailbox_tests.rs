@@ -1220,3 +1220,221 @@ fn the_byte_bound_holds_and_one_oversized_record_still_passes() {
         Some(Item::Resume(Source::Inbox, 10))
     ));
 }
+
+/// **THE INBOX FACE SAYS WHAT ITS READER HAS NOT READ YET** (ATERM-KI-1115-1149): nothing is
+/// unread before a reader starts; once one whose tail is marked does, everything is until it
+/// reads past it: one past a pushed record, a mark's `next`, the highest of them, a lower one
+/// moving nothing back. A gap notice reads only to its start, the tail's cursor: astream
+/// delivers a record retention still holds inside its range after it, which then reads on
+/// past it. A queued record answers queued, and once taken, read. Another face's mark reads
+/// nothing of the inbox. A reset ends the generation, which then reads nothing; the old
+/// reader's pushes, gap notices and marks are refused, and its end is not the new one's. A
+/// reader that ended pushed all it read: nothing is unread past it. A reader whose tail is not
+/// marked says nothing of where it stands: nothing of it is unread. NEGATIVE CONTROL
+/// (`Mailbox::gaps_pass_their_range`, `Mutant::GapPassesItsRange`'s switch): the gap notice
+/// reads the face to its end, the record still on its way inside it read.
+#[test]
+fn the_inbox_face_says_what_its_reader_has_not_read_yet() {
+    for control in [false, true] {
+        let mb = Mailbox::default();
+        mb.gaps_pass_their_range(control);
+        assert_eq!(
+            mb.inbox_at(5),
+            InboxAt::Read,
+            "no reader reads before one starts"
+        );
+        let g = mb.reader_starts(Source::Inbox, true);
+        assert_eq!(
+            mb.inbox_at(0),
+            InboxAt::Unread,
+            "a reader that read nothing passed nothing"
+        );
+        assert_eq!(
+            mb.push(Source::Inbox, rec(5), None, g, t0()),
+            Pushed::Queued
+        );
+        assert_eq!(
+            mb.inbox_at(5),
+            InboxAt::Queued("/s/5".to_string(), Vec::new()),
+            "a pushed record is queued"
+        );
+        assert_eq!(mb.inbox_at(4), InboxAt::Read, "below the record pushed");
+        assert_eq!(mb.inbox_at(6), InboxAt::Unread, "past the record pushed");
+        assert!(matches!(
+            mb.take(Duration::ZERO, t0()),
+            Some(Item::Inbox((5, _, _), _))
+        ));
+        assert_eq!(mb.inbox_at(5), InboxAt::Read, "taken, and read past");
+
+        let gap = astream_broker::Gap {
+            from: 7,
+            to: 10,
+            records: Some(2),
+        };
+        assert!(mb.push_gap(Source::Inbox, gap, g, t0()));
+        assert_eq!(mb.inbox_at(6), InboxAt::Read, "below the notice's start");
+        if control {
+            assert_eq!(
+                mb.inbox_at(8),
+                InboxAt::Read,
+                "CONTROL: the notice reads its range"
+            );
+            continue;
+        }
+        assert_eq!(
+            mb.inbox_at(8),
+            InboxAt::Unread,
+            "inside the notice's range: retention may still hold a record there"
+        );
+        assert!(matches!(
+            mb.take(Duration::ZERO, t0()),
+            Some(Item::Gap(Source::Inbox, _))
+        ));
+        assert_eq!(
+            mb.push(Source::Inbox, rec(8), None, g, t0()),
+            Pushed::Queued,
+            "the record retention held, delivered after the notice"
+        );
+        assert!(matches!(mb.inbox_at(8), InboxAt::Queued(..)));
+        assert_eq!(mb.inbox_at(7), InboxAt::Read, "below it");
+        assert_eq!(mb.inbox_at(9), InboxAt::Unread, "past it");
+        assert!(mb.push_mark(Source::Inbox, 12, g));
+        assert_eq!(mb.inbox_at(11), InboxAt::Read, "below the mark's next");
+        assert_eq!(mb.inbox_at(12), InboxAt::Unread, "at it");
+        assert!(mb.push_mark(Source::Inbox, 3, g));
+        assert_eq!(
+            mb.inbox_at(11),
+            InboxAt::Read,
+            "a lower mark moves nothing back"
+        );
+        let say = mb.reader_starts(Source::Say, true);
+        assert!(mb.push_mark(Source::Say, 40, say));
+        assert_eq!(
+            mb.inbox_at(12),
+            InboxAt::Unread,
+            "another face's mark reads nothing of the inbox"
+        );
+
+        mb.reset_source(Source::Inbox);
+        assert_eq!(
+            mb.inbox_at(12),
+            InboxAt::Read,
+            "the reset ends the reader's generation"
+        );
+        assert!(
+            !mb.push_mark(Source::Inbox, 50, g),
+            "a torn-down generation's mark"
+        );
+        assert!(!mb.push_gap(Source::Inbox, gap, g, t0()), "its gap notice");
+        assert_eq!(
+            mb.push(Source::Inbox, rec(60), None, g, t0()),
+            Pushed::Stale
+        );
+        assert_eq!(
+            mb.inbox_at(60),
+            InboxAt::Read,
+            "and its record: none moved the face"
+        );
+        let fresh = mb.reader_starts(Source::Inbox, true);
+        assert_ne!(fresh, g);
+        assert_eq!(
+            mb.inbox_at(0),
+            InboxAt::Unread,
+            "the new generation read nothing yet"
+        );
+        mb.push_lost(Source::Inbox, g, End::Eof);
+        assert_eq!(
+            mb.inbox_at(0),
+            InboxAt::Unread,
+            "the old reader's end is not the new one's"
+        );
+        mb.push_lost(Source::Inbox, fresh, End::Eof);
+        assert_eq!(
+            mb.inbox_at(0),
+            InboxAt::Read,
+            "a reader that ended pushed all it read"
+        );
+
+        mb.reset_source(Source::Inbox);
+        let unmarked = mb.reader_starts(Source::Inbox, false);
+        assert_eq!(
+            mb.push(Source::Inbox, rec(70), None, unmarked, t0()),
+            Pushed::Queued
+        );
+        assert_eq!(
+            [mb.inbox_at(0), mb.inbox_at(71)],
+            [InboxAt::Read, InboxAt::Read],
+            "a reader whose tail is not marked says nothing past what it pushed"
+        );
+    }
+}
+
+/// **A LANE'S ANSWER ON ITS WAY IN IS TOLD BY A READER WHOSE TAIL IS MARKED**
+/// (ATERM-KI-1115-1149, `Bridge::answer_queued`): the queued records of the lane are listed
+/// with whether a record below `below` may still come. A reader whose tail is marked says it
+/// from its start, before its first mark too, while it reads a backlog: its broker marks it
+/// once that is read. One whose tail is not marked says nothing of a range it may have passed
+/// with no record of its filter there. Asked nothing (`None`), or once read to `below`, or once
+/// reset, nothing more is on its way.
+#[test]
+fn a_lanes_answer_on_its_way_in_is_told_by_a_reader_whose_tail_is_marked() {
+    let mb = Mailbox::default();
+    let g = mb.reader_starts(Source::Inbox, true);
+    let answer = (7, "/f/f/in/n/s/x/answer".to_string(), b"re=3".to_vec());
+    assert_eq!(
+        mb.push(Source::Inbox, answer, None, g, t0()),
+        Pushed::Queued
+    );
+    let _ = mb.push(Source::Inbox, rec(8), None, g, t0());
+    let (queued, unread) = mb.inbox_queued_on("/f/f/in/n/s/", Some(20));
+    assert_eq!(
+        queued,
+        [(7, "/f/f/in/n/s/x/answer".to_string(), b"re=3".to_vec())],
+        "only the lane's, at its offset"
+    );
+    assert!(
+        unread,
+        "a backlog read to 9 of 20, no mark yet: the rest may still come"
+    );
+    assert!(mb.push_mark(Source::Inbox, 10, g));
+    assert!(
+        mb.inbox_queued_on("/f/f/in/n/s/", Some(20)).1,
+        "marked, read to 10 of 20"
+    );
+    assert!(
+        !mb.inbox_queued_on("/f/f/in/n/s/", Some(10)).1,
+        "read to the range's end"
+    );
+    assert!(
+        !mb.inbox_queued_on("/f/f/in/n/s/", None).1,
+        "asked of no range"
+    );
+    assert!(mb.push_mark(Source::Inbox, 25, g));
+    assert!(
+        !mb.inbox_queued_on("/f/f/in/n/s/", Some(20)).1,
+        "read past it"
+    );
+    mb.reset_source(Source::Inbox);
+    let fresh = mb.reader_starts(Source::Inbox, true);
+    assert_eq!(
+        mb.inbox_queued_on("/f/f/in/n/s/", Some(20)),
+        (Vec::new(), true),
+        "the reset emptied the face, and the new reader has read nothing yet"
+    );
+    assert!(mb.push_mark(Source::Inbox, 2, fresh));
+    assert!(
+        mb.inbox_queued_on("/f/f/in/n/s/", Some(20)).1,
+        "and then to 2"
+    );
+    mb.reset_source(Source::Inbox);
+    assert!(
+        !mb.inbox_queued_on("/f/f/in/n/s/", Some(20)).1,
+        "no reader reads after a reset"
+    );
+    let unmarked = mb.reader_starts(Source::Inbox, false);
+    let _ = mb.push(Source::Inbox, rec(8), None, unmarked, t0());
+    assert!(
+        !mb.inbox_queued_on("/f/f/in/n/s/", Some(20)).1,
+        "a reader whose tail is not marked says nothing past what it pushed"
+    );
+}

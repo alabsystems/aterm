@@ -865,12 +865,19 @@ fn held_daemon_fifo(inst: &Instance) -> std::fs::File {
         0,
         "make daemon FIFO"
     );
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
-        .expect("hold the daemon FIFO read-write until release")
+    // The daemon is released by the EOF this end's drop gives, so no other process may hold a
+    // copy: opened through `kept_out`, it is made under the spawn lock and kept out of every
+    // fork, as `aterm_uds::pipe` keeps its ends. A sibling test's child forked while this end
+    // was open would otherwise hold it until its exec, which a loaded Mac can stall past the
+    // hang detector.
+    aterm_uds::kept_out(|| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&path)
+    })
+    .expect("hold the daemon FIFO read-write until release")
 }
 
 fn prove_daemon(inst: &Instance, release_parent: &RcRelease, observed: &RcRelease) -> Leftover {

@@ -3475,11 +3475,9 @@ fn an_atdb7_peer_converges_with_this_build_on_atdb7() {
     }
     assert_eq!(sessions, CONTROL.div_ceil(RECORDS_PER_ROUND));
     assert_eq!(control_held(&fixture, 0), union);
-    for mac in 0..2 {
+    for (mac, paths) in fixture.paths.iter().enumerate().take(2) {
         assert_eq!(
-            client::load_records(&fixture.paths[mac])
-                .unwrap()
-                .inventory(),
+            client::load_records(paths).unwrap().inventory(),
             records,
             "Mac {mac}'s membership records"
         );

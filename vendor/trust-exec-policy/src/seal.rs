@@ -44,7 +44,9 @@ impl ExecutionSeal {
         };
         install_profile(profile)?;
         if !fork_denied(std::process::id())? {
-            return Err(io::Error::other("native execution seal observation unavailable"));
+            return Err(io::Error::other(
+                "native execution seal observation unavailable",
+            ));
         }
         Ok(())
     }
@@ -70,6 +72,13 @@ pub(super) fn install_image_profile(
         std::ptr::null(),
     ];
     let profile = c"(version 1)(deny default)(allow file-read* file-map-executable (literal (param \"IMAGE\")) (literal (param \"DESCRIPTOR\")))";
+    install_parameterized_profile(profile, &parameters)
+}
+
+pub(super) fn install_parameterized_profile(
+    profile: &std::ffi::CStr,
+    parameters: &[*const libc::c_char],
+) -> io::Result<()> {
     let mut message = std::ptr::null_mut();
     // SAFETY: fixed profile, live native strings and a null-terminated pair list.
     // The path is passed as data, so quotes/backslashes cannot add policy rules.
@@ -86,7 +95,9 @@ fn finish_installation(result: i32, message: *mut libc::c_char) -> io::Result<()
         unsafe { sandbox_free_error(message) };
     }
     if result != 0 {
-        return Err(io::Error::other("native execution seal installation refused"));
+        return Err(io::Error::other(
+            "native execution seal installation refused",
+        ));
     }
     Ok(())
 }
@@ -102,9 +113,15 @@ pub fn fork_denied(pid: u32) -> io::Result<bool> {
 }
 
 fn valid_pid(pid: u32) -> io::Result<i32> {
-    i32::try_from(pid).ok().filter(|pid| *pid > 0).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "invalid native process identity")
-    })
+    i32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid native process identity",
+            )
+        })
 }
 
 fn verdict(result: i32) -> io::Result<bool> {

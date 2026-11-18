@@ -377,11 +377,12 @@ fn pass_starting(
 
 #[cfg(unix)]
 fn ended_status(status: std::process::ExitStatus) -> Ended {
-    match status.code() {
-        _ if status.success() => Ended::Ran,
-        Some(code) if code == i32::from(aterm_secrets::converge::UNFINISHED) => Ended::Unfinished,
-        Some(code) if code == i32::from(aterm_secrets::converge::STANDING) => Ended::Standing,
-        code => Ended::Failed(code),
+    use aterm_secrets::converge::{Last, RunnerResult};
+    match RunnerResult::from_exit_code(status.code()).last {
+        Last::Ended => Ended::Ran,
+        Last::Unfinished => Ended::Unfinished,
+        Last::Standing => Ended::Standing,
+        _ => Ended::Failed(status.code()),
     }
 }
 

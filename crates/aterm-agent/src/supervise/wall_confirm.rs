@@ -833,6 +833,10 @@ pub(super) struct Verdict {
     found: Option<aterm_phase::Wall>,
     named: Option<Named>,
     pub(super) conversation: Option<Conversation>,
+    /// The wall the point shows, confirmed, is the limit an account move left
+    /// ([`super::super::policy::turn_end::TurnEndState::left_limit_of`]), judged once at the
+    /// decision's read ([`Session::limit_left_at`]).
+    left: bool,
 }
 
 fn is_owner_row(row: &str) -> bool {
@@ -856,6 +860,7 @@ impl<C: Ctl> Session<'_, C> {
     ) {
         let seq = screen.seq;
         let decided = self.wall_verdict.as_ref().filter(|v| v.seq == seq);
+        let decided_here = !matches!((check, decided), (Check::AsDecided, Some(_)));
         let (refused, found, named) = match (check, decided) {
             (Check::AsDecided, Some(v)) => (v.refused.is_some(), v.found.clone(), v.named.clone()),
             _ => {
@@ -882,11 +887,32 @@ impl<C: Ctl> Session<'_, C> {
                     found: found.clone(),
                     named: named.clone(),
                     conversation: None,
+                    left: false,
                 });
                 (out, found, named)
             }
         };
         apply_verdict(reading, screen, refused, found, named);
+        // The wall the verdict leaves, judged against the notice this read dated: the limit a
+        // move left is judged once, here, for the point's later reads and its episode.
+        if decided_here {
+            let left = reading
+                .wall
+                .as_ref()
+                .is_some_and(|w| self.turn_end.left_limit_of(w.kind));
+            if let Some(v) = self.wall_verdict.as_mut().filter(|v| v.seq == seq) {
+                v.left = left;
+            }
+        }
+    }
+
+    /// Whether the wall point `seq` shows is the limit an account move left, as the decision's
+    /// read judged it ([`Verdict::left`]): no limit of the moved-to account's, so no episode of
+    /// its own ([`Session::limit_after`]) and no wall memory ([`Session::wall_memory_step`]).
+    pub(super) fn limit_left_at(&self, seq: u64) -> bool {
+        self.wall_verdict
+            .as_ref()
+            .is_some_and(|v| v.seq == seq && v.left)
     }
 
     /// Whether the wall check at point `seq` refused the screen's wall (no transcript confirmed

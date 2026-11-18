@@ -424,9 +424,16 @@ pub fn read_fleet(text: &str) -> Result<(Fleet, Vec<String>), String> {
     Ok((fleet, notes))
 }
 
-/// The bytes of the file at `path` ([`aterm_uds::shared_write`]).
+/// The bytes of the file at `path` ([`aterm_uds::shared_write`]). With a trace scope armed on
+/// this thread, the file's stamp is recorded before it is opened and a read that fails for a
+/// reason no stamp decides records a retry (`aterm_uds::trace::fs::opening`, `failed`), as the
+/// shared readers do.
 fn read_private(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     use std::io::Read as _;
+    let failed = |e: std::io::Error| {
+        aterm_uds::trace::fs::failed(path, &e);
+        one(&e.to_string())
+    };
     let mut open = std::fs::OpenOptions::new();
     open.read(true);
     #[cfg(unix)]
@@ -434,14 +441,15 @@ fn read_private(path: &Path, max: u64) -> Result<Vec<u8>, String> {
         use std::os::unix::fs::OpenOptionsExt as _;
         open.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
+    aterm_uds::trace::fs::opening(path);
     let file = match open.open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err("no such file".to_string());
         }
-        Err(e) => return Err(one(&e.to_string())),
+        Err(e) => return Err(failed(e)),
     };
-    let meta = file.metadata().map_err(|e| one(&e.to_string()))?;
+    let meta = file.metadata().map_err(failed)?;
     if !meta.is_file() {
         return Err("not a regular file".to_string());
     }
@@ -453,7 +461,7 @@ fn read_private(path: &Path, max: u64) -> Result<Vec<u8>, String> {
         if meta.uid() != me {
             return Err("owned by another user".to_string());
         }
-        if aterm_uds::shared_write::others_can_write(&file).map_err(|e| one(&e.to_string()))? {
+        if aterm_uds::shared_write::others_can_write(&file).map_err(failed)? {
             return Err("writable by others".to_string());
         }
     }
@@ -462,9 +470,7 @@ fn read_private(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     }
     let cap = usize::try_from(meta.len().min(max).saturating_add(1)).unwrap_or(0);
     let mut bytes = Vec::with_capacity(cap);
-    file.take(max + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| one(&e.to_string()))?;
+    file.take(max + 1).read_to_end(&mut bytes).map_err(failed)?;
     if bytes.len() as u64 > max {
         return Err(format!("larger than {} KiB", max / 1024));
     }
@@ -491,12 +497,13 @@ pub fn load_fleet(path: &Path, key: Option<&str>) -> Result<(Fleet, Vec<String>)
 }
 
 /// Reads the fleet document `source` names: a file as [`load_fleet`] reads it; a URL's as
-/// the cache under `ai_dir` holds it, verified again under `key` ([`super::fleet::held`]).
+/// the cache under `ai_dir` holds it, verified again under `key` and judged unexpired as of `now`
+/// ([`super::fleet::held`]).
 pub fn load_source(
     source: &FleetSource,
     key: Option<&str>,
     ai_dir: Option<&Path>,
-    now: i64,
+    now: impl Into<aterm_uds::trace::Now>,
 ) -> Result<(Fleet, Vec<String>), String> {
     match source {
         FleetSource::Path(p) => load_fleet(p, key),
@@ -545,7 +552,7 @@ pub fn fleet_source(local: &Local, config: Option<&Path>) -> Option<FleetSource>
             .map(|dir| dir.join(FLEET_FILE))
             .filter(|path| {
                 !matches!(
-                    std::fs::symlink_metadata(path),
+                    aterm_uds::trace::fs::symlink_metadata(path),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound
                 )
             })
@@ -707,9 +714,13 @@ pub fn read_config(config: Option<&Path>) -> Result<Option<String>, String> {
 /// Reads `aterm.toml` at `config` ([`read_config`]; absent: every default) and the fleet
 /// document. A file that is there and is not read sets nothing and names no fleet document, as
 /// the window runs every setting at its default when it cannot read the file at launch; a note
-/// says why.
+/// says why. A fleet document's expiry is judged as of `now` ([`load_source`]).
 #[must_use]
-pub fn load_with(config: Option<&Path>, ai_dir: Option<&Path>, now: i64) -> Settings {
+pub fn load_with(
+    config: Option<&Path>,
+    ai_dir: Option<&Path>,
+    now: impl Into<aterm_uds::trace::Now>,
+) -> Settings {
     load_read(&read_config(config), config, ai_dir, now).0
 }
 
@@ -719,7 +730,7 @@ pub(crate) fn load_read(
     read: &Result<Option<String>, String>,
     config: Option<&Path>,
     ai_dir: Option<&Path>,
-    now: i64,
+    now: impl Into<aterm_uds::trace::Now>,
 ) -> (Settings, Option<Value>) {
     match read {
         Ok(text) => load_from_text(text.as_deref(), config, ai_dir, now),
@@ -738,7 +749,7 @@ fn load_from_text(
     text: Option<&str>,
     config: Option<&Path>,
     ai_dir: Option<&Path>,
-    now: i64,
+    now: impl Into<aterm_uds::trace::Now>,
 ) -> (Settings, Option<Value>) {
     let (parsed_doc, (local, notes)) = match text {
         Some(text) => match aterm_toml::from_str::<Value>(text) {

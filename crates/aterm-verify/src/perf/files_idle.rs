@@ -7,9 +7,9 @@
 //! It builds aterm-db's library tests in the `test` profile and runs one ignored test alone,
 //! `alab::upkeep::tests::an_idle_hour_reports_its_counts` ([`TEST`]): on a two-Mac lab whose
 //! registry is in its second generation, carrying a facts row of each Mac from a membership
-//! epoch that is no longer current, the owner's materializer schedule (on the test's clock)
-//! makes its first pass over the seven shared files, then 60 regular ones with nothing arriving
-//! and nothing changing. Thread counters, which no release build compiles, count each pass's
+//! epoch that is no longer current, and whose owner declares `lab/tracker` with no entry, the
+//! owner's materializer schedule (on the test's clock) makes its first pass over the nine
+//! shared files, then 60 regular ones with nothing arriving and nothing changing. Thread counters, which no release build compiles, count each pass's
 //! work, and the test prints one `FILES-IDLE {json}` line: what the first pass counted
 //! (`first_<counter>`) and what the 60 after it counted together (`idle_<counter>`), for each of
 //! [`COUNTERS`]. The test runs on one thread and counts only that thread's work, and before its
@@ -81,7 +81,7 @@ const SPANS: [&str; 2] = ["first", "idle"];
 /// the registry generation and the carried facts rows.
 const SHAPE: [(&str, u64); 4] = [
     ("passes", 61),
-    ("files", 7),
+    ("files", 9),
     ("generation", 2),
     ("carried", 2),
 ];
@@ -90,7 +90,8 @@ const COMMENT: &str = "aterm FILES-IDLE baseline: exact counts of the shared fil
     materializer over an idle hour, from aterm-db's ignored drive \
     alab::upkeep::tests::an_idle_hour_reports_its_counts in the test profile: a two-Writer lab \
     whose registry is in its second generation, carrying each Mac's facts row from an old \
-    membership epoch; the owner's schedule makes its first pass over the seven shared files \
+    membership epoch, and whose owner declares lab/tracker with no entry; the owner's schedule \
+    makes its first pass over the nine shared files \
     (first_*) and then 60 regular passes with nothing changing (idle_*, summed). Counted on the \
     drive's thread: table views read to project (projections), MACHINE's claim projections and \
     claim contexts, durable writes by the recordings (puts), folder modes set by the looks, the \

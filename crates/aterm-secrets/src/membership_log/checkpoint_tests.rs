@@ -316,7 +316,7 @@ fn vault_checkpoint_two_proposers_write_one_body() {
         (&None, T, &[two_logs.head][..])
     );
     assert_eq!(plan.dropped, vec![two_logs.superseded]);
-    assert_eq!(*dropped, dropped_digest(&plan.dropped));
+    assert_eq!(*dropped, dropped_digest(&plan.stubs));
     // The body recomputes at its heads, on either Mac.
     assert_eq!(
         encode_body(&plan_at(&two_logs.q, T, &[two_logs.head]).unwrap().body),

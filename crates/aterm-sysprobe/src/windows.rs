@@ -10,6 +10,18 @@ use std::mem::{offset_of, size_of};
 use crate::jobs::RunState;
 use crate::machine::{Commit, layout_by_rank};
 use crate::procs::{MAX_PROCESSES, ProcessReading, Sweep};
+
+#[path = "windows_console.rs"]
+mod console;
+pub use console::{ConsoleFact, ConsoleFacts, ConsoleTree, collect_console_facts};
+
+/// Read bounded, generation-checked console facts for roots in this process census.
+/// Native calls belong on the caller's process-reading lane, before publication.
+#[cfg(all(windows, target_pointer_width = "64"))]
+#[must_use]
+pub fn read_console_facts(procs: &[ProcessReading], roots: &[u32]) -> ConsoleFacts {
+    collect_console_facts(procs, roots, crate::win::checked_console)
+}
 use crate::{
     CoreTicks, CpuLayout, GroupMemory, MAX_GROUP_PIDS, MemberUsage, MemoryDetail, MemoryLevel,
 };
@@ -626,6 +638,7 @@ pub fn processes(bytes: &[u8], base: u64) -> Sweep {
                     scheduling: None,
                     pid: u32::try_from(pid).unwrap_or(u32::MAX),
                     start,
+                    birth: start.and_then(crate::procs::birth_micros_of_filetime),
                     ppid: u32::try_from(field(
                         rec,
                         offset_of!(ProcessInformation64, inherited_from_unique_process_id),

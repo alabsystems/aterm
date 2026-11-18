@@ -1930,6 +1930,7 @@ fn candidates_sort_by_one_key_fresh_dedicated_soonest_week_label() {
                 "pool-a".to_string(),
                 Ok(Rank {
                     borrowed: false,
+                    model_walled: false,
                     low: false,
                     class: Class::Pool,
                     week_reset: None
@@ -4371,7 +4372,8 @@ fn samples_offers_auth_and_sessions_are_recorded_newest_first() {
         SessionRow {
             account: "work-2".into(),
             at: NOW + 2,
-            held: None
+            held: None,
+            owner: Owner::here(),
         }
     );
     note_session(&mut s, "s-2", "work-2", None, NOW + 3);
@@ -4791,7 +4793,7 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
 }
 
 #[test]
-fn a_reset_used_or_a_limit_lifted_clears_only_its_claimed_window() {
+fn a_reset_used_or_a_limit_lifted_clears_only_the_windows_it_refilled() {
     use alab_policy::vocab::ResetKind;
     let r = three();
     let enrolled = all(&r);
@@ -4852,31 +4854,45 @@ fn a_reset_used_or_a_limit_lifted_clears_only_its_claimed_window() {
         left: Some(left),
     };
     // What each outcome refilled: the claim's window, both windows for a full reset, and nothing
-    // for a limit that lifted by itself.
-    for (done, kind, why, refilled) in [
+    // for a limit that lifted by itself; and the walls a reset used lifted with its claim's, each
+    // told by its own row: a full reset's five-hour window ([`refills_with`]).
+    for (done, kind, why, refilled, with) in [
         (
             used(ResetKind::Weekly, 1),
             Kind::ResetUsed,
             "1 weekly reset left",
             &[WEEK_LIMIT][..],
+            &[][..],
         ),
         (
             used(ResetKind::Session, 0),
             Kind::ResetUsed,
             "no five-hour resets left",
             &[WEEK_LIMIT][..],
+            &[][..],
         ),
         (
             used(ResetKind::Full, 2),
             Kind::ResetUsed,
             "2 full resets left",
             &[WEEK_LIMIT, SESSION_LIMIT][..],
+            &[SESSION_LIMIT][..],
         ),
-        (ResetDone::Lifted, Kind::ResetKept, "lifted", &[][..]),
+        (
+            ResetDone::Lifted,
+            Kind::ResetKept,
+            "lifted",
+            &[][..],
+            &[][..],
+        ),
     ] {
         let mut s = walled.clone();
         let rows = reset_outcome(&mut s, "main", until, "s-one", &done, NOW);
         assert_eq!(rows[0].refilled, refilled, "{done:?}: what it refilled");
+        let lifted_with: Vec<String> = with
+            .iter()
+            .map(|window| format!("{window}{WALL_LIFTED}a full reset refilled it"))
+            .collect();
         assert_eq!(
             rows.iter()
                 .map(|e| (
@@ -4887,13 +4903,25 @@ fn a_reset_used_or_a_limit_lifted_clears_only_its_claimed_window() {
                     e.why.as_str()
                 ))
                 .collect::<Vec<_>>(),
-            [(NOW, kind, "main", Some("s-one"), why)],
+            std::iter::once((NOW, kind, "main", Some("s-one"), why))
+                .chain(lifted_with.iter().map(|why| (
+                    NOW,
+                    Kind::Wall,
+                    "main",
+                    Some("s-one"),
+                    why.as_str()
+                )))
+                .collect::<Vec<_>>(),
             "{done:?}: the count is its kind's, in the vendor's words"
         );
-        assert!(rows[0].wakes(), "{done:?}");
+        assert!(rows.iter().all(Event::wakes), "{done:?}");
         let main = &s.accounts["main"];
         assert!(main.walls[WEEK_LIMIT].cleared, "{done:?}: the claimed wall");
         for window in [SESSION_LIMIT, "seven_day_sonnet", "future_quota"] {
+            if with.contains(&window) {
+                assert!(main.walls[window].cleared, "{done:?}: {window}");
+                continue;
+            }
             assert_eq!(
                 main.walls[window], walled.accounts["main"].walls[window],
                 "{done:?}: {window}"
@@ -4904,7 +4932,10 @@ fn a_reset_used_or_a_limit_lifted_clears_only_its_claimed_window() {
             "{done:?}: no account-wide owner clear"
         );
         assert_eq!(main.cleared_since(WEEK_LIMIT, written, NOW), Some(NOW));
-        assert_eq!(main.cleared_since(SESSION_LIMIT, written, NOW), None);
+        assert_eq!(
+            main.cleared_since(SESSION_LIMIT, written, NOW),
+            with.contains(&SESSION_LIMIT).then_some(NOW)
+        );
         assert_eq!(
             s.reset.as_ref().and_then(|c| c.done.as_deref()),
             Some(done.word()),
@@ -5146,6 +5177,7 @@ fn a_reset_is_allowed_only_on_the_machines_own_login_with_no_other_login_on_reco
                 account: "pool-a".into(),
                 at,
                 held: None,
+                owner: None,
             },
         );
         s
@@ -5618,7 +5650,7 @@ fn the_machine_id_is_minted_once_and_kept() {
         store.load(NOW).expect("ours").0.machine,
         store.load(NOW).expect("ours").0.machine,
     );
-    assert_ne!(a, b, "minted per load with none kept");
+    assert_eq!(a, b, "drawn once in the process while none is kept");
     assert!(!store.dir.exists(), "a load makes nothing");
     let mut note = None;
     store
@@ -5637,6 +5669,7 @@ fn the_machine_id_is_minted_once_and_kept() {
         .expect("kept")
         .trim()
         .to_owned();
+    assert_eq!(id, a, "the id the loads answered is the one kept");
     #[cfg(unix)]
     assert_eq!(mode(&store.machine_file()), 0o600);
     let held = store.load(NOW).expect("ours").0;
@@ -6222,6 +6255,31 @@ fn a_process_login_is_read_from_its_own_environment_and_nothing_else() {
     );
 }
 
+/// A CHILD STARTED ON ITS STORED LOGIN KEEPS EVERY OTHER VARIABLE: [`names_a_login_or_route`],
+/// the names `InheritNoLogin` takes out of a test's child, holds neither the directories a
+/// helper hands its child on purpose (`HOME`, `XDG_CONFIG_HOME`) nor a name that only resembles
+/// a login or route variable, so a child keeps them. The names it does hold are the reader's own:
+/// `ProcessLogin::of_env` skips every name outside it, so a name dropped from it is a name the
+/// reader stops judging, which the reader's own tests catch.
+#[test]
+fn a_child_on_its_stored_login_keeps_every_name_no_login_or_route_reads() {
+    for name in [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "PATH",
+        "USER",
+        "ATERM_PARENT_SESSION_ID",
+        "ATERM_CLAUDE_TOKEN_OLD",
+        "CLAUDE_CONFIG_DIR_BACKUP",
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR_OLD",
+        "ANTHROPIC_MODEL",
+        "anthropic_api_key",
+        "",
+    ] {
+        assert!(!names_a_login_or_route(name), "{name}");
+    }
+}
+
 #[test]
 fn a_process_login_names_its_row_byte_for_byte() {
     let r = three();
@@ -6500,6 +6558,7 @@ fn the_recorder_records_this_process_wall_for_its_account_once() {
             account: "main".to_string(),
             at: NOW,
             held: None,
+            owner: Owner::here(),
         }
     );
     assert_eq!(
@@ -7186,46 +7245,6 @@ fn a_reset_more_than_eight_days_past_its_row_is_recorded_as_naming_none() {
         Condition::Limited {
             until: NOW + NO_RESET_WALL_S[0]
         }
-    );
-}
-
-#[test]
-fn a_session_row_older_than_thirty_days_is_dropped_when_the_state_is_saved() {
-    let dir = tmp("sessions-old");
-    let store = Store::at(dir.path());
-    let mut seeded = state();
-    note_session(&mut seeded, "s-old", "main", None, NOW - 30 * DAY - 1);
-    note_session(&mut seeded, "s-edge", "main", Some("jobs"), NOW - 30 * DAY);
-    note_session(&mut seeded, "s-new", "work-2", None, NOW - HOUR);
-    note_session(&mut seeded, "s-ahead", "main", None, NOW + DAY);
-    store.save(&seeded).expect("saves");
-    assert_eq!(drop_stale_sessions(&mut seeded.clone(), NOW), 1);
-    assert_eq!(
-        drop_stale_sessions(&mut seeded.clone(), NOW - 1),
-        0,
-        "a second earlier, the oldest row is thirty days old to the second"
-    );
-    let keys = |store: &Store| {
-        let (state, _) = store.load(NOW).expect("ours");
-        state.sessions.keys().cloned().collect::<Vec<_>>()
-    };
-
-    let mut note = None;
-    let rows = store.transact(NOW, &mut note, |_| Ok(Vec::new()));
-    assert_eq!(rows, Ok(Vec::new()));
-    assert_eq!(keys(&store), ["s-ahead", "s-edge", "s-new", "s-old"]);
-
-    store
-        .transact(NOW, &mut note, |state| {
-            Ok(note_session(state, "s-two", "main", None, NOW))
-        })
-        .expect("writes");
-    assert_eq!(keys(&store), ["s-ahead", "s-edge", "s-new", "s-two"]);
-    let (state, _) = store.load(NOW).expect("ours");
-    assert_eq!(
-        state.sessions["s-edge"].held.as_deref(),
-        Some("jobs"),
-        "a row kept is kept whole"
     );
 }
 
@@ -8544,14 +8563,15 @@ fn a_refill_inside_a_window_lifts_the_wall_it_replaced_and_wakes_the_wait() {
         "an older observer does not raise it again"
     );
 
-    // A wall filed while the refill was already on record is lifted by the next reading.
+    // A wall filed while the refill was already on record, sighted before it and never since,
+    // is lifted by the next reading.
     let (mut s, _) = run(NOW, true);
     let wall = s
         .accounts
         .get_mut("main")
         .and_then(|a| a.walls.get_mut(SESSION_LIMIT))
         .expect("the wall");
-    (wall.cleared, wall.at) = (false, NOW);
+    (wall.cleared, wall.at, wall.seen) = (false, NOW, None);
     assert!(s.accounts["main"].limited_until(NOW + MIN).is_some());
     let events = note_reading(
         &mut s,
@@ -10340,6 +10360,9 @@ fn a_relative_login_file_never_names_the_default_account() {
 #[path = "accounts_wall_ladder_tests.rs"]
 mod wall_ladder;
 
+#[path = "accounts_week_family_tests.rs"]
+mod week_family;
+
 #[path = "accounts_login_attribution_tests.rs"]
 mod login_attribution;
 
@@ -11320,6 +11343,7 @@ fn weeks_said_holds_a_models_week_and_no_decision_reads_it() {
             let account = state.account(OWN);
             (
                 account.limited_until(now),
+                account.model_limited_until(FABLE, now),
                 account.low(now),
                 account.leave_early(now),
                 account.observed(),
@@ -11329,7 +11353,7 @@ fn weeks_said_holds_a_models_week_and_no_decision_reads_it() {
         };
         let before = decided(NOW + MIN);
         assert_eq!(
-            (before.3, before.4),
+            (before.4, before.5),
             if seen {
                 (true, Condition::Usable)
             } else {
@@ -11373,9 +11397,14 @@ fn weeks_said_holds_a_models_week_and_no_decision_reads_it() {
             credits: None,
         };
         record_wall(&store, &r, "s-1", &stored(), &wall, NOW - HOUR, NOW + MIN);
+        let walled = decided(NOW + MIN);
+        assert_ne!(
+            walled, before,
+            "the control: the same wall recorded as a wall moves the readings"
+        );
         assert!(
-            decided(NOW + MIN).0.is_some(),
-            "the control: the same wall recorded as a wall stands"
+            walled.1.is_some(),
+            "the same wall recorded as a wall stands, for Fable's sessions: {walled:?}"
         );
     }
 }
@@ -11724,7 +11753,7 @@ fn weeks_said_ends_a_no_reset_wall_with_the_week_an_earlier_read_named() {
             now: walled + MIN,
             tz_s: 0,
             machine: Some("3f9a1b2c4d5e6f70"),
-            label: OWN,
+            name: crate::harness::account_stats::HomeName::label(OWN),
             profile: &profile,
             account: Some(&account),
             state_unread: false,
@@ -12737,21 +12766,37 @@ fn a_rotation_off_a_limits_wall_passes_an_active_the_records_hold_off_it() {
         active: "work-2".into(),
     });
     let mut s = records(Some("codex_other"));
-    assert!(rotate(&mut s, Some("codex_other")).is_ok());
+    assert!(rotate(&mut s, Some(&limit_wall("codex_other"))).is_ok());
     assert_eq!(
         (s.active.as_deref(), s.rotations.as_slice()),
         (Some("pool-a"), [NOW].as_slice())
     );
     let mut s = records(None);
-    assert_eq!(rotate(&mut s, Some("codex_other")), held, "no wall of it");
+    assert_eq!(
+        rotate(&mut s, Some(&limit_wall("codex_other"))),
+        held,
+        "no wall of it"
+    );
     let mut s = records(Some("codex_another"));
-    assert_eq!(rotate(&mut s, Some("codex_other")), held, "another's");
+    assert_eq!(
+        rotate(&mut s, Some(&limit_wall("codex_other"))),
+        held,
+        "another's"
+    );
     let mut s = records(Some("codex_other"));
     s.pinned = true;
-    assert_eq!(rotate(&mut s, Some("codex_other")), held, "the pin");
+    assert_eq!(
+        rotate(&mut s, Some(&limit_wall("codex_other"))),
+        held,
+        "the pin"
+    );
     let mut s = records(Some("codex_other"));
     s.proven = false;
-    assert_eq!(rotate(&mut s, Some("codex_other")), held, "the canary");
+    assert_eq!(
+        rotate(&mut s, Some(&limit_wall("codex_other"))),
+        held,
+        "the canary"
+    );
     let mut s = records(Some("codex_other"));
     assert_eq!(rotate(&mut s, None), held, "CONTROL");
     assert_eq!(
@@ -12775,6 +12820,7 @@ fn token_read(state: &mut State, label: &str, read_at: i64, end: i64) {
     state.tokens_here = Some(TokensHere {
         read_at,
         ends: [(label.to_owned(), end)].into(),
+        vouched: false,
     });
 }
 
@@ -12932,7 +12978,7 @@ fn a_signed_out_row_whose_vault_token_is_in_use_here_is_picked_by_rotation_and_s
     );
     assert!(matches!(
         launch_judged(started, TokenFact::InUse),
-        Decision::Token { ref account, .. } if account.named() == "pool-a"
+        Decision::Token { ref account, .. } if account.label.as_deref() == Some("pool-a")
     ));
     // A pool of that row alone still has a working login while its token lasts.
     let alone = Roster {
@@ -13268,6 +13314,7 @@ fn an_unknown_vault_read_keeps_the_previous_reading_of_the_rows_on_their_token()
     let kept = TokensHere {
         read_at: NOW,
         ends: [("pool-a".to_owned(), NOW + DAY)].into(),
+        vouched: false,
     };
     assert_eq!(store.read_tokens_here(), Some(kept.clone()));
 

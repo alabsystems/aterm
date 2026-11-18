@@ -384,7 +384,12 @@ fn wide_append_rejections_preserve_capacity_for_a_complete_edit() {
                 b"join".to_vec()
             })
         });
-        assert!(result.is_err(), "the complete edit cannot be admitted");
+        let error = result.expect_err("the complete edit cannot be admitted");
+        assert_eq!(
+            error.is_capacity_exhausted(),
+            matches!(refusal, Refusal::Records | Refusal::Bytes),
+            "only retained-evidence admission is a capacity refusal: {error}"
+        );
         assert_eq!(store.records.len(), before, "refusal spent a table slot");
         assert_eq!(
             std::fs::read(directory.join("table.astream")).unwrap(),
@@ -582,9 +587,7 @@ fn a_stores_writer_counts_are_what_a_walk_of_its_records_gives() {
     reopened.writer_records = 3;
     let refused = reopened.commit_catalog(&session, b"over the quota");
     assert!(
-        refused
-            .as_ref()
-            .is_err_and(|error| error.to_string().contains("writer evidence quota")),
+        refused.as_ref().is_err_and(Error::is_capacity_exhausted),
         "a writer holding its quota is refused its next record: {refused:?}"
     );
     reopened.writer_records = 4;

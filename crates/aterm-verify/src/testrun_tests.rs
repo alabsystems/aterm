@@ -2590,11 +2590,11 @@ fn the_most_at_once_and_the_overruns_are_read_from_the_runs() {
     assert_eq!(overruns(&bins[..1], &apart[..1]), "");
 }
 
-/// A RUN'S CEILING SPENT halts the dispatch: nothing more starts, and what it left is
+/// A requested stop halts the dispatch: nothing more starts, and what it left is
 /// unanswered (the run reports it as never started), as is one whose run answered that it did
-/// not start. NEGATIVE CONTROL: unspent, every binary runs.
+/// not start. NEGATIVE CONTROL: without a stop, every binary runs.
 #[test]
-fn a_spent_ceiling_starts_nothing_more() {
+fn a_dispatch_stop_starts_nothing_more() {
     let bins: Vec<Binary> = (0..4)
         .map(|i| Binary {
             harness: false,
@@ -2617,13 +2617,13 @@ fn a_spent_ceiling_starts_nothing_more() {
             usage: None,
         })
     };
-    let spent = || done.load(Ordering::SeqCst) >= 2;
+    let stop = || done.load(Ordering::SeqCst) >= 2;
     let ran = dispatch(
         &bins,
         &plan,
         None,
         &|| 0.0,
-        &spent,
+        &stop,
         |_, _, _| ok(),
         |_, _, _| {
             done.fetch_add(1, Ordering::SeqCst);
@@ -3313,18 +3313,23 @@ fn the_long_poles_name_the_slowest_binaries_longest_first() {
     assert_eq!(named, [1, 4, 8, 3, 7, 9, 0, 6], "{line}");
 }
 
-/// A BINARY THE RUN'S CEILING LEFT NO TIME TO START is a FAIL in cargo's
-/// shape — its header, the run's TIMEOUT words, cargo's re-run
-/// line — one finding for the row, which says so.
+/// A child killed at its work ceiling yields one whole-row finding in the combined log.
 #[test]
-fn a_binary_the_ceiling_left_no_time_for_is_a_fail() {
+fn a_binary_that_reaches_its_own_ceiling_gives_one_finding() {
     let b = Binary {
         harness: false,
         header: "     Running tests/late.rs (target/debug/deps/late-1)".into(),
         spec: "-p x --test late".into(),
         record: rec("/r/late", "x"),
     };
-    let run = not_started(&b, Duration::from_secs(10_800));
+    let run = Run {
+        output: format!(
+            "{}\n{} — child killed at its work ceiling\n",
+            b.header,
+            crate::findings::CEILING_KILL
+        ),
+        ..Run::default()
+    };
     assert!(!run.ok);
     assert!(run.output.starts_with(&b.header), "{}", run.output);
     assert!(

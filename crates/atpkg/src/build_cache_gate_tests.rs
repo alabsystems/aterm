@@ -169,6 +169,7 @@ impl Gates {
             within,
             work,
         )
+        .map(|(admission, held, _)| (admission, held))
     }
 
     /// The producer's refusal: [`Self::produce`] that did not take the gate.
@@ -313,6 +314,71 @@ fn a_producer_waits_for_a_running_holder_on_record_and_not_for_one_unrecorded() 
         error.to_string().contains("after a wait of"),
         "a refusal says how long it waited wherever it paused, whoever its last read names: {error}"
     );
+}
+
+#[test]
+fn suppression_waits_and_protects_its_roots_including_new_registrations() {
+    use super::super::{create_checked, gate_path, index, key, read, suppress_configured};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    for configured in [false, true] {
+        for mode in ["record", "raw"] {
+            let scratch = aterm_tempfile::tempdir().unwrap();
+            let home = scratch.path().canonicalize().unwrap();
+            let owner = home.join("workspace");
+            std::fs::create_dir(&owner).unwrap();
+            std::fs::write(owner.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+            let root = home.join("target.noindex");
+            assert!(create_checked(&home, &root, &owner).unwrap());
+            let directory = index(&home).unwrap();
+            let record = directory.join(format!("{}.json", key(&root).unwrap()));
+            let gate = gate_path(&record).unwrap();
+            let markers = home.join("holder");
+            let held = stand_in(&markers, &gate, mode);
+            let added = home.join("added.noindex");
+            let waits = Rc::new(Cell::new(0));
+            let _hook = seam::on_waiting({
+                let waits = Rc::clone(&waits);
+                let (home, owner, added) = (home.clone(), owner.clone(), added.clone());
+                move |_| {
+                    waits.set(waits.get() + 1);
+                    if mode == "record" && waits.get() == 1 {
+                        // This takes the admission lock: suppression must have released it.
+                        assert!(create_checked(&home, &added, &owner).unwrap());
+                        publish(&markers.join("release"), "go");
+                    }
+                }
+            });
+            let result = if configured {
+                suppress_configured(&home)
+            } else {
+                super::super::suppress_unresolved(&home, &root).map(|protected| assert!(protected))
+            };
+            if mode == "record" {
+                assert!(
+                    result.is_ok(),
+                    "a recorded holder is waited for: {result:?}"
+                );
+                assert!(waits.get() > 0);
+                for root in [&root, &added] {
+                    let receipt =
+                        read(&directory.join(format!("{}.json", key(root).unwrap()))).unwrap();
+                    assert_eq!(
+                        receipt.owners_unknown,
+                        configured || root != &added,
+                        "{} protection follows the invocation scope",
+                        root.display()
+                    );
+                }
+            } else {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+                assert!(!read(&record).unwrap().owners_unknown);
+                assert_eq!(waits.get(), 1, "an unrecorded holder is not waited for");
+            }
+            drop(held);
+        }
+    }
 }
 
 /// A producer waits for a running holder on record while that holder works, however long past

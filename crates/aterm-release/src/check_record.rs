@@ -217,7 +217,7 @@ pub struct CheckRecord {
     pub tree: String,
     /// The commit whose release ran it.
     pub commit: String,
-    /// The run's build-inputs identity ([`crate::build_inputs::current`]); a release-input
+    /// The run's build-inputs identity ([`crate::build_inputs::current_with_sdk`]); a release-input
     /// namespace additionally binds its selection and finalized execution context.
     pub seal: String,
     /// The separately declared content this check read.  The authoritative key above remains

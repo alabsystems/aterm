@@ -11,6 +11,7 @@ mod account_backfill;
 pub mod account_card;
 pub mod account_catalog;
 pub mod account_history;
+pub mod account_names;
 pub mod account_progress;
 pub mod account_series;
 pub mod account_stats;
@@ -32,6 +33,7 @@ pub mod accounts_token_view;
 #[cfg(unix)]
 pub mod accounts_tokens;
 pub mod accounts_upkeep_counts;
+pub mod accounts_upkeep_memo;
 pub mod acts;
 pub mod agent_image;
 pub mod agents;

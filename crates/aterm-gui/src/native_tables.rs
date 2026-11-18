@@ -195,8 +195,13 @@ use crate::native_ui::{
 };
 use crate::native_workers::{one_line, text_width};
 
+#[path = "native_tables_claims.rs"]
+mod claims;
 #[path = "native_tables_history.rs"]
 mod history;
+pub(crate) use history::registry::{
+    Asked, Logged, LoggedCell, Opened, OpenedCell, Paged, SCAN, Valued, place_words, words_of,
+};
 #[path = "native_tables_columns.rs"]
 mod native_tables_columns;
 
@@ -250,13 +255,6 @@ impl Group {
 
 /// Who wrote an operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(unix),
-    expect(
-        dead_code,
-        reason = "only the registry read of macOS and Linux names a writer"
-    )
-)]
 /// What kind of write an operation is, as `aterm-db` decides it (`aterm_db::att::EntryKind`):
 /// the record does not say who typed an explicit write, a person or a program at that Mac.
 pub(crate) enum AuthorKind {
@@ -430,6 +428,9 @@ pub(crate) struct Schema {
     pub(crate) compiled: &'static crate::tables_store::Compiled,
     pub(crate) collection: &'static aterm_db::typed::Collection,
     pub(crate) cells: std::sync::Arc<aterm_db::typed::cell::Cells>,
+    /// How each claimed column settled in that read: what a label staged in one reads as once
+    /// written is asked of it ([`claims`]).
+    pub(crate) settled: std::sync::Arc<aterm_db::typed::claim::Settlements>,
 }
 
 impl PartialEq for Schema {
@@ -437,6 +438,7 @@ impl PartialEq for Schema {
         std::ptr::eq(self.compiled, other.compiled)
             && self.collection == other.collection
             && std::sync::Arc::ptr_eq(&self.cells, &other.cells)
+            && std::sync::Arc::ptr_eq(&self.settled, &other.settled)
     }
 }
 
@@ -571,6 +573,10 @@ pub(crate) struct Wrote {
 enum Work {
     /// Read again at the point the reader is at, where the registry moved since the last read.
     Read,
+    /// Read one page of History, the registry's records newest first ([`history::registry`]).
+    History(history::registry::Asked),
+    /// Read what one record wrote, replaced, had not seen and what wrote its cells since.
+    Record([u8; 32]),
     /// Whether a view of the page is shown: a hidden page's reader sleeps until one is.
     Shown(bool),
     /// Read as of an operation (the table as it is, where `None`), and stay there once read.
@@ -583,11 +589,56 @@ pub(crate) enum Reply {
     Read {
         read: Result<Snapshot, String>,
         moved: bool,
+        /// The registry's revision as it was asked before the read (`None` where it could not
+        /// be): History reads again only where it is another than History's.
+        revision: Option<[u8; 32]>,
     },
     /// The registry had not moved when it was asked at this time (ms): the page shows what it
     /// showed, read as of then.
     Unchanged(u64),
     Wrote(Result<Wrote, String>),
+    /// A page of History, answering the ask numbered `seq`.
+    History {
+        seq: u64,
+        read: Result<history::registry::Paged, String>,
+    },
+    /// What record `operation` wrote, opened.
+    Record {
+        operation: [u8; 32],
+        read: Result<history::registry::Opened, String>,
+    },
+}
+
+/// The Tables reader's next work: the first of `queued`, else the channel's (a read again where
+/// `again` passes with none, `None` once the page is gone). A read of History that a later one
+/// queued behind it stands for is dropped unread: the page takes only the answer to its last ask
+/// ([`history::registry::Registry::take_page`]), so a word typed into Find a key at a time reads
+/// the registry once, not once a key. Every other ask is done, in the order asked.
+fn next_work(
+    rx: &mpsc::Receiver<Work>,
+    queued: &mut std::collections::VecDeque<Work>,
+    again: Option<Duration>,
+) -> Option<Work> {
+    loop {
+        let work = match queued.pop_front() {
+            Some(work) => work,
+            None => match again {
+                Some(again) => match rx.recv_timeout(again) {
+                    Ok(work) => work,
+                    Err(mpsc::RecvTimeoutError::Timeout) => Work::Read,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+                },
+                None => rx.recv().ok()?,
+            },
+        };
+        if matches!(work, Work::History(_)) {
+            queued.extend(rx.try_iter());
+            if queued.iter().any(|later| matches!(later, Work::History(_))) {
+                continue;
+            }
+        }
+        return Some(work);
+    }
 }
 
 /// A staged cell's address: collection, row, column.
@@ -615,6 +666,9 @@ pub(crate) struct TablesApp {
     /// the staged cells.
     checked: BTreeMap<At, String>,
     checked_of: Option<(u64, BTreeMap<At, String>)>,
+    /// Each staged label another row claims, as the read settles it once written ([`claims`]),
+    /// worked out with `checked`.
+    claimed: BTreeMap<At, claims::Claimed>,
     /// Moves to another point asked for that have not answered: the page takes no edit until
     /// the last of them has, since each answer may land it on a past table.
     asked: usize,
@@ -633,6 +687,8 @@ pub(crate) struct TablesApp {
     born_count: u64,
     /// The new rows the Write in flight carried.
     sent_born: Vec<(&'static str, String)>,
+    /// What History, the drawer's Registry scope, has read of the registry's records.
+    registry: history::registry::Registry,
     /// Each new row's key as the save would derive it from its staged cells now, where the
     /// save's reading of them refuses nothing ([`crate::tables_store::Reading::keys`]).
     born_keys: BTreeMap<(&'static str, String), String>,
@@ -673,19 +729,15 @@ impl TablesApp {
             // check out); `None` until a read succeeds there.
             let mut read_at = None;
             let mut shown = true;
+            // The asks taken off the channel to look behind one, not yet done.
+            let mut queued = std::collections::VecDeque::new();
+            // History's order at the registry's revision, kept from one of its reads to the
+            // next: Read older and a filter changed at that revision read no record again.
+            let mut kept = crate::tables_store::Kept::default();
             loop {
                 // A hidden page's reader asks nothing until a view of it is shown again.
-                let work = if let Some(again) = again.filter(|_| shown) {
-                    match work_rx.recv_timeout(again) {
-                        Ok(work) => work,
-                        Err(mpsc::RecvTimeoutError::Timeout) => Work::Read,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                    }
-                } else {
-                    match work_rx.recv() {
-                        Ok(work) => work,
-                        Err(mpsc::RecvError) => return,
-                    }
+                let Some(work) = next_work(&work_rx, &mut queued, again.filter(|_| shown)) else {
+                    return;
                 };
                 if let Work::Shown(now) = work {
                     let was = std::mem::replace(&mut shown, now);
@@ -696,14 +748,52 @@ impl TablesApp {
                 let paths = match &paths {
                     Ok(paths) => paths,
                     Err(why) => {
-                        let moved = matches!(work, Work::At(_));
-                        let read = Err(why.clone());
-                        if reply_tx.send(Reply::Read { read, moved }).is_err() {
+                        let reply = match work {
+                            Work::History(asked) => Reply::History {
+                                seq: asked.seq,
+                                read: Err(why.clone()),
+                            },
+                            Work::Record(operation) => Reply::Record {
+                                operation,
+                                read: Err(why.clone()),
+                            },
+                            work => Reply::Read {
+                                read: Err(why.clone()),
+                                moved: matches!(work, Work::At(_)),
+                                revision: None,
+                            },
+                        };
+                        if reply_tx.send(reply).is_err() {
                             return;
                         }
                         wake();
                         continue;
                     }
+                };
+                // History's reads stand apart from the point the page shows: they list every
+                // record, whatever point the tables are read at.
+                let work = match work {
+                    Work::History(asked) => {
+                        let read = crate::tables_store::history(paths, &asked, &mut kept);
+                        let reply = Reply::History {
+                            seq: asked.seq,
+                            read,
+                        };
+                        if reply_tx.send(reply).is_err() {
+                            return;
+                        }
+                        wake();
+                        continue;
+                    }
+                    Work::Record(operation) => {
+                        let read = crate::tables_store::record(paths, operation);
+                        if reply_tx.send(Reply::Record { operation, read }).is_err() {
+                            return;
+                        }
+                        wake();
+                        continue;
+                    }
+                    work => work,
                 };
                 let mut at = point;
                 let moved = matches!(work, Work::At(_));
@@ -716,7 +806,7 @@ impl TablesApp {
                         }
                     }
                     Work::At(asked) => at = asked,
-                    Work::Read | Work::Shown(_) => {}
+                    Work::Read | Work::Shown(_) | Work::History(_) | Work::Record(_) => {}
                 }
                 let checking = check.load(std::sync::atomic::Ordering::Relaxed);
                 // Asked before the read, so a write landing during it moves the next mark. A
@@ -725,6 +815,7 @@ impl TablesApp {
                 let rests = crate::tables_store::mark(paths)
                     .ok()
                     .map(|mark| (mark, checking));
+                let revision = rests.as_ref().map(|(mark, _)| mark.digest());
                 if again && rests.is_some() && rests == read_at {
                     let now = aterm_time::unix_millis().unwrap_or(0);
                     if reply_tx.send(Reply::Unchanged(now)).is_err() {
@@ -746,7 +837,12 @@ impl TablesApp {
                         Err(why)
                     }
                 };
-                if reply_tx.send(Reply::Read { read, moved }).is_err() {
+                let reply = Reply::Read {
+                    read,
+                    moved,
+                    revision,
+                };
+                if reply_tx.send(reply).is_err() {
                     return;
                 }
                 wake();
@@ -766,6 +862,7 @@ impl TablesApp {
             refused: BTreeMap::new(),
             checked: BTreeMap::new(),
             checked_of: None,
+            claimed: BTreeMap::new(),
             asked: 0,
             shown: true,
             reads: 0,
@@ -774,6 +871,7 @@ impl TablesApp {
             born_count: 0,
             sent_born: Vec::new(),
             born_keys: BTreeMap::new(),
+            registry: history::registry::Registry::default(),
         };
         let _ = app.work.send(Work::Read);
         Ok(app)
@@ -835,6 +933,7 @@ impl TablesApp {
         self.take(Reply::Read {
             read: Ok(snapshot),
             moved: false,
+            revision: None,
         });
     }
 
@@ -843,6 +942,7 @@ impl TablesApp {
             Reply::Read {
                 read: Ok(snapshot),
                 moved,
+                revision,
             } => {
                 self.snapshot = Some(snapshot);
                 self.unread = None;
@@ -853,10 +953,17 @@ impl TablesApp {
                 self.show_born();
                 self.drop_stranded();
                 self.recheck();
+                // History reads again where this read found the registry at another revision.
+                self.registry_moved(revision);
+            }
+            Reply::History { seq, read } => self.registry_take(seq, read),
+            Reply::Record { operation, read } => {
+                self.registry.take_record(operation, read);
             }
             Reply::Read {
                 read: Err(why),
                 moved,
+                ..
             } => {
                 if moved {
                     self.asked = self.asked.saturating_sub(1);
@@ -1157,6 +1264,7 @@ impl TablesApp {
         }
         let mut checked = BTreeMap::new();
         let mut born_keys = BTreeMap::new();
+        let mut records = claims::Records::new();
         if let Some(snapshot) = &self.snapshot {
             for sheet in &snapshot.sheets {
                 let cells: BTreeMap<(String, String), String> = self
@@ -1174,6 +1282,9 @@ impl TablesApp {
                 }
                 for (new, key) in reading.keys {
                     born_keys.insert((sheet.name, new), key);
+                }
+                if let Some(carried) = reading.records {
+                    records.insert(sheet.name, carried);
                 }
             }
         }
@@ -1194,6 +1305,7 @@ impl TablesApp {
         });
         self.checked = checked;
         self.born_keys = born_keys;
+        self.claimed = claims::claimed(self, &records);
         self.checked_of = Some((self.reads, self.staged.clone()));
     }
 
@@ -2579,6 +2691,11 @@ impl TablesApp {
                         view.scroll.set(0.0);
                         return true;
                     }
+                    if key == history::FIND_RECORDS {
+                        view.history.find = TextInputState::new(value.clone());
+                        self.history_found(view);
+                        return true;
+                    }
                     if key == PASTE {
                         return self.paste(view, value);
                     }
@@ -2587,6 +2704,7 @@ impl TablesApp {
                     let input = match key.as_str() {
                         EDIT => view.editing.as_mut().map(|e| &mut e.input),
                         FIND => Some(&mut view.find),
+                        history::FIND_RECORDS => Some(&mut view.history.find),
                         _ => None,
                     };
                     if let Some(input) = input {
@@ -2599,11 +2717,14 @@ impl TablesApp {
                         return true;
                     }
                 }
-                if key == EDIT || key == FIND {
+                if key == EDIT || key == FIND || key == history::FIND_RECORDS {
                     view.focus(&key);
                     return true;
                 }
                 if let Some(done) = crate::native_tables_check::act(self, view, &key) {
+                    return done;
+                }
+                if let Some(done) = claims::act(self, view, &key) {
                     return done;
                 }
                 if let Some(done) = rows::act(self, view, &key) {
@@ -2722,13 +2843,23 @@ impl TablesApp {
                     return true;
                 }
                 if let Some(hex) = key.strip_prefix(AS_OF) {
-                    let operation = self.snapshot.as_ref().and_then(|s| {
-                        s.sheets
-                            .iter()
-                            .flat_map(|sheet| &sheet.written)
-                            .map(|w| w.operation)
-                            .find(|op| aterm_codec::hex::encode_lower(op) == hex)
-                    });
+                    let operation = self
+                        .snapshot
+                        .as_ref()
+                        .and_then(|s| {
+                            s.sheets
+                                .iter()
+                                .flat_map(|sheet| &sheet.written)
+                                .map(|w| w.operation)
+                                .find(|op| aterm_codec::hex::encode_lower(op) == hex)
+                        })
+                        .or_else(|| {
+                            self.registry
+                                .records
+                                .iter()
+                                .map(|record| record.operation)
+                                .find(|op| aterm_codec::hex::encode_lower(op) == hex)
+                        });
                     if let Some(operation) = operation {
                         view.close_edit(self, false);
                         self.go(Some(operation));
@@ -2827,6 +2958,16 @@ impl TablesApp {
                             edit(&mut view.find, event);
                         }
                         view.scroll.set(0.0);
+                        true
+                    }
+                    // History's Find, as the grid's: Escape empties it.
+                    Some(history::FIND_RECORDS) => {
+                        if matches!(event, TextInputEvent::Cancel) {
+                            view.history.find = TextInputState::new(String::new());
+                        } else if !matches!(event, TextInputEvent::Submit) {
+                            edit(&mut view.history.find, event);
+                        }
+                        self.history_found(view);
                         true
                     }
                     // Left from a pane's Keep or Undo returns to the selected cell.
@@ -3274,6 +3415,7 @@ impl TablesApp {
         match key {
             EDIT => view.editing.as_ref().map(|e| &e.input),
             FIND => Some(&view.find),
+            history::FIND_RECORDS => Some(&view.history.find),
             _ => None,
         }
     }
@@ -3656,16 +3798,25 @@ fn content_width<'a>(
             text_width(&cell.text, SemanticRole::Text, StyleRef::Primary) + tag + 10.0
         })
         .fold(0.0_f32, f32::max);
-    // A staged value the save would refuse shows beside its `refused` tag.
+    // A staged value the save would refuse shows beside its `refused` tag, a label another row
+    // claims beside its `in use`.
     let refused = app
         .staged
         .iter()
         .filter(|((name, _, col), _)| name == sheet.name && *col == column.name)
-        .filter_map(|(at, text)| app.refusal(at).map(|_| text))
-        .map(|text| {
-            text_width(text, SemanticRole::Text, StyleRef::Primary)
-                + text_width("refused", SemanticRole::Text, StyleRef::Danger)
-                + 10.0
+        .filter_map(|(at, text)| {
+            let tag = match app.refusal(at) {
+                Some(_) => ("refused", StyleRef::Danger),
+                None => app
+                    .claimed
+                    .get(at)
+                    .map(|_| (claims::IN_USE, StyleRef::Note))?,
+            };
+            Some(
+                text_width(text, SemanticRole::Text, StyleRef::Primary)
+                    + text_width(tag.0, SemanticRole::Text, tag.1)
+                    + 10.0,
+            )
         })
         .fold(0.0_f32, f32::max);
     header.max(widest).max(refused) + 20.0
@@ -3734,15 +3885,21 @@ fn rail(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiN
         if heading != Some(group_word) {
             if heading.is_some() {
                 children.push(
-                    group(format!("tables/rail/gap/{group_word}"))
-                        .layout(Layout::default().height(Length::Fixed(6.0 * scale()))),
+                    group(format!(
+                        "tables/rail/gap/{}",
+                        crate::native_ui::key_word(group_word)
+                    ))
+                    .layout(Layout::default().height(Length::Fixed(6.0 * scale()))),
                 );
                 step(&mut tall, 6.0 * scale());
             }
             heading = Some(group_word);
             children.push(
                 fitted(
-                    format!("tables/rail/group/{group_word}"),
+                    format!(
+                        "tables/rail/group/{}",
+                        crate::native_ui::key_word(group_word)
+                    ),
                     group_word,
                     StyleRef::Note,
                     inner,
@@ -4357,8 +4514,10 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                         _ => shown.map(|c| c.text.clone()).unwrap_or_default(),
                     });
                 let conflict = staged.is_none() && shown.is_some_and(|c| !c.values.is_empty());
-                // A value the save cannot take: the rule it breaks, said at the cell.
+                // A value the save cannot take: the rule it breaks, said at the cell; else a label
+                // another row claims, said in the note's ink ([`claims`]).
                 let refusal = app.refusal(&at);
+                let claimed = app.claimed.get(&at).filter(|_| refusal.is_none());
                 let changed = app.as_of().is_some()
                     && sheet
                         .since
@@ -4394,6 +4553,9 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                 if let Some(rule) = refusal {
                     spoken.push_str(&format!(", refused: {rule}"));
                 }
+                if let Some(claimed) = claimed {
+                    spoken.push_str(&format!(", {}: {}", claims::IN_USE, claimed.words));
+                }
                 if changed {
                     spoken.push_str(", changed since");
                 }
@@ -4420,6 +4582,7 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                 if near {
                     let mut face = Vec::new();
                     if refusal.is_some()
+                        || claimed.is_some()
                         || life_word.is_some()
                         || conflict
                         || changed
@@ -4427,9 +4590,12 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                     {
                         let n = shown.map_or(0, |c| c.values.len());
                         // A refusal is said in the danger ink, over any other tag the cell has;
-                        // then the row's word for a change not written, in that ink.
+                        // then a label another row claims, in the note's ink, since the Write
+                        // still takes it; then the row's word for a change not written.
                         let (tag, tag_style) = if refusal.is_some() {
                             ("refused".to_owned(), StyleRef::Danger)
+                        } else if claimed.is_some() {
+                            (claims::IN_USE.to_owned(), StyleRef::Note)
                         } else if let Some(word) = life_word {
                             (word.to_owned(), StyleRef::Unwritten)
                         } else if conflict {
@@ -4873,7 +5039,8 @@ fn left_out_words(
 /// The state is what the grid marks on the cell, in the grid's order: a staged cell is not
 /// written, and `refused` first where the check or a Write refused it ([`TablesApp::refusal`]),
 /// as the grid's tag says it over every other (nothing else is said of it, as its grid cell
-/// wears no other mark); a conflict says how many values; a linked count has none, its
+/// wears no other mark); else, where another row claims a staged label, `in use` first and
+/// what the label already names and what this row reads as once written ([`claims`]); a conflict says how many values; a linked count has none, its
 /// sentence being the line under the grid's; a Mac that reports another value is named with
 /// what it reports ([`reports_words`], the words the grid's cell speaks, under [`disagrees`],
 /// the grid's own rule); in a past table a cell changed since says what it holds now and who
@@ -4960,6 +5127,12 @@ fn bar_words(app: &TablesApp, view: &TablesViewState, sheet: &Sheet) -> BarWords
         let at = (sheet.name.to_owned(), row.pk.clone(), column.name.clone());
         if app.refusal(&at).is_some() {
             state.push(run("refused", StyleRef::Danger));
+            state.push(run(format!("\u{b7} {unwritten}"), StyleRef::Note));
+        } else if let Some(claimed) = app.claimed.get(&at) {
+            // A label another row claims: the grid's word, then what it already names and what
+            // this row reads as once written, all in the note's ink.
+            state.push(run(claims::IN_USE, StyleRef::Note));
+            state.push(run(format!("\u{b7} {}", claimed.words), StyleRef::Note));
             state.push(run(format!("\u{b7} {unwritten}"), StyleRef::Note));
         } else {
             state.push(run(unwritten, StyleRef::Note));
@@ -5420,7 +5593,12 @@ fn typed_words(column: &SheetColumn, typed: &str) -> String {
 
 /// A field's name in the pane: `Nickname`, `Ram gb`.
 fn field_words(column: &SheetColumn) -> String {
-    let lower = column.label.to_lowercase();
+    sentence(&column.label)
+}
+
+/// `words` in sentence case, words apart: `RAM_GB` and `ram_gb` read `Ram gb`.
+pub(crate) fn sentence(words: &str) -> String {
+    let lower = words.replace('_', " ").to_lowercase();
     let mut chars = lower.chars();
     chars
         .next()
@@ -5506,6 +5684,7 @@ fn pane(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
     for (node, h, action) in rows::pane_lines(app, sheet, row, inner, line)
         .into_iter()
         .chain(rows::reference_lines(app, sheet, row, inner, line))
+        .chain(claims::pane_lines(app, sheet, row, inner, line))
     {
         if let Some(action) = action {
             actions.push((action, tall.get(), tall.get() + h));
@@ -5586,7 +5765,10 @@ fn pane(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
         if members.is_empty() {
             continue;
         }
-        let head = format!("tables/pane/group/{}", group_of.word());
+        let head = format!(
+            "tables/pane/group/{}",
+            crate::native_ui::key_word(group_of.word())
+        );
         let mut head_line = vec![fitted(
             format!("{head}/word"),
             group_of.word(),
@@ -5709,7 +5891,10 @@ fn pane(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
         if !empty.is_empty() {
             let words = format!("Empty: {}", empty.join(", "));
             let node = crate::native_about::wrapped(
-                &format!("tables/pane/empty/{}", group_of.word()),
+                &format!(
+                    "tables/pane/empty/{}",
+                    crate::native_ui::key_word(group_of.word())
+                ),
                 &words,
                 inner,
                 SemanticRole::Text,

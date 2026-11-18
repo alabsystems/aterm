@@ -191,8 +191,14 @@ impl Group {
     }
 }
 
+/// A sitting cat's paw on the ground at its right: centre and radii, its left one mirrored.
+pub(super) const SIT_PAW: (f32, f32, f32, f32) = (24.0, -5.0, 11.0, 6.0);
+
+/// A sitting cat's haunch at its right, behind its paw: centre and radii, its left one mirrored.
+pub(super) const SIT_HAUNCH: (f32, f32, f32, f32) = (23.0, -17.0, 16.0, 17.0);
+
 /// How large each pose is drawn: the sitting cat a touch smaller, as it stands taller.
-fn scale(pose: CatPose) -> f32 {
+pub(super) fn scale(pose: CatPose) -> f32 {
     match pose {
         CatPose::Walk | CatPose::Loaf => 1.0,
         CatPose::Sit | CatPose::LookUp | CatPose::Worried => 0.95,
@@ -203,7 +209,7 @@ fn scale(pose: CatPose) -> f32 {
 pub(super) fn front_paw(pose: CatPose) -> f32 {
     let reach = match pose {
         CatPose::Walk => 27.0 + 10.0,
-        CatPose::Sit | CatPose::LookUp | CatPose::Worried => 24.0 + 11.0,
+        CatPose::Sit | CatPose::LookUp | CatPose::Worried => SIT_PAW.0 + SIT_PAW.2,
         CatPose::Loaf => 46.0 + 11.0,
     };
     (reach + OW) * scale(pose)
@@ -220,7 +226,7 @@ pub(super) fn paint(c: &mut Canvas, pose: CatPose, tilt: f32, ink: &Ink) {
         (0.0, 0.0, 0.0),
         1.0,
     );
-    c.glow(&shadow.tile, 2.5, ink.shadow, (0.0, 0.0));
+    c.glow(&shadow, 2.5, ink.shadow, (0.0, 0.0));
     c.with(
         Affine::rotate(tilt).then(Affine::scale(s)),
         |c| match pose {
@@ -604,8 +610,9 @@ fn sit(c: &mut Canvas, k: &Coat, how: Sitting) {
         k,
     );
     let mut b = Group::default();
-    b.e(-23.0, -17.0, 16.0, 17.0, k.coat);
-    b.e(23.0, -17.0, 16.0, 17.0, k.coat);
+    let (hx, hy, hrx, hry) = SIT_HAUNCH;
+    b.e(-hx, hy, hrx, hry, k.coat);
+    b.e(hx, hy, hrx, hry, k.coat);
     b.p(
         Shape::new()
             .m(0.0, -72.0)
@@ -617,8 +624,9 @@ fn sit(c: &mut Canvas, k: &Coat, how: Sitting) {
             .z(),
         k.coat,
     );
-    b.e(-24.0, -5.0, 11.0, 6.0, k.coat);
-    b.e(24.0, -5.0, 11.0, 6.0, k.coat);
+    let (px, py, rx, ry) = SIT_PAW;
+    b.e(-px, py, rx, ry, k.coat);
+    b.e(px, py, rx, ry, k.coat);
     if wave {
         b.l(
             Shape::new()

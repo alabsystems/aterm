@@ -195,3 +195,127 @@ fn parked_read_wakes_on_peer_write() {
     assert_eq!(&buf[..n], b"hello");
     reader.join().expect("reader thread");
 }
+
+/// A write to a stream whose peer has closed fails at that write, as a Unix socket's `EPIPE`
+/// does, where afunix takes the first send into such a connection and fails only the next: a
+/// relay forwarding a byte to a host that has gone sees it at once. A zero-length send writes
+/// nothing the peer reads, and a peer that shut only its write half reads what is written.
+/// NEGATIVE CONTROL: with the check after a send (`CtlStream::delivered`) answering the send's
+/// own count, the first write to each gone peer answers `Ok`.
+#[test]
+fn a_write_to_a_peer_that_has_closed_fails_at_that_write() {
+    use std::io::{IoSlice, Read, Write};
+    let gone = |e: &io::Error| {
+        matches!(
+            e.kind(),
+            io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+        )
+    };
+    let (writer, peer) = CtlStream::pair().expect("pair");
+    drop(peer);
+    let wrote = (&writer).write(b"x");
+    assert!(wrote.as_ref().is_err_and(gone), "a closed peer: {wrote:?}");
+
+    let (writer, peer) = CtlStream::pair().expect("pair");
+    crate::hangup::hang_up(&peer);
+    drop(peer);
+    let wrote = (&writer).write_vectored(&[IoSlice::new(b"ab"), IoSlice::new(b"c")]);
+    assert!(wrote.as_ref().is_err_and(gone), "a hung-up peer: {wrote:?}");
+
+    let (writer, peer) = CtlStream::pair().expect("pair");
+    peer.shutdown(std::net::Shutdown::Write)
+        .expect("the peer shuts its write half");
+    (&writer)
+        .write_all(b"still read")
+        .expect("a half-closed peer still takes bytes");
+    peer.set_read_timeout(Some(HANG_DETECTOR))
+        .expect("a hang detector");
+    let mut got = [0u8; 10];
+    (&peer)
+        .read_exact(&mut got)
+        .expect("the half-closed peer reads");
+    assert_eq!(&got, b"still read");
+    let mut more = [0u8; 1];
+    let after = peer.read_nonblocking(&mut more);
+    assert!(
+        after
+            .as_ref()
+            .is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock),
+        "nothing past the bytes written: {after:?}"
+    );
+}
+
+/// A WRITE THE PEER READ BEFORE IT CLOSED STAYS DELIVERED: the check after a send
+/// (`CtlStream::delivered`) reads only what a send found, so a peer that reads the bytes and then
+/// closes between the send and that check leaves the write answering its count, as a Unix write
+/// that reached its peer does, and the next write is the one that fails, as on Unix. That holds
+/// for a peer dropped, hung up first, or that wrote an answer this end has not read yet (a host
+/// that reads a forwarded request, answers and goes), whose answer this end still reads, then
+/// its end. A peer that closes with the bytes still unread discards them, and afunix resets the
+/// connection then: that write fails, since nothing will ever read what it sent. Each case runs
+/// the send and the check as `send_with` does, with the peer's close between them.
+/// NEGATIVE CONTROL: a check that reads the peer's end (a peeking `recv` that reads EOF) in place
+/// of the zero-length send fails the delivered write (`Err` where `Ok(5)` is due).
+#[test]
+fn a_write_the_peer_read_before_it_closed_stays_delivered() {
+    use std::io::{Read, Write};
+    let gone = |e: &io::Error| {
+        matches!(
+            e.kind(),
+            io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+        )
+    };
+    // (the case, the peer reads the bytes, it answers, it hangs up before it is dropped)
+    for (case, reads, answers, hangs_up) in [
+        ("read, then dropped", true, false, false),
+        ("read, then hung up and dropped", true, false, true),
+        ("read, answered, then dropped", true, true, false),
+        ("dropped with the bytes unread", false, false, false),
+    ] {
+        let (writer, peer) = CtlStream::pair().expect("pair");
+        // SAFETY: `raw` is `writer`'s live socket; the five bytes outlive the call.
+        let sent = unsafe { ffi::send(writer.0.raw, b"reply".as_ptr(), 5, 0) };
+        assert_eq!(sent, 5, "{case}: the send");
+        if reads {
+            peer.set_read_timeout(Some(HANG_DETECTOR))
+                .expect("a hang detector");
+            let mut got = [0u8; 5];
+            (&peer).read_exact(&mut got).expect("the peer reads");
+            assert_eq!(&got, b"reply", "{case}");
+        }
+        if answers {
+            (&peer).write_all(b"done").expect("the peer answers");
+        }
+        if hangs_up {
+            crate::hangup::hang_up(&peer);
+        }
+        drop(peer);
+        let answered = writer.delivered(5);
+        if reads {
+            assert!(
+                matches!(answered, Ok(5)),
+                "{case}: a write the peer read before it closed: {answered:?}"
+            );
+        } else {
+            assert!(
+                answered.as_ref().is_err_and(gone),
+                "{case}: a write nothing will read: {answered:?}"
+            );
+        }
+        if answers {
+            writer
+                .set_read_timeout(Some(HANG_DETECTOR))
+                .expect("a hang detector");
+            let mut answer = Vec::new();
+            (&writer)
+                .read_to_end(&mut answer)
+                .expect("the answer, then the end");
+            assert_eq!(answer, b"done", "{case}");
+        }
+        let next = (&writer).write(b"x");
+        assert!(
+            next.as_ref().is_err_and(gone),
+            "{case}: the next write: {next:?}"
+        );
+    }
+}

@@ -246,7 +246,15 @@ fn current_login_failure_is_visible_without_becoming_a_rotation_candidate() {
     assert!(
         failed
             .details
-            .contains(&accounts::SignInAction::Login.next_step(accounts::Cli::Claude, "current"))
+            .contains(&accounts::SignInAction::Login.next_step(
+                accounts::Cli::Claude,
+                &crate::harness::account_names::sign_in_word_of(
+                    accounts::Cli::Claude,
+                    "current",
+                    &roster.rows,
+                    None
+                ),
+            ))
     );
     assert!(
         failed
@@ -322,7 +330,13 @@ fn pending_human_steps_are_visible_only_while_sign_in_is_needed() {
             (baseline.known, baseline.eligible)
         );
         assert_eq!(progress.details[0].split(':').next(), Some("alternate"));
-        let instruction = action.next_step(accounts::Cli::Claude, "alternate");
+        let word = crate::harness::account_names::sign_in_word_of(
+            accounts::Cli::Claude,
+            "alternate",
+            &roster.rows,
+            None,
+        );
+        let instruction = action.next_step(accounts::Cli::Claude, &word);
         assert!(progress.details.contains(&instruction));
         let ready = project(&logins, &BTreeSet::from(["alternate".into()]));
         assert_eq!(ready.eligible, Some(1));

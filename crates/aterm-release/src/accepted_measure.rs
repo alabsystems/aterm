@@ -49,7 +49,7 @@ pub fn record(repo: &Path, check: Check, report: &Path, reason: &str) -> Result<
         &git,
         &journal.commit,
         (check, executable.as_deref()),
-        &crate::build_inputs::current()?,
+        &crate::build_inputs::for_commit(&git, &journal.commit)?,
         (&report, &report_sha256),
         reason.trim(),
     )?;

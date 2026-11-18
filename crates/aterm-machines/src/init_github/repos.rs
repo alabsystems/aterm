@@ -61,7 +61,7 @@ pub(super) struct Partition {
     pub(super) missing: Vec<Repo>,
     pub(super) present: Vec<(Repo, PathBuf)>,
     pub(super) dependencies: Vec<(Repo, PathBuf)>,
-    /// Matching worktrees without a commit need a fresh, owned remote observation.
+    /// Matching worktrees without a commit or reusable empty-origin evidence.
     pub(super) unborn: Vec<(Repo, PathBuf)>,
     pub(super) notes: Vec<String>,
     /// Dependencies whose local inspection waits for a capable Git, without touching them.
@@ -84,8 +84,9 @@ impl Partition {
     }
 }
 
-/// A complete empty advertisement, bound to this pass's unchanged physical checkout.
-/// Only acquisition can construct it; local absence and catalogue metadata cannot.
+/// A complete empty advertisement bound to exact local storage. Acquisition establishes it;
+/// durable reuse needs a matching account/source record and a freshly admitted local capture.
+/// Local absence and catalogue metadata alone establish none.
 #[derive(Clone, Debug)]
 pub(super) struct EmptyCheckout {
     name: String,
@@ -131,12 +132,84 @@ impl EmptyCheckout {
         })
     }
 
+    /// The exact checkout admitted by this observation, without retaining a name or path.
+    fn subject(&self) -> crate::sync::repository_refresh::CheckoutDigest {
+        let mut hash = aterm_digest::Sha256::new();
+        hash.update(b"aterm empty repository observation/1\0");
+        for part in [&self.owner, &self.name, &self.branch] {
+            hash.update((part.len() as u64).to_le_bytes());
+            hash.update(part.as_bytes());
+        }
+        for file in self.physical {
+            hash.update(file.dev.to_le_bytes());
+            hash.update(file.ino.to_le_bytes());
+            hash.update([u8::from(file.born_ns.is_some())]);
+            hash.update(file.born_ns.unwrap_or_default().to_le_bytes());
+        }
+        hash.update(self.refs);
+        crate::sync::repository_refresh::CheckoutDigest::new(hash.finalize())
+    }
+
     fn current(&self, sys: &dyn System, user: &User, repo: &Repo, path: &Path) -> bool {
         self.is_for(repo)
             && Self::capture(sys, user, repo, path).is_ok_and(|now| {
                 now.branch == self.branch && now.physical == self.physical && now.refs == self.refs
             })
     }
+}
+
+/// Reconstitute only observations whose durable keys match freshly admitted local storage.
+/// A checkout with a commit, a changed ref set or changed physical identity matches none.
+pub(super) fn remembered_empty(
+    sys: &dyn System,
+    user: &User,
+    all: &[Repo],
+    scope: aterm_secrets::converge::RefreshScope,
+    remembered: &crate::sync::repository_refresh::EmptyCheckouts,
+) -> Vec<EmptyCheckout> {
+    all.iter()
+        .filter_map(|repo| {
+            let path = Path::new(&user.home).join(&repo.name);
+            let checkout = crate::sync::repository_refresh::CheckoutDigest::folder(&path);
+            if !remembered.has_checkout(scope, checkout) {
+                return None;
+            }
+            let proof = EmptyCheckout::capture(sys, user, repo, &path).ok()?;
+            remembered
+                .contains(scope, checkout, proof.subject())
+                .then_some(proof)
+        })
+        .collect()
+}
+
+pub(super) fn empty_subjects(
+    sys: &dyn System,
+    user: &User,
+    all: &[Repo],
+    empty: &[EmptyCheckout],
+) -> Vec<(
+    crate::sync::repository_refresh::CheckoutDigest,
+    crate::sync::repository_refresh::CheckoutDigest,
+)> {
+    if empty.is_empty() {
+        return Vec::new();
+    }
+    let by_name: BTreeMap<_, _> = empty
+        .iter()
+        .map(|proof| ((proof.owner.as_str(), proof.name.as_str()), proof))
+        .collect();
+    all.iter()
+        .filter_map(|repo| {
+            let proof = by_name.get(&(repo.owner.as_str(), repo.name.as_str()))?;
+            let path = Path::new(&user.home).join(&repo.name);
+            proof.current(sys, user, repo, &path).then(|| {
+                (
+                    crate::sync::repository_refresh::CheckoutDigest::folder(&path),
+                    proof.subject(),
+                )
+            })
+        })
+        .collect()
 }
 
 fn owned_storage(sys: &dyn System, user: &User, path: &Path) -> Result<(), String> {

@@ -204,6 +204,7 @@ mod models_account_sync_commit;
 mod models_account_sync_new_labels;
 mod models_account_sync_report;
 mod models_account_tap_read;
+mod models_account_upkeep_verdict;
 mod models_account_usage_observation;
 mod models_account_worker_environment;
 mod models_account_workflow_scope;
@@ -435,6 +436,7 @@ pub use models_account_sync_commit::account_sync_commit_model;
 pub use models_account_sync_new_labels::account_sync_new_labels_model;
 pub use models_account_sync_report::account_sync_report_model;
 pub use models_account_tap_read::account_tap_read_model;
+pub use models_account_upkeep_verdict::account_upkeep_verdict_model;
 pub use models_account_usage_observation::account_usage_observation_model;
 pub use models_account_worker_environment::account_worker_environment_model;
 pub use models_account_workflow_scope::{

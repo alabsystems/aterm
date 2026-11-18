@@ -351,17 +351,17 @@ mod read {
     use super::*;
     use crate::machine_rename_sheet::Field;
     use crate::machine_title::page::fixture::{
-        Names, Scratch, WIDEST_NICK, found, found_local, found_unread_labels, held_by_older_build,
-        named, page, publish_all, rename, snapshot, with_node,
+        Names, Scratch, WIDEST_NICK, found, found_local, found_unread_labels, found_with_history,
+        held_by_older_build, named, page, publish_all, rename, renamed, snapshot, with_node,
     };
+    use crate::machine_title::page::{PageFound, PageHistory};
+    use aterm_agent::machine_name::history::{self, History, NO_HISTORY, NO_ROW, PAGE_ROWS};
     use aterm_types::machine_name::Class;
 
-    /// A name renamed twice by a person, m7 Heron then m8 Puffin, so Undo Last Rename has m7
-    /// Heron to give back.
-    fn renamed_twice() -> Scratch {
-        let scratch = named(Class::Chosen, 7, "Heron");
-        rename(&scratch, Class::Chosen, 8, "Puffin");
-        scratch
+    /// A name renamed twice by a person, m7 Heron then m8 Puffin, and the History its registry
+    /// row would hold, so Undo Last Rename has m7 Heron to give back.
+    fn renamed_twice() -> (Scratch, History) {
+        renamed(&[(7, "Heron"), (8, "Puffin")])
     }
 
     /// The words node `key` says, whole.
@@ -600,20 +600,24 @@ mod read {
     /// offers an undo and no page write is out; a number the vault's labels were not read for is
     /// left for the undo to check, as Save leaves one. NEGATIVE CONTROLS: a page write out, the
     /// vault's label on the number it would give back, another Mac's claim on it (an older
-    /// build's, today's holder), and a first number, whose undo would leave this Mac unnumbered,
-    /// each draw it unavailable and press nothing.
+    /// build's, today's holder), a first number, whose undo would leave this Mac unnumbered, a
+    /// History not read, and a name no registry row is this Mac's, each draw it unavailable,
+    /// say why and press nothing; and with `edit::undoes` ignoring the read's offer
+    /// (`!machine.busy` alone), the refused states draw it available and the loop fails.
     #[test]
     fn undo_says_what_it_gives_back_and_presses_only_where_it_can() {
         let names = Names::authorized(Ok(true));
-        let scratch = renamed_twice();
-        let mut route = machine_route(page(1, found(&scratch, &[], &names), false));
+        let (scratch, shown) = renamed_twice();
+        let read_with =
+            |held: &[u32]| found_with_history(&scratch, held, &names, Ok(shown.clone()));
+        let mut route = machine_route(page(1, read_with(&[]), false));
         assert_eq!(undo_button(&route), (format!("{NAME_UNDO}@1"), true));
         assert_eq!(
             write_of(&whole(&route), NAME_UNDO).as_deref(),
             Some(NAME_UNDO)
         );
-        let read = snapshot(1, found(&scratch, &[], &names));
-        assert!(read.undo.seen.is_some());
+        let read = snapshot(1, read_with(&[]));
+        assert!(read.undo.undo.is_some());
         assert_eq!(label_of(&whole(&route), "name/undo/line"), read.undo.line);
         assert!(undo_command(&route));
         assert_eq!(
@@ -621,7 +625,14 @@ mod read {
             [MachineRequest::Undo { rev: 1 }]
         );
 
-        let unread = machine_route(page(1, found_unread_labels(&scratch), false));
+        let unread = machine_route(page(
+            1,
+            PageFound {
+                history: Ok(shown.clone()),
+                ..found_unread_labels(&scratch)
+            },
+            false,
+        ));
         assert!(
             undo_button(&unread).1,
             "control: unread labels leave the undo to check its number"
@@ -630,60 +641,85 @@ mod read {
 
         let busy = MachinePageState {
             busy: true,
-            ..page(1, found(&scratch, &[], &names), false)
+            ..page(1, read_with(&[]), false)
         };
-        let labelled = page(1, found(&scratch, &[7], &names), false);
-        let holder = renamed_twice();
+        let labelled = page(1, read_with(&[7]), false);
+        let (holder, held_shown) = renamed_twice();
         held_by_older_build(&holder, 7);
-        let held = page(1, found(&holder, &[], &names), false);
-        let first = page(
+        let held = page(
             1,
-            found(&named(Class::Chosen, 7, "Heron"), &[], &names),
+            found_with_history(&holder, &[], &names, Ok(held_shown.clone())),
             false,
         );
-        for (what, state) in [
-            ("busy", busy),
-            ("labelled", labelled),
-            ("held", held),
-            ("first", first),
+        let (first, born) = renamed(&[(7, "Heron")]);
+        let first = page(
+            1,
+            found_with_history(&first, &[], &names, Ok(born.clone())),
+            false,
+        );
+        let why = "no answer within 2 s";
+        let unread_history = page(
+            1,
+            found_with_history(&scratch, &[], &names, Err(why.to_owned())),
+            false,
+        );
+        let no_row = page(1, found(&scratch, &[], &names), false);
+        for (what, state, read) in [
+            ("busy", busy, Ok(shown.clone())),
+            ("labelled", labelled, Ok(shown.clone())),
+            ("held", held, Ok(held_shown)),
+            ("first", first, Ok(born)),
+            ("history unread", unread_history, Err(why.to_owned())),
+            ("no row", no_row, Ok(History::default())),
         ] {
             // What refuses the undo, as `aterm name undo` would say it from the same read.
-            let refused = match &state.read {
-                PageRead::Read(read) => read
-                    .snapshot
-                    .preview()
-                    .and_then(|preview| preview.undo().err()),
+            let refused = match (&state.read, &read) {
+                (PageRead::Read(shown), Ok(row)) => history::undo_of(row).err().or_else(|| {
+                    let undo = history::undo_of(row).ok()?;
+                    shown.snapshot.preview()?.undo(&undo).err()
+                }),
                 _ => None,
             };
             let mut route = machine_route(state);
             assert!(!undo_button(&route).1, "{what}");
             assert!(!undo_command(&route), "{what}");
             let line = label_of(&whole(&route), "name/undo/line");
-            match refused {
-                Some(refused) => assert!(
+            match (refused, &read) {
+                (Some(refused), _) => assert!(
                     line.ends_with(&crate::machine_rename_sheet::sentence(&refused.why)),
                     "{what}: {line:?} ends with {:?}",
                     refused.why
                 ),
-                None => assert_eq!(what, "busy", "only a write out leaves the undo unrefused"),
+                (None, Err(why)) => assert!(line.contains(why), "{what}: {line:?}"),
+                (None, Ok(_)) => {
+                    assert_eq!(what, "busy", "only a write out leaves the undo unrefused");
+                }
             }
             assert!(act(&mut route, NAME_UNDO, None).is_empty(), "{what}");
         }
     }
 
-    /// HISTORY lists each kept change as `aterm name history` does, one row per change, newest
-    /// first, in its line. NEGATIVE CONTROL: a name file with no History (one an older build
-    /// wrote) draws only the row that says so.
+    /// HISTORY lists this Mac's registry row's writes as `aterm name history` does, one row per
+    /// line of [`History::lines`] over the same History, newest first, keyed by place; in place
+    /// of rows, one row says there is no row ([`NO_ROW`]), no write ([`NO_HISTORY`]), or that
+    /// History was not read and why.
+    /// NEGATIVE CONTROL: with the HISTORY card drawing its rows oldest first
+    /// (`lines.iter().rev()`), `name/history/0` says m7 Heron's write and its label assertion
+    /// fails.
     #[test]
     fn history_lists_each_change_as_aterm_name_history_does() {
         let names = Names::authorized(Ok(true));
-        let scratch = renamed_twice();
-        let route = machine_route(page(1, found(&scratch, &[], &names), false));
-        let drawn = whole(&route);
-        let kept = aterm_agent::machine_name::file::read(&scratch.state)
-            .expect("reads")
-            .expect("a name")
-            .history;
+        let (scratch, shown) = renamed_twice();
+        let drawn_with = |history: Result<History, String>| {
+            whole(&machine_route(page(
+                1,
+                found_with_history(&scratch, &[], &names, history),
+                false,
+            )))
+        };
+        let drawn = drawn_with(Ok(shown.clone()));
+        let lines = shown.lines(Some(PAGE_ROWS));
+        assert_eq!(lines.len(), 2, "{lines:?}");
         // HISTORY's rows, without its card's heading.
         let rows_of = |drawn: &crate::native_ui::CompiledUi| {
             keys(drawn)
@@ -695,17 +731,32 @@ mod read {
                 .collect::<Vec<_>>()
         };
         let rows = rows_of(&drawn);
-        assert_eq!(rows.len(), kept.len(), "{rows:?}");
-        for (at, change) in kept.iter().enumerate() {
-            assert_eq!(
-                label_of(&drawn, &format!("name/history/{at}")),
-                change.line()
-            );
+        assert_eq!(rows.len(), lines.len(), "{rows:?}");
+        for (at, line) in lines.iter().enumerate() {
+            assert_eq!(label_of(&drawn, &format!("name/history/{at}")), *line);
         }
+        assert!(
+            label_of(&drawn, "name/history/0").contains("Heron -> Puffin"),
+            "newest first"
+        );
 
-        let seeded = named(Class::Seeded, 7, "Heron");
-        let drawn = whole(&machine_route(page(1, found(&seeded, &[], &names), false)));
-        assert_eq!(rows_of(&drawn), ["name/history/none"]);
+        let sentence = crate::machine_rename_sheet::sentence;
+        let why = "no answer within 2 s";
+        for (history, said) in [
+            (Ok(History::default()), sentence(NO_ROW)),
+            (
+                Ok(crate::machine_title::page::fixture::history(vec![])),
+                sentence(NO_HISTORY),
+            ),
+            (
+                Err(why.to_owned()),
+                sentence(&format!("History was not read ({why})")),
+            ),
+        ] {
+            let drawn = drawn_with(history);
+            assert_eq!(rows_of(&drawn), ["name/history/none"]);
+            assert_eq!(label_of(&drawn, "name/history/none"), said);
+        }
     }
 
     /// A typed number another Mac's label holds names the next free numbers above it on the live
@@ -750,8 +801,12 @@ mod read {
     #[test]
     fn undo_last_rename_is_not_settings_undo() {
         let names = Names::authorized(Ok(true));
-        let scratch = renamed_twice();
-        let mut route = machine_route(page(1, found(&scratch, &[], &names), false));
+        let (scratch, shown) = renamed_twice();
+        let mut route = machine_route(page(
+            1,
+            found_with_history(&scratch, &[], &names, Ok(shown)),
+            false,
+        ));
         let commands = route.0.commands(route.1, route.2).unwrap();
         let of = |id: &str| {
             let mut listed = commands.iter().filter(|command| command.id.as_str() == id);
@@ -958,12 +1013,50 @@ mod read {
     /// the Nickname field's.
     type Typed = (String, Option<String>);
 
+    /// A full History of the widest lines: [`PAGE_ROWS`] writes, each a revert by `m999999`
+    /// that wrote the largest numbers and the widest nickname over two values each, written at
+    /// once with another write and replaced since, with both cells of this Mac's still on their
+    /// way to the row.
+    fn widest_history() -> History {
+        use crate::machine_title::page::fixture::{cell, history, write};
+        use aterm_db::att::EntryKind;
+        use aterm_db::file::Renamed;
+        let writes = (0..PAGE_ROWS)
+            .map(|at| {
+                let op = u8::try_from(at + 1).expect("a small op");
+                let widest = |column: Renamed, value: &str, replaced: [&str; 2]| {
+                    let mut written = cell(column, value, false, &replaced);
+                    written.unseen = vec![[0xff; 32]];
+                    written
+                };
+                let mut written = write(
+                    op,
+                    "m999999",
+                    EntryKind::Explicit,
+                    vec![
+                        widest(Renamed::Label, "m999999", ["m999998", "m999997"]),
+                        widest(Renamed::Nickname, WIDEST_NICK, [WIDEST_NICK, WIDEST_NICK]),
+                    ],
+                );
+                written.reverts = Some([0xee; 32]);
+                written
+            })
+            .rev()
+            .collect();
+        History {
+            pending: vec![Renamed::Label, Renamed::Nickname],
+            ..history(writes)
+        }
+    }
+
     /// The states a read leaves the page in, at their widest: the widest nickname on the largest
     /// number with a node key (its Node fact is `node-` and 32 hex digits), a 200-character
     /// entry in each field and the line's refusal of it, the longest primary label, that of
     /// a missing naming rule in an instance with no window, an undo of the widest name, a full
-    /// History of the widest names, each by this node, and a held number typed, its next free
-    /// numbers named.
+    /// History ([`PAGE_ROWS`] writes, each cell still on its way too) of the widest lines a write
+    /// makes (the largest numbers and the widest nickname, each written at once with another
+    /// write, replaced since, over two values, in a revert by the widest Mac name), and a held
+    /// number typed, its next free numbers named.
     fn widest() -> Vec<(&'static str, MachinePageState, Option<Typed>)> {
         let names = Names::authorized(Err("not readable here".to_owned()));
         let scratch = named(Class::Chosen, 999_999, WIDEST_NICK);
@@ -972,17 +1065,30 @@ mod read {
         let missing = Names::authorized(Ok(false));
         let headless = page(1, found(&scratch, &[], &missing), false);
         let long = "W".repeat(200);
-        let undone = named(Class::Chosen, 999_999, WIDEST_NICK);
+        let (undone, shown) = renamed(&[(999_999, WIDEST_NICK), (999_998, WIDEST_NICK)]);
         with_node(&undone);
-        rename(&undone, Class::Chosen, 999_998, WIDEST_NICK);
-        let undo = page(1, found(&undone, &[], &names), true);
-        let full = named(Class::Chosen, 999_999, WIDEST_NICK);
-        with_node(&full);
-        for at in 0..aterm_agent::machine_name::file::HISTORY_MAX {
-            let n = if at % 2 == 0 { 999_998 } else { 999_999 };
-            rename(&full, Class::Chosen, n, WIDEST_NICK);
-        }
-        let full = page(1, found(&full, &[], &names), true);
+        let undo = page(1, found_with_history(&undone, &[], &names, Ok(shown)), true);
+        assert!(
+            matches!(&undo.read, PageRead::Read(read) if read.undo.undo.is_some()),
+            "an undo of the widest name is offered"
+        );
+        let full = page(
+            1,
+            found_with_history(&scratch, &[], &names, Ok(widest_history())),
+            true,
+        );
+        let rows = match &full.read {
+            PageRead::Read(read) => match &read.history {
+                Some(PageHistory::Rows(rows)) => rows.len(),
+                _ => 0,
+            },
+            _ => 0,
+        };
+        assert_eq!(
+            rows,
+            PAGE_ROWS + 2,
+            "a full History: the newest writes and both cells on their way"
+        );
         let held = page(1, found(&scratch, &[999_990], &names), true);
         vec![
             ("reading", MachinePageState::default(), None),

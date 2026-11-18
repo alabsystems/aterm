@@ -86,6 +86,11 @@ impl Causes {
         Self(self.0 | other.0)
     }
 
+    /// Retire causes whose queued work no longer calls for a start.
+    pub(super) const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
     /// Whether no cause is set.
     #[must_use]
     pub const fn is_empty(self) -> bool {

@@ -424,6 +424,99 @@ fn a_failing_row_waits_until_its_backoff_ends_or_its_inputs_change() {
     assert!(!ladder.held("m2", "a mailbox", t1));
 }
 
+/// A ROW'S WAIT THAT HOLDS RECORDS WHEN IT ENDS, AND ONE OVER RECORDS NOTHING. Under a trace
+/// scope, a row held by its backoff records the backoff's end as the scope's monotonic deadline,
+/// and so does the retry clock's read of it; a row whose wait is over, a row its changed inputs
+/// release and a row never tried record no deadline, since no later instant answers otherwise.
+///
+/// NEGATIVE CONTROL (2026-11-15): `Ladder::held` comparing its wait raw (`now < b.next` in place
+/// of `!reached(b.next, now)`), the one mutation of its mutant build that reached this test and
+/// L6 (`a_backed_off_row_asks_exactly_its_retry_at_and_at_it_renews_once_and_spawns_once`): `a
+/// held row records when its wait ends` failed, left `None`, right the wait's end; restored, the
+/// file touched.
+#[test]
+fn a_rows_wait_that_holds_records_when_it_ends_and_one_over_records_nothing() {
+    let mut ladder = Ladder::default();
+    let t0 = Instant::now();
+    let end = t0 + BACKOFF_FIRST;
+    assert_eq!(ladder.failed("m2", "nothing", t0), BACKOFF_FIRST);
+    let during = t0 + Duration::from_secs(60);
+
+    let (held, read) = aterm_uds::trace::scope(|| ladder.held("m2", "nothing", during));
+    assert!(held);
+    assert_eq!(
+        read.mono_deadline(),
+        Some(end),
+        "a held row records when its wait ends"
+    );
+    let (retry, read) = aterm_uds::trace::scope(|| ladder.retry_at("m2", during));
+    assert_eq!(retry, Some(end));
+    assert_eq!(
+        read.mono_deadline(),
+        Some(end),
+        "the retry clock's read records it too"
+    );
+
+    let (held, read) = aterm_uds::trace::scope(|| ladder.held("m2", "nothing", end));
+    assert!(!held, "the wait ends at its end");
+    assert_eq!(read.mono_deadline(), None, "a wait over records nothing");
+    let (retry, read) = aterm_uds::trace::scope(|| ladder.retry_at("m2", end));
+    assert_eq!((retry, read.mono_deadline()), (None, None));
+    let (held, read) = aterm_uds::trace::scope(|| ladder.held("never", "nothing", during));
+    assert_eq!(
+        (held, read.mono_deadline()),
+        (false, None),
+        "a row never tried"
+    );
+    let (held, read) = aterm_uds::trace::scope(|| ladder.held("m2", "a mailbox", during));
+    assert_eq!(
+        (held, read.mono_deadline()),
+        (false, None),
+        "changed inputs release the row, at no instant"
+    );
+}
+
+/// THE VAULT'S WAIT RECORDS WHEN ITS RESULT GOES STALE, AND A RUNNING REFRESH RECORDS NOTHING.
+/// Under a trace scope, a turn that reuses the last refresh's result records the end of its
+/// wait as the scope's monotonic deadline; a turn at that end, which finds a refresh due, and a
+/// turn while that refresh runs, which no clock ends, record none.
+///
+/// NEGATIVE CONTROL (2026-11-15): `Ladder::vault_result` comparing its wait raw
+/// (`now.saturating_duration_since(run.at) < run.wait` in place of the `Since` judgment), the one
+/// mutation of its mutant build that reached this test: `a reused result records when it goes
+/// stale` failed, left `None`, right the wait's end; restored, the file touched.
+#[test]
+fn the_vaults_wait_records_when_its_result_goes_stale_and_a_running_refresh_records_nothing() {
+    let mut ladder = Ladder::default();
+    let t0 = Instant::now();
+    assert_eq!(ladder.vault_turn(Some([1; 32]), t0), VaultTurn::Due);
+    ladder.vault_done(Vault::Unchanged(51));
+    let stale = t0 + BACKOFF_FIRST;
+
+    let (turn, read) =
+        aterm_uds::trace::scope(|| ladder.vault_turn(Some([1; 32]), t0 + Duration::from_secs(60)));
+    assert_eq!(turn, VaultTurn::Seen(Vault::Unchanged(51)));
+    assert_eq!(
+        read.mono_deadline(),
+        Some(stale),
+        "a reused result records when it goes stale"
+    );
+    let (seen, read) = aterm_uds::trace::scope(|| ladder.vault_result([1; 32], t0));
+    assert_eq!(
+        (seen, read.mono_deadline()),
+        (Some(Vault::Unchanged(51)), Some(stale))
+    );
+
+    let (turn, read) = aterm_uds::trace::scope(|| ladder.vault_turn(Some([1; 32]), stale));
+    assert_eq!((turn, read.mono_deadline()), (VaultTurn::Due, None));
+    let (turn, read) = aterm_uds::trace::scope(|| ladder.vault_turn(Some([1; 32]), stale));
+    assert_eq!(
+        (turn, read.mono_deadline()),
+        (VaultTurn::Running, None),
+        "a running refresh, which no clock ends, records nothing"
+    );
+}
+
 /// A move of this machine's network (docs/DESIGN-fluid-swarm-2026-10-28.md F3c) ends the vault's
 /// wait, whose clock starts again from the first wait, and each row's backoff, which keeps its
 /// step; a refresh running then runs on.

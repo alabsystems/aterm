@@ -15,6 +15,7 @@ use super::{
     book::{self, Book, Planned, Presence, WEEK},
     event::{Event, Pk},
     heard,
+    mine::Source,
     place::Holding,
     relay::Heard,
     upd::Records,
@@ -57,7 +58,8 @@ pub(crate) enum Flushed {
     Kept(&'static str),
 }
 
-/// [`pass_with`] with no holdings report and no update record, so no place or `upd` row changes.
+/// [`pass_with`] with no holdings report and no update record, so no place, login or `upd` row
+/// changes.
 ///
 /// # Errors
 /// As [`pass_with`].
@@ -73,13 +75,21 @@ pub(crate) fn pass(
 }
 
 /// One flusher pass at `now` (Unix seconds); `presence` is read only when a record is made, and
-/// `holdings` (what this Mac holds that no preference here names, [`super::place`]) only once a
-/// table read is due, so a quiet minute asks the harness nothing; `None` from it leaves every
-/// place row as the book holds it. `record` (this Mac's update record, [`super::upd`]) is read
-/// every pass, a small file another process may have changed; a record the last `upd` row did
-/// not say is due as a sharp event is, and `None` leaves the row as it was. With the journal off (`off`, `[alab] journal = false`, [`super::publishing`]) what the spool
-/// and the outbox hold is dropped unpublished and folded into nothing, and the pass writes only
-/// the `sum` row that says so: once a week, and once when the journal is turned off or on.
+/// `holdings` (what this Mac holds that no preference here names, [`super::place`]) and the
+/// `logins` source's report (this Mac's own logins, [`super::mine`]) only past the quiet gate
+/// and before the journal writer is taken, so a quiet minute asks the harness nothing and reads
+/// no accounts store. The gate passes too where a file a login row is read from moved
+/// ([`Source::moved`], a look at each file's stamp): such a pass reads the logins, and reads the
+/// window only where a login's row changed urgently ([`Book::logins_urgent`]), so an urgent
+/// change the harness noted no sharp event beside (a token withdrawn, a login dropped) goes in
+/// the next record the pace line admits. `None` from `holdings` leaves every place row as the
+/// book holds it, and a CLI the report did not read keeps its login rows. `record` (this Mac's
+/// update record, [`super::upd`]) is read every pass, a small file another process may have
+/// changed; a record the last `upd` row did not say is due as a sharp event is, and `None`
+/// leaves the row as it was. With the journal off (`off`, `[alab] journal = false`,
+/// [`super::publishing`]) what the spool and the outbox hold is dropped unpublished and folded
+/// into nothing, and the pass writes only the `sum` row that says so: once a week, and once when
+/// the journal is turned off or on.
 ///
 /// # Errors
 /// The spool, outbox or book cannot be read or written; no Commons writer; or a window table
@@ -108,11 +118,16 @@ pub(crate) fn pass(
         project = "aterm_db::alab::journal::model_tests::journal_transition"
     )
 )]
-pub(crate) fn pass_with(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one pass's inputs, each distinct"
+)]
+pub(crate) fn pass_observed(
     paths: &Paths,
     spool: &Spool,
     presence: &dyn Fn() -> Presence,
     holdings: &dyn Fn() -> Option<Vec<Holding>>,
+    logins: &dyn Source,
     record: &Records,
     off: bool,
     now: u64,
@@ -122,10 +137,37 @@ pub(crate) fn pass_with(
         spool,
         presence,
         holdings,
+        logins,
         record,
         off,
         now,
         Instant::now(),
+    )
+}
+
+/// [`pass_observed`] with no login report, so no `login` row changes.
+///
+/// # Errors
+/// As [`pass_observed`].
+#[cfg(test)]
+pub(crate) fn pass_with(
+    paths: &Paths,
+    spool: &Spool,
+    presence: &dyn Fn() -> Presence,
+    holdings: &dyn Fn() -> Option<Vec<Holding>>,
+    record: &Records,
+    off: bool,
+    now: u64,
+) -> Result<Flushed> {
+    pass_observed(
+        paths,
+        spool,
+        presence,
+        holdings,
+        &super::mine::Unreported,
+        record,
+        off,
+        now,
     )
 }
 
@@ -172,7 +214,7 @@ pub(super) fn take_in(spool: &Spool, off: bool, now: u64) -> Result<(Book, Vec<E
     Ok((book, outbox))
 }
 
-/// [`pass_with`] with local custody admission's hang detector running from `started`.
+/// [`pass_observed`] with local custody admission's hang detector running from `started`.
 #[expect(
     clippy::too_many_arguments,
     reason = "one pass's inputs, each distinct"
@@ -182,6 +224,7 @@ pub(super) fn pass_started(
     spool: &Spool,
     presence: &dyn Fn() -> Presence,
     holdings: &dyn Fn() -> Option<Vec<Holding>>,
+    logins: &dyn Source,
     record: &Records,
     off: bool,
     now: u64,
@@ -191,10 +234,13 @@ pub(super) fn pass_started(
     book.upd = if off { None } else { record() };
     let period = now / WEEK;
     // Without a table read: nothing can be due while a hold stands (the pace line, a kept
-    // append's retry), nor unless the week is new, a sharp event or a batch waits, or the routine
-    // interval passed since the last write or the last read that found nothing to write.
-    let waiting =
-        outbox.iter().any(Event::sharp) || book.upd_waiting() || outbox.len() >= book::BATCH_EVENTS;
+    // append's retry), nor unless the week is new, a sharp event, a login row that changed
+    // urgently or a batch waits, or the routine interval passed since the last write or the last
+    // read that found nothing to write.
+    let waiting = outbox.iter().any(Event::sharp)
+        || book.upd_waiting()
+        || book.logins_urgent(now)
+        || outbox.len() >= book::BATCH_EVENTS;
     let routine = now
         >= book
             .flushed_at
@@ -202,14 +248,26 @@ pub(super) fn pass_started(
             .saturating_add(book::ROUTINE_S);
     // Turning the journal off or on restates the `sum` row; off, nothing else is ever due.
     let flip = book.sum_off != off;
-    let quiet = !flip && (off || (!waiting && !routine));
-    if now < book.held_until || (book.sum_period == Some(period) && quiet) {
+    let this_week = book.sum_period == Some(period);
+    // With nothing else due, a file a login row is read from that moved (a look at its stamp)
+    // has the logins read, so a login whose row changed urgently with no sharp event beside it
+    // goes in the next record too.
+    let moved = this_week && !off && !flip && !waiting && !routine && logins.moved();
+    let quiet = !flip && (off || (!waiting && !routine && !moved));
+    if now < book.held_until || (this_week && quiet) {
         return Ok(Flushed::Idle);
     }
 
     // Asked before the journal writer is taken: a first look at the lab reads the registry, which
     // takes `commons.lock`, and an admission holds that lock while it waits for this writer, so
     // asking with the writer in hand would be a lock-order cycle only a hang detector ends.
+    if let Some(reports) = if off { None } else { logins.report() } {
+        book.take_logins(&reports, now);
+    }
+    if moved && !book.logins_urgent(now) {
+        book.save(spool)?;
+        return Ok(Flushed::Idle);
+    }
     let held_here = if off { None } else { holdings() };
 
     let selected = crate::generation::selected(paths)?;

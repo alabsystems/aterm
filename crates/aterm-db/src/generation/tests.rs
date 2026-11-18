@@ -2766,6 +2766,7 @@ impl Shelf {
         let original = lab.paths[0].clone();
         let config = lab._home.path().join("aterm.toml");
         crate::alab::Registry::at(original.clone()).open().unwrap();
+        crate::file::tests::declare(&original, &crate::att::TRACKER);
         let shelf = Self {
             lab,
             original,
@@ -2850,7 +2851,8 @@ impl Shelf {
     /// Every file's pass ended in `word` (`why`), every file's status says the same, and what
     /// the pass did to `lab/machines`' snapshot is `recorded`. The files that hold no rows (no
     /// account or link is written here, no record reaches the journal ring, so `ai/limits` folds
-    /// no reading) keep the snapshot their first pass wrote: where `lab/machines`' is replaced,
+    /// no reading, and none reaches `lab/tracker`, so its logs hold no entry) keep the snapshot
+    /// their first pass wrote: where `lab/machines`' is replaced,
     /// theirs is kept (`Recorded { replaced: false }`), and otherwise each did what
     /// `lab/machines`' did.
     #[track_caller]

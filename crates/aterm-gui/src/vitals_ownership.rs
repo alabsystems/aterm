@@ -109,6 +109,8 @@ impl Images {
     /// A same-image or validly signed copy outside this instance's known trees is shared app work.
     /// Recheck start and loaded image around the read: PID reuse or an intervening exec supplies
     /// no proof. An installed update replacing the image pathname does not change either inode.
+    /// A generation the cache holds unowned is read no further: no read after it could prove it
+    /// shared, and its entry would be put back unchanged.
     pub(super) fn roots(
         &mut self,
         self_pid: u32,
@@ -155,6 +157,9 @@ impl Images {
                     return None;
                 }
                 let cached = version.and_then(|v| self.cache.get(&(p.pid, v)).copied());
+                if cached == Some(false) {
+                    return None;
+                }
                 let owned = cached.unwrap_or_else(|| {
                     let image = self.read_image(p.pid);
                     let signed = own_signature

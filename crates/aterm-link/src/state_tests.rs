@@ -2610,11 +2610,13 @@ fn a_reply_re_witnessed_onto_a_moved_log_takes_its_head_down_to_its_fork() {
 /// carried cut may have kept it below the head the attach read. Here the attach read 50, above
 /// the pin's 40, as on a log renamed with its records; a move that continues to 30 brings the
 /// head down to 30, one that continues to 45 leaves it at 40, and a head already anywhere stays
-/// anywhere through a move. A keyed re-post's pin (`via_key`) goes to the head the attach read:
-/// every re-post of its key shares its sequence, so no origin tells its attempt from an earlier
-/// re-post's (ATERM-KI-1114-1414's step S3). NEGATIVE CONTROLS: the rule from critic review F1 to
-/// ATERM-KI-1114-1414 puts it at the head the attach read on a log that continues none
-/// (`heads_at_the_attach`), and every build before F1's rule took it out
+/// anywhere through a move. A keyed re-post's pin (`via_key`) goes to the head the attach read,
+/// `From`, its own head (`Head::OwnFrom`) too, which it no longer is: every re-post of its key
+/// shares its sequence, so no origin tells its attempt from an earlier re-post's
+/// (ATERM-KI-1114-1414), and its attempt may lie below that head; a move brings an own head down
+/// to its fork, still its own. NEGATIVE CONTROLS: the rule from critic review F1 to
+/// ATERM-KI-1114-1414 puts an unkeyed one at the head the attach read on a log that continues
+/// none (`heads_at_the_attach`), and every build before F1's rule took it out
 /// (`pin_head_gone_on_another_log`); neither touches a move's.
 #[test]
 fn a_pins_head_on_a_log_that_continues_none_is_anywhere() {
@@ -2645,6 +2647,13 @@ fn a_pins_head_on_a_log_that_continues_none_is_anywhere() {
                 Head::From(50),
             ),
             (
+                "a keyed pin's own head, a log that continues none",
+                Head::OwnFrom(40),
+                None,
+                true,
+                Head::From(50),
+            ),
+            (
                 "a move that continues to 30",
                 Head::From(40),
                 Some(30),
@@ -2657,6 +2666,13 @@ fn a_pins_head_on_a_log_that_continues_none_is_anywhere() {
                 Some(30),
                 true,
                 Head::From(30),
+            ),
+            (
+                "a keyed pin's own head, a move to 30",
+                Head::OwnFrom(40),
+                Some(30),
+                true,
+                Head::OwnFrom(30),
             ),
             (
                 "a move that continues to 45",
@@ -2676,6 +2692,7 @@ fn a_pins_head_on_a_log_that_continues_none_is_anywhere() {
             let want = match rule {
                 _ if keep_below.is_some() => Some(want),
                 Rule::Anywhere => Some(want),
+                Rule::AtTheAttach if via_key => Some(want),
                 Rule::AtTheAttach => Some(Head::From(50)),
                 Rule::Gone => None,
             };
@@ -2950,6 +2967,7 @@ fn an_ask_costs_one_append_and_its_settle_one_more() {
     st.note_asks([asks::Frame::DeadlineGone {
         off: 5,
         sid: "s-a".to_string(),
+        how: None,
     }])
     .expect("noted");
     st.write_asks().expect("written");
@@ -2985,6 +3003,7 @@ fn a_settled_deadline_is_remembered_across_a_reopen_a_rewrite_and_a_hand_off() {
     st.note_asks([asks::Frame::DeadlineGone {
         off: 5,
         sid: "s-a".to_string(),
+        how: None,
     }])
     .expect("noted");
     st.write_asks().expect("written");
@@ -3025,11 +3044,145 @@ fn a_settled_deadline_is_remembered_across_a_reopen_a_rewrite_and_a_hand_off() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// **A JUDGED `expired`'S VERDICT SURVIVES A REOPEN, A REWRITE AND A HAND-OFF**
+/// (ATERM-KI-1115-7889): the settle by the sweep's `expired` names what it judged it in its
+/// tail (`moot=<e> by=<a>`, `expired=<e>`), which the next open reads back for the bridge's
+/// cache (`StateDir::asks_verdicts`), a rewrite from the index writes again, and a hand-off,
+/// whose tables hold no settle, leaves in the journal. A later settle of the same ask that
+/// names none keeps it; an unjudged one is never journaled (it would not read back).
+#[test]
+fn a_judged_expirys_verdict_survives_a_reopen_a_rewrite_and_a_hand_off() {
+    let dir = scratch("asks-verdict");
+    let st = StateDir::open(&dir).expect("open");
+    let moot = asks::Verdict::Moot { at: 9, by: 7 };
+    let expired = asks::Verdict::Expired { at: 12 };
+    st.note_asks([
+        asks::Frame::Deadline(ask_deadline(5, "s-a")),
+        asks::Frame::Deadline(ask_deadline(6, "s-b")),
+        asks::Frame::DeadlineGone {
+            off: 5,
+            sid: "s-a".to_string(),
+            how: Some(moot),
+        },
+        asks::Frame::DeadlineGone {
+            off: 6,
+            sid: "s-b".to_string(),
+            how: Some(expired),
+        },
+    ])
+    .expect("noted");
+    st.write_asks().expect("written");
+    let verdicts = vec![
+        (5, "s-a".to_string(), moot),
+        (6, "s-b".to_string(), expired),
+    ];
+    let reopened = StateDir::open(&dir).expect("reopen");
+    assert_eq!(reopened.asks_verdicts(), verdicts, "the tails replay");
+    assert!(reopened.deadline_settled(5, "s-a"));
+
+    reopened
+        .note_asks([asks::Frame::DeadlineGone {
+            off: 5,
+            sid: "s-a".to_string(),
+            how: None,
+        }])
+        .expect("noted");
+    assert_eq!(
+        reopened.asks_verdicts(),
+        verdicts,
+        "a settle naming none keeps it"
+    );
+    assert!(
+        reopened
+            .note_asks([asks::Frame::DeadlineGone {
+                off: 8,
+                sid: "s-a".to_string(),
+                how: Some(asks::Verdict::Unjudged { at: 14 }),
+            }])
+            .is_err(),
+        "an unjudged verdict does not read back"
+    );
+    reopened.refuse_writes_of(Some(asks::FILE));
+    assert!(reopened.write_asks().is_err(), "refused: rewritten next");
+    reopened.refuse_writes_of(None);
+    reopened.write_asks().expect("the rewrite");
+    assert_eq!(
+        StateDir::open(&dir).expect("reopen").asks_verdicts(),
+        verdicts,
+        "rewritten from the index"
+    );
+
+    reopened.hand_asks_to_files().expect("the hand-off");
+    assert_eq!(
+        StateDir::open(&dir).expect("reopen").asks_verdicts(),
+        verdicts,
+        "the journal keeps them past a hand-off"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **A LOG MOVE FORGETS A VERDICT PAST ITS FORK, IN THE JOURNAL AS IN THE BRIDGE**
+/// (ATERM-KI-1115-7889 review): asks at @5, @6 and @7 below a fork at @10, settled by an
+/// `expired` at @12 (`expired=12`), by one at @12 moot behind an answer at @11
+/// (`moot=12 by=11`) and by one at @9 moot behind an answer at @8 (`moot=9 by=8`). The move
+/// keeps the three settles, and the verdict only where its `expired` and its answer lie below
+/// the fork: the next open restores no offset of the old log as one of the new, which would
+/// mark an answer there `late=1` or name it the answer an `expired` is moot behind. CONTROL: a
+/// fork at @13 keeps every verdict.
+#[test]
+fn a_log_move_forgets_a_verdict_past_its_fork_in_the_journal_as_in_the_bridge() {
+    for fork in [10, 13] {
+        let dir = scratch(&format!("asks-verdict-fork-{fork}"));
+        let st = StateDir::open(&dir).expect("open");
+        let past = asks::Verdict::Expired { at: 12 };
+        let moot_past = asks::Verdict::Moot { at: 12, by: 11 };
+        let below = asks::Verdict::Moot { at: 9, by: 8 };
+        let gone = |off: u64, how| asks::Frame::DeadlineGone {
+            off,
+            sid: "s-a".to_string(),
+            how: Some(how),
+        };
+        st.note_asks([gone(5, past), gone(6, moot_past), gone(7, below)])
+            .expect("noted");
+        st.write_asks().expect("written");
+        st.forget_log_offsets(100, None, Some(fork), None)
+            .expect("the move");
+        let kept = if fork == 10 {
+            vec![(7, "s-a".to_string(), below)]
+        } else {
+            vec![
+                (5, "s-a".to_string(), past),
+                (6, "s-a".to_string(), moot_past),
+                (7, "s-a".to_string(), below),
+            ]
+        };
+        assert_eq!(
+            st.asks_verdicts(),
+            kept,
+            "fork {fork}: as the move left them"
+        );
+        let reopened = StateDir::open(&dir).expect("reopen");
+        assert_eq!(
+            reopened.asks_verdicts(),
+            kept,
+            "fork {fork}: the next open restores no verdict past the fork"
+        );
+        for off in [5, 6, 7] {
+            assert!(
+                reopened.deadline_settled(off, "s-a"),
+                "fork {fork}: the settle of @{off} stays"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Settle deadline `off`, then more than the index remembers, so that settle ages out.
 fn settle_past_the_memory(st: &StateDir, off: u64) {
     let settle = |off| asks::Frame::DeadlineGone {
         off,
         sid: "s-a".to_string(),
+        how: None,
     };
     st.note_asks([settle(off)]).expect("noted");
     st.note_asks((0..=DEADLINES_KEEP as u64).map(|n| settle(off + 1 + n)))
@@ -3141,6 +3294,7 @@ fn an_older_builds_move_of_the_log_between_runs_has_the_last_word() {
             asks::Frame::DeadlineGone {
                 off: 40,
                 sid: "s-a".to_string(),
+                how: None,
             },
         ])
         .expect("noted");
@@ -3278,6 +3432,7 @@ fn the_asks_journal_is_rewritten_past_its_bound_and_keeps_what_is_live() {
             asks::Frame::DeadlineGone {
                 off,
                 sid: "s-a".to_string(),
+                how: None,
             },
         ])
         .expect("noted");
@@ -3380,6 +3535,7 @@ fn a_hand_off_reads_to_an_older_build_and_its_tables_are_taken_back() {
         asks::Frame::DeadlineGone {
             off: 4,
             sid: "s-a".to_string(),
+            how: None,
         },
     ])
     .expect("noted");
@@ -3702,8 +3858,9 @@ fn a_witness_keeps_where_the_node_met_its_log() {
 
 /// **THE NODE STANDS MET WHERE IT MET THE LOG'S LINE, BROUGHT DOWN BY EACH MOVE** ([`Met::after`]):
 /// the same log keeps the meeting; a move that continues it to a fork brings its head down to the
-/// fork and keeps the log it met, never up; a log that continues none, and a node that stood met
-/// nowhere, meet the new log at the attach's head; a log with no identity meets none.
+/// fork and keeps the log it met, never up, and a proved step to another id ([`Proved`]) meets
+/// that id's line as far down; a log that continues none, and a node that stood met nowhere,
+/// meet the new log at the attach's head; a log with no identity meets none.
 #[test]
 fn the_node_stands_met_where_it_met_the_logs_line_brought_down_by_each_move() {
     let log = |id: u8, generation| astream_broker::LogIdentity {
@@ -3748,6 +3905,16 @@ fn the_node_stands_met_where_it_met_the_logs_line_brought_down_by_each_move() {
         "met nowhere before a move"
     );
     assert_eq!(Met::after(met, None, 80, None), None, "no identity");
+    assert_eq!(
+        Met::after(met, Some(log(2, 0)), 80, Some(Some(12))),
+        at(log(2, 0), 12),
+        "a proved step to another id, its fork below the meeting, meets that id's line"
+    );
+    assert_eq!(
+        Met::after(met, Some(log(2, 0)), 80, Some(Some(60))),
+        at(log(2, 0), 30),
+        "a proved step whose fork lies above the meeting keeps its head"
+    );
 }
 
 /// **A READ BACK ON A LOG THAT CONTINUES NONE STARTS WHERE THE NODE MET ITS LINE**
@@ -4895,7 +5062,7 @@ fn a_torn_file_after_an_unclean_stop_is_set_aside_and_within_a_boot_refused() {
                 Some(""),
                 "the mirror's pin stays, for the mirror to refuse"
             );
-            st.publication_offset_resets(None, 0)
+            st.publication_offset_resets(None, 0, None)
                 .expect("a log move's reset reads");
             assert!(st.set_aside_torn().expect("again").is_empty(), "idempotent");
             std::fs::write(&journal_path, &cut_journal).expect("a record cut short");
@@ -4943,7 +5110,7 @@ fn a_torn_file_after_an_unclean_stop_is_set_aside_and_within_a_boot_refused() {
                 next.post_pin("s-a", 2).expect_err("refused").kind(),
                 io::ErrorKind::InvalidData
             );
-            assert!(next.publication_offset_resets(None, 0).is_err());
+            assert!(next.publication_offset_resets(None, 0, None).is_err());
             assert!(next.topic_floors("s-a").is_err());
             assert!(next
                 .logpin()
@@ -6962,5 +7129,647 @@ fn in_flight_point_reads_preserve_reopen_removal_and_uncertain_journal_errors() 
             io::ErrorKind::InvalidData,
             "a damaged journal is not an absent entry"
         );
+    }
+}
+
+/// **THE TOLD SAMPLES KEEP THE NEWEST RECORD OF EACH SUBJECT ON ONE LOG** ([`ToldSamples`],
+/// ATERM-KI-1116-7314): a record is noted only above the one kept for its subject; another log
+/// starts them again; a move keeps those below its fork, now of the new log; past
+/// [`ToldSamples::MAX`] subjects the lowest offsets go; they round-trip through their text, a
+/// text any line of which does not read is none, as is every prefix a power cut can leave of
+/// one (NEGATIVE CONTROL: unsealed, a prefix that cut the last subject short read as a sample of
+/// that prefix), and the state dir keeps them.
+#[test]
+fn the_told_samples_keep_the_newest_record_of_each_subject_on_one_log() {
+    let log = |id: u8, generation| astream_broker::LogIdentity {
+        id: [id; 16],
+        generation,
+    };
+    let mut told = ToldSamples::default();
+    assert!(told.note(log(1, 0), "/f/f/in/a", 5, b"one"), "the first");
+    assert!(
+        !told.note(log(1, 0), "/f/f/in/a", 5, b"one"),
+        "the same record again"
+    );
+    assert!(
+        !told.note(log(1, 0), "/f/f/in/a", 3, b"older"),
+        "an older record"
+    );
+    assert!(
+        told.note(log(1, 0), "/f/f/in/a", 9, b"newer"),
+        "a newer one"
+    );
+    assert!(
+        told.note(log(1, 0), "/f/f/in/b", 2, b"b"),
+        "another subject"
+    );
+    assert_eq!(
+        told.rows.get("/f/f/in/a"),
+        Some(&(9, told_digest(b"newer")))
+    );
+    assert_eq!(told.log, Some(log(1, 0)));
+    assert_eq!(
+        ToldSamples::parse(&told.render()),
+        Some(told.clone()),
+        "round trip"
+    );
+    let dir = scratch("told-samples");
+    let st = StateDir::open(&dir).expect("open");
+    assert_eq!(st.told_samples(), ToldSamples::default(), "none recorded");
+    st.set_told_samples(&told).unwrap();
+    assert_eq!(st.told_samples(), told, "as recorded");
+
+    let mut moved = told.clone();
+    moved.moved(Some(log(1, 0)), log(2, 0), 9);
+    assert_eq!(moved.log, Some(log(2, 0)), "of the new log");
+    assert_eq!(
+        moved.rows.keys().collect::<Vec<_>>(),
+        ["/f/f/in/b"],
+        "those below the fork"
+    );
+    assert_eq!(
+        moved.moved_from,
+        Some((log(1, 0), 9)),
+        "still records of the log they were read on, below the fork"
+    );
+    assert_eq!(
+        ToldSamples::parse(&moved.render()),
+        Some(moved.clone()),
+        "round trip of moved samples"
+    );
+    let mut stale = told.clone();
+    stale.moved(Some(log(4, 0)), log(2, 0), 9);
+    assert_eq!(
+        stale,
+        ToldSamples {
+            log: Some(log(2, 0)),
+            moved_from: None,
+            rows: BTreeMap::new(),
+        },
+        "a move from another log than the one they were read on keeps none"
+    );
+    // An attach refused after a lineage move took the samples leaves its witness on the log
+    // they were read on, and the next attach meets the move again (ATERM-KI-1116-7314's keyed
+    // seed 42): the rule before cleared them there.
+    let mut lineage = told.clone();
+    lineage.moved(Some(log(1, 0)), log(1, 1), 10);
+    assert_eq!(lineage.rows.len(), 2, "both below the fork");
+    let mut again = lineage.clone();
+    again.moved(Some(log(1, 0)), log(1, 1), 10);
+    assert_eq!(again, lineage, "the same move met again keeps what it kept");
+    let mut on = lineage.clone();
+    on.moved(Some(log(1, 0)), log(1, 2), 20);
+    assert_eq!(
+        (on.log, on.moved_from, on.rows.len()),
+        (Some(log(1, 2)), Some((log(1, 0), 10)), 2),
+        "a later move from the same witness keeps them below both forks"
+    );
+    let mut lower = lineage.clone();
+    lower.moved(Some(log(1, 0)), log(1, 2), 5);
+    assert_eq!(
+        (
+            lower.moved_from,
+            lower.rows.keys().map(String::as_str).collect::<Vec<_>>()
+        ),
+        (Some((log(1, 0), 5)), vec!["/f/f/in/b"]),
+        "and a lower fork cuts them"
+    );
+    let mut from_here = lineage.clone();
+    from_here.moved(Some(log(1, 1)), log(1, 2), 20);
+    assert_eq!(
+        (from_here.moved_from, from_here.rows.len()),
+        (Some((log(1, 1), 20)), 2),
+        "a move from the log they are of now names that log"
+    );
+
+    assert!(told.note(log(3, 0), "/f/f/in/c", 1, b"c"), "another log");
+    assert_eq!(told.log, Some(log(3, 0)));
+    assert_eq!(told.rows.keys().collect::<Vec<_>>(), ["/f/f/in/c"]);
+
+    let mut many = ToldSamples::default();
+    for n in 0..=ToldSamples::MAX as u64 {
+        many.note(log(1, 0), &format!("/f/f/in/s{n}"), 100 + n, b"x");
+    }
+    assert_eq!(many.rows.len(), ToldSamples::MAX);
+    assert!(
+        !many.rows.contains_key("/f/f/in/s0"),
+        "the lowest offset dropped"
+    );
+
+    let text = told.render();
+    let unsealed = text.rsplit_once('\n').expect("an end line").0;
+    let cut = &unsealed[..unsealed.len() - 2];
+    let lines = cut.lines().count();
+    assert_eq!(
+        cut.lines()
+            .skip(1)
+            .filter(|l| l.split_whitespace().count() == 3)
+            .count(),
+        lines - 1,
+        "NEGATIVE CONTROL: the cut text's rows each read as a row"
+    );
+    for len in 0..text.len() {
+        assert_eq!(
+            ToldSamples::parse(&text[..len]),
+            None,
+            "a prefix of {len} bytes"
+        );
+    }
+    let mut flipped = text.clone().into_bytes();
+    flipped[10] ^= 1;
+    assert_eq!(
+        ToldSamples::parse(&String::from_utf8_lossy(&flipped)),
+        None,
+        "other bytes"
+    );
+    let sealed = |body: &str| format!("{body}\nend {:016x}", ToldSamples::seal(body));
+    let digest = format!("{:016x}", told_digest(b"x"));
+    for torn in [
+        String::new(),
+        "log=zz".to_string(),
+        "5 0123456789abcdef /a".to_string(),
+        "log=-\n5 0123 /a".to_string(),
+        "log=-\n5 0123456789abcdef".to_string(),
+        "log=-\nx 0123456789abcdef /a".to_string(),
+        format!("log=-\n5 {digest} /a extra"),
+        format!("log=-\n5 {digest} /a\n6 {digest} /a"),
+    ] {
+        assert_eq!(ToldSamples::parse(&sealed(&torn)), None, "{torn:?}");
+    }
+    assert_eq!(
+        ToldSamples::parse(&sealed("log=-")),
+        Some(ToldSamples::default()),
+        "none, of no log"
+    );
+    assert_eq!(
+        ToldSamples::parse(&sealed(&format!("log=-\n5 {digest} /a"))),
+        Some(ToldSamples {
+            log: None,
+            moved_from: None,
+            rows: [("/a".to_string(), (5, told_digest(b"x")))].into(),
+        }),
+        "a sealed row"
+    );
+    for odd in [
+        format!("log=-\nfrom=- 5\n5 {digest} /a"),
+        format!("log=-\nfrom={} x\n5 {digest} /a", log(1, 0)),
+        format!("log=-\nfrom={}\n5 {digest} /a", log(1, 0)),
+    ] {
+        assert_eq!(ToldSamples::parse(&sealed(&odd)), None, "{odd:?}");
+    }
+    assert_ne!(told_digest(b"a"), told_digest(b"b"), "other bytes");
+}
+
+/// **A PROVED STEP SAYS WHERE A HEAD KEPT ON THE LOG BEFORE CONTINUES** ([`Proved::continues`],
+/// ATERM-KI-1116-7314): on the step's own log, its fork; on a later generation of that log, the
+/// fork brought down by the lineage astream tells; nowhere for a generation the lineage does not
+/// reach, another generation of the log before, or another log; the newest step from a log
+/// answers. [`Proved::reach`] says it in its two parts, the step's fork and where `now` stops
+/// holding the step's log ([`Proved::head`], the head it was proved at, on the step's own log;
+/// on a generation since, the lower of it and the lineage's fork), whose lower is that answer.
+/// The state dir keeps the newest [`Proved::MAX`] steps, a step recorded again moving to the
+/// end, and passes a line that does not read; a line a build before the head wrote, which names
+/// none, reads with its fork for it. The head goes on a line of its own
+/// ([`Proved::render_head`]), so a build before it, which reads `was~now@fork` only, still reads
+/// every step this one writes (the control: the one line `was~now@fork^head` it reads as none).
+#[test]
+fn a_proved_step_says_where_a_head_kept_on_the_log_before_continues() {
+    let log = |id: u8, generation| astream_broker::LogIdentity {
+        id: [id; 16],
+        generation,
+    };
+    let step = |was, now, fork| Proved {
+        was,
+        now,
+        fork,
+        head: fork + 20,
+    };
+    let steps = [
+        step(log(1, 0), log(2, 0), 40),
+        step(log(3, 1), log(4, 0), 7),
+    ];
+    let lineage = astream_broker::Lineage::from_steps(&[(1, 25)]).expect("a lineage");
+    let at = |was, now, lineage| Proved::continues(&steps, was, now, lineage);
+    assert_eq!(at(log(1, 0), log(2, 0), None), Some(40), "the step's log");
+    assert_eq!(
+        at(log(1, 0), log(2, 1), Some(&lineage)),
+        Some(25),
+        "a generation since, down to the lineage's common"
+    );
+    assert_eq!(
+        at(log(1, 0), log(2, 2), Some(&lineage)),
+        None,
+        "a generation the lineage does not reach"
+    );
+    assert_eq!(at(log(1, 0), log(2, 1), None), None, "no lineage told");
+    assert_eq!(
+        at(log(1, 1), log(2, 0), None),
+        None,
+        "another generation of the log before"
+    );
+    assert_eq!(at(log(1, 0), log(5, 0), None), None, "another log");
+    assert_eq!(
+        Proved::reach(&steps, log(1, 0), log(2, 0), None),
+        Some((40, 60)),
+        "the step's log: its fork, and the head it was proved at"
+    );
+    assert_eq!(
+        Proved::reach(&steps, log(1, 0), log(2, 1), Some(&lineage)),
+        Some((40, 25)),
+        "a generation since: the step's fork and the lineage's apart"
+    );
+    let lineage_above = astream_broker::Lineage::from_steps(&[(1, 75)]).expect("a lineage");
+    assert_eq!(
+        Proved::reach(&steps, log(1, 0), log(2, 1), Some(&lineage_above)),
+        Some((40, 60)),
+        "a generation since that continues past the head the step was proved at: that head"
+    );
+    assert_eq!(
+        Proved::reach(&steps, log(1, 0), log(2, 2), Some(&lineage)),
+        None,
+        "a generation the lineage does not reach"
+    );
+    let newer = [steps[0], step(log(1, 0), log(2, 0), 12)];
+    assert_eq!(
+        Proved::continues(&newer, log(1, 0), log(2, 0), None),
+        Some(12),
+        "the newest step"
+    );
+
+    let dir = scratch("proved-logs");
+    let st = StateDir::open(&dir).expect("open");
+    assert!(st.proved_steps().is_empty(), "none recorded");
+    let all: Vec<Proved> = (0..=Proved::MAX as u8)
+        .map(|n| step(log(n, 0), log(n + 100, 0), u64::from(n) + 1))
+        .collect();
+    for s in &all {
+        st.add_proved_step(*s).unwrap();
+    }
+    assert_eq!(st.proved_steps(), all[1..], "the newest kept");
+    assert_eq!(
+        st.add_proved_step(all[1]).unwrap(),
+        [&all[2..], &all[1..2]].concat()
+    );
+    let (a, b) = (log(3, 0), log(103, 0));
+    assert_eq!(
+        Proved::render_all(&all[3..4]),
+        format!("{a}~{b}@4\n^{a}~{b}@4^24"),
+        "a step line every build reads, and its head on a line of its own"
+    );
+    assert_eq!(
+        Proved::parse_all(&Proved::render_all(&all)),
+        all,
+        "round trip"
+    );
+    // A build before the head (origin/main's `Proved::parse`, kept here word for word) reads
+    // every step this build writes, and passes the head lines; the one line `was~now@fork^head`
+    // the head was first written as it read as no step (the control).
+    let before_the_head = |line: &str| -> Option<(String, String, u64)> {
+        let (logs, fork) = line.trim().split_once('@')?;
+        let (was, now) = logs.split_once('~')?;
+        astream_broker::LogIdentity::parse(was)?;
+        astream_broker::LogIdentity::parse(now)?;
+        Some((was.to_string(), now.to_string(), crate::parse_uint(fork)?))
+    };
+    let read: Vec<_> = Proved::render_all(&all)
+        .lines()
+        .filter_map(before_the_head)
+        .collect();
+    let wanted: Vec<_> = all
+        .iter()
+        .map(|s| (s.was.to_string(), s.now.to_string(), s.fork))
+        .collect();
+    assert_eq!(read, wanted, "an older build reads every step");
+    assert_eq!(
+        before_the_head(&format!("{a}~{b}@4^24")),
+        None,
+        "control: the one-line codec is no step to an older build"
+    );
+    assert_eq!(
+        Proved::parse_all(&format!("{a}~{b}@4")),
+        vec![Proved { head: 4, ..all[3] }],
+        "a line a build before the head wrote: its fork for its head"
+    );
+    assert_eq!(
+        Proved::parse_all(&format!("{a}~{b}@4\n^{a}~{b}@4^2")),
+        vec![Proved { head: 4, ..all[3] }],
+        "a head below the fork reads at the fork"
+    );
+    assert_eq!(
+        Proved::parse_all(&format!("{a}~{b}@4\n^{a}~{b}@5^90")),
+        vec![Proved { head: 4, ..all[3] }],
+        "a head line of another step names no head of this one"
+    );
+    let line = Proved::render_all(&all[2..3]);
+    std::fs::write(
+        dir.join("proved-logs"),
+        format!("{line}\nnot a step\n{line}"),
+    )
+    .unwrap();
+    assert_eq!(
+        st.proved_steps(),
+        vec![all[2], all[2]],
+        "a torn line passed"
+    );
+}
+
+/// **A HEAD ABOVE A PROVED FORK READS AS ON A LOG THAT CONTINUES NONE, A KEYED ONE FROM ITS OWN
+/// HEAD** ([`Head::below_a_proved_fork`], ATERM-KI-1116-7314): a remint keeps every record at its
+/// offset, so past the fork stand records from before an attempt, a sender's earlier post of the
+/// same words among them, which a read from the fork by words alone takes for it. Across the
+/// proved step `A → B` below 30, proved at `B`'s head 50 ([`Proved::head`]), an unkeyed pin at 40
+/// goes anywhere and a keyed one's own head stays itself, 40 (`Head::OwnFrom`, the mark the drain
+/// makes it at, ATERM-KI-1114-1414), not the head the attach read, 50, above which a carried cut
+/// may have kept its attempt; a keyed own head at 60, above the head the step was proved at
+/// (`B` a log a power loss cut short before astream reminted it), comes down to 50, past which
+/// records published since stand; a keyed one's plain head at 40 (`From`, which an older build
+/// wrote for every keyed head, the head an attach read where the log continued none among them)
+/// goes to 50, never to an own head, since it bounds none of the post's attempts; one at 20
+/// stays, as does one anywhere. A reply in flight kept on `A`, re-witnessed onto `B`, goes
+/// anywhere from 90, a keyed one's own head 90 comes down to 50, a keyed one's plain head 90 goes
+/// to 50, and one at 25 keeps it; its pin's head goes the same way (the replay reads it on the
+/// log the entry names). NEGATIVE CONTROLS: `StateDir::heads_to_a_proved_fork` (the seam
+/// `Mutant::ProvedHeadToTheFork` sets) brings each down to the fork, as on a move astream's
+/// lineage names; `StateDir::proved_keyed_heads_at_the_attach` (the seam
+/// `Mutant::ProvedKeyedHeadAtTheMeeting` sets) takes a keyed pin to the head the attach read and a
+/// keyed reply anywhere, as every build before the own head took them;
+/// `StateDir::plain_from_heads_own` (the seam `Mutant::PlainFromHeadReadAsOwn` sets) keeps a
+/// keyed plain head as an own head, as the own head's second cut read every keyed `From`;
+/// `StateDir::own_heads_above_the_proved_head` (the seam `Mutant::OwnHeadAboveAShorterLog` sets)
+/// leaves an own head above the head the step was proved at; `StateDir::rewitness_keeps_the_head`
+/// (the seam `Mutant::RewitnessKeepsTheOldHead` sets) leaves a reply's heads, its pin's too, as
+/// they were on `A`.
+#[test]
+fn a_head_above_a_proved_fork_reads_as_on_a_log_that_continues_none() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Rule {
+        Proved,
+        ToTheFork,
+        KeyedAtTheAttach,
+        PlainFromOwn,
+        AboveTheProvedHead,
+        KeepsTheHead,
+    }
+    let log = |id: u8| astream_broker::LogIdentity {
+        id: [id; 16],
+        generation: 0,
+    };
+    let (was, now) = (log(1), log(2));
+    let step = Proved {
+        was,
+        now,
+        fork: 30,
+        head: 50,
+    };
+    assert_eq!(Head::From(30).below_a_proved_fork(30), Some(Head::From(30)));
+    assert_eq!(Head::From(31).below_a_proved_fork(30), None);
+    assert_eq!(Head::OwnFrom(31).below_a_proved_fork(30), None);
+    assert_eq!(
+        Head::OwnFrom(30).below_a_proved_fork(30),
+        Some(Head::OwnFrom(30))
+    );
+    assert_eq!(Head::Anywhere.below_a_proved_fork(0), Some(Head::Anywhere));
+    assert_eq!(Head::OwnFrom(40).min(30), Head::OwnFrom(30));
+    assert_eq!(Head::OwnFrom(40).start(), 40);
+    assert_eq!(
+        [Head::From(40), Head::OwnFrom(41), Head::Anywhere].map(Head::own),
+        [None, Some(41), None],
+        "an own head is `OwnFrom` alone"
+    );
+    // A reply's pin keeps the head its entry was journaled at, as a first attempt's does.
+    let reply = |seq: u64, re: u64, via_key: bool, at: Head| InFlight {
+        pin: PublishPin {
+            seq,
+            via_key,
+            identity: None,
+            original: None,
+            original_off: None,
+            owner: None,
+            at: Some(at),
+        },
+        subject: "/f/f/in/n-a/s-b/n-a/ack".into(),
+        body: format!("v=1 t=1 re={re}").into_bytes(),
+        log: Some(was),
+        at: Some(at),
+    };
+    let rules = [
+        Rule::Proved,
+        Rule::ToTheFork,
+        Rule::KeyedAtTheAttach,
+        Rule::PlainFromOwn,
+        Rule::AboveTheProvedHead,
+        Rule::KeepsTheHead,
+    ];
+    for rule in rules {
+        let seams = |st: &StateDir| {
+            st.heads_to_a_proved_fork(rule == Rule::ToTheFork);
+            st.proved_keyed_heads_at_the_attach(rule == Rule::KeyedAtTheAttach);
+            st.plain_from_heads_own(rule == Rule::PlainFromOwn);
+            st.own_heads_above_the_proved_head(rule == Rule::AboveTheProvedHead);
+            st.rewitness_keeps_the_head(rule == Rule::KeepsTheHead);
+        };
+        // (what, its head, keyed, under the rule, to the fork, a keyed one at the attach, a plain
+        // one read as own, an own one above the proved head)
+        for (what, at, via_key, want, to_the_fork, at_the_attach, plain_own, above) in [
+            (
+                "an unkeyed pin above the fork",
+                Head::From(40),
+                false,
+                Head::Anywhere,
+                Head::From(30),
+                Head::Anywhere,
+                Head::Anywhere,
+                Head::Anywhere,
+            ),
+            (
+                "a keyed pin's plain head above the fork",
+                Head::From(40),
+                true,
+                Head::From(50),
+                Head::From(30),
+                Head::From(50),
+                Head::OwnFrom(40),
+                Head::From(50),
+            ),
+            (
+                "a keyed pin's own head above the fork",
+                Head::OwnFrom(40),
+                true,
+                Head::OwnFrom(40),
+                Head::OwnFrom(30),
+                Head::From(50),
+                Head::OwnFrom(40),
+                Head::OwnFrom(40),
+            ),
+            (
+                "a keyed pin's own head above the head the step was proved at",
+                Head::OwnFrom(60),
+                true,
+                Head::OwnFrom(50),
+                Head::OwnFrom(30),
+                Head::From(50),
+                Head::OwnFrom(50),
+                Head::OwnFrom(60),
+            ),
+            (
+                "a pin below the fork",
+                Head::From(20),
+                false,
+                Head::From(20),
+                Head::From(20),
+                Head::From(20),
+                Head::From(20),
+                Head::From(20),
+            ),
+            (
+                "a keyed pin's plain head below the fork",
+                Head::From(20),
+                true,
+                Head::From(20),
+                Head::From(20),
+                Head::From(20),
+                Head::From(20),
+                Head::From(20),
+            ),
+            (
+                "a keyed pin's own head below the fork",
+                Head::OwnFrom(20),
+                true,
+                Head::OwnFrom(20),
+                Head::OwnFrom(20),
+                Head::OwnFrom(20),
+                Head::OwnFrom(20),
+                Head::OwnFrom(20),
+            ),
+            (
+                "a pin anywhere",
+                Head::Anywhere,
+                false,
+                Head::Anywhere,
+                Head::Anywhere,
+                Head::Anywhere,
+                Head::Anywhere,
+                Head::Anywhere,
+            ),
+        ] {
+            let dir = scratch("proved-fork-pin-head");
+            let st = StateDir::open(&dir).expect("open");
+            seams(&st);
+            st.take_incarnation(0).expect("an attach");
+            let pin = PublishPin {
+                at: Some(at),
+                via_key,
+                ..in_flight_entry(7).pin
+            };
+            st.set_post_pin("s-a", 1, &pin).expect("reserved");
+            st.forget_log_offsets_proved(50, Some(now), Some(30), None, Some(step))
+                .expect("forgotten");
+            let want = match rule {
+                Rule::Proved | Rule::KeepsTheHead => want,
+                Rule::ToTheFork => to_the_fork,
+                Rule::KeyedAtTheAttach => at_the_attach,
+                Rule::PlainFromOwn => plain_own,
+                Rule::AboveTheProvedHead => above,
+            };
+            assert_eq!(
+                StateDir::open(&dir)
+                    .expect("reopen")
+                    .post_pin("s-a", 1)
+                    .expect("reads")
+                    .map(|pin| pin.at),
+                Some(Some(want)),
+                "{rule:?}: {what}, across a reopen"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        let dir = scratch("proved-fork-reply-head");
+        let st = StateDir::open(&dir).expect("open");
+        seams(&st);
+        // (sequence, re=, keyed, its head, under the rule, to the fork, a keyed one anywhere, a
+        // plain one read as own, an own one above the proved head)
+        let journaled = [
+            (
+                1,
+                10,
+                false,
+                Head::From(90),
+                Head::Anywhere,
+                Head::From(30),
+                Head::Anywhere,
+                Head::Anywhere,
+                Head::Anywhere,
+            ),
+            (
+                2,
+                12,
+                false,
+                Head::From(25),
+                Head::From(25),
+                Head::From(25),
+                Head::From(25),
+                Head::From(25),
+                Head::From(25),
+            ),
+            (
+                3,
+                14,
+                true,
+                Head::OwnFrom(90),
+                Head::OwnFrom(50),
+                Head::OwnFrom(30),
+                Head::Anywhere,
+                Head::OwnFrom(50),
+                Head::OwnFrom(90),
+            ),
+            (
+                4,
+                16,
+                true,
+                Head::From(90),
+                Head::From(50),
+                Head::From(30),
+                Head::Anywhere,
+                Head::OwnFrom(50),
+                Head::From(50),
+            ),
+        ];
+        for &(seq, re, via_key, at, ..) in &journaled {
+            st.set_in_flight(&reply(seq, re, via_key, at))
+                .expect("journaled");
+        }
+        assert_eq!(
+            st.forget_log_offsets_proved(50, Some(now), Some(30), None, Some(step))
+                .expect("forgotten"),
+            Vec::new(),
+            "{rule:?}: every reply lies below the fork"
+        );
+        let want: Vec<(u64, InFlight)> = journaled
+            .iter()
+            .map(
+                |&(seq, re, via_key, at, want, to_the_fork, anywhere, plain_own, above)| {
+                    let head = match rule {
+                        Rule::Proved => want,
+                        Rule::ToTheFork => to_the_fork,
+                        Rule::KeyedAtTheAttach => anywhere,
+                        Rule::PlainFromOwn => plain_own,
+                        Rule::AboveTheProvedHead => above,
+                        Rule::KeepsTheHead => at,
+                    };
+                    (
+                        seq,
+                        InFlight {
+                            log: Some(now),
+                            ..reply(seq, re, via_key, head)
+                        },
+                    )
+                },
+            )
+            .collect();
+        assert_eq!(
+            st.in_flight().expect("reads"),
+            want,
+            "{rule:?}: re-witnessed onto the proved log, its pin's head with it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

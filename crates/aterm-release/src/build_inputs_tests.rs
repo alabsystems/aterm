@@ -3,6 +3,119 @@
 
 use super::*;
 
+#[cfg(target_os = "macos")]
+#[test]
+fn a_captured_sdk_binds_command_and_seal_and_refuses_selection_or_content_drift() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let a = dir.path().join("sdk-a");
+    let b = dir.path().join("sdk-b");
+    for root in [&a, &b] {
+        std::fs::create_dir(root).unwrap();
+        std::fs::write(root.join("SDKSettings.plist"), "original SDK").unwrap();
+    }
+    let sdk = AppleSdk {
+        root: a.canonicalize().unwrap(),
+    };
+    let selected = std::cell::RefCell::new(sdk.root.clone());
+    let mut command = aterm_uds::spawnfd::command("unused");
+    command.env_clear().env("SDKROOT", &b);
+    sdk.apply(&mut command);
+    let command_root = PathBuf::from(
+        command
+            .get_envs()
+            .find(|(name, _)| *name == "SDKROOT")
+            .unwrap()
+            .1
+            .unwrap(),
+    );
+    assert_eq!(command_root, sdk.root);
+    let mut roots = || {
+        sdk.verify_selected(selected.borrow().clone())?;
+        Ok(vec![(input_seal::SDK.to_owned(), command_root.clone())])
+    };
+    let mut process = input_seal::Process::unstarted(SCHEMAS);
+    let mut sources = input_seal::Sources {
+        roots: &mut roots,
+        facts: &mut |_| read_facts(),
+        open: &mut crate::durable::open_regular_file,
+        now: &mut || input_seal::now_ns() + 3_600_000_000_000,
+        stopped: &|| false,
+        report: &mut |_| {},
+    };
+    let before = process.identity(&mut sources, false).unwrap();
+    assert!(process.holds(&mut sources, &before));
+    *selected.borrow_mut() = b.canonicalize().unwrap();
+    assert!(process.identity(&mut sources, false).is_err());
+    assert!(!process.holds(&mut sources, &before));
+    *selected.borrow_mut() = sdk.root.clone();
+    std::fs::write(a.join("SDKSettings.plist"), "changed SDK").unwrap();
+    assert!(!process.holds(&mut sources, &before));
+    assert_ne!(process.identity(&mut sources, false).unwrap(), before);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_native_seal_needs_neither_stock_proxies_nor_foreign_standard_libraries() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let bin = root.join("bin");
+    std::fs::create_dir_all(root.join("lib/rustlib/aarch64-apple-darwin/lib")).unwrap();
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(
+        root.join("lib/rustlib/aarch64-apple-darwin/lib/native.rlib"),
+        b"native",
+    )
+    .unwrap();
+    let trustc = bin.join("trustc");
+    let quoted_root = crate::release::shell_word(root.to_str().unwrap());
+    std::fs::write(&trustc, format!("#!/bin/sh\ncase \"$1\" in --print) printf '%s\\n' {quoted_root} ;; -vV) printf 'host: aarch64-apple-darwin\\n' ;; *) exit 1 ;; esac\n")).unwrap();
+    std::fs::set_permissions(&trustc, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut compiler = candidate(&root);
+    compiler.stock = Ok(crate::buildplan::Stock::unavailable_for_test(
+        &root,
+        &compiler.pin.stock_toolchain,
+    ));
+    let sdk = AppleSdk::capture().unwrap();
+    let before = crate::buildplan::TakePurpose::Native
+        .identity(Some(&compiler), &sdk)
+        .unwrap()
+        .unwrap();
+    assert!(
+        crate::buildplan::TakePurpose::Universal
+            .identity(Some(&compiler), &sdk)
+            .is_err(),
+        "the same inputs cannot seal a universal product without its stock role"
+    );
+    assert_eq!(
+        crate::buildplan::TakePurpose::Native
+            .identity(Some(&compiler), &sdk)
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    let captured_error = "captured unusable RUSTUP_HOME".to_owned();
+    compiler.stock = Err(captured_error.clone());
+    assert_eq!(
+        crate::buildplan::TakePurpose::Native
+            .identity(Some(&compiler), &sdk)
+            .unwrap(),
+        Some(before)
+    );
+    assert_eq!(
+        crate::buildplan::TakePurpose::Universal
+            .identity(Some(&compiler), &sdk)
+            .unwrap_err(),
+        captured_error,
+    );
+    assert!(
+        crate::buildplan::TakePurpose::Native
+            .identity(None, &sdk)
+            .unwrap()
+            .is_some()
+    );
+}
+
 /// A call's report reaches the log [`arm`] named (the cutter's transcript, which `release
 /// status` counts its `inputs` events from) line by line, and no file where none was named.
 /// NEGATIVE CONTROL: without the append the transcript holds none of it.
@@ -73,6 +186,180 @@ fn read_facts() -> input_seal::Facts {
         sdk_settings: Some("5".repeat(64)),
         trust_build: Some(format!("16387 {}", "4".repeat(64))),
     }
+}
+
+#[cfg(unix)]
+fn candidate(root: &Path) -> CompilerInputs {
+    CompilerInputs {
+        bin: root.join("bin").canonicalize().unwrap(),
+        stock: crate::buildplan::Stock::under(root.as_os_str(), "1.91.1"),
+        pin: crate::trust_lock::CompilerPin {
+            build: 27009,
+            tree_root: "4".repeat(64),
+            compiler_commit: "5".repeat(40),
+            receipt: "SEED-MINT sha256:fixture".into(),
+            stock_toolchain: "1.91.1".into(),
+        },
+    }
+}
+
+#[cfg(unix)]
+fn role_roots(root: &Path, compiler: &CompilerInputs) -> Vec<input_seal::Root> {
+    candidate_roots_with(compiler, |bin, stock| {
+        assert_eq!(bin, compiler.bin);
+        assert_eq!(stock, compiler.pin.stock_toolchain);
+        Ok(vec![
+            (input_seal::TRUST_SELECTED.into(), bin.to_owned()),
+            ("stock/bin".into(), root.join("lib")),
+            (input_seal::SDK.into(), root.join("sdk")),
+        ])
+    })
+    .unwrap()
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct RoleReads {
+    opens: std::cell::Cell<usize>,
+    hashes: std::cell::Cell<usize>,
+    adoptions: std::cell::Cell<usize>,
+}
+
+#[cfg(unix)]
+fn role_identity(
+    process: &mut input_seal::Process,
+    compiler: &CompilerInputs,
+    root: &Path,
+    reads: &RoleReads,
+) -> String {
+    process
+        .identity(
+            &mut input_seal::Sources {
+                roots: &mut || Ok(role_roots(root, compiler)),
+                facts: &mut |_| candidate_facts(compiler, read_facts()),
+                open: &mut |path| {
+                    reads.opens.set(reads.opens.get() + 1);
+                    crate::durable::open_regular_file(path)
+                },
+                now: &mut || input_seal::now_ns() + 3_600_000_000_000,
+                stopped: &|| false,
+                report: &mut |report| match report {
+                    Report::Hashed { .. } => reads.hashes.set(reads.hashes.get() + 1),
+                    Report::Adopted { .. } => reads.adoptions.set(reads.adoptions.get() + 1),
+                    _ => {}
+                },
+            },
+            false,
+        )
+        .unwrap()
+}
+
+/// Identical physical inputs under a different complete source declaration are another
+/// candidate identity and another kept-file key, including a stock-only change.
+#[cfg(unix)]
+#[test]
+fn candidate_seals_bind_every_compiler_pin_field() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let root = fixed_tree(dir.path());
+    let compiler = candidate(&root);
+    let state = dir.path().join("state/inputs-seal");
+    let mut process = input_seal::Process::unstarted(SCHEMAS);
+    process.arm(state.clone());
+    let first = role_identity(&mut process, &compiler, &root, &RoleReads::default());
+    let mut changed = vec![compiler.clone(); 5];
+    changed[0].pin.build += 1;
+    changed[1].pin.tree_root = "6".repeat(64);
+    changed[2].pin.compiler_commit = "7".repeat(40);
+    changed[3].pin.receipt.push_str("-other");
+    changed[4].pin.stock_toolchain = "1.92.0".into();
+    for other in changed {
+        assert_ne!(
+            candidate_facts(&compiler, read_facts()),
+            candidate_facts(&other, read_facts())
+        );
+        assert!(
+            input_seal::matching_kept(SCHEMAS, &state, &first, &role_roots(&root, &other))
+                .is_none()
+        );
+        let actual = role_identity(&mut process, &other, &root, &RoleReads::default());
+        assert_ne!(actual, first, "{:?}", other.pin);
+    }
+    assert_eq!(
+        role_identity(&mut process, &compiler, &root, &RoleReads::default()),
+        first,
+        "an immutable original binding still reads its own retained seal"
+    );
+}
+
+/// A warm call and the receiving process reuse only the same roles. Handing A's valid
+/// seal to B cannot authorize it, even where both roles resolve the same physical files.
+#[cfg(unix)]
+#[test]
+fn candidate_roles_recheck_and_handoff_without_ambient_pin_reuse() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let root = fixed_tree(dir.path());
+    let compiler = candidate(&root);
+    let state = dir.path().join("state/inputs-seal");
+    let mut process = input_seal::Process::unstarted(SCHEMAS);
+    process.arm(state);
+    let first = role_identity(&mut process, &compiler, &root, &RoleReads::default());
+    let handed = process.saved().unwrap().to_owned();
+    let warm = RoleReads::default();
+    assert_eq!(role_identity(&mut process, &compiler, &root, &warm), first);
+    assert_eq!(warm.opens.get(), 0);
+    assert_eq!(warm.hashes.get(), 0);
+
+    let mut receiver = input_seal::Process::unstarted(SCHEMAS);
+    receiver.begin(Some(handed.clone()), None);
+    let adopted = RoleReads::default();
+    assert_eq!(
+        role_identity(&mut receiver, &compiler, &root, &adopted),
+        first
+    );
+    assert_eq!(adopted.opens.get(), 0);
+    assert_eq!(adopted.adoptions.get(), 1);
+
+    let mut other = compiler.clone();
+    other.pin.stock_toolchain = "1.92.0".into();
+    assert!(!process.holds(
+        &mut input_seal::Sources {
+            roots: &mut || Ok(role_roots(&root, &other)),
+            facts: &mut |_| candidate_facts(&other, read_facts()),
+            open: &mut |_| panic!("a held check must hash no file"),
+            now: &mut || input_seal::now_ns() + 3_600_000_000_000,
+            stopped: &|| false,
+            report: &mut |_| {},
+        },
+        &first,
+    ));
+    let mut receiver = input_seal::Process::unstarted(SCHEMAS);
+    receiver.begin(Some(handed), None);
+    let refused = RoleReads::default();
+    assert_ne!(role_identity(&mut receiver, &other, &root, &refused), first);
+    assert_eq!(refused.adoptions.get(), 0);
+    assert_eq!(refused.hashes.get(), 1);
+    assert!(refused.opens.get() > 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn candidate_root_resolution_never_falls_back_or_accepts_an_alias() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let root = fixed_tree(dir.path());
+    let mut compiler = candidate(&root);
+    let why = candidate_roots_with(&compiler, |bin, stock| {
+        assert_eq!(bin, compiler.bin);
+        assert_eq!(stock, compiler.pin.stock_toolchain);
+        Err("selected role unavailable".into())
+    })
+    .unwrap_err();
+    assert_eq!(why, "selected role unavailable");
+    let alias = dir.path().join("alias-bin");
+    std::os::unix::fs::symlink(&compiler.bin, &alias).unwrap();
+    compiler.bin = alias;
+    assert!(candidate_roots_with(&compiler, |_, _| panic!("noncanonical role executed")).is_err());
+    compiler.bin = "relative/bin".into();
+    assert!(candidate_roots_with(&compiler, |_, _| panic!("relative role executed")).is_err());
 }
 
 /// The release's identity of [`fixed_tree`], taken through `atpkg::input_seal` under

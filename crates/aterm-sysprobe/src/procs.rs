@@ -79,6 +79,11 @@ pub struct ProcessReading {
     pub pid: u32,
     /// Kernel start identity: Mach absolute ticks on macOS, boot nanoseconds on Linux, creation FILETIME on Windows.
     pub start: Option<u64>,
+    /// Precise lifetime birth in the platform's native identity units: `/proc` start ticks on
+    /// Linux, Unix microseconds on Windows. Never reconstructed from [`Self::birth_ms`] or a
+    /// rounded boot-clock start. macOS leaves this unread: an upper reader may pair the wall
+    /// record with this row's Mach start using a generation-bracketed native observation.
+    pub birth: Option<u64>,
     /// Its parent's pid (0 when the kernel names none).
     pub ppid: u32,
     /// User plus system CPU time since it started, nanoseconds; `None` where the OS refuses (another user's process on macOS). An unreaped zombie answers its final time (macOS).
@@ -196,7 +201,7 @@ pub struct CoreSplit {
 /// What a sweep reads beyond each process's row ([`processes_with`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SweepOpts {
-    /// Each process's resource coalition and pid version ([`ProcessReading::coalition`], [`ProcessReading::version`]): one more `proc_pidinfo` a process on macOS, two more for one whose coalition [`processes_keeping`]'s ids do not hold under that version, nothing elsewhere.
+    /// Each process's resource coalition and pid version ([`ProcessReading::coalition`], [`ProcessReading::version`]): one more `proc_pidinfo` a process on macOS, two more for one whose coalition [`processes_keeping`]'s ids do not hold under that version, nothing elsewhere. On macOS, with every version read, a name at the short name's cut ([`whole_name`]) is read whole once for each pid version and short name: [`processes_keeping`]'s ids keep it for the sweeps after ([`crate::coalitions::CoalitionIds::name`]).
     pub coalitions: bool,
     /// The pid version of each process whose start the sweep cannot read (another user's, on macOS, whose usage the kernel refuses), which is what tells a new process at its pid (or an exec) from the one a reader kept something for: one more `proc_pidinfo` for each such process on macOS, nothing elsewhere. [`Self::coalitions`] reads every process's.
     pub versions: bool,
@@ -253,7 +258,10 @@ pub fn processes_with(opts: SweepOpts) -> Option<Sweep> {
 }
 
 /// [`processes_with`], each process's coalition taken from `ids` where they hold it under the
-/// process's pid version, else read and kept there; `ids` then holds the swept processes' alone.
+/// process's pid version, else read and kept there, and where `opts` asks for coalitions (so
+/// every version is read) on macOS, each name at the short name's cut likewise, under the
+/// process's pid version and short name ([`crate::coalitions::CoalitionIds::name`]); `ids` then
+/// holds the swept processes' alone.
 #[must_use]
 pub fn processes_keeping(
     opts: SweepOpts,
@@ -358,6 +366,13 @@ pub fn birth_of_filetime(ticks: u64) -> Option<i64> {
     i64::try_from(ticks.checked_sub(UNIX_EPOCH_TICKS)? / 10_000).ok()
 }
 
+/// A Windows creation `FILETIME` as the Unix microseconds used by process lifetime evidence.
+/// This preserves the kernel record's microsecond identity; display milliseconds do not.
+#[must_use]
+pub fn birth_micros_of_filetime(ticks: u64) -> Option<u64> {
+    Some(ticks.checked_sub(UNIX_EPOCH_TICKS)? / 10)
+}
+
 /// How long a process created at `ticks` (`FILETIME`, 100 ns since 1601-01-01 UTC) had run at
 /// `now_us` (µs since the Unix epoch), ms; `None` before the Unix epoch, `0` when born past `now_us`.
 #[must_use]
@@ -428,7 +443,7 @@ pub(crate) mod imp {
 
     use super::{CoreSplit, MAX_PROCESSES, ProcessReading, Sweep, SweepOpts, ticks_to_ns};
     use crate::jobs::RunState;
-    use crate::jobs::darwin::{PROC_FLAG_CONTROLT, PROC_FLAG_EXEC};
+    use crate::jobs::darwin::{Kinfo, PROC_FLAG_CONTROLT, PROC_FLAG_EXEC};
     use crate::rusage::{Flavor, RusageV6, Usage};
 
     /// `PROC_PIDT_SHORTBSDINFO` (`sys/proc_info.h`), which the `libc` crate does not export.
@@ -436,7 +451,7 @@ pub(crate) mod imp {
 
     /// `struct proc_bsdshortinfo` (64 bytes).
     #[repr(C)]
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Default)]
     pub(crate) struct ShortInfo {
         pub(crate) pid: u32,
         pub(crate) ppid: u32,
@@ -508,13 +523,106 @@ pub(crate) mod imp {
         Some(path.file_name()?.as_bytes().to_vec())
     }
 
-    /// `pid`'s longer names for [`super::whole_name`], each read only once pulled: its `p_name`
-    /// (0.5 to 0.9 µs each, measured 2026-11-04 over 290 names at the cut, but refused for another
-    /// user's process), then its image's basename (2.5 to 6.5 µs each).
-    fn longer_names(pid: c_int) -> impl Iterator<Item = Option<(Vec<u8>, Option<usize>)>> {
-        std::iter::once_with(move || p_name(pid).map(|n| (n, Some(P_NAME_CUT)))).chain(
-            std::iter::once_with(move || image_name(pid).map(|n| (n, None))),
+    /// `pid`'s longer names for [`super::whole_name`], each read from `kernel` only once pulled:
+    /// its `p_name` (0.5 to 0.9 µs each, measured 2026-11-04 over 290 names at the cut, but
+    /// refused for another user's process), then its image's basename (2.5 to 6.5 µs each).
+    fn longer_names(
+        kernel: &impl Reads,
+        pid: c_int,
+    ) -> impl Iterator<Item = Option<(Vec<u8>, Option<usize>)>> {
+        std::iter::once_with(move || kernel.p_name(pid).map(|n| (n, Some(P_NAME_CUT)))).chain(
+            std::iter::once_with(move || kernel.image_name(pid).map(|n| (n, None))),
         )
+    }
+
+    /// Every kernel read the sweep makes ([`sweep`]): [`Native`]'s in production; the tests'
+    /// scripted world answers and counts them.
+    pub(super) trait Reads {
+        /// Every pid `proc_listallpids` lists, its live processes newest first and then its
+        /// zombies, at most `MAX_PROCESSES + 1`; `None` where it does not answer.
+        fn pids(&self) -> Option<Vec<c_int>>;
+        /// `pid`'s usage ([`rusage_result`]).
+        fn rusage(&self, pid: c_int) -> Result<Usage, i32>;
+        /// `pid`'s short BSD info ([`short_info`]).
+        fn short_info(&self, pid: c_int) -> Option<ShortInfo>;
+        /// `pid`'s pid version ([`pid_version`]).
+        fn version(&self, pid: c_int) -> Option<i32>;
+        /// `pid`'s resource coalition ([`crate::coalitions::coalition_of`]).
+        fn coalition(&self, pid: u32) -> Option<u64>;
+        /// `getpriority(which, pid)` ([`priority`]).
+        fn priority(&self, pid: c_int, which: c_int) -> Result<i32, i32>;
+        /// `getsid(pid)`.
+        fn sid(&self, pid: c_int) -> c_int;
+        /// `pid`'s `p_name` ([`p_name`]).
+        fn p_name(&self, pid: c_int) -> Option<Vec<u8>>;
+        /// `pid`'s image's basename ([`image_name`]).
+        fn image_name(&self, pid: c_int) -> Option<Vec<u8>>;
+        /// `pid`'s kernel record ([`crate::jobs::macos_kinfo`]).
+        fn kinfo(&self, pid: c_int) -> Option<Kinfo>;
+        /// The whole table's `(pid, ppid, reaps unwaited)` rows
+        /// ([`crate::kproc::reaps_unwaited_all`]).
+        fn unwaited(&self) -> Option<Vec<(u32, u32, bool)>>;
+    }
+
+    /// The kernel's own reads.
+    pub(super) struct Native;
+
+    impl Reads for Native {
+        fn pids(&self) -> Option<Vec<c_int>> {
+            crate::lane::mark("proc_listallpids", None);
+            // SAFETY: a null buffer asks for the count only.
+            let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+            let count = usize::try_from(count).ok()?;
+            let mut pids = vec![0i32; (count + 64).min(MAX_PROCESSES + 1)];
+            let bytes = c_int::try_from(pids.len() * std::mem::size_of::<i32>()).ok()?;
+            // SAFETY: `pids` is `bytes` writable bytes.
+            let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+            let n = usize::try_from(n).ok()?.min(pids.len());
+            pids.truncate(n);
+            Some(pids)
+        }
+
+        fn rusage(&self, pid: c_int) -> Result<Usage, i32> {
+            rusage_result(pid)
+        }
+
+        fn short_info(&self, pid: c_int) -> Option<ShortInfo> {
+            short_info(pid)
+        }
+
+        fn version(&self, pid: c_int) -> Option<i32> {
+            pid_version(pid)
+        }
+
+        fn coalition(&self, pid: u32) -> Option<u64> {
+            crate::coalitions::coalition_of(pid)
+        }
+
+        fn priority(&self, pid: c_int, which: c_int) -> Result<i32, i32> {
+            priority(pid, which)
+        }
+
+        fn sid(&self, pid: c_int) -> c_int {
+            crate::lane::mark("getsid", u32::try_from(pid).ok());
+            // SAFETY: a plain syscall on an integer.
+            unsafe { libc::getsid(pid) }
+        }
+
+        fn p_name(&self, pid: c_int) -> Option<Vec<u8>> {
+            p_name(pid)
+        }
+
+        fn image_name(&self, pid: c_int) -> Option<Vec<u8>> {
+            image_name(pid)
+        }
+
+        fn kinfo(&self, pid: c_int) -> Option<Kinfo> {
+            crate::jobs::macos_kinfo(pid)
+        }
+
+        fn unwaited(&self) -> Option<Vec<(u32, u32, bool)>> {
+            crate::kproc::reaps_unwaited_all()
+        }
     }
 
     /// `PROC_PIDUNIQIDENTIFIERINFO` (`sys/proc_info.h`).
@@ -611,18 +719,18 @@ pub(crate) mod imp {
         super::priority_result(value, errno)
     }
 
-    fn scheduling(pid: c_int, flags: u32) -> super::Scheduling {
+    fn scheduling(kernel: &impl Reads, pid: c_int, flags: u32) -> super::Scheduling {
         // PRIO_DARWIN_ROLE is selector 6 in Apple's published resource_private.h. It is a
         // read only here; an OS that refuses it retains that errno, never an invented role.
         super::Scheduling {
-            nice: priority(pid, libc::PRIO_PROCESS),
+            nice: kernel.priority(pid, libc::PRIO_PROCESS),
             // These target-specific bits come from proc_get_darwinbgstate in XNU.
             // getpriority(PRIO_DARWIN_PROCESS, pid) instead reads current_task().
             application: flags & 0x0100_0000 != 0,
             background_internal: flags & 0x0000_8000 != 0,
             background_external: flags & 0x0001_0000 != 0,
             suppressed: flags & 0x0080_0000 != 0,
-            role: priority(pid, 6),
+            role: kernel.priority(pid, 6),
             qos_cpu_ns: None,
         }
     }
@@ -690,16 +798,16 @@ pub(crate) mod imp {
         opts: SweepOpts,
         ids: &mut crate::coalitions::CoalitionIds,
     ) -> Option<Sweep> {
-        crate::lane::mark("proc_listallpids", None);
-        // SAFETY: a null buffer asks for the count only.
-        let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-        let count = usize::try_from(count).ok()?;
-        let mut pids = vec![0i32; (count + 64).min(MAX_PROCESSES + 1)];
-        let bytes = c_int::try_from(pids.len() * std::mem::size_of::<i32>()).ok()?;
-        // SAFETY: `pids` is `bytes` writable bytes.
-        let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
-        let n = usize::try_from(n).ok()?.min(pids.len());
-        pids.truncate(n);
+        sweep(&Native, opts, ids)
+    }
+
+    /// The sweep ([`super::processes_keeping`]), each of its kernel reads made through `kernel`.
+    pub(super) fn sweep(
+        kernel: &impl Reads,
+        opts: SweepOpts,
+        ids: &mut crate::coalitions::CoalitionIds,
+    ) -> Option<Sweep> {
+        let mut pids = kernel.pids()?;
         let truncated = pids.len() > MAX_PROCESSES;
         pids.truncate(MAX_PROCESSES);
         let (numer, denom) = timebase();
@@ -721,25 +829,32 @@ pub(crate) mod imp {
             if pid <= 0 {
                 continue;
             }
-            let before_read = rusage_result(pid);
+            let before_read = kernel.rusage(pid);
             let before = before_read.ok();
-            let Some(info) = short_info(pid) else {
+            let Some(info) = kernel.short_info(pid) else {
                 dead.push((pid, before));
                 continue;
             };
             let (coalition, version) = if opts.coalitions {
                 ids.read(
                     pid as u32,
-                    || pid_version(pid),
-                    || crate::coalitions::coalition_of(pid as u32),
+                    || kernel.version(pid),
+                    || kernel.coalition(pid as u32),
                 )
             } else if opts.versions && before.is_none() {
-                (None, pid_version(pid))
+                (None, kernel.version(pid))
             } else {
                 (None, None)
             };
-            let mut scheduling = scheduling(pid, info.flags);
-            let after_read = rusage_result(pid);
+            let mut scheduling = scheduling(kernel, pid, info.flags);
+            // The second read brackets the short info by the start the first read named. A first
+            // read the kernel refused (`EPERM`: another user's process) named none, so it is not
+            // made again: the row keeps that refusal and no counters, whatever a second read would
+            // have answered (a process readable by then, or one reaped by then, `ESRCH`).
+            let after_read = match before_read {
+                Err(libc::EPERM) => before_read,
+                _ => kernel.rusage(pid),
+            };
             scheduling.qos_cpu_ns = match after_read {
                 Err(errno) => Some(Err(errno)),
                 Ok(u) => {
@@ -757,11 +872,19 @@ pub(crate) mod imp {
                 _ => continue,
             };
             let read_at = Some(std::time::Instant::now());
-            crate::lane::mark("getsid", u32::try_from(pid).ok());
-            // SAFETY: a plain syscall on an integer.
-            let sid = unsafe { libc::getsid(pid) };
+            let sid = kernel.sid(pid);
             let end = info.comm.iter().position(|b| *b == 0).unwrap_or(16);
-            let name = super::whole_name(&info.comm[..end], SHORT_COMM_CUT, longer_names(pid));
+            let comm = &info.comm[..end];
+            let whole = || super::whole_name(comm, SHORT_COMM_CUT, longer_names(kernel, pid));
+            // A name at the cut costs its longer readers. Each names the file the process last
+            // exec'd, and an exec moves its pid version, so a name read under this version and
+            // short name is kept for the sweeps that read both again.
+            let name = match version {
+                Some(version) if opts.coalitions && comm.len() == SHORT_COMM_CUT => {
+                    ids.name(pid as u32, version, comm, whole)
+                }
+                _ => whole(),
+            };
             procs.push(ProcessReading {
                 scheduling: Some(scheduling),
                 ppid: info.ppid,
@@ -789,11 +912,11 @@ pub(crate) mod imp {
         // named, is kept: no reap between the reads moved it to its parent, and a pid reused
         // between them lends none of it.
         for (pid, before) in dead.into_iter().rev() {
-            let Some(k) = crate::jobs::macos_kinfo(pid) else {
+            let Some(k) = kernel.kinfo(pid) else {
                 continue;
             };
             let last = before
-                .zip(rusage(pid))
+                .zip(kernel.rusage(pid).ok())
                 .filter(|(b, a)| a.ri.ri_proc_start_abstime == b.ri.ri_proc_start_abstime)
                 .map(|(_, a)| a);
             procs.push(ProcessReading {
@@ -807,7 +930,11 @@ pub(crate) mod imp {
                 disk_read: last.map(|u| u.ri.ri_diskio_bytesread),
                 disk_written: last.map(|u| u.ri.ri_diskio_byteswritten),
                 energy_nj: last.and_then(|u| u.energy_nj()),
-                name: super::whole_name(k.comm.as_bytes(), KINFO_COMM_CUT, longer_names(pid)),
+                name: super::whole_name(
+                    k.comm.as_bytes(),
+                    KINFO_COMM_CUT,
+                    longer_names(kernel, pid),
+                ),
                 pgid: k.pgid,
                 uid: Some(k.uid),
                 state: RunState::from_bsd(k.stat),
@@ -822,7 +949,7 @@ pub(crate) mod imp {
         if opts.coalitions {
             ids.end_sweep();
         }
-        read_unwaited(&mut procs);
+        read_unwaited(kernel, &mut procs);
         Some(Sweep { procs, truncated })
     }
 
@@ -840,13 +967,17 @@ pub(crate) mod imp {
     /// the pid and stays unread. Where the table was wanted and not read, every one stays unread:
     /// a table the kernel did not answer in time ([`crate::kproc::records`]) waits on a process
     /// in the middle of an exec, and its own `kinfo_proc` would wait on it too.
-    fn read_unwaited(procs: &mut [ProcessReading]) {
-        read_unwaited_by(procs, crate::kproc::reaps_unwaited_all, |pid| {
-            c_int::try_from(pid)
-                .ok()
-                .and_then(crate::jobs::macos_kinfo)
-                .map(|k| (k.ppid, k.reaps_unwaited))
-        });
+    fn read_unwaited(kernel: &impl Reads, procs: &mut [ProcessReading]) {
+        read_unwaited_by(
+            procs,
+            || kernel.unwaited(),
+            |pid| {
+                c_int::try_from(pid)
+                    .ok()
+                    .and_then(|pid| kernel.kinfo(pid))
+                    .map(|k| (k.ppid, k.reaps_unwaited))
+            },
+        );
     }
 
     /// [`read_unwaited`] by `table`, the whole table's `(pid, ppid, reaps unwaited)` rows, and

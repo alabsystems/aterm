@@ -142,6 +142,7 @@ fn project_with(
     now_ms: u64,
 ) -> LabAccounts {
     let now = seconds(now_ms);
+    let lab = aterm_agent::harness::alab_roster::current();
     let rows: Vec<_> = records.roster.rows.iter().map(|row| {
         let account = records.state.accounts.get(&row.label).cloned().unwrap_or_default();
         let binding = records.logins.get(&row.label);
@@ -151,8 +152,15 @@ fn project_with(
         // A row on its vault token here runs on it, and renewal is off for it: no recovery or
         // renewal is its next step, as the report and the account card say.
         let on_token = accounts::on_token_here(row, &records.state, now);
+        // The step types the row's account word, never its label.
+        let word = aterm_agent::harness::account_names::sign_in_word(
+            Cli::Claude,
+            row,
+            &records.raw_roster.rows,
+            lab.as_deref(),
+        );
         let next_step = current_task
-            .map(|task| task.action.next_step(Cli::Claude, &row.label))
+            .map(|task| task.action.next_step(Cli::Claude, &word))
             .or_else(|| {
                 (account.current_auth(row) == Auth::SignedOut
                     || current_attempt.is_some_and(|attempt| attempt.outcome.failing()))

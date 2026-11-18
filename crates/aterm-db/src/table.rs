@@ -799,6 +799,16 @@ impl<'a> Session<'a> {
         Ok(Some(observation))
     }
 
+    /// Every current member's actor, as this session's membership names them: the seats a table
+    /// checkpoint's finality counts ([`crate::checkpoint::finals`]).
+    pub(crate) fn member_actors(&self) -> std::collections::BTreeSet<Actor> {
+        self.access
+            .members()
+            .iter()
+            .map(|member| member.binding().actor())
+            .collect()
+    }
+
     /// Every current member's binding, for an application that names who has answered.
     pub(crate) fn members(&self) -> Result<Vec<aterm_secrets::commons::binding::Binding>> {
         let deadline = crate::admission::deadline();

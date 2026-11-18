@@ -656,17 +656,26 @@ fn a_launch_loads_no_page_for_a_row_a_bot_protection_stopped_on_any_clock() {
             Ok(Vec::new())
         })
         .unwrap();
+    // The refusal reaches aterm.log, the launch note and the wake file, so it names the row as a
+    // log does, by its account's key (no lab slugs it here), and never by its address or label;
+    // its step types the same key. NEGATIVE CONTROL: with `launch_renewal` naming the row as a
+    // message does (`Reader::Person`), this fails on `google person@example.com: not run: …`
+    // (2026-11-16, by hand, then restored).
+    let pk = aterm_db::typed::keys::account_pk("google", EMAIL).expect("a key");
+    let expected = format!(
+        "{pk}: not run: its last sign-in stopped where only a person at this Mac can go on; a \
+         person runs `aterm harness accounts login {pk} --cli agy` in a terminal on this Mac"
+    );
     for later in [3_600, 6 * 3_600 + 60, 25 * 3_600] {
-        assert_eq!(
-            launch(NOW + 2 + later),
-            (
-                Some(Refused::SignedOut(super::super::cli::left_words(
-                    Cli::Agy,
-                    "one"
-                ))),
-                0
-            ),
-            "{later} s after the check"
+        let (refused, ran) = launch(NOW + 2 + later);
+        assert_eq!(ran, 0, "{later} s after the check: no sign-in ran");
+        let Some(Refused::SignedOut(why)) = refused else {
+            panic!("{later} s after the check: {refused:?}");
+        };
+        assert_eq!(why, expected, "{later} s after the check");
+        assert!(
+            !why.contains('@'),
+            "an address in a launcher's refusal: {why}"
         );
     }
     let at = NOW + 2 + 25 * 3_600 + 60;

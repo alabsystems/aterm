@@ -196,7 +196,11 @@ impl Bed {
     }
 
     fn run(&self, due: bool, host: &Host) -> (ExitCode, String) {
-        let labels = if due { Vec::new() } else { vec!["main".into()] };
+        let labels = if due {
+            Vec::new()
+        } else {
+            vec!["main@example.test".into()]
+        };
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let args = (labels.as_slice(), due, Some([].as_slice()));
         let code = if self.cli == Cli::Claude {

@@ -25,6 +25,26 @@ Native qualification also found that installing a second sandbox after the
 no-fork profile is refused. Managed final-payload integration must not assume
 that a prelude's first sandbox can be tightened after exec.
 
+`install_no_fork_closed_exec` supplies a distinct first-install restriction:
+no fork and exec only at up to sixteen held original executable names. Its
+policy source is fixed; names are native parameters. This unsafe self restriction
+creates no owner or no-exec observation. The provenance `HeldExecImageSet`
+retains whole original owners through checked SAME-program borrows, original
+credential/deadline bookends, sticky refusal and one self-install attempt. Its
+opaque `PreparedExecTransfer` binds the actual initial member and retains that
+same population for a separate authenticated prelude. Each prelude still owns
+its one plan and real child; name DATA cannot reconstruct the transfer. Native
+capture and installation remain unavailable outside the qualified host platform.
+An external lifetime
+owner must still hold those SAME actual inputs across self-exec and retirement;
+local Rust guards and CLOEXEC descriptors do not survive exec. Name filtering
+is not descriptor execution or complete-chain/CLT selection authority. Original
+runtime/search inputs, no concurrent same-UID name writers, actual child/GO/EOF
+settlement and semantic validation remain separate duties. Existing NoFork and
+query/object profiles are unchanged. The standalone `closed_exec_native` actors
+exercise initial/later exec, unowned exec/fork denial, original-input failures,
+and refusal to reuse or tighten an old seal; they are no Host or SDK validator.
+
 `ForkingGroupRestriction` is a separate prospective constraint for a trusted
 forking producer. At its original single-threaded session-leader entry it installs
 one fixed Darwin syscall filter denying `setpgid` (82), `setsid` (147) and

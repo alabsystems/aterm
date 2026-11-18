@@ -35,6 +35,16 @@ impl Wire {
         }
     }
 
+    /// The bytes it keeps in memory from its start: every byte, or a shelved record's frame,
+    /// read back or not (a version-2 record's runs through its signature).
+    pub(crate) fn frame(&self) -> &[u8] {
+        match self {
+            Self::Whole(bytes) => bytes,
+            #[cfg(any(unix, windows))]
+            Self::Shelved(shelved) => &shelved.frame,
+        }
+    }
+
     /// The signed length, read back or not.
     pub(crate) fn len(&self) -> usize {
         match self {

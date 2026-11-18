@@ -1316,7 +1316,7 @@ pub struct Ctx {
         fn(&Ctx, &shape::Piece, bool, &mut unitgraph::Interner) -> Result<unitgraph::Graph, String>,
     /// What enumerates the workspace members for adaptive test-compile shaping. Production reads
     /// Cargo's resolved workspace; a planner test supplies a fixed graph beside [`Ctx::unit_graph`].
-    pub workspace_members: fn(&Ctx) -> changed::Members,
+    pub workspace_members: fn(&Ctx) -> Result<changed::Members, String>,
     /// What the run's shaped test compile has built so far, what the fresh check said
     /// ([`shape::fresh_check`]), and what every compile call reported of its build directory
     /// ([`disk::note_call`]).
@@ -1998,8 +1998,8 @@ pub(crate) struct RunPlan<'ctx> {
 }
 
 impl<'ctx> RunPlan<'ctx> {
-    fn capture(ctx: &'ctx Ctx, seams: Seams) -> Self {
-        let mut stages = plan::plan(ctx);
+    fn capture(ctx: &'ctx Ctx, seams: Seams) -> Result<Self, String> {
+        let mut stages = plan::plan(ctx)?;
         let wanted = stages.iter().any(|s| s.id == plan::StageId::ForeignCells);
         let mut cells = if wanted && ended(ctx).is_none() {
             seams.prepare_cells.and_then(|prepare| prepare(ctx))
@@ -2023,12 +2023,12 @@ impl<'ctx> RunPlan<'ctx> {
                 }
             }
         }
-        Self {
+        Ok(Self {
             ctx,
             stages,
             cells,
             cells_compile,
-        }
+        })
     }
 
     pub(crate) fn context(&self) -> &Ctx {
@@ -3488,7 +3488,14 @@ fn run_seamed<'ctx>(
     let _ = writeln!(log, "{head}");
     let _ = write!(log, "{}", toolchain_lines(ctx));
 
-    let mut invocation = prepared.unwrap_or_else(|| RunPlan::capture(ctx, seams));
+    let mut invocation = match prepared.map_or_else(|| RunPlan::capture(ctx, seams), Ok) {
+        Ok(invocation) => invocation,
+        Err(why) => {
+            writeln!(out, "verify: {why}; no check was run")?;
+            let _ = writeln!(log, "verify: {why}; no check was run");
+            return Ok(exit::COULD_NOT_RUN);
+        }
+    };
     if !std::ptr::eq(invocation.ctx, ctx) {
         writeln!(
             out,
@@ -4217,6 +4224,15 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
             format!("verify: COULD NOT RUN — {why}"),
         )
     };
+    // A stopped graph read must report its original capture, then retain the
+    // run's existing signal outcome instead of turning an interrupt into a
+    // fresh operational verdict.
+    let graph_unavailable = |why: String| {
+        let code = could_not_run(why);
+        #[cfg(unix)]
+        exec::group::end_interrupted();
+        code
+    };
     let measure_artifact = match parsed
         .app
         .as_deref()
@@ -4328,7 +4344,10 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     }
     if parsed.builds_packages_here() {
         let path_env = tools.path_with_stage2_first(&env.path);
-        let foreign = changed::foreign_specs(&root, &tools, &path_env, &parsed.packages);
+        let foreign = match changed::foreign_specs(&root, &tools, &path_env, &parsed.packages) {
+            Ok(foreign) => foreign,
+            Err(why) => return graph_unavailable(why),
+        };
         if !foreign.is_empty() {
             return stop(exit::USAGE, changed::foreign_refusal(&foreign));
         }
@@ -4381,7 +4400,10 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
             .clone()
             .unwrap_or_else(|| changed::default_base(&root, &path_env));
         let sel = cone_selection(round, &root, &tools, &path_env, &base);
-        let (scope, said) = changed::cone(&base, &sel);
+        let (scope, said) = match changed::cone(&base, &sel) {
+            Ok(selection) => selection,
+            Err(why) => return graph_unavailable(why),
+        };
         (scope, Some(said))
     };
     let (wanted, cells_pulled) = planned_checks(&parsed, &scope, &root);
@@ -4444,7 +4466,16 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     }
     ctx.hang_samples = log.as_ref().map(|log| run_log::sample_dir(&log.path));
     let log_shown = log.as_ref().map(|log| log.path.display().to_string());
-    let invocation = RunPlan::capture(&ctx, LIVE);
+    let invocation = match RunPlan::capture(&ctx, LIVE) {
+        Ok(invocation) => invocation,
+        Err(why) => {
+            if let Some(record) = &ctx.runs {
+                record.finish(&runs::LiveKernel);
+            }
+            std::fs::remove_dir_all(&scratch).ok();
+            return graph_unavailable(why);
+        }
+    };
     // A heavy run takes the judgment turn before it claims its disk, so a run that waits for the
     // turn holds nothing another run could use (`docs/DESIGN-landing-economy.md` §2.3).
     let turn = match turn::take(&invocation, parsed.queued_since, parsed.admit) {

@@ -1497,6 +1497,9 @@ pub struct Sample {
     /// What the jobs engine's newest pass found stuck, as the host held it when it took this
     /// reading ([`crate::blockage::StuckWork`]); `None` until a pass has run.
     pub stuck_work: Option<crate::blockage::StuckWork>,
+    /// Each volume's Spotlight indexing as the host's `mdutil` cadence last read it
+    /// ([`crate::spotlight::Cadence`]); `None` unread.
+    pub spotlight_volumes: Option<crate::spotlight::VolumesRead>,
 }
 
 /// End of a frontend sweep on clocks shared with native owning waits.
@@ -2101,7 +2104,7 @@ pub enum State {
     Waiting,
     /// A job gone quiet (◔).
     Quiet,
-    /// Zombies left unreaped by a tab's process (☠).
+    /// Zombies left unreaped across the machine (☠).
     Zombies,
     /// A stuck job (⊘).
     Stuck,
@@ -2112,7 +2115,7 @@ pub enum State {
 }
 
 impl State {
-    /// Derive the Processes row state from the worst active job condition in `view`.
+    /// Derive the Processes row state from active job conditions and machine zombie piles.
     #[must_use]
     pub fn of_jobs(view: &crate::jobs::JobsView) -> Option<Self> {
         use crate::jobs::Verdict;
@@ -2127,7 +2130,7 @@ impl State {
             .findings
             .zombies
             .iter()
-            .any(|z| z.tab.is_some() && z.count > 0)
+            .any(|z| z.count > 0)
             .then_some(Self::Zombies);
         rows.chain(zombies).max()
     }
@@ -2936,6 +2939,9 @@ pub struct Snapshot {
     /// The machine's situation and type, as the reading's [`Sample::situation`] carried them
     /// (A4 §8, §9): the Machine row's name and glyphs. Its place is [`Self::place`].
     pub situation: crate::situation::Situation,
+    /// The Spotlight family over the last split by coalition, carried for
+    /// [`crate::spotlight::READING_CARRIED_MS`]; `None` unread ([`crate::spotlight`]).
+    pub spotlight: Option<crate::spotlight::Reading>,
 }
 
 /// A sum of process memory charges with its independent read coverage. Charges can include
@@ -3764,6 +3770,8 @@ pub struct Vitals {
     strip_rewrites: u64,
     /// The heat chain's state across readings: the usual Super clock per decile.
     heat: crate::heat::Engine,
+    /// The Spotlight family's last split reading and its day ([`crate::spotlight`]).
+    spotlight: crate::spotlight::Family,
 }
 
 /// The most gaps, the most events and the most situation spans a strip keeps.
@@ -4020,6 +4028,13 @@ pub struct StripLine {
 }
 
 impl Vitals {
+    /// Immutable zombie facts from this reading's supported process census. Missing or
+    /// unsupported current input is unavailable even while an older display view is retained.
+    #[must_use]
+    pub fn current_zombie_facts(&self) -> Option<Arc<crate::blockage::ZombieFacts>> {
+        self.rows.blockage.current_zombie_facts()
+    }
+
     /// Published growth by its original observed assignment, including closed tabs.
     #[must_use]
     pub fn historical_reported(&self) -> crate::explain::HistoricalReported {
@@ -4443,6 +4458,24 @@ impl Vitals {
         &self.rows.weeks
     }
 
+    /// The Spotlight family's day, for the host to persist.
+    #[must_use]
+    pub fn spotlight_history(&self) -> &crate::history::SpotlightHistory {
+        self.spotlight.history()
+    }
+
+    /// Take the Spotlight family's day the host persisted in an earlier run.
+    pub fn restore_spotlight_history(&mut self, history: crate::history::SpotlightHistory) {
+        self.spotlight.restore_history(history);
+    }
+
+    /// Whether the Spotlight family's last reading is at or over a bar: what the host's
+    /// `mdutil` cadence reads ([`crate::spotlight::Cadence::step`]).
+    #[must_use]
+    pub fn spotlight_busy(&self) -> bool {
+        self.spotlight.busy()
+    }
+
     /// Take the three-week free history the host persisted in an earlier run
     /// ([`history::FreeSeries::restored`]).
     pub fn restore_free_weeks(&mut self, weeks: FreeWeeks) {
@@ -4813,10 +4846,11 @@ impl Vitals {
         let (resources, mut facts, net) =
             self.rows
                 .absorb(s, stamp, busy, figs, sweep_dt, scoped_cpu.as_ref());
-        (facts.zombies, facts.dstate) = self
-            .rows
-            .blockage
-            .absorb(s, pass.attribution.as_ref().map(|(m, _)| m.as_slice()));
+        (facts.zombies, facts.dstate) = self.rows.blockage.absorb(
+            self.seq,
+            s,
+            pass.attribution.as_ref().map(|(m, _)| m.as_slice()),
+        );
         facts.blocked =
             crate::blockage::Blocked::judge(&facts.zombies, &facts.dstate, s.stuck_work.as_ref());
         let heat = self.heat.absorb(&crate::heat::Input {
@@ -4958,9 +4992,16 @@ impl Vitals {
             strip_events: self.strip_events.iter().cloned().collect(),
             units,
             situation: s.situation.clone(),
+            spotlight: None,
         };
         snap.why = self.why.finish(s, &snap, prepared_why);
         snap.coal_lane = self.why.lane(s);
+        let fresh = snap.why.as_deref().filter(|f| {
+            f.at_ns == s.at_ns && f.lane.on() && f.split.via == crate::explain::Via::Coalitions
+        });
+        snap.spotlight = self
+            .spotlight
+            .absorb(fresh, s.spotlight_volumes.as_ref(), s.mono_ms);
         snap.events = self.detector.detect(&snap);
         snap.cpu_diagnostics = self.hardware_recorder.observe(&snap, s.cores.as_deref());
         snap

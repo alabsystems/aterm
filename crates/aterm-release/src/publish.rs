@@ -6061,14 +6061,9 @@ pub fn verified_release_bundle(
     version: &str,
     toolchain: &str,
 ) -> Result<VerifiedBundle> {
-    verified_release_bundle_with_inputs(
-        operator,
-        repo,
-        source,
-        version,
-        toolchain,
-        crate::build_inputs::current,
-    )
+    verified_release_bundle_with_inputs(operator, repo, source, version, toolchain, || {
+        crate::build_inputs::for_commit(operator, source)
+    })
 }
 
 pub(crate) fn verified_release_bundle_with_inputs(
@@ -6943,7 +6938,7 @@ pub fn run_cut_sign(repo: &Path, opts: &CutOptions) -> Result<()> {
         &source,
         &version,
         &toolchain,
-        crate::build_inputs::current,
+        || crate::build_inputs::for_commit(&operator, &source),
         !opts.sign_prepare,
     )?;
     step("gate", &verified.line);

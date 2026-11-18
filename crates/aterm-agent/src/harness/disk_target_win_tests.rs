@@ -589,6 +589,18 @@ fn tree_of(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// A build directory whose folders and files are a sync engine's placeholders loses nothing.
+/// Exposed, as every `aterm_dirfd` call exposes them, the placeholders fence it: no tier
+/// reclaims, each says why, and every synced byte stays. Left in the mode a program that never
+/// asks runs in (`leave_placeholders_disguised`), Windows shows a placeholder as a plain folder
+/// through a handle on it and in a placeholder folder's listing, so the pass gets past every
+/// fence that stopped it and stages `incremental/`. A plain folder's listing, though, the
+/// stage's, still names a placeholder in it a reparse point (`FILE_ATTRIBUTE_REPARSE_POINT`,
+/// the cloud tag), in every listing class and in std's: the stage's delete keeps it, it goes
+/// back where it was, and still every byte stays.
+///
+/// Negative control: a delete that judged a listed entry by its handle rather than by the
+/// listing takes `incremental/` there (the disguised pass then answers it reclaimed).
 #[test]
 fn a_build_directory_in_a_cloud_sync_root_loses_nothing() {
     let tmp = Tmp::new("win-sync-root");
@@ -629,8 +641,22 @@ fn a_build_directory_in_a_cloud_sync_root_loses_nothing() {
     aterm_dirfd::seam::leave_placeholders_disguised(true);
     let done = reclaim(&t, &judge(now));
     aterm_dirfd::seam::leave_placeholders_disguised(false);
-    let done = done.expect("disguised: reclaimed");
-    assert_eq!(done.units, vec![at(&t, "debug/incremental")], "{done:?}");
+    let err = done
+        .expect_err("disguised: the stage's listing names the placeholder")
+        .to_string();
+    assert!(!err.contains(IN_SYNC_ROOT), "past every fence: {err}");
+    let kept = format!(
+        "{}: {}",
+        at(&t, "debug/incremental").display(),
+        std::io::Error::from(aterm_dirfd::Errno::FOREIGN_REPARSE)
+    );
+    assert!(err.contains(&kept), "{err}");
+    assert_eq!(
+        snapshot(&t, &|_| false),
+        before,
+        "every synced byte stays, back where it was"
+    );
+    assert_eq!(aterm_dirfd::seam::thread_placeholder_mode(), 0);
     drop(root);
 }
 
@@ -769,12 +795,16 @@ fn a_pass_on_windows_lets_go_of_the_cargo_locks_before_it_deletes() {
         let lock = debug.join(".cargo-lock");
         let mut order = Vec::new();
         let mut held_when_staged = None;
+        let mut staged_in: Vec<PathBuf> = Vec::new();
         let mut free_at_first_removal = None;
         let mut build: Option<Build> = None;
-        let done = windows_method(method, &t, now, seen, &mut |stage, _| {
+        let done = windows_method(method, &t, now, seen, &mut |stage, folder| {
             if stage != Stage::Removing {
-                if stage == Stage::Staged && held_when_staged.is_none() {
-                    held_when_staged = Some(held(&lock));
+                if stage == Stage::Staged {
+                    if held_when_staged.is_none() {
+                        held_when_staged = Some(held(&lock));
+                    }
+                    staged_in.push(folder.to_path_buf());
                 }
                 order.push(stage);
                 return;
@@ -796,6 +826,11 @@ fn a_pass_on_windows_lets_go_of_the_cargo_locks_before_it_deletes() {
         match method {
             0 | 1 => assert!(!debug.join(INCREMENTAL).exists(), "method {method}"),
             2 => {
+                // Each folder it stages in, spelled as its lock and its lines spell it: the
+                // directory itself is the path it was given, no separator after.
+                let spelled: Vec<&std::ffi::OsStr> =
+                    staged_in.iter().map(|p| p.as_os_str()).collect();
+                assert_eq!(spelled, [t.as_os_str(), debug.as_os_str()], "{done:?}");
                 assert!(t.join("CACHEDIR.TAG").exists(), "{done:?}");
                 assert!(lock.exists(), "the build's lock stays: {done:?}");
                 assert!(!debug.join("deps").exists(), "{done:?}");

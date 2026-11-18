@@ -1690,18 +1690,18 @@ fn disabled_native_command_is_visible_but_inert() {
 #[cfg(target_os = "macos")]
 #[test]
 fn the_palette_tells_this_macs_undo_from_settings_undo() {
-    use crate::machine_title::page::fixture::{Names, found, named, rename};
-    use aterm_types::machine_name::Class;
+    use crate::machine_title::page::fixture::{Names, found_with_history, renamed};
     const SETTINGS_UNDO: &str = "settings/undo";
     const RENAME_UNDO: &str = "name/press/undo";
-    let scratch = named(Class::Chosen, 7, "Heron");
-    rename(&scratch, Class::Chosen, 8, "Puffin");
+    // Renamed twice, with the History its registry row would hold, so the rename's undo is
+    // available.
+    let (scratch, shown) = renamed(&[(7, "Heron"), (8, "Puffin")]);
     let names = Names::authorized(Ok(true));
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Machine));
     let seq = app.machine_page.reads;
-    app.machine_page_read(seq, found(&scratch, &[], &names));
+    app.machine_page_read(seq, found_with_history(&scratch, &[], &names, Ok(shown)));
     // The label of `action`'s one row, and whether it carries a key.
     let row = |app: &App, action: &str| {
         let lines = app.windows[&wid].palette().unwrap().controls_lines();

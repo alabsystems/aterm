@@ -336,7 +336,7 @@ fn every_crate_of_a_cone_is_linted_with_every_target() {
     };
     let cone_of_all = ["aterm-update", "both", "dev", "normal", "seed", "seed-two"];
     assert_eq!(crates, &cone_of_all);
-    let (scope, _) = cone("main", &selection);
+    let (scope, _) = cone("main", &selection).expect("complete graph and plan");
     let lint = crate::stages::lint_invocations(&scope, &[], false);
     assert_eq!(lint.len(), 1, "one pass: {lint:?}");
     let args = &lint[0].args;
@@ -557,7 +557,7 @@ fn a_change_confined_to_its_own_tests_judges_its_member_alone() {
             alone: paths(&["aterm-grid"]),
         }
     );
-    let (scope, summary) = cone("base", &sel);
+    let (scope, summary) = cone("base", &sel).expect("complete graph and plan");
     assert_eq!(summary, "the change cone since base: aterm-grid (alone)");
     assert!(scope.touches("aterm-grid") && !scope.reaches_dependents("aterm-grid"));
     let unconfined = pick(&grid, &|_, _| false, Replan::Nothing);
@@ -568,7 +568,12 @@ fn a_change_confined_to_its_own_tests_judges_its_member_alone() {
             paths(&["aterm-bench", "aterm-cli", "aterm-grid", "aterm-gui"])
         )
     );
-    assert!(!cone("base", &unconfined).1.contains("(alone)"));
+    assert!(
+        !cone("base", &unconfined)
+            .expect("complete graph and plan")
+            .1
+            .contains("(alone)")
+    );
     let both = pick(
         &[
             "crates/aterm-grid/src/lib.rs",
@@ -983,6 +988,7 @@ fn picked(selection: Selection) -> (Vec<String>, Vec<String>, Vec<String>) {
             alone,
             ..
         } => (seeds, crates, alone),
+        Selection::Unavailable(why) => panic!("graph unavailable: {why}"),
         Selection::Widened(why) => panic!("widened: {why}"),
     }
 }
@@ -2063,6 +2069,7 @@ fn a_mounted_file_this_reader_cannot_settle_reads_its_whole_package() {
 fn narrowed(sel: &Selection) -> (Vec<String>, Vec<String>) {
     match sel {
         Selection::Narrowed { seeds, crates, .. } => (seeds.clone(), crates.clone()),
+        Selection::Unavailable(why) => panic!("graph unavailable: {why}"),
         Selection::Widened(why) => panic!("widened unexpectedly: {why}"),
     }
 }
@@ -2297,7 +2304,11 @@ fn a_dev_edge_is_the_final_hop_of_the_cone() {
         Reach::default(),
         "this host's graph does not hold it"
     );
-    assert_eq!(unknown, None, "a spec the graph cannot answer widens");
+    let why = unknown.expect_err("a failed original graph refuses selection");
+    assert!(
+        why.contains("no-such-package") && why.contains("stderr ("),
+        "{why}"
+    );
     assert!(
         matches!(&member_file, Selection::Narrowed { seeds, .. } if seeds == &["anchored"]),
         "{member_file:?}"
@@ -2721,7 +2732,12 @@ fn a_seed_this_hosts_graph_does_not_hold_widens() {
             matches!(&sel, Selection::Widened(why) if why.contains("offhost")),
             "{answer:?}: {sel:?}"
         );
-        assert!(cone("main", &sel).0.is_workspace());
+        assert!(
+            cone("main", &sel)
+                .expect("complete graph and plan")
+                .0
+                .is_workspace()
+        );
     }
     assert_eq!(
         narrowed(&pick(&|_| Some(vec!["aterm-gui".to_string()]))),
@@ -2787,7 +2803,7 @@ fn a_trust_lock_change_replans_everything() {
 }
 
 #[test]
-fn whatever_the_selection_cannot_answer_widens() {
+fn policy_changes_widen_and_unavailable_graphs_refuse() {
     let m = members(&["aterm-grid", "aterm-link"]);
     let lib = "crates/aterm-grid/src/lib.rs";
     let fork = || {
@@ -2853,8 +2869,21 @@ fn whatever_the_selection_cannot_answer_widens() {
         resolve(Path::new("/"), &no_targo, OsStr::new(""), "main"),
     ));
     for (case, sel) in cases {
+        if matches!(case.as_str(), "no members" | "no targo") {
+            let Selection::Unavailable(why) = &sel else {
+                panic!("{case}: {sel:?}")
+            };
+            assert_eq!(cone("main", &sel).unwrap_err(), *why);
+            continue;
+        }
         assert!(matches!(sel, Selection::Widened(_)), "{case}: {sel:?}");
-        assert!(cone("main", &sel).0.is_workspace(), "{case}");
+        assert!(
+            cone("main", &sel)
+                .expect("complete graph and plan")
+                .0
+                .is_workspace(),
+            "{case}"
+        );
     }
 }
 
@@ -2954,15 +2983,26 @@ fn a_vendored_package_or_its_gitlink_selects_the_members_that_depend_on_it() {
         )
     );
     assert_eq!(
-        cone("origin/main", &bump).0.crates(),
+        cone("origin/main", &bump)
+            .expect("complete graph and plan")
+            .0
+            .crates(),
         ["aterm", "aterm-link"],
         "a vendored seed is no crate of the cone"
     );
     assert!(
-        cone("origin/main", &bump).0.touches("astream-cap"),
+        cone("origin/main", &bump)
+            .expect("complete graph and plan")
+            .0
+            .touches("astream-cap"),
         "and is still what the change touched"
     );
-    assert!(!cone("origin/main", &bump).0.touches("aterm-link"));
+    assert!(
+        !cone("origin/main", &bump)
+            .expect("complete graph and plan")
+            .0
+            .touches("aterm-link")
+    );
     assert_eq!(
         narrowed(&pick(&["vendor/indexmap/src/map.rs"])).1,
         ["aterm-gui"]
@@ -3534,13 +3574,15 @@ fn a_member_whose_name_the_lock_shares_is_named_with_its_version() {
 fn the_cone_hands_the_checks_its_crates_or_nothing() {
     let m = members(&["aterm-grid", "aterm-gui", "aterm-cli", "aterm-bench"]);
     let sel = |p: &[&str]| select(&paths(p), &manifests(), &m, &no_packages, &graph(EDGES));
-    let (scope, _) = cone("origin/main", &sel(&["crates/aterm-grid/src/lib.rs"]));
+    let (scope, _) = cone("origin/main", &sel(&["crates/aterm-grid/src/lib.rs"]))
+        .expect("complete graph and plan");
     assert_eq!(
         scope.crates(),
         ["aterm-bench", "aterm-cli", "aterm-grid", "aterm-gui"]
     );
     assert!(
         cone("origin/main", &sel(&["docs/x.md"]))
+            .expect("complete graph and plan")
             .0
             .selects_nothing()
     );

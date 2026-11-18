@@ -1882,6 +1882,8 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
     let (network_source, service_derivations) = (None, None);
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     aterm_gui::install_host_quit(commons_stop_at_quit);
+    #[cfg(unix)]
+    aterm_gui::install_shared_face_commit(commit_saved_face);
     #[expect(
         clippy::disallowed_methods,
         reason = "the one window door: every window route reaches the GUI here"
@@ -2010,6 +2012,59 @@ fn spawn_acaffeine_watch() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 static COMMONS_RUNTIME: std::sync::OnceLock<aterm_db::runtime::Runtime> =
     std::sync::OnceLock::new();
+
+/// The window's commit of a shared file's face saved in an Editor tab
+/// (`aterm_gui::install_shared_face_commit`, docs/DESIGN-shared-files-2026-11-11.md §3): `aterm
+/// file commit <name> --by editor` from this same executable, run on a thread of its own so the
+/// event loop never waits on custody or the publisher. Only a face under this user's own root
+/// (`~/.aterm/files`, as saved or as its real path) commits; what the commit answered goes to the
+/// log, and a face it refused keeps saying so in `aterm file status` and `<leaf>.problems`.
+/// Whether it started a commit: a face under another home's root commits nothing here.
+#[cfg(unix)]
+fn commit_saved_face(path: &std::path::Path) -> bool {
+    let Some(root) = aterm_file::Root::live() else {
+        return false;
+    };
+    let name = root.name_of(path).or_else(|| {
+        std::fs::canonicalize(root.path())
+            .ok()
+            .and_then(|real| aterm_file::Root::at(&real).name_of(path))
+    });
+    let (Some(name), Ok(exe)) = (name, std::env::current_exe()) else {
+        return false;
+    };
+    let spawned = std::thread::Builder::new()
+        .name("face-commit".to_owned())
+        .spawn(move || {
+            let name = name.to_string();
+            match aterm_uds::spawnfd::command(exe)
+                .args(["file", "commit", &name, "--by", "editor"])
+                .output()
+            {
+                Ok(output) if output.status.success() => aterm_log::info!(
+                    "shared file {name}: the saved face was committed: {}",
+                    String::from_utf8_lossy(&output.stdout).trim()
+                ),
+                Ok(output) => aterm_log::warn!(
+                    "shared file {name}: the saved face was not committed ({}): {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                Err(error) => {
+                    aterm_log::warn!(
+                        "shared file {name}: `aterm file commit` did not start: {error}"
+                    );
+                }
+            }
+        });
+    match spawned {
+        Ok(_) => true,
+        Err(error) => {
+            aterm_log::warn!("shared file: the commit of a saved face did not start: {error}");
+            false
+        }
+    }
+}
 
 /// How long an ending process waits for its Commons runtime's owner thread to stop
 /// (`aterm_db::runtime::Runtime::shutdown`). Past it the process exits anyway and the network

@@ -152,6 +152,9 @@ pub struct TabFact {
     pub key: u64,
     /// Its stable session id, a tab ID (`tqn5r6e0148`).
     pub sid: String,
+    /// Launch nonce captured with the full process reading and revalidated by the host;
+    /// absent evidence cannot bind a part to a later live session with the same local key.
+    pub sampled_nonce: Option<String>,
     /// Its window's stable id (`sessions`' `window=`); `None` for a session no window shows.
     pub window: Option<usize>,
     /// Its tab's place in that window's tab bar, 1-based.

@@ -32,11 +32,26 @@ fn scratch() -> (aterm_tempfile::TempDir, Store) {
     (dir, store)
 }
 
+/// The lab's names of the test account: its slug and its name.
+const SLUG: &str = "claude-work-x";
+const NAME: &str = "claude person@example.com";
+
 fn covered(login: LoginHalf) -> Covered {
+    let named = Named {
+        pk: KEY.to_owned(),
+        row: None,
+        names: aterm_file::AccountNames {
+            slug: SLUG.to_owned(),
+            name: Some(NAME.to_owned()),
+            ..aterm_file::AccountNames::default()
+        },
+    };
     Covered {
         key: key(),
         email: EMAIL.to_owned(),
         label: Some("work".to_owned()),
+        word: named.word(),
+        named,
         logged_in: true,
         login: LoginHere::Half(login),
         login_turns: None,
@@ -228,7 +243,7 @@ fn the_step_for_soon_and_exposed_carries_replace() {
             Some(replace) => assert_eq!(
                 step,
                 Some(Step::Token {
-                    label: "work".to_owned(),
+                    word: covered(LoginHalf::Ok).named.word(),
                     replace,
                 }),
                 "{name}"
@@ -264,7 +279,12 @@ fn row() -> TokenRow {
 }
 
 /// THE REPORT'S TEXT AND JSON CARRY THE FIELDS: every owner-named field of an account with a
-/// token, and its sessions with their routes.
+/// token, and its sessions with their routes, each session's row named by the account it holds
+/// (its name and slug in the text, its key and slug in the JSON), never by the row's label,
+/// which the survey carries. A session on a row no covered account holds is said to be on one
+/// with no account key.
+/// NEGATIVE CONTROL (2026-11-16, by hand, then restored): with the sessions line printing the
+/// survey's `account=` as it came, `` @s-1 on work token `` is printed.
 #[test]
 fn the_report_carries_the_fields() {
     let shown = account(
@@ -278,21 +298,40 @@ fn the_report_carries_the_fields() {
     let report = Report::Accounts {
         accounts: vec![shown],
         peers: PeersShown::Read,
-        sessions: Some(sessions_of(&[format!(
-            "session local=1 sid=s-1 account=work auth=token token={KEY}"
-        )])),
+        sessions: Some(sessions_of(&[
+            format!("session local=1 sid=s-1 account=work auth=token token={KEY}"),
+            "session local=2 sid=s-2 account=bare auth=stored token=-".to_owned(),
+        ])),
         steps: Held::default(),
     };
     let text = report.text();
-    for field in [entry.as_str(), "m7 in aterm's window", "@s-1", "token"] {
+    let shown = format!("{NAME} ({SLUG})");
+    for field in [
+        entry.as_str(),
+        "m7 in aterm's window",
+        &format!("@s-1 on {shown} token"),
+        "@s-2 on a row with no account key stored",
+        &shown,
+    ] {
         assert!(text.contains(field), "{field}: {text}");
+    }
+    assert!(!text.contains("(person@example.com)"), "{text}");
+    for label in ["work", "bare"] {
+        assert!(
+            !crate::harness::accounts_tokens::tests::says_label(&text, label),
+            "the label `{label}` is printed: {text}"
+        );
     }
     let json = report.json();
     let account = &json["accounts"][0];
+    assert!(account.get("label").is_none(), "no roster label: {json}");
+    assert_eq!(account["slug"], Value::from(SLUG));
+    assert_eq!(account["name"], Value::from(NAME));
     for field in [
         "key",
         "email",
-        "label",
+        "slug",
+        "name",
         "state",
         "entry",
         "minted_at",
@@ -318,6 +357,10 @@ fn the_report_carries_the_fields() {
     assert_eq!(account["used_on"]["peers_read"], Value::from(true));
     assert_eq!(json["sessions"][0]["route"], Value::from("token"));
     assert_eq!(json["sessions"][0]["token"], Value::from(KEY));
+    assert_eq!(json["sessions"][0]["account"]["key"], Value::from(KEY));
+    assert_eq!(json["sessions"][0]["account"]["slug"], Value::from(SLUG));
+    assert_eq!(json["sessions"][1]["account"], Value::Null);
+    assert!(!json.to_string().contains("\"bare\""), "{json}");
 }
 
 /// A TOKEN'S VERIFICATION IS SHOWN FROM THE VAULT'S STAMP, WITH THE MAC THAT WROTE IT (FL-134):
@@ -672,6 +715,7 @@ fn the_covered_rows_say_which_logins_this_mac_holds() {
             super::covered(&Places {
                 store: &store,
                 roster: Some(&roster),
+                lab: None,
                 logins,
                 now: i64::try_from(NOW).unwrap(),
                 offers: true,
@@ -770,6 +814,7 @@ fn the_view_covers_a_rowless_session_login_in_one_read() {
                     &Places {
                         store: &store,
                         roster: None,
+                        lab: None,
                         logins: &logins,
                         now: i64::try_from(NOW).unwrap(),
                         offers,
@@ -785,12 +830,11 @@ fn the_view_covers_a_rowless_session_login_in_one_read() {
     assert_eq!(shown.len(), 1);
     assert_eq!(shown[0].key, KEY);
     assert_eq!(shown[0].label, None);
+    // A row-less account's step names it by the resolver's key of its address, never the address.
+    let (pk, _) = account_names::names_of_login(Cli::Claude, None, EMAIL, None).expect("a key");
     assert_eq!(
-        shown[0].offer.as_ref().map(|offer| offer.step.clone()),
-        Some(Step::Token {
-            label: EMAIL.to_owned(),
-            replace: false,
-        })
+        shown[0].offer.as_ref().map(|offer| offer.step.to_string()),
+        Some(format!("aterm harness accounts token {pk}"))
     );
     // CONTROL: a host whose verb makes no token (off macOS) is offered no step, and still says
     // the token's state.
@@ -864,6 +908,7 @@ fn a_waiting_replacement_leaves_the_view_judging_the_vaults_token_by_its_own_fac
                     &Places {
                         store: &store,
                         roster: None,
+                        lab: None,
                         logins: &[],
                         now: i64::try_from(NOW).unwrap(),
                         offers: true,
@@ -1129,7 +1174,7 @@ fn a_stopped_token_step_is_shown_on_demand_while_its_record_holds() {
             "\n    token step: stopped 2027-01-15: the consent page held Authorize behind a \
              human check; it is tried again only by a person at a terminal on this Mac, who \
              meets the check in aterm's sign-in window: at their own sign-in of the account \
-             there, or by `aterm harness accounts token work`"
+             there, or by `aterm harness accounts token claude-work-x`"
         ),
         "{text}"
     );
@@ -1255,7 +1300,7 @@ fn the_upkeeps_record_of_a_run_is_shown_on_demand_while_it_holds_the_gap() {
              upkeep's capture with nobody there made no token, and it runs none again for that \
              token until a new Claude Code or aterm build, the account's window store, a mailbox \
              configuration file or its saved Google mail grant written after it, or a token made \
-             after it, such as `aterm harness accounts token work` makes"
+             after it, such as `aterm harness accounts token claude-work-x` makes"
         ),
         "{text}"
     );

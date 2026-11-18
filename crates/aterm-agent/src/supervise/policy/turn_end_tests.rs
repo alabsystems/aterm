@@ -207,6 +207,24 @@ fn typed(rule: &'static str) -> TurnEndAction {
     }
 }
 
+/// The resume an account move made at a wall owes, typed in the move's words ([`MOVED_TEXT`])
+/// under the limit's resume rule.
+fn moved_on() -> TurnEndAction {
+    TurnEndAction::Type {
+        text: MOVED_TEXT.to_string(),
+        rule_id: RULE_LIMIT_RESUME,
+    }
+}
+
+/// The resume a login moved elsewhere owes, typed in the login's words ([`LOGIN_MOVED_TEXT`])
+/// under the limit's resume rule.
+fn login_moved_on() -> TurnEndAction {
+    TurnEndAction::Type {
+        text: LOGIN_MOVED_TEXT.to_string(),
+        rule_id: RULE_LIMIT_RESUME,
+    }
+}
+
 /// Cruise's continuation within the hour the person's last key holds the go-ahead: it does not say
 /// the go-ahead is no need ([`alab_policy::go_ahead::unless_held`]).
 fn continued_held() -> TurnEndAction {
@@ -816,13 +834,14 @@ fn a_login_back_or_moved_drops_the_taps_reset_of_a_usage_limit() {
         reset_at: Some(reset),
         ..cancelled.clone()
     };
-    for (name, dropped) in [
+    for (name, dropped, resume) in [
         (
             "login back",
             TurnEndReading {
                 login_back: true,
                 ..carried.clone()
             },
+            typed(RULE_LIMIT_RESUME),
         ),
         (
             "login moved",
@@ -830,16 +849,13 @@ fn a_login_back_or_moved_drops_the_taps_reset_of_a_usage_limit() {
                 login_moved: true,
                 ..carried.clone()
             },
+            login_moved_on(),
         ),
     ] {
         let mut st = TurnEndState::default();
         at(&mut st, &armed, t);
         assert!(st.tracks_tapped_limit(), "{name}");
-        assert_eq!(
-            at(&mut st, &dropped, t + MIN),
-            typed(RULE_LIMIT_RESUME),
-            "{name}"
-        );
+        assert_eq!(at(&mut st, &dropped, t + MIN), resume, "{name}");
         assert!(!st.waits_on_named_reset(), "{name}: dropped on its reading");
         assert!(
             !st.tracks_tapped_limit(),
@@ -9425,7 +9441,7 @@ fn a_login_moved_off_a_held_limit_resumes_it_once() {
         ..r.clone()
     };
     let a = at(&mut st, &moved, now);
-    assert_eq!(a, typed(RULE_LIMIT_RESUME));
+    assert_eq!(a, login_moved_on());
     st.acted(&a, &moved, now);
     assert!(!st.login_resume_owed());
     st.took();
@@ -9458,12 +9474,12 @@ fn a_login_moved_off_a_held_limit_the_screen_left_resumes_it() {
     };
     let (mut st, r, now) = held_limit();
     assert_ne!(
-        at(&mut st, &off(&r, false), now),
-        typed(RULE_LIMIT_RESUME),
+        at(&mut st, &off(&r, false), now).rule_id(),
+        Some(RULE_LIMIT_RESUME),
         "the control"
     );
     let (mut st, r, now) = held_limit();
-    assert_eq!(at(&mut st, &off(&r, true), now), typed(RULE_LIMIT_RESUME));
+    assert_eq!(at(&mut st, &off(&r, true), now), login_moved_on());
 }
 
 /// A moved login's resume left untyped (a person typing, their own draft standing) is owed no
@@ -9488,7 +9504,7 @@ fn a_turn_served_since_a_moved_login_owes_its_resume_no_more() {
     let mut owed = st.clone();
     assert_eq!(
         at(&mut owed, &again, later),
-        typed(RULE_LIMIT_RESUME),
+        login_moved_on(),
         "the control: no turn since, still owed"
     );
     let a = at(
@@ -9501,9 +9517,9 @@ fn a_turn_served_since_a_moved_login_owes_its_resume_no_more() {
     );
     assert!(!st.login_resume_owed());
     assert_ne!(
-        a,
-        typed(RULE_LIMIT_RESUME),
-        "the new login's limit is waited on or held"
+        a.rule_id(),
+        Some(RULE_LIMIT_RESUME),
+        "the new login's limit is waited on or held: {a:?}"
     );
 }
 
@@ -9533,12 +9549,12 @@ fn a_prompt_answered_since_a_moved_login_owes_its_resume_no_more() {
     let mut kept = st.clone();
     assert_eq!(
         at(&mut kept, &answered(1, &r), now),
-        typed(RULE_LIMIT_RESUME),
+        login_moved_on(),
         "the control: the same answer"
     );
     let a = at(&mut st, &answered(2, &r), now);
     assert!(!st.login_resume_owed());
-    assert_ne!(a, typed(RULE_LIMIT_RESUME), "{a:?}");
+    assert_ne!(a.rule_id(), Some(RULE_LIMIT_RESUME), "{a:?}");
 }
 
 /// A moved login's resume is the limit's: owed no more once another wall takes the limit's place
@@ -9595,8 +9611,8 @@ fn a_resume_owed_to_a_moved_login_stands_over_a_track_held_off_the_screen() {
         };
         at(&mut st, &off, now)
     };
-    assert_eq!(run(true), typed(RULE_LIMIT_RESUME));
-    assert_ne!(run(false), typed(RULE_LIMIT_RESUME), "the control");
+    assert_eq!(run(true), login_moved_on());
+    assert_ne!(run(false).rule_id(), Some(RULE_LIMIT_RESUME), "the control");
 }
 
 #[test]
@@ -10940,6 +10956,9 @@ fn advice_to_wait_for_the_walls_own_reset_keeps_the_walls_words() {
     );
 }
 
+/// A model bucket no fallback answers (this file's launches are unread, so even Fable's notice
+/// gets no relaunch onto Opus) moves to the advised account first, its wait the otherwise. Where
+/// the fallback answers it, Fable's wall keeps its account (`turn_end_fable_tests.rs`).
 #[test]
 fn a_model_bucket_moves_account_first_and_its_wait_is_the_otherwise() {
     let t = t0();
@@ -11554,7 +11573,7 @@ fn a_lost_login_before_any_turn_is_asked_is_the_old_process_s() {
     off.retry_api_errors = false;
     assert_eq!(exception_for(&st, &r, &off, t + MIN), None);
     let a = decide_turn_end(&st, &r, &cfg(), t + MIN);
-    assert_eq!(a, typed(RULE_LIMIT_RESUME));
+    assert_eq!(a, moved_on());
     st.acted(&a, &r, t + MIN);
     let after = walled(
         WallKind::Auth,
@@ -11592,7 +11611,7 @@ fn a_lost_login_before_any_turn_is_asked_is_the_old_process_s() {
     assert_eq!(st.account_point(&repaint, &cfg()), None);
     assert_eq!(
         decide_turn_end(&st, &repaint, &cfg(), t + 3 * MIN),
-        typed(RULE_LIMIT_RESUME)
+        moved_on()
     );
     for c in [cfg(), no_continue()] {
         let mut ahead = moved(AccountAt::Ahead);
@@ -11720,14 +11739,14 @@ fn a_move_over_an_unanswered_move_owes_what_that_move_owed() {
     assert!(st.account_resume_owed());
     assert_eq!(
         at_under(&mut st, &first, t + 3 * MIN, &no_continue()),
-        typed(RULE_LIMIT_RESUME),
+        moved_on(),
         "begun at a wall: the resume"
     );
     let mut st = chain(AccountAt::Ahead, true);
     assert!(st.account_resume_owed(), "a turn asked, and cut short");
     assert_eq!(
         at_under(&mut st, &first, t + 3 * MIN, &no_continue()),
-        typed(RULE_LIMIT_RESUME)
+        moved_on()
     );
     let mut st = TurnEndState::default();
     st.restarted(&to_account("work-2", AccountAt::Ahead), true, &first, t);
@@ -12583,7 +12602,7 @@ fn a_move_made_at_a_wall_owes_the_walls_resume() {
     for (what, r) in [("the prompt", &prompt), ("the old notice", &repainted)] {
         let mut st = moved(AccountAt::Wall);
         let a = at_under(&mut st, r, t + MIN, &quiet);
-        assert_eq!(a, typed(RULE_LIMIT_RESUME), "{what}");
+        assert_eq!(a, moved_on(), "{what}");
         st.acted(&a, r, t + MIN);
         let answered = idle("Carrying on: stage 3.", Some(4 * MIN));
         assert_eq!(
@@ -12683,11 +12702,7 @@ fn a_move_at_a_limit_is_answered_by_the_resumed_turn_not_the_replayed_limit() {
     assert_eq!(st.account_answer(&replayed), None, "no turn asked yet");
     assert_eq!(st.login_seen(&replayed), None, "no login served or lost");
     let resume = at(&mut st, &replayed, t + s(9));
-    assert_eq!(
-        resume,
-        typed(RULE_LIMIT_RESUME),
-        "the move's one owed resume"
-    );
+    assert_eq!(resume, moved_on(), "the move's one owed resume");
     st.acted(&resume, &replayed, t + s(18));
     st.took();
     assert_eq!(
@@ -13670,7 +13685,7 @@ fn a_turn_that_ran_since_the_move_pays_the_resume_whatever_it_ended_on() {
     let a = at(&mut st, &repainted, t + 2 * MIN);
     assert!(st.account_resume_owed());
     assert_eq!(st.account_point(&repainted, &cfg()), None);
-    assert_eq!(a, typed(RULE_LIMIT_RESUME));
+    assert_eq!(a, moved_on());
 }
 
 #[test]
@@ -13689,13 +13704,10 @@ fn a_move_a_later_loop_takes_up_owes_its_resume_only_at_the_notice_it_left() {
     };
     let due = t + 60 * MIN + GRACE;
     let mut st = seeded(AccountAt::Wall, false, false);
-    assert_eq!(
-        at_under(&mut st, &notice, t, &quiet),
-        typed(RULE_LIMIT_RESUME)
-    );
+    assert_eq!(at_under(&mut st, &notice, t, &quiet), moved_on());
     assert!(st.account_resume_owed());
     assert_eq!(st.account_point(&notice, &quiet), None);
-    st.acted(&typed(RULE_LIMIT_RESUME), &notice, t);
+    st.acted(&moved_on(), &notice, t);
     assert!(!st.account_resume_owed(), "typed: owed no more");
     let mut st = seeded(AccountAt::Wall, false, false);
     let prompt = idle("Suites are running.", None);
@@ -13756,14 +13768,14 @@ fn a_seeded_resume_is_owed_while_the_notice_it_left_stands_unserved() {
     let mut st = seeded();
     assert_eq!(
         at_under(&mut st, &cancelled(false), t, &quiet),
-        typed(RULE_LIMIT_RESUME),
+        moved_on(),
         "the notice it left, its vendor's continue cancelled"
     );
     let gone = walled(WallKind::Auth, "Not logged in · Please run /login", None);
     let mut st = seeded();
     assert_eq!(
         at_under(&mut st, &gone, t, &quiet),
-        typed(RULE_LIMIT_RESUME),
+        moved_on(),
         "the lost login it left"
     );
     let mut st = seeded();
@@ -23170,6 +23182,9 @@ fn claude_and_kimi_move_accounts() {
 
 #[path = "sysmsg_replay_tests.rs"]
 mod sysmsg_replay;
+
+#[path = "turn_end_move_resume_tests.rs"]
+mod move_resume;
 
 fn routed(r: &TurnEndReading, to: RouteTo) -> TurnEndReading {
     TurnEndReading {

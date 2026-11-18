@@ -14,7 +14,9 @@
 //! macOS, `util/flock.rs`), so a pass takes the same kind of lock, exclusive and without waiting
 //! ([`crate::lock::Flock::try_lock`]): a unit any build holds stays, and while aterm holds it no
 //! build reads or writes it. Held, the unit is renamed aside in its own folder and removed there;
-//! a build arriving meanwhile finds no unit at its path and builds a fresh one. The lock is the
+//! a build arriving meanwhile finds no unit at its path and builds a fresh one. Windows renames no
+//! folder holding an open file, so there the lock goes just before the rename, which Windows then
+//! refuses while a build holds the lock (`used_while_let_go`). The lock is the
 //! store's whole custody contract (targo: "coordinates readers and writers through a per-unit
 //! lock"), so no process scan is made per unit: a store holds thousands of them.
 //!
@@ -30,6 +32,9 @@
 //! next read moves it ([`keep`]). A unit a build holds while a pass reads it is in use at that
 //! moment, and its `.lock` says so ([`record_use`]). A pass that finds a unit idle long enough
 //! reads its use again once it holds the lock, so a build that used it since stops the removal.
+//! A volume that records no reads (NTFS with last-access updates off, ReFS, a Linux `noatime`
+//! mount) shows no read at all, so there a unit builds only read is last used when it was written
+//! (docs/KNOWN_ISSUES.md ATERM-KI-1116-72913).
 //!
 //! THE STORES: Targo names the store from the build's environment (`CARGO_HOME`, else
 //! `TARGO_HOME`, else `~/.cargo`), but the passes run from launchd (the window's disk watch, the
@@ -324,7 +329,7 @@ fn idle(used: SystemTime, now: SystemTime) -> Duration {
 
 /// Set `unit`'s `.lock` times to `at` where they are older: the use a pass records for it.
 fn record_use(unit: &Path, at: SystemTime) -> std::io::Result<()> {
-    let (file, meta) = crate::metadata_io::open_regular_with_meta(&unit.join(LOCK))?;
+    let (file, meta) = crate::metadata_io::open_regular_to_time(&unit.join(LOCK))?;
     if meta.modified().is_ok_and(|was| was >= at) {
         return Ok(());
     }
@@ -334,7 +339,7 @@ fn record_use(unit: &Path, at: SystemTime) -> std::io::Result<()> {
 /// ARM `path` where it is a regular file whose access time is not below its write time: its
 /// access time becomes [`ARMED`] below its write time, which stays, so the next read moves it.
 fn arm_file(path: &Path) {
-    let Ok((file, meta)) = crate::metadata_io::open_regular_with_meta(path) else {
+    let Ok((file, meta)) = crate::metadata_io::open_regular_to_time(path) else {
         return;
     };
     let (Ok(written), Ok(read)) = (meta.modified(), meta.accessed()) else {
@@ -478,7 +483,9 @@ pub fn reclaim_lru(
 /// while this pass holds its lock without waiting ([`hold`]), and only where its use read again
 /// under that lock is still `after` old (a build that used it since the walk keeps it, its use
 /// kept), from before its intent until it is gone: renamed aside in its own folder under the
-/// lowest free stage name ([`STAGE`]) and removed whole there ([`super::remove::tree`]). Each is
+/// lowest free stage name ([`STAGE`]) and removed whole there ([`super::remove::tree`]). On
+/// Windows, which renames no folder holding an open file, the lock goes just before the rename,
+/// and Windows' refusal of the rename stands for it (`used_while_let_go`). Each is
 /// returned with why it went ([`Unused::SharedUnits`], one unit), a stage some entry of which
 /// stayed with what stayed ([`Unused::Stayed`]), and a unit whose rename was refused after its
 /// intent with [`Unused::Refused`]. The folders a unit sat in stay: a build makes its unit's
@@ -540,18 +547,26 @@ pub(super) fn reclaim_on(
         if !intents.ask(&unit, why) {
             break;
         }
+        // Windows renames no folder that holds an open file, this pass's `.lock` among them: the
+        // lock goes first there (`used_while_let_go`).
+        #[cfg(windows)]
+        drop(lock);
         super::seams::staging(&unit);
         let stage = match super::stage_aside(&unit, &holder, OsStr::new(STAGE)) {
-            Ok(stage) => {
-                intents.moved(&stage);
-                stage
-            }
+            Ok(stage) => stage,
             Err(e) => {
                 intents.refused(super::Refusal::Rename(e.kind()));
                 continue;
             }
         };
+        #[cfg(windows)]
+        if used_while_let_go(&unit, &stage, now, after) {
+            intents.refused(super::Refusal::Stopped);
+            continue;
+        }
+        intents.moved(&stage);
         let left = super::remove::tree(&stage);
+        #[cfg(not(windows))]
         drop(lock);
         if left.whole() {
             intents.outcome(unit, why);
@@ -566,6 +581,20 @@ pub(super) fn reclaim_on(
         }
     }
     intents.finish()
+}
+
+/// WINDOWS' CUSTODY OF A UNIT BETWEEN ITS LOCK AND ITS RENAME ([`reclaim_on`]): Windows renames no
+/// folder while any file in it is open, so a pass lets go of the unit's lock just before its
+/// rename aside, and Windows then refuses that rename while a build holds the unit's lock (or
+/// any file of it) open, as the lock refused that build until then. A build that took the lock
+/// and let it go in between used the unit: its use is read again at `stage`, the unit as renamed,
+/// and where it is under `after` old at `now` the unit is put back at `unit` (never over another
+/// entry) and `true` returned, so it stays and its intent closes with nothing gone. Where
+/// something took `unit` meanwhile, a build made a fresh unit there, and the stage goes.
+#[cfg(windows)]
+fn used_while_let_go(unit: &Path, stage: &Path, now: SystemTime, after: Duration) -> bool {
+    last_used(stage).is_some_and(|used| idle(used, now) < after)
+        && crate::platform::rename_noreplace(stage, unit).is_ok()
 }
 
 #[cfg(test)]

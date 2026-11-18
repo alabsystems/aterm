@@ -558,6 +558,194 @@ fn example_g_a_zombie_pile_under_a_logging_server_is_running_with_its_zombies_co
     );
 }
 
+fn zombie_parent_world() -> World {
+    let mut w = World::new();
+    w.run_bg(1, sleeper(6120, "parent"));
+    w
+}
+
+fn add_zombie(w: &mut World, pid: u32, parent: u32) {
+    let mut child = Proc::new(pid, parent, "unreaped-child");
+    child.pgid = 6120;
+    child.sid = 200;
+    child.tty = true;
+    child.state = ProcState::Zombie;
+    w.add(child);
+}
+
+#[test]
+fn one_zombie_book_counts_the_whole_parent_pile_outside_the_job_member_map() {
+    let mut w = zombie_parent_world();
+    add_zombie(&mut w, 6200, 6120);
+    w.p(6200).pgid = 200;
+    w.observe_processes();
+    w.advance(10_000);
+    let tick = w.capture_tick();
+    assert!(
+        tick.procs.iter().any(|p| p.pid == 6200),
+        "the child has a detailed reading in the shell's own group"
+    );
+    let facts = tick
+        .zombie_facts
+        .as_ref()
+        .expect("canonical supported reading");
+    let pile = facts.parent_pile(6120).expect("mature parent pile");
+    let view = w.jobs.absorb(&tick);
+    let remembered_members = w.jobs.plan(&tick.sweep, &[]);
+    assert!(remembered_members.iter().any(|p| p.pid == 6120));
+    assert!(
+        !remembered_members.iter().any(|p| p.pid == 6200),
+        "with no tabs to discover, the planner requests only remembered job members"
+    );
+    let held = view
+        .row("j6120")
+        .expect("live background parent")
+        .zombies
+        .expect("whole parent pile");
+    assert_eq!(
+        (held.count, held.parent, held.per_min_deci),
+        (pile.count(), 6120, pile.per_min_deci())
+    );
+    assert_eq!(
+        held.count, 1,
+        "the job's member subset does not narrow the canonical parent pile"
+    );
+    assert!(std::sync::Arc::ptr_eq(
+        view.zombie_facts.as_ref().unwrap(),
+        facts
+    ));
+}
+
+#[test]
+fn one_zombie_book_sums_parent_counts_but_keeps_the_named_parents_canonical_rate() {
+    for other_count in [2, 3] {
+        let mut w = zombie_parent_world();
+        let mut other_parent = Proc::new(6121, 6120, "second-parent");
+        other_parent.pgid = 6120;
+        other_parent.sid = 200;
+        other_parent.tty = true;
+        w.add(other_parent);
+        for pid in 6200..6202 {
+            add_zombie(&mut w, pid, 6120);
+        }
+        w.observe_processes();
+        w.advance(120_000);
+        for pid in 6300..6300 + other_count {
+            add_zombie(&mut w, pid, 6121);
+        }
+        w.observe_processes();
+        w.advance(60_000);
+        let tick = w.capture_tick();
+        let facts = tick.zombie_facts.as_ref().unwrap();
+        let expected_parent = if other_count == 2 { 6120 } else { 6121 };
+        let chosen = facts.parent_pile(expected_parent).unwrap();
+        let view = w.jobs.absorb(&tick);
+        let held = view.row("j6120").unwrap().zombies.unwrap();
+        assert_eq!(held.count, 2 + other_count);
+        assert_eq!(
+            held.parent, expected_parent,
+            "largest pile, then the lower PID on a tie"
+        );
+        assert_eq!(held.per_min_deci, chosen.per_min_deci());
+        assert_ne!(
+            held.per_min_deci,
+            aterm_vitals::blockage::per_min_deci(held.count, chosen.elapsed_ms()),
+            "the total count never borrows the named parent's age"
+        );
+        assert_ne!(
+            facts.parent_pile(6120).unwrap().per_min_deci(),
+            facts.parent_pile(6121).unwrap().per_min_deci(),
+            "unequal canonical ages make the rate control nonvacuous"
+        );
+    }
+}
+
+#[test]
+fn one_zombie_book_receipts_do_not_age_at_assessment_clocks_or_survive_failed_admission() {
+    use aterm_vitals::jobs::Jobs;
+    let mut w = zombie_parent_world();
+    add_zombie(&mut w, 6200, 6120);
+    let immature = w.capture_tick();
+    assert!(immature.zombie_facts.as_ref().unwrap().piles().is_empty());
+    let mut engine = Jobs::new();
+    let _ = engine.absorb(&immature);
+    let mut later = immature.clone();
+    later.at_ms += 60_000;
+    later.read_ms = later.at_ms;
+    later.probe_ms = later.at_ms;
+    let still_immature = engine.absorb(&later);
+    assert!(
+        still_immature.rows.iter().all(|row| row.zombies.is_none()),
+        "reassessing an old reading cannot mature a zombie"
+    );
+    assert!(std::sync::Arc::ptr_eq(
+        still_immature.zombie_facts.as_ref().unwrap(),
+        immature.zombie_facts.as_ref().unwrap()
+    ));
+
+    w.advance(10_000);
+    let mature = w.capture_tick();
+    let facts = mature.zombie_facts.as_ref().unwrap();
+    assert_eq!(facts.parent_pile(6120).unwrap().count(), 1);
+    for clock in [mature.at_ms - 5_000, mature.at_ms + 86_400_000] {
+        let mut assessed = mature.clone();
+        assessed.at_ms = clock;
+        assessed.read_ms = clock;
+        assessed.probe_ms = clock;
+        let view = Jobs::new().absorb(&assessed);
+        assert_eq!(view.row("j6120").unwrap().zombies.unwrap().count, 1);
+        assert!(std::sync::Arc::ptr_eq(
+            view.zombie_facts.as_ref().unwrap(),
+            facts
+        ));
+        assert_eq!(
+            view.zombie_facts.as_ref().unwrap().mono_ms(),
+            facts.mono_ms()
+        );
+    }
+
+    let mut engine = Jobs::new();
+    assert!(
+        engine
+            .absorb(&mature)
+            .row("j6120")
+            .unwrap()
+            .zombies
+            .is_some()
+    );
+    w.process_truncated = true;
+    let partial = w.capture_tick();
+    assert!(!partial.zombie_facts.as_ref().unwrap().whole());
+    for missing in 0..4 {
+        let mut tick = mature.clone();
+        match missing {
+            0 => tick.zombie_facts = None,
+            1 => tick.source_seq = None,
+            2 => tick.source_seq = tick.source_seq.map(|seq| seq + 1),
+            3 => tick = partial.clone(),
+            _ => unreachable!(),
+        }
+        let view = engine.absorb(&tick);
+        assert!(
+            view.zombie_facts.is_none(),
+            "missing or mismatched/cut input has no admitted receipt"
+        );
+        assert!(view.findings.zombies.is_empty());
+        assert!(
+            view.rows.iter().all(|row| row.zombies.is_none()),
+            "no cached or private book substitutes for absent authority"
+        );
+    }
+    w.process_truncated = false;
+    w.procs.retain(|_, p| p.state != ProcState::Zombie);
+    let empty = w.capture_tick();
+    let view = engine.absorb(&empty);
+    assert!(
+        view.zombie_facts.as_ref().unwrap().piles().is_empty(),
+        "known empty remains a receipt, distinct from missing input"
+    );
+}
+
 #[test]
 fn every_scenario_of_the_expectation_table_reads_as_the_table_says() {
     let all = scenarios::all();

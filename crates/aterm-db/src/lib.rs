@@ -45,6 +45,7 @@ pub mod fleet_db;
 mod generation;
 #[cfg(unix)]
 pub mod import;
+pub mod lab;
 #[cfg(unix)]
 pub mod local;
 pub mod machines;
@@ -136,6 +137,8 @@ enum FailureKind {
     Other,
     Busy,
     SnapshotChanged,
+    /// The table's or writer's retained evidence does not admit another append.
+    Capacity,
     Repair(aterm_types::network_state::RepairCause),
     #[cfg(unix)]
     EnrollmentPending,
@@ -163,6 +166,19 @@ const SNAPSHOT_CHANGED: &str = "table witness advanced during observation; reope
 #[cfg(unix)]
 const ENROLLMENT_PENDING: &str = "table enrollment is not yet complete";
 impl Error {
+    /// Whether a table's or writer's operation record or byte budget refused an append.
+    /// Membership-repair limits and transport quotas are separate refusals.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn is_capacity_exhausted(&self) -> bool {
+        matches!(self.1, FailureKind::Capacity)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn capacity(reason: &str) -> Self {
+        Self(reason.into(), FailureKind::Capacity)
+    }
+
     #[cfg(unix)]
     pub(crate) fn repair(reason: &str, cause: aterm_types::network_state::RepairCause) -> Self {
         Self(reason.into(), FailureKind::Repair(cause))
@@ -171,6 +187,7 @@ impl Error {
     pub(crate) fn repair_cause(&self) -> aterm_types::network_state::RepairCause {
         use aterm_types::network_state::RepairCause;
         match self.1 {
+            FailureKind::Capacity => RepairCause::Quota,
             FailureKind::Repair(cause) => cause,
             FailureKind::Busy | FailureKind::SnapshotChanged => RepairCause::NotReady,
             #[cfg(unix)]

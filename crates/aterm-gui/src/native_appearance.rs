@@ -480,6 +480,11 @@ pub(crate) struct NativeRoles {
     /// ([`NOT_WRITTEN`], held 3:1 on the page's grounds). Fixed: it follows neither the theme's
     /// accent nor the OS's.
     pub(crate) unwritten: [u8; 3],
+    /// A staged cell's ground, and a staged line's: the elevated ground washed toward
+    /// [`Self::unwritten`] at most [`UNWRITTEN_WASH`], and no further than leaves the words it
+    /// carries (its value in the readable secondary or the primary ink, a tag in the danger ink)
+    /// reading at [`SHEET_WORD_FLOOR`] ([`sheet_ground`]).
+    pub(crate) unwritten_wash: [u8; 3],
     /// [`Self::unwritten`] as text, over its own wash too.
     pub(crate) unwritten_ink: [u8; 3],
 }
@@ -492,8 +497,15 @@ pub(crate) const NOT_WRITTEN: SystemAccent = SystemAccent {
     on_light: [0x2F, 0x6F, 0xC4],
 };
 
-/// How far toward [`NativeRoles::unwritten`] a staged cell's ground is washed.
+/// The most a staged cell's ground is washed toward [`NativeRoles::unwritten`]; less where its
+/// words would read under [`SHEET_WORD_FLOOR`] ([`NativeRoles::unwritten_wash`]).
 pub(crate) const UNWRITTEN_WASH: f32 = 0.24;
+
+/// The secondary ink lifted toward the primary one, as words a person must read on a sheet are
+/// set in it (`native_ui`'s note, cell and plain styles).
+pub(crate) fn readable_secondary(text_secondary: [u8; 3], text_primary: [u8; 3]) -> [u8; 3] {
+    mix_srgb(text_secondary, text_primary, 0.55)
+}
 
 /// The most a sheet's header ground (its header line, its row numbers) is lifted off the
 /// elevated ground toward the primary ink. A theme whose inks would read under
@@ -856,15 +868,18 @@ fn solve_roles(
     );
 
     let unwritten = ensure_contrast_on(NOT_WRITTEN.for_surface(bg), &grounds, ACCENT_INK_FLOOR);
-    let unwritten_ink = ensure_contrast_on(
+    let unwritten_wash = sheet_ground(
+        elevated,
         unwritten,
         &[
-            surface,
-            elevated,
-            mix_srgb(elevated, unwritten, UNWRITTEN_WASH),
+            readable_secondary(text_secondary, text_primary),
+            text_primary,
+            danger,
         ],
-        ink_target,
+        UNWRITTEN_WASH,
     );
+    let unwritten_ink =
+        ensure_contrast_on(unwritten, &[surface, elevated, unwritten_wash], ink_target);
 
     NativeRoles {
         surface,
@@ -882,6 +897,7 @@ fn solve_roles(
         danger,
         success,
         unwritten,
+        unwritten_wash,
         unwritten_ink,
     }
 }

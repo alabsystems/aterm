@@ -49,7 +49,7 @@ fn native_preparation_id(key: impl Into<String>) -> super::super::native_keys::P
 fn native_cancellation_after_preclaim_before_task_return_retires_the_retry_claim() {
     use super::super::native_keys::{self, PreparationId, PreparationTask};
     let bed = Bed::new(None);
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let lifetime = crate::harness::account_work::Lifetime::default();
     let scope = lifetime.enter().unwrap();
     let paused = Arc::new(Mutex::new(None));
@@ -102,7 +102,7 @@ fn native_cancellation_after_preclaim_before_task_return_retires_the_retry_claim
 fn native_admission_preserves_busy_candidates_and_skips_longer_guard_cooldowns() {
     use super::super::native_keys::{self, PreparationQueue, PreparationTask};
     let bed = Bed::new(None);
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let queue = Arc::new(Mutex::new(PreparationQueue::default()));
     let calls = Arc::new(Mutex::new(Vec::new()));
     let clock = Arc::new(AtomicU64::new(0));
@@ -173,7 +173,7 @@ fn native_tasks_need_the_exact_admitted_identity_before_they_can_run() {
     use super::super::native_keys::{self, PreparationTask};
     let bed = Bed::new(None);
     for mismatch in 0..3 {
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         let discovery = Box::new(
             move |_: &Path, _: &Path, _: &Path, admit: &mut dyn FnMut(&super::super::native_keys::PreparationId) -> bool| {
                 if mismatch > 0 {
@@ -253,7 +253,7 @@ fn native_preparation_logs_a_lasting_refusal_once_per_change() {
             let lines = lines.clone();
             Arc::new(move |line| lines.lock().unwrap().push(line.to_owned()))
         };
-        let pass = |guard: &Arc<Mutex<AutoRenewGuard>>, now: usize, times: usize| {
+        let pass = |guard: &Arc<Watched<AutoRenewGuard>>, now: usize, times: usize| {
             mode.store(now, Ordering::SeqCst);
             for _ in 0..times {
                 assert_eq!(
@@ -285,7 +285,7 @@ fn native_preparation_logs_a_lasting_refusal_once_per_change() {
                 })
                 .collect()
         };
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         pass(&guard, 0, 5);
         assert_eq!(causes(), [EXCLUDED]);
         pass(&guard, 1, 2);
@@ -312,7 +312,7 @@ fn native_preparation_logs_a_lasting_refusal_once_per_change() {
                 "the unadmitted task says one line each time"
             );
         }
-        let other = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let other = AutoRenewGuard::default().shared();
         pass(&other, 0, 2);
         pass(&guard, 0, 1);
         pass(&guard, 0, 1);
@@ -327,7 +327,7 @@ fn native_preparation_logs_a_lasting_refusal_once_per_change() {
 
 struct NativeRevisionFixture {
     bed: Bed,
-    guard: Arc<Mutex<AutoRenewGuard>>,
+    guard: Arc<Watched<AutoRenewGuard>>,
     revision: Arc<AtomicU64>,
     clock: Arc<AtomicU64>,
     calls: Arc<AtomicUsize>,
@@ -432,7 +432,7 @@ fn with_native_revision<T>(run: impl FnOnce(&mut NativeRevisionFixture) -> T) ->
     use super::super::native_keys::{self, PreparationId, PreparationQueue, PreparationTask};
     let mut fixture = NativeRevisionFixture {
         bed: Bed::new(None),
-        guard: Arc::new(Mutex::new(AutoRenewGuard::default())),
+        guard: AutoRenewGuard::default().shared(),
         revision: Arc::new(AtomicU64::new(1)),
         clock: Arc::new(AtomicU64::new(0)),
         calls: Arc::new(AtomicUsize::new(0)),
@@ -695,10 +695,16 @@ impl Bed {
         &self,
         discover: &shared_renewal::Discovery,
         spawn: &SpawnRenewal<'_>,
-        guard: &Arc<Mutex<AutoRenewGuard>>,
+        guard: &Arc<Watched<AutoRenewGuard>>,
     ) {
         self.with_preparations(discover, spawn, guard, |fx| {
-            shared_renewal::adopt_first(&self.home, &self.state, &self.roster, NOW, fx);
+            shared_renewal::adopt_first(
+                &self.home,
+                &self.state,
+                &self.roster,
+                aterm_uds::trace::Now::at(NOW),
+                fx,
+            );
         });
     }
 
@@ -706,15 +712,15 @@ impl Bed {
         &self,
         discover: &shared_renewal::Discovery,
         spawn: &SpawnRenewal<'_>,
-        guard: &Arc<Mutex<AutoRenewGuard>>,
+        guard: &Arc<Watched<AutoRenewGuard>>,
         run: impl FnOnce(&UpkeepEffects<'_>) -> T,
     ) -> T {
         let fx = UpkeepEffects {
             scope: None,
             fetch: &|_, _| panic!("no source fetch"),
             spawn_renewal: spawn,
-            sync_cooldown: &Mutex::new(None),
-            rediscovery: &Mutex::new(Rediscovery::default()),
+            sync_cooldown: &Watched::new("accounts_sync/sync_cooldown", None),
+            rediscovery: &Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
             renew_guard: guard,
             find_browser: &|_| false,
             vault_sync: |_, _scope| super::super::sign_in_ladder::Vault::NotMember,
@@ -820,7 +826,7 @@ impl Bed {
         spawn: &SpawnRenewal<'_>,
         mailbox: bool,
     ) -> Upkept {
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         self.upkeep_observed(factory, spawn, mailbox, &guard, Arc::new(|_| {}))
     }
 
@@ -829,7 +835,7 @@ impl Bed {
         factory: Option<&shared_renewal::Factory>,
         spawn: &SpawnRenewal<'_>,
         mailbox: bool,
-        guard: &Arc<Mutex<AutoRenewGuard>>,
+        guard: &Arc<Watched<AutoRenewGuard>>,
         log: SignInLog,
     ) -> Upkept {
         self.upkeep_discovered(factory, None, spawn, mailbox, guard, log)
@@ -841,15 +847,15 @@ impl Bed {
         discover: Option<&shared_renewal::Discovery>,
         spawn: &SpawnRenewal<'_>,
         mailbox: bool,
-        guard: &Arc<Mutex<AutoRenewGuard>>,
+        guard: &Arc<Watched<AutoRenewGuard>>,
         log: SignInLog,
     ) -> Upkept {
         let fx = UpkeepEffects {
             scope: None,
             fetch: &|_, _| panic!("no source fetch"),
             spawn_renewal: spawn,
-            sync_cooldown: &Mutex::new(None),
-            rediscovery: &Mutex::new(Rediscovery::default()),
+            sync_cooldown: &Watched::new("accounts_sync/sync_cooldown", None),
+            rediscovery: &Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
             renew_guard: guard,
             find_browser: &|_| false,
             vault_sync: |_, _scope| super::super::sign_in_ladder::Vault::NotMember,
@@ -875,7 +881,7 @@ impl Bed {
         upkeep(
             &self.home,
             &self.state,
-            (&self.roster, NOW, UpkeepStep::Renew),
+            (&self.roster, trace::Now::at(NOW), UpkeepStep::Renew),
             &fx,
         )
     }
@@ -901,7 +907,7 @@ impl Bed {
 
 struct RenewalAdmission {
     bed: Bed,
-    guard: Arc<Mutex<AutoRenewGuard>>,
+    guard: Arc<Watched<AutoRenewGuard>>,
     held: Option<accounts::SigninTurn>,
     start: Instant,
 }
@@ -912,7 +918,7 @@ impl RenewalAdmission {
         // Keep the row eligible after its consumed attempt so Used reaches
         // the renewal gate instead of being filtered as already signed in.
         bed.provider.status_error.store(true, Ordering::SeqCst);
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         let start = Instant::now();
         {
             let mut history = guard.lock().unwrap();
@@ -1076,7 +1082,7 @@ fn shared_renewal_backoffs_preserve_admission_history() {
 #[test]
 fn a_new_shared_preparation_wakes_unchanged_unavailable_routes() {
     let bed = Bed::new(None);
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let lines = Arc::new(Mutex::new(Vec::new()));
     let logs = lines.clone();
     let log: SignInLog = Arc::new(move |line| logs.lock().unwrap().push(line.to_owned()));
@@ -1153,7 +1159,7 @@ fn shared_renewal_activity_names_the_running_route_and_ends_with_the_attempt() {
     for fails in [false, true] {
         let bed = Bed::new(None);
         bed.provider.fail.store(fails, Ordering::SeqCst);
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         let jobs = Arc::new(Mutex::new(Vec::new()));
         let queued = jobs.clone();
         let queue = move |work| {
@@ -1536,7 +1542,7 @@ fn shared_recovery_conforms_and_detects_the_silent_noop() {
 fn a_shared_policy_stop_is_deferred_without_a_failure_or_retry_wait() {
     for during_provider in [false, true] {
         let bed = Bed::new(None);
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         let lines = Arc::new(Mutex::new(Vec::new()));
         let logged = Arc::clone(&lines);
         let jobs = Arc::new(Mutex::new(Vec::new()));
@@ -1801,8 +1807,8 @@ fn automatic_shared_renewal_refuses_a_profile_that_contradicts_the_successful_st
 
 // For the unattended-renewal tests alone, which run only where aterm links the opener (Unix).
 #[cfg(unix)]
-fn observed_upkeep(bed: &Bed) -> (Arc<Mutex<AutoRenewGuard>>, Vec<String>) {
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+fn observed_upkeep(bed: &Bed) -> (Arc<Watched<AutoRenewGuard>>, Vec<String>) {
+    let guard = AutoRenewGuard::default().shared();
     let lines = Arc::new(Mutex::new(Vec::new()));
     let logged = Arc::clone(&lines);
     bed.upkeep_observed(
@@ -1918,7 +1924,7 @@ pub(super) fn unstarted_candidate(
 #[test]
 fn sparse_shared_preparation_passes_do_not_starve_later_candidates() {
     let bed = Bed::with_custody(None, false);
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let offered = calls.clone();
     let discover = move |_: &Path| {
@@ -1950,7 +1956,7 @@ fn sparse_shared_preparation_passes_do_not_starve_later_candidates() {
 #[test]
 fn two_accounts_adoptions_start_ten_minutes_apart() {
     let bed = Bed::with_custody(None, false);
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let offered = calls.clone();
     let discover = move |_: &Path| {
@@ -1989,7 +1995,7 @@ fn two_accounts_adoptions_start_ten_minutes_apart() {
 fn shared_candidate_history_is_independent_across_networks() {
     for offsets in [[0, 901, 1802, 2703], [0, 1, 2, 3]] {
         let bed = Bed::with_custody(None, false);
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let offered = calls.clone();
         let discover = move |_: &Path| {
@@ -2035,7 +2041,7 @@ fn shared_candidate_history_is_independent_across_networks() {
 #[test]
 fn reissued_shared_candidate_runs_without_resetting_its_peer_cooldown() {
     let bed = Bed::with_custody(None, false);
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let offered = calls.clone();
     let reissued = Arc::new(AtomicBool::new(false));
@@ -2077,7 +2083,7 @@ fn reissued_shared_candidate_runs_without_resetting_its_peer_cooldown() {
 fn held_shared_candidates_preserve_history_and_let_peers_run() {
     for bot in [false, true] {
         let bed = Bed::with_custody(None, false);
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let offered = calls.clone();
         let a = unstarted_candidate(1, &calls);
@@ -2144,7 +2150,7 @@ impl Authority for RevokedAfterRanking {
 #[test]
 fn shared_candidate_rank_does_not_bypass_live_authorization() {
     let bed = Bed::with_custody(None, false);
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let offered = calls.clone();
     let discover = move |_: &Path| {
@@ -2182,7 +2188,7 @@ fn shared_candidate_rank_does_not_bypass_live_authorization() {
 #[test]
 fn shared_candidates_in_cooldown_do_not_block_an_unseen_candidate() {
     let bed = Bed::with_custody(None, false);
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let offered = calls.clone();
     let discover = move |_: &Path| {
@@ -2212,7 +2218,7 @@ fn shared_candidates_in_cooldown_do_not_block_an_unseen_candidate() {
 fn steady_native_preparations_give_shared_oauth_the_next_admission() {
     use super::super::native_keys::{self, PreparationTask};
     let bed = Bed::with_custody(None, false);
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let provider = Arc::new(ResumableAdoption {
         calls: AtomicUsize::new(0),
     });
@@ -2279,7 +2285,7 @@ fn steady_native_preparations_give_shared_oauth_the_next_admission() {
 fn unavailable_shared_preparation_falls_back_to_native_without_a_wasted_pass() {
     use super::super::native_keys::{self, PreparationTask};
     let bed = Bed::with_custody(None, false);
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let native_calls = Arc::new(AtomicUsize::new(0));
     let shared_reads = Arc::new(AtomicUsize::new(0));
     let reads = shared_reads.clone();
@@ -2324,7 +2330,7 @@ fn unavailable_shared_preparation_falls_back_to_native_without_a_wasted_pass() {
 fn unavailable_native_preparation_keeps_first_chance_while_shared_work_progresses() {
     use super::super::native_keys;
     let bed = Bed::with_custody(None, false);
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let provider = Arc::new(ResumableAdoption {
         calls: AtomicUsize::new(0),
     });
@@ -2428,7 +2434,7 @@ impl super::super::cli::shared_provider::Provider for ResumableAdoption {
 
 fn observe_adoption_progress(phase: i64) -> [i64; 3] {
     let bed = Bed::with_custody(None, false);
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let provider = Arc::new(ResumableAdoption {
         calls: AtomicUsize::new(0),
     });
@@ -2585,7 +2591,7 @@ impl super::super::cli::shared_provider::Provider for ExistingMustUseRenewal {
 
 fn observe_shared_progress(phase: i64) -> [i64; 4] {
     let bed = Bed::new(None);
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let approval = bed.approval.clone();
     let discover = move |_: &Path| {
         Ok(vec![shared_renewal::Candidate {
@@ -2788,7 +2794,7 @@ fn observe_disposition(before: bool, after: bool, provider: bool, replay: bool) 
     let bed = Bed::new(None);
     bed.provider.stop.store(!after, Ordering::SeqCst);
     bed.provider.fail.store(!provider, Ordering::SeqCst);
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let lines = Arc::new(Mutex::new(Vec::new()));
     let logged = Arc::clone(&lines);
     let jobs = Arc::new(Mutex::new(Vec::new()));
@@ -3012,7 +3018,7 @@ impl Authority for CountedApproval {
 #[test]
 fn a_shared_adoption_a_bot_protection_stopped_waits_for_a_person() {
     let bed = Bed::with_custody(None, false);
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let calls = Arc::new(AtomicUsize::new(0));
     let recoveries = Arc::new(AtomicUsize::new(0));
     let generation = Arc::new(AtomicU64::new(0));

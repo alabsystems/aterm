@@ -37,6 +37,33 @@ fn facts(c: &'static Connector, shim: PathBuf) -> Facts {
     }
 }
 
+/// The address of the Claude row `work` these tests list ([`listed_view`]).
+const WORK_ADDRESS: &str = "work@x.example";
+/// The address of the Kimi Code row `kimi-one` these tests pool.
+const KIMI_ADDRESS: &str = "kimi-one@x.example";
+
+/// The account key `realm` and the address `email` make, independently of the harness's names: the
+/// word a sign-in names an addressed row by where no lab slugs its account.
+fn key(realm: &str, email: &str) -> String {
+    aterm_db::typed::keys::account_pk(realm, email).expect("a key")
+}
+
+/// The word `cli`'s sign-in of the row with the address `email` types, with no lab, as the facts
+/// carry it ([`crate::harness::account_names::word_of_login`]).
+fn word(cli: Cli, email: &str) -> crate::harness::account_names::Word {
+    crate::harness::account_names::word_of_login(cli, email, None).expect("an address")
+}
+
+/// A pool's sign-in words by label, for rows labelled `label` with the address `email`.
+fn words(
+    cli: Cli,
+    rows: &[(&str, &str)],
+) -> std::collections::BTreeMap<String, crate::harness::account_names::Word> {
+    rows.iter()
+        .map(|(label, email)| ((*label).to_owned(), word(cli, email)))
+        .collect()
+}
+
 fn row(c: &'static Connector, state: State) -> Row {
     Row {
         connector: c,
@@ -177,7 +204,10 @@ fn under_an_agent_aterms_own_renewals_run_and_claudes_adoption_does_not() {
                 .iter()
                 .map(|c| (c.terminal, c.args.join(" ")))
                 .collect::<Vec<_>>(),
-            [(false, "harness accounts renew work".to_string())],
+            [(
+                false,
+                format!("harness accounts renew {}", key("claude", WORK_ADDRESS))
+            )],
             "{marker}"
         );
 
@@ -185,6 +215,7 @@ fn under_an_agent_aterms_own_renewals_run_and_claudes_adoption_does_not() {
         pooled.pool = Some(crate::ai::facts::CliAccounts {
             roster: PathBuf::from("/home/me/.config/aterm/accounts-kimi.toml"),
             next: Some("kimi-one".to_string()),
+            words: words(Cli::Kimi, &[("kimi-one", KIMI_ADDRESS)]),
             ..crate::ai::facts::CliAccounts::default()
         });
         let runner = FakeRunner::quiet();
@@ -192,7 +223,14 @@ fn under_an_agent_aterms_own_renewals_run_and_claudes_adoption_does_not() {
         assert_eq!(done, Done::SignedIn(None), "{marker}");
         assert_eq!(
             runner.calls()[0].args,
-            ["harness", "accounts", "renew", "kimi-one", "--cli", "kimi"],
+            [
+                "harness",
+                "accounts",
+                "renew",
+                &key("kimi:global", KIMI_ADDRESS),
+                "--cli",
+                "kimi"
+            ],
             "{marker}"
         );
         assert!(!runner.calls()[0].terminal, "{marker}");
@@ -336,17 +374,23 @@ fn claude_signs_in_only_through_accounts_v2s_renewal() {
             "harness",
             "accounts",
             "adopt-default",
-            "main",
             "--email",
             "me@example.com"
         ]
     );
-    assert_eq!(calls[1].args, ["harness", "accounts", "renew", "main"]);
+    // The renewal names the adopted row by the account its address makes.
+    let adopted = crate::harness::account_names::word_of_login(Cli::Claude, "me@example.com", None)
+        .expect("an address");
+    assert_eq!(
+        calls[1].args,
+        ["harness", "accounts", "renew", adopted.as_str()]
+    );
     assert!(calls.iter().all(|c| c.program != "claude"));
     let mut f = facts(&CLAUDE, shim.clone());
     f.accounts = Some(ClaudeAccounts {
         pool_picks: false,
         label: "m7".into(),
+        sign_in_word: Some(word(Cli::Claude, "m7@x.example")),
         store: None,
         roster: None,
         listed: false,
@@ -380,7 +424,12 @@ fn claude_signs_in_only_through_accounts_v2s_renewal() {
             .iter()
             .map(|c| c.args.clone())
             .collect::<Vec<_>>(),
-        [vec!["harness", "accounts", "renew", "m7"]]
+        [vec![
+            "harness".to_owned(),
+            "accounts".to_owned(),
+            "renew".to_owned(),
+            key("claude", "m7@x.example")
+        ]]
     );
     let runner = FakeRunner::quiet();
     let done = rig.sign_in(
@@ -400,6 +449,7 @@ fn listed_view(renews: bool, refused: Option<&str>) -> ClaudeAccounts {
         store: None,
         roster: None,
         label: "work".into(),
+        sign_in_word: Some(word(Cli::Claude, WORK_ADDRESS)),
         listed: true,
         refused: refused.map(str::to_string),
         unread: None,
@@ -457,6 +507,8 @@ fn claude_never_adopts_over_a_listed_row_or_a_refused_roster() {
     }
     let mut with_successor = listed_view(false, None);
     with_successor.next_sign_in = Some("m27".into());
+    // The facts carry the successor's word, the row the sign-in renews.
+    with_successor.sign_in_word = Some(word(Cli::Claude, "m27@x.example"));
     let mut f = facts(&CLAUDE, shim);
     f.accounts = Some(with_successor);
     let runner = FakeRunner::quiet();
@@ -471,7 +523,12 @@ fn claude_never_adopts_over_a_listed_row_or_a_refused_roster() {
             .iter()
             .map(|c| c.args.clone())
             .collect::<Vec<_>>(),
-        [vec!["harness", "accounts", "renew", "m27"]]
+        [vec![
+            "harness".to_owned(),
+            "accounts".to_owned(),
+            "renew".to_owned(),
+            key("claude", "m27@x.example")
+        ]]
     );
 }
 
@@ -841,6 +898,7 @@ fn claude_limited_with_next_sign_in_renews_the_successor_account() {
     f.accounts = Some(ClaudeAccounts {
         pool_picks: false,
         label: "m27-3".into(),
+        sign_in_word: Some(word(Cli::Claude, "m27@x.example")),
         store: None,
         roster: None,
         listed: true,
@@ -880,7 +938,60 @@ fn claude_limited_with_next_sign_in_renews_the_successor_account() {
             .iter()
             .map(|c| c.args.clone())
             .collect::<Vec<_>>(),
-        [vec!["harness", "accounts", "renew", "m27"]]
+        [vec![
+            "harness".to_owned(),
+            "accounts".to_owned(),
+            "renew".to_owned(),
+            key("claude", "m27@x.example")
+        ]]
+    );
+}
+
+/// A renewal types the word the facts carry for the row it renews, never the row's label, which
+/// `accounts renew` refuses for a row with an address: where the facts carry no word (the roster
+/// no longer lists the row they name), nothing runs and the refusal says so, naming no label.
+/// CONTROL: the same facts with the row's word run `renew <key>`.
+/// NEGATIVE CONTROL: with `claude` falling back to the label (`sign_in_word_of(…, &[], None)`),
+/// the renewal runs and this fails on `SignedIn(None)` (2026-11-16, by hand, then restored).
+#[test]
+fn a_claude_renewal_with_no_word_for_its_row_runs_nothing() {
+    let b = machine(&["claude"]);
+    let store = Store::at(&b.state);
+    let shim = b.twin("claude");
+    let rig = Rig::new(&[]);
+    let mut f = facts(&CLAUDE, shim);
+    f.accounts = Some(listed_view(true, None));
+    let runner = FakeRunner::quiet();
+    assert_eq!(
+        rig.sign_in(&runner, &store, &f, &row(&CLAUDE, State::SignedOut), &[]),
+        Done::SignedIn(None),
+        "CONTROL"
+    );
+    assert_eq!(
+        runner.calls()[0].args,
+        [
+            "harness".to_owned(),
+            "accounts".to_owned(),
+            "renew".to_owned(),
+            key("claude", WORK_ADDRESS)
+        ],
+        "CONTROL"
+    );
+    f.accounts = Some(ClaudeAccounts {
+        sign_in_word: None,
+        ..listed_view(true, None)
+    });
+    let runner = FakeRunner::quiet();
+    let done = rig.sign_in(&runner, &store, &f, &row(&CLAUDE, State::SignedOut), &[]);
+    assert!(
+        matches!(&done, Done::Refused(why) if why.contains("no longer lists the row to renew")
+            && !why.contains("work")),
+        "{done:?}"
+    );
+    assert!(
+        runner.calls().is_empty(),
+        "nothing ran: {:?}",
+        runner.calls()
     );
 }
 
@@ -896,6 +1007,7 @@ fn a_cli_with_its_own_roster_signs_in_through_its_renewal_and_one_without_runs_i
         roster: PathBuf::from("/home/me/.config/aterm/accounts-kimi.toml"),
         refused: None,
         next: Some("kimi-one".to_string()),
+        words: words(Cli::Kimi, &[("kimi-one", KIMI_ADDRESS)]),
         ..crate::ai::facts::CliAccounts::default()
     });
     let runner = FakeRunner::quiet();
@@ -910,7 +1022,14 @@ fn a_cli_with_its_own_roster_signs_in_through_its_renewal_and_one_without_runs_i
     );
     assert_eq!(
         calls[0].args,
-        ["harness", "accounts", "renew", "kimi-one", "--cli", "kimi"]
+        [
+            "harness",
+            "accounts",
+            "renew",
+            &key("kimi:global", KIMI_ADDRESS),
+            "--cli",
+            "kimi"
+        ]
     );
 
     let mut empty = pooled.clone();
@@ -1157,9 +1276,17 @@ fn a_codex_default_row_on_a_build_that_ignores_codex_auth_path_signs_in_by_codex
         rig.sign_in(&runner, &store, &f, &r, &[]),
         Done::SignedIn(None)
     );
+    let word = crate::harness::account_names::tests::row_name(Cli::Codex, &roster, "work").word;
     assert_eq!(
         runner.calls()[0].args,
-        ["harness", "accounts", "renew", "work", "--cli", "codex"]
+        [
+            "harness",
+            "accounts",
+            "renew",
+            word.as_str(),
+            "--cli",
+            "codex"
+        ]
     );
 }
 
@@ -1197,6 +1324,7 @@ fn a_managed_default_login_records_failure_without_overwriting_a_newer_sign_in()
             default_label: Some("main".into()),
             default_row: Some(DefaultRow::SignedOut {
                 label: "main".into(),
+                word: None,
                 stored: false,
             }),
             serving_label: Some("main".into()),
@@ -1295,6 +1423,7 @@ fn unbound_default_login(
         default_label: Some("main".into()),
         default_row: Some(DefaultRow::SignedOut {
             label: "main".into(),
+            word: None,
             stored: false,
         }),
         serving_label: Some("main".into()),
@@ -1428,7 +1557,7 @@ fn a_codex_pool_that_serves_the_default_row_alone_signs_in_nothing_while_it_serv
         roster: PathBuf::from("/home/me/.config/aterm/accounts-codex.toml"),
         next: None,
         default_label: Some("main".to_string()),
-        default_row: Some(DefaultRow::Serves("main".to_string())),
+        default_row: Some(DefaultRow::Serves("main".to_string(), None)),
         unread: true,
         default_only: true,
         ..crate::ai::facts::CliAccounts::default()
@@ -1549,7 +1678,7 @@ fn a_held_signed_out_default_row_on_a_build_that_ignores_codex_auth_path_signs_i
 /// marker nothing runs; off as excluded, it is refused with that fact; with no
 /// roster its own `grok login` runs on this terminal, with neither a carried login nor its home's
 /// override dropped; with a roster it is the pool's sign-in of the next row on this terminal
-/// (`aterm harness accounts login <label> --cli grok`), never its headless renewal, which stops
+/// (`aterm harness accounts login <account> --cli grok`), never its headless renewal, which stops
 /// at accounts.x.ai's block page (CONTROL: Kimi's pool renews, in
 /// `a_cli_with_its_own_roster_signs_in_through_its_renewal_and_one_without_runs_its_login`).
 /// Over SSH it is `grok login --device-auth`, kept off this
@@ -1633,6 +1762,7 @@ fn grok_signs_in_on_this_terminal_or_through_its_pool_and_never_for_an_agent() {
         roster: PathBuf::from("/home/me/.config/aterm/accounts-grok.toml"),
         refused: None,
         next: Some("grok-two".to_string()),
+        words: words(Cli::Grok, &[("grok-two", "grok-two@x.example")]),
         ..crate::ai::facts::CliAccounts::default()
     });
     let runner = FakeRunner::quiet();
@@ -1645,9 +1775,10 @@ fn grok_signs_in_on_this_terminal_or_through_its_pool_and_never_for_an_agent() {
         "{:?}",
         calls[0]
     );
+    let grok_key = key("grok", "grok-two@x.example");
     assert_eq!(
         calls[0].args,
-        ["harness", "accounts", "login", "grok-two", "--cli", "grok"]
+        ["harness", "accounts", "login", &grok_key, "--cli", "grok"]
     );
     // A Grok roster with no row to sign in asks for a row, never an email `accounts login`
     // does not need.
@@ -1676,7 +1807,7 @@ fn grok_signs_in_on_this_terminal_or_through_its_pool_and_never_for_an_agent() {
             &[],
         );
         assert!(
-            matches!(done, Done::Refused(ref why) if why.contains("accounts login grok-two")),
+            matches!(done, Done::Refused(ref why) if why.contains(&format!("accounts login {grok_key}"))),
             "{marker}: {done:?}"
         );
         assert!(runner.calls().is_empty(), "{marker}: nothing ran");
@@ -1870,12 +2001,13 @@ fn with_nobody_here_aterm_starts_only_a_sign_in_that_runs_unattended() {
         f
     };
     let nobody = [Rig::new(&[("CLAUDECODE", "1")]), Rig::new(&[]).no_tty()];
+    // The window's step names the row's account by its word, never the row's label.
+    let window = format!(
+        "aterm harness accounts browser {}",
+        word(Cli::Claude, WORK_ADDRESS)
+    );
     let cases: [(&str, EditView<'_>, &str); 3] = [
-        (
-            "no route",
-            &|v| v.unattended = false,
-            "aterm harness accounts browser work",
-        ),
+        ("no route", &|v| v.unattended = false, window.as_str()),
         (
             "sign-ins off",
             &|v| v.off = Some("`[harness] logins = \"off\"`".into()),
@@ -1949,8 +2081,17 @@ fn with_nobody_here_a_pools_renewal_waits_on_a_bot_check_or_a_persons_step() {
     let pool = crate::ai::facts::CliAccounts {
         roster: PathBuf::from("/home/me/.config/aterm/accounts-kimi.toml"),
         next: Some("kimi-one".to_string()),
+        words: words(Cli::Kimi, &[("kimi-one", KIMI_ADDRESS)]),
         ..crate::ai::facts::CliAccounts::default()
     };
+    let kimi_login = format!(
+        "aterm harness accounts login {} --cli kimi",
+        key("kimi:global", KIMI_ADDRESS)
+    );
+    let kimi_window = format!(
+        "aterm harness accounts browser {} --cli kimi",
+        key("kimi:global", KIMI_ADDRESS)
+    );
     let agent = Rig::new(&[("CODEX_THREAD_ID", "t")]);
     for (case, edit, names) in [
         (
@@ -1959,7 +2100,7 @@ fn with_nobody_here_a_pools_renewal_waits_on_a_bot_check_or_a_persons_step() {
                 check_at: Some(1_800_000_000 - 60),
                 ..pool.clone()
             },
-            "aterm harness accounts login kimi-one --cli kimi",
+            kimi_login.as_str(),
         ),
         (
             "bot check a day on",
@@ -1975,7 +2116,7 @@ fn with_nobody_here_a_pools_renewal_waits_on_a_bot_check_or_a_persons_step() {
                 person_task: Some(crate::harness::accounts::SignInAction::Browser),
                 ..pool.clone()
             },
-            "aterm harness accounts browser kimi-one --cli kimi",
+            kimi_window.as_str(),
         ),
     ] {
         pooled.pool = Some(edit);

@@ -889,7 +889,7 @@ pub static VERBS: &[Verb] = &[
     Verb {
         path: &["repo", "clone"],
         class: Class::Git,
-        usage: "agh repo clone REPO [DIR] [--depth N | --mirror]",
+        usage: "agh repo clone REPO [DIR] [--depth N | --mirror] [--source-object-cache DIR]",
         summary: "clone a repository through agh's isolated git runner and its credential helper",
         example: "agh repo clone alabsystems/aterm <dir> --depth 1",
         noun: Noun::Repo,
@@ -900,6 +900,10 @@ pub static VERBS: &[Verb] = &[
             on(
                 "--mirror",
                 "a complete bare mirror of every ref (default DIR: REPO.git)",
+            ),
+            value(
+                "--source-object-cache",
+                "a local repository whose objects the clone copies; only the rest is downloaded",
             ),
         ],
         positionals: &["REPO", "DIR?"],

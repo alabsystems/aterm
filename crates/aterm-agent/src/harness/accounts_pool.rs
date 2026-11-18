@@ -629,10 +629,15 @@ fn launch_renewal(
     if let Some(hold) =
         super::accounts_sync::person_hold(&seat.store(Cli::Agy), &raw, raw_row, logins)
     {
+        // A launcher's refusal reaches aterm.log, the session's launch note and its wake file,
+        // so each row is named as a log names it, by its account's key and slug, never its
+        // address ([`super::cli::Reader::Log`]).
         return Err(super::worker::Refused::SignedOut(super::cli::held_words(
             Cli::Agy,
-            &row.label,
+            &super::account_names::RowName::here(Cli::Agy, &row.label, &raw.rows),
             &hold,
+            &raw.rows,
+            super::cli::Reader::Log,
         )));
     }
     let path = seat.config_dir.join(Cli::Agy.accounts().roster_file);
@@ -1020,7 +1025,7 @@ pub fn check_launch_login_identity(
                 });
             match moved {
                 Some(address) => {
-                    let end = default_moved_end(cli, row, program, sync);
+                    let end = default_moved_end(cli, row, &roster.rows, program, sync);
                     IdentityRefusal::DefaultMoved {
                         words: default_moved_words(&address, &end),
                         row: row.label.clone(),
@@ -1029,7 +1034,7 @@ pub fn check_launch_login_identity(
                 }
                 None => IdentityRefusal::Login(format!(
                     "{why}: `{}`",
-                    row_sign_in_step(cli, row, program)
+                    row_sign_in_step(cli, row, &roster.rows, program)
                 )),
             }
         })?;
@@ -1080,28 +1085,32 @@ pub struct SyncHere<'a> {
 /// row's login its own ([`super::codex_alab::auth_path_unread`]) and the row is on the default
 /// login, the vendor's in that home, since a pool sign-in refuses it there
 /// ([`super::codex_alab::default_row_staging`]).
+/// The row's own sign-in names it by its word among `roster`'s rows and the lab
+/// ([`super::account_names::sign_in_word`]).
 #[must_use]
-pub fn row_sign_in_step(cli: Cli, row: &Row, program: Option<&Path>) -> Step {
+pub fn row_sign_in_step(cli: Cli, row: &Row, roster: &[Row], program: Option<&Path>) -> Step {
+    let lab = super::alab_roster::current();
+    let word = super::account_names::sign_in_word(cli, row, roster, lab.as_deref());
     if row.dir.is_none() {
-        default_row_sign_in_step(cli, &row.label, row.email.is_some(), program)
+        default_row_sign_in_step(cli, word, row.email.is_some(), program)
     } else {
-        Step::sign_in(cli, &row.label, row.email.is_some())
+        Step::sign_in(cli, word, row.email.is_some())
     }
 }
 
-/// [`row_sign_in_step`] of a row on the default login, known by its label and whether it has an
-/// `email`.
+/// [`row_sign_in_step`] of a row on the default login, known by the word its sign-in names it by
+/// and whether it has an `email`.
 #[must_use]
 pub fn default_row_sign_in_step(
     cli: Cli,
-    label: &str,
+    word: super::account_names::Word,
     addressed: bool,
     program: Option<&Path>,
 ) -> Step {
     if program.is_some_and(|program| super::codex_alab::auth_path_unread(program).is_some()) {
         Step::VendorLogin(cli)
     } else {
-        Step::sign_in(cli, label, addressed)
+        Step::sign_in(cli, word, addressed)
     }
 }
 
@@ -1122,6 +1131,7 @@ pub struct DefaultMovedEnd {
 pub fn default_moved_end(
     cli: Cli,
     row: &Row,
+    roster: &[Row],
     program: Option<&Path>,
     sync: Option<SyncHere<'_>>,
 ) -> DefaultMovedEnd {
@@ -1141,11 +1151,11 @@ pub fn default_moved_end(
             sync_refused: None,
         },
         DefaultMove::Stays => DefaultMovedEnd {
-            step: row_sign_in_step(cli, row, program),
+            step: row_sign_in_step(cli, row, roster, program),
             sync_refused: None,
         },
         DefaultMove::Refused(why) => DefaultMovedEnd {
-            step: row_sign_in_step(cli, row, program),
+            step: row_sign_in_step(cli, row, roster, program),
             sync_refused: Some(why),
         },
     }
@@ -2032,10 +2042,12 @@ pub fn default_serving<'a>(
         });
     }
     let pinned = state.pinned && state.active.as_deref() == Some(row.label.as_str());
+    let word = || super::codex_alab::pin_word(row, &roster.rows);
     match accounts::condition(row, state, enrolled.contains(&row.label), now) {
         cond @ (accounts::Condition::NotEnrolled | accounts::Condition::SignedOut) => {
             Err(DefaultRow::SignedOut {
                 label,
+                word: word(),
                 stored: cond == accounts::Condition::SignedOut,
             })
         }
@@ -2051,6 +2063,7 @@ pub fn default_serving<'a>(
             });
             Err(DefaultRow::Walled {
                 label,
+                word: word(),
                 window: wall.map_or_else(
                     || accounts::UNNAMED_WINDOW.to_string(),
                     |(window, _, _)| window.clone(),
@@ -2091,7 +2104,7 @@ pub fn default_row_now(seat: &Seat<'_>, cli: Cli) -> Result<super::codex_alab::D
     let enrolled = accounts::enrolled_in(cli, &roster, seat.home);
     Ok(
         match default_serving(&roster, &state, &enrolled, seat.now) {
-            Ok(row) => super::codex_alab::DefaultRow::Serves(row.label.clone()),
+            Ok(row) => super::codex_alab::DefaultRow::serves(row, &roster.rows),
             Err(blocked) => blocked,
         },
     )
@@ -2806,7 +2819,7 @@ fn refused_pin(
         ..state.clone()
     };
     let default = match default_serving(roster, &unpinned, enrolled, now) {
-        Ok(row) => super::codex_alab::DefaultRow::Serves(row.label.clone()),
+        Ok(row) => super::codex_alab::DefaultRow::serves(row, &roster.rows),
         Err(blocked) => blocked,
     };
     format!(
@@ -5492,9 +5505,10 @@ fn finish_move<T>(
         me.label(),
         seat.now,
     );
-    // A move off a wall of another limit rotates past an `active` the records hold off it.
+    // A move off a wall of another limit, or of a model's own week, rotates past an `active`
+    // the records hold off it, as the advice judged it ([`accounts::begin_rotation_for`]).
     let asked = match &session.point {
-        Point::Wall { window, .. } => accounts::limit_of(window),
+        Point::Wall { window, .. } => Some(window.as_str()),
         _ => None,
     };
     let enrolled = accounts::enrolled_in(session.cli, &current.roster, seat.home);

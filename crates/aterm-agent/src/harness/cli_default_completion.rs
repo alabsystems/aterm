@@ -3,9 +3,16 @@
 
 //! Complete an existing local default row from the native login, without enrolling a
 //! new fleet account, changing credentials, or replacing authored account settings.
+//!
+//! Traced by the accounts keeper: what this file reads of the file system itself, it reads
+//! through `aterm_uds::trace::fs` (census `traced-reads`).
 
 use super::*;
 use aterm_toml::edit::{ArrayOfTables, DocumentMut, Item, TableLike};
+
+/// Why a completion that reads the default login is not kept as the accounts keeper's verdict
+/// ([`complete_with`]).
+const DEFAULT_LOGIN_UNTRACED: &str = "the default Codex login is read past the trace";
 
 fn identity(read: &mut impl FnMut(&Path) -> Option<String>, home: &Path) -> Option<String> {
     read(home)
@@ -69,16 +76,13 @@ fn complete_with(
         return Ok(None);
     };
     let roster = Roster::parse_for(Cli::Codex, &text)?;
-    let Some(row) = asked.map_or_else(|| roster.row_for_login(None), |a| roster.row(&a.label))
-    else {
+    // The default login's row: an account a person names is never a row's label, so the row
+    // completed is the one with no `dir`. Upkeep completes it only while it names no address;
+    // `adopt-default` completes it again, which changes nothing, or is refused where what it was
+    // asked for differs from the row.
+    let Some(row) = roster.row_for_login(None) else {
         return Ok(None);
     };
-    if row.dir.is_some() {
-        return Err(format!(
-            "`{}` is not this machine's default login",
-            row.label
-        ));
-    }
     if row.held_by.is_some() {
         return if asked.is_some() {
             Err("the existing account is held; metadata is unchanged".into())
@@ -90,6 +94,10 @@ fn complete_with(
         return Ok(None);
     }
     local_roster(&path)?;
+    // From here the default login's own files are read (`ai::facts::codex_file_store`, the
+    // identity `read` finds), past the trace, and the reading is compared as a number: a run
+    // that comes this far is not kept as the accounts keeper's verdict.
+    aterm_uds::trace::poison(DEFAULT_LOGIN_UNTRACED);
     let Some(home) = env
         .home
         .as_ref()
@@ -146,10 +154,24 @@ fn complete_with(
             ("browser", asked.browser.as_deref(), row.browser.as_deref()),
         ] {
             if let Some(supplied) = supplied {
-                let agrees = if name == "email" && existing.is_none() {
-                    accounts::email_matches(supplied, &seen)
-                } else {
-                    existing == Some(supplied)
+                // The identity asked for (the account `adopt-default` names) is what the login
+                // must report, and the row must name no other; an address the row lacks agrees
+                // where the login reports it.
+                if name == "identity_email" && !accounts::email_matches(supplied, &seen) {
+                    return Err(
+                        "the default login reports another account than the one named; metadata \
+                         is unchanged"
+                            .into(),
+                    );
+                }
+                let agrees = match (name, existing) {
+                    ("email", None) => accounts::email_matches(supplied, &seen),
+                    ("identity_email", existing) => {
+                        accounts::email_matches(supplied, &seen)
+                            && existing
+                                .is_none_or(|existing| accounts::email_matches(existing, supplied))
+                    }
+                    (_, existing) => existing == Some(supplied),
                 };
                 if !agrees {
                     return Err(format!("existing `{name}` differs; metadata is unchanged"));
@@ -266,7 +288,7 @@ fn with_email(text: &str, label: &str, email: &str) -> Result<String, String> {
 /// Metadata completion owns only a direct local roster, never a symlink into a
 /// source or another consumer's roster. Atomic replacement leaves hard-link aliases intact.
 fn local_roster(path: &Path) -> Result<(), String> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    let metadata = aterm_uds::trace::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
     if !metadata.file_type().is_file() {
         return Err("default metadata completion requires a direct local roster; linked roster is unchanged".into());
     }

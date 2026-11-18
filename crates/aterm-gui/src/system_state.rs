@@ -48,7 +48,8 @@ pub(crate) fn release_lockup_images() {
 }
 
 /// Whether any System State view is on screen (its tab in front, its window neither minimised
-/// nor covered): hidden, the lockup's images and queued bakes go, and come back as it shows.
+/// nor covered): hidden, nothing is queued and each view keeps only the moment its lockup last
+/// drew ([`prebake::set_shown`]); shown again, what each view wants and has not kept is queued.
 pub(crate) fn lockup_shown(shown: bool) {
     prebake::set_shown(shown);
 }
@@ -3529,7 +3530,8 @@ pub(crate) struct SystemStateViewState {
     #[cfg(test)]
     every_line_open: Cell<bool>,
     /// The road and the cat this view's lockup painted last, as baked (their moment, width and
-    /// scale), which it keeps painting until the next moment's images are kept
+    /// scale), which it keeps painting until the next moment's images are kept, where they were
+    /// laid out after the same words at the same size on the same ground
     /// ([`lockup::LockupSpec::paint`]).
     lockup_drawn: Cell<Option<lockup::Baked>>,
     /// This view's part in what the lockup's worker bakes and keeps: what it wants, what it

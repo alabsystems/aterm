@@ -689,6 +689,137 @@ fn folders_above_two_files_share_one_listener_each() {
     assert!(events.above().is_empty());
 }
 
+/// A scratch folder named for `name` holding `a/one/doc.txt` and `a/two/doc.txt`: it, `a`, and the
+/// two files.
+#[cfg(target_os = "macos")]
+fn two_files_under_one_folder(name: &str) -> (aterm_tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    let dir = scratch(name);
+    let top = dir.path().join("a");
+    let one = top.join("one").join("doc.txt");
+    let two = top.join("two").join("doc.txt");
+    for path in [&one, &two] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "").unwrap();
+    }
+    (dir, top, one, two)
+}
+
+/// Two watches whose paths run through the same folders listen on each folder above through one
+/// descriptor both their listeners share, each with a filter of its own: the one that lets go
+/// takes only its own filter off, so the other still hears a folder above renamed and the one
+/// that let go is told nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn watches_listen_above_through_one_descriptor_their_listeners_share() {
+    use std::os::unix::fs::MetadataExt as _;
+    let identity = |path: &Path| {
+        let there = std::fs::metadata(path).unwrap();
+        (there.dev(), there.ino())
+    };
+    let (dir, top, one, two) = two_files_under_one_folder("amacs-watch-above-across");
+    let mut first = kqueue::KqueueEvents::new().unwrap();
+    let mut second = kqueue::KqueueEvents::new().unwrap();
+    first.arm(1, &one).unwrap();
+    second.arm(2, &two).unwrap();
+
+    let (held_first, held_second) = (first.above_descriptors(), second.above_descriptors());
+    for folder in [&top, &dir.path().to_path_buf()] {
+        let id = identity(folder);
+        assert!(
+            held_first.contains_key(&id),
+            "{} is above the first watch's file: {held_first:?}",
+            folder.display()
+        );
+        assert_eq!(
+            held_second.get(&id),
+            held_first.get(&id),
+            "{}: one descriptor for both watches",
+            folder.display()
+        );
+    }
+
+    first.disarm(1);
+    assert!(first.above_descriptors().is_empty());
+    let touched = heard_for(&mut second, || {
+        std::fs::rename(&top, dir.path().join("a.old")).unwrap()
+    });
+    assert_eq!(
+        touched,
+        [2],
+        "the watch still listening hears the folder renamed"
+    );
+    assert_eq!(
+        first.vnode_events_now(),
+        0,
+        "the watch that let go keeps no filter on the descriptor the other holds"
+    );
+}
+
+/// A watch that drops while another holds the folders above both watches' files takes its
+/// filters off those descriptors: its kqueue, which its waker keeps open, hears nothing of a
+/// folder above renamed, which the other watch still hears.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_watch_dropped_takes_its_filters_off_the_descriptors_above_another_watch_holds() {
+    let (dir, top, one, two) = two_files_under_one_folder("amacs-watch-above-dropped");
+    let mut first = kqueue::KqueueEvents::new().unwrap();
+    let mut second = kqueue::KqueueEvents::new().unwrap();
+    first.arm(1, &one).unwrap();
+    second.arm(2, &two).unwrap();
+    let kq = first.kqueue_descriptor();
+    let waker = first.waker();
+
+    drop(first);
+    let touched = heard_for(&mut second, || {
+        std::fs::rename(&top, dir.path().join("a.old")).unwrap()
+    });
+    assert_eq!(
+        touched,
+        [2],
+        "the watch still listening hears the folder renamed"
+    );
+    assert_eq!(
+        kqueue::vnode_events_on(kq),
+        0,
+        "the dropped watch's kqueue keeps no filter on a descriptor the other holds"
+    );
+    drop(waker);
+}
+
+/// A listen on a folder above that another watch holds open, which moves after the listen opened
+/// it and before its filter took, answers that it moved and takes its filter off the descriptor
+/// the other watch keeps: the folder moved again is heard by the other watch alone.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_listen_above_whose_folder_moved_before_its_filter_took_keeps_no_filter() {
+    let (dir, top, _, two) = two_files_under_one_folder("amacs-watch-above-moved");
+    let mut second = kqueue::KqueueEvents::new().unwrap();
+    second.arm(2, &two).unwrap();
+    let mut first = kqueue::KqueueEvents::new().unwrap();
+    let old = dir.path().join("a.old");
+
+    let moved = first.listen_one_then(1, &top, || std::fs::rename(&top, &old).unwrap());
+    assert_eq!(
+        moved.map_err(|error| error.kind()),
+        Err(io::ErrorKind::NotFound),
+        "the folder moved before the filter took"
+    );
+    assert!(first.above_descriptors().is_empty());
+    let touched = heard_for(&mut second, || {
+        std::fs::rename(&old, dir.path().join("a.older")).unwrap()
+    });
+    assert_eq!(
+        touched,
+        [2],
+        "the watch holding the folder hears it renamed"
+    );
+    assert_eq!(
+        first.vnode_events_now(),
+        0,
+        "the listen that found its folder moved keeps no filter on the descriptor the other holds"
+    );
+}
+
 /// A folder above the file's own renamed and made again as the watch arms, after the file's own
 /// listens and before the walk above, leaves those listens on the folders it moved: the arm sees
 /// its folder is no longer what its path names and arms again, so the file there now is heard.

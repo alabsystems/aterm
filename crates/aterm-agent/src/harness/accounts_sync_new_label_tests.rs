@@ -123,6 +123,7 @@ fn seed(case: i64, store: &accounts::Store, label: &str) {
                     account: label.into(),
                     at: NOW,
                     held: None,
+                    owner: None,
                 },
             );
         }

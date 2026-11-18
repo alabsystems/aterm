@@ -8,7 +8,7 @@
 //! address (docs/DESIGN-shared-files-2026-11-11.md §10); an address row is its key and its
 //! mailbox's label, never its text, and `mail` names each account by key and slug alone. Every
 //! verb that takes an account takes its slug, its key, its provider word and address, or an
-//! address that names one account ([`crate::alab::account_names`]). A writer writes only the
+//! address that names one account (`aterm_file::account`). A writer writes only the
 //! cells that change, as the owner (one record a row, a random request id,
 //! `att::Handle::commit_owner`), and touches no Mac's login: nothing here reaches an account
 //! directory, so no one is signed out by a retire or a relabel.
@@ -17,7 +17,7 @@ use super::{Args, Io, account_row, named_row};
 use crate::{
     Error, Result,
     alab::{
-        account_names::{self, Found},
+        account_names,
         journal::{
             self,
             event::{Event, Window},
@@ -35,6 +35,7 @@ use crate::{
         guard, keys,
     },
 };
+use aterm_file::account::Found;
 use aterm_json::{Value, json};
 use aterm_secrets::client::Paths;
 use std::collections::BTreeMap;
@@ -97,10 +98,10 @@ fn name_of(lab: &LabView, pk: &str) -> Option<String> {
     lab.name(pk).map(str::to_owned)
 }
 
-/// The account `word` names ([`account_names::one`]), live or not: its slug, its key, its
+/// The account `word` names (`aterm_file::account::one`), live or not: its slug, its key, its
 /// provider word and address, or an address that names one account.
 fn account_named(lab: &LabView, word: &str) -> Result<String> {
-    account_names::one(&lab.names, word)
+    aterm_file::account::one(&lab.names, word)
         .map(str::to_owned)
         .map_err(|why| Error::new(&why))
 }
@@ -666,7 +667,7 @@ pub(super) fn log(paths: &Paths, args: &Args, io: &Io<'_>, now_ms: u64) -> Resul
         // Only an address names several accounts, and no machine is named by one.
         (Found::Many(_), _) => {
             return Err(Error::new(
-                &account_names::one(&lab.names, name)
+                &aterm_file::account::one(&lab.names, name)
                     .err()
                     .unwrap_or_default(),
             ));

@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm harness accounts history [<label|key>] [--since <span>] [--rows] [--json]`: one
+//! `aterm harness accounts history [<account>] [--since <span>] [--rows] [--json]`: one
 //! account's days from this Mac's readings series (`docs/DESIGN-account-stats-2026-10-15.md` §5),
 //! one line a local day, with that day's ledger rows and every Mac's journal events about it
-//! beneath ([`alab_seen::history`]); with no name, every roster row's, in roster order. Only the
-//! account's own readings count: its label's series and, by its keys, any other of this Mac's
-//! series that holds its rows (a renamed row's), each row judged by the keys it carries
-//! (the fold is [`crate::harness::account_history`]'s, which the Account card shares). On a Mac whose roster has one login, the walls its home's transcripts record of
-//! windows the series holds no word of join the home's row's days ([`account_backfill`], marked
-//! `(backfill)`). It stores nothing of its own: no compaction runs and no derived or backfilled
-//! row is kept. Nothing calls a provider, and neither a ledger row's free text nor a transcript's
-//! text is printed.
+//! beneath ([`alab_seen::history`]); with no account named, every roster row's, in roster order.
+//! The account is named as every accounts verb names one ([`account_names::resolve`]: its slug,
+//! its key, its provider word and address, or its address), and printed by its names, never by
+//! its row's label, the local key the series files and the ledger still hold. Only the
+//! account's own readings count: its row's series and, by its keys, any other of this Mac's
+//! series that holds its rows (a renamed row's), each row judged by the keys it carries (the
+//! fold is [`crate::harness::account_history`]'s, which the Account card shares). On a Mac whose
+//! roster has one login, the walls its home's transcripts record of windows the series holds no
+//! word of join the home's row's days ([`account_backfill`], marked `(backfill)`). It stores
+//! nothing of its own: no compaction runs and no derived or backfilled row is kept. Nothing calls
+//! a provider, and neither a ledger row's free text nor a transcript's text is printed.
 
 use std::fmt::Write as _;
 use std::io::Write;
@@ -20,33 +23,96 @@ use std::process::ExitCode;
 
 use aterm_json::{Map, Value};
 
-use super::{Cli, Env, home_profile, no_home_for, put_time, stats_label};
+use super::{Cli, Env, home_profile, no_home_for, put_time, stats_home};
 use crate::harness::account_backfill::{self, Cut, Walls};
 use crate::harness::account_history::{
     Happened, HistoryDay, HistoryWho, RESET_USED, Series, Span, by_key, days_of, gather,
 };
+use crate::harness::account_names::{self, Candidates, Named};
 use crate::harness::account_series::{self, SeriesRow};
 use crate::harness::account_stats::{self, day_of, hm, span as span_word};
-use crate::harness::accounts::{self, SESSION_LIMIT, WEEK_LIMIT, WEEK_WINDOW_S};
+use crate::harness::accounts::{self, Row, SESSION_LIMIT, WEEK_LIMIT, WEEK_WINDOW_S};
+use crate::harness::alab_roster::Lab;
 use crate::harness::alab_seen;
 use crate::harness::profile::AccountKey;
+use aterm_file::AccountNames;
 
 const DOT: &str = " \u{b7} ";
 const DAY_S: i64 = 86_400;
 
+/// The `account-history` JSON's schema: 2 names each account by its key, slug and name, where 1
+/// named it by its roster label.
+const HISTORY_SCHEMA: u64 = 2;
+
 /// The account a block is about ([`HistoryWho`]: its row's label here, its lab key and its
-/// account key, as many as are known) and the name the block goes by.
+/// account key, as many as are known) and its names.
 #[derive(Debug, Clone)]
 struct Who {
     of: HistoryWho,
-    name: String,
+    /// Its names; `None` for a roster row with no address, which has no key and no names.
+    names: Option<AccountNames>,
 }
 
 impl Who {
+    /// The account `named` resolved to, its row here where it has one; its account key the one
+    /// the state holds for that row or for its lab key ([`key_in`]).
+    fn of_named(named: Named<'_>, state: &accounts::State) -> Who {
+        let label = named.row.map(|row| row.label.clone());
+        let key = key_in(state, label.as_deref(), Some(&named.pk));
+        Who {
+            of: HistoryWho {
+                label,
+                pk: Some(named.pk),
+                key,
+            },
+            names: Some(named.names),
+        }
+    }
+
+    /// `cli`'s roster row `row`, named as [`account_names::names_of_row`] names its account; a
+    /// row with no address has no names.
+    fn of_row(cli: Cli, row: &Row, state: &accounts::State, lab: Option<&Lab>) -> Who {
+        match account_names::names_of_row(cli, row, lab) {
+            Some((pk, names)) => Who::of_named(
+                Named {
+                    pk,
+                    row: Some(row),
+                    names,
+                },
+                state,
+            ),
+            None => Who {
+                of: HistoryWho {
+                    label: Some(row.label.clone()),
+                    pk: None,
+                    key: key_in(state, Some(&row.label), None),
+                },
+                names: None,
+            },
+        }
+    }
+
     fn asked(&self) -> alab_seen::Asked {
         alab_seen::Asked {
             label: self.of.label.clone(),
             pk: self.of.pk.clone(),
+        }
+    }
+
+    /// The account as its block's header shows it: its name and slug ([`Named::shown`]); a row
+    /// with no address by its label, marked so, since it has no other name.
+    fn shown(&self) -> String {
+        match (&self.names, &self.of.pk) {
+            (Some(names), Some(pk)) => Named {
+                pk: pk.clone(),
+                row: None,
+                names: names.clone(),
+            }
+            .shown(),
+            _ => format!(
+                "{} (no address)",
+                self.of.label.as_deref().unwrap_or_default()
+            ),
         }
     }
 }
@@ -70,68 +136,126 @@ fn key_in(state: &accounts::State, label: Option<&str>, pk: Option<&str>) -> Opt
         })
 }
 
-/// Which account `name` is: what [`alab_seen::resolve`] finds (a row label, a lab key, a lab or
-/// legacy label), else an account key (`c-<12 hex>`) matched against the state's records and
-/// the forgotten ones; a key nothing here holds is still asked for, by key alone. A key's label
-/// is a roster row's only where that row still names the account, as [`alab_seen::resolve`]
-/// keeps an explicit lab key's: the row whose lab key is the record's, or, for a record keyed by
-/// no lab key, the record's own row where it names none either.
+/// The account keys (`ac-…`) this Mac's records of the pool hold: each record's and each
+/// forgotten record's ([`Candidates::held`]), so a key names its account here while this Mac
+/// keeps its observations, though no row holds it now and no lab copy names it.
+fn held_keys(state: &accounts::State) -> Vec<String> {
+    let mut keys: Vec<String> = state
+        .accounts
+        .values()
+        .filter_map(|account| account.pk.clone())
+        .chain(state.forgotten.keys().cloned())
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+/// The account `word` names among this Mac's roster rows, the lab's accounts of `cli`'s pool and
+/// the account keys this Mac's records hold ([`account_names::resolve`]): its slug, its key
+/// (`ac-…`), its provider word and address, or an address that names one account of the pool.
+///
+/// # Errors
+/// The resolver's refusal: `word` names no account of the pool (a roster label names none),
+/// several, or one while the roster row labelled with it holds another.
 fn resolve(
     cli: Cli,
-    name: &str,
+    word: &str,
     records: &accounts::AccountRecords,
-    lab: Option<&crate::harness::alab_roster::Lab>,
-) -> Option<Who> {
-    let state = &records.state;
-    if let Some(asked) = alab_seen::resolve(cli, name, &records.roster, lab) {
-        let key = key_in(state, asked.label.as_deref(), asked.pk.as_deref());
-        return Some(Who {
-            of: HistoryWho {
-                label: asked.label,
-                pk: asked.pk,
-                key,
-            },
-            name: name.to_owned(),
-        });
-    }
-    let key = AccountKey::parse(name)?;
-    let held = state
-        .accounts
-        .iter()
-        .find(|(_, a)| a.key == Some(key))
-        .map(|(label, a)| (Some(label.as_str()), a.pk.clone()))
-        .or_else(|| {
-            state
-                .forgotten
-                .iter()
-                .find(|(_, a)| a.key == Some(key))
-                .map(|(pk, _)| (None, Some(pk.clone())))
-        });
-    let (label, pk) = held.unwrap_or((None, None));
-    let label = match pk.as_deref() {
-        Some(pk) => records
-            .roster
-            .rows
-            .iter()
-            .find(|row| alab_seen::row_key(cli, row).as_deref() == Some(pk))
-            .map(|row| row.label.clone()),
-        None => label
-            .filter(|label| {
-                records
-                    .roster
-                    .row(label)
-                    .is_some_and(|row| alab_seen::row_key(cli, row).is_none())
-            })
-            .map(str::to_owned),
+    lab: Option<&Lab>,
+) -> Result<Who, String> {
+    let held = held_keys(&records.state);
+    let candidates = Candidates {
+        roster: &records.roster.rows,
+        logins: &[],
+        lab,
+        held: &held,
     };
-    Some(Who {
-        name: label.clone().unwrap_or_else(|| name.to_owned()),
-        of: HistoryWho {
-            label,
-            pk,
-            key: Some(key),
-        },
-    })
+    account_names::resolve(cli, word, &candidates).map(|named| Who::of_named(named, &records.state))
+}
+
+/// What a ledger line says of an account a ledger row holds by a label this Mac's records do not
+/// place with the account its row holds now ([`held_then`]): the label may have changed hands.
+const HELD_THEN: &str = "(an account a row here held then)";
+
+/// Whether this Mac's records say the roster row labelled `label` held the account `pk` (the one
+/// it holds now) at `t`: the state's record of the label carries `pk` as its lab key (a
+/// transaction learns it from the row, [`crate::harness::journal::learn`]) and was not keyed to
+/// another account after `t` (`keyed_at`), and every ledger row of the label that carried a key,
+/// from the newest at or before `t` on, carried `pk`. Where the record is missing or holds no
+/// key, nothing says whose the label was, and the answer is no: a label is never named as the
+/// account its row holds now unless the records place it there then.
+fn held_then(
+    label: &str,
+    pk: &str,
+    t: i64,
+    state: &accounts::State,
+    ledger: &[accounts::Event],
+) -> bool {
+    let record = state.accounts.get(label);
+    if record.is_none_or(|account| {
+        account.pk.as_deref() != Some(pk) || account.keyed_at.is_some_and(|at| at > t)
+    }) {
+        return false;
+    }
+    let keyed: Vec<(i64, &str)> = ledger
+        .iter()
+        .filter(|event| event.account == label)
+        .filter_map(|event| Some((event.t, event.pk.as_deref()?)))
+        .collect();
+    let since = keyed
+        .iter()
+        .map(|(at, _)| *at)
+        .filter(|at| *at <= t)
+        .max()
+        .unwrap_or(i64::MIN);
+    keyed
+        .iter()
+        .filter(|(at, _)| *at >= since)
+        .all(|(_, held)| *held == pk)
+}
+
+/// How a ledger line names an account a ledger row holds by its row label, at the row's instant
+/// ([`alab_seen::history`]): by the key the row carried (`pk`, for the account the row is about)
+/// with the slug the lab gives it; else, where the records say the roster row labelled so held
+/// then the account it holds now ([`held_then`]), by that account's key and slug
+/// ([`Named::logged`]), and otherwise as [`HELD_THEN`]; a row with no address by its label,
+/// marked so, since it has no other name; and a label no row here holds now as `(a row no
+/// longer here)`. Never an address. A rotation row's `to=` carries no key, so it is always
+/// named this way.
+pub(super) fn ledger_name<'a>(
+    cli: Cli,
+    records: &'a accounts::AccountRecords,
+    ledger: &'a [accounts::Event],
+    lab: Option<&'a Lab>,
+) -> impl Fn(&str, Option<&str>, i64) -> String + 'a {
+    move |label, pk, t| {
+        if let Some(pk) = pk {
+            let names = lab
+                .and_then(|lab| lab.names.get(pk))
+                .cloned()
+                .unwrap_or_default();
+            return Named {
+                pk: pk.to_owned(),
+                row: None,
+                names,
+            }
+            .logged();
+        }
+        let Some(row) = records.roster.rows.iter().find(|row| row.label == label) else {
+            return "(a row no longer here)".to_owned();
+        };
+        match account_names::names_of_row(cli, row, lab) {
+            Some((pk, names)) if held_then(label, &pk, t, &records.state, ledger) => Named {
+                pk,
+                row: Some(row),
+                names,
+            }
+            .logged(),
+            Some(_) => HELD_THEN.to_owned(),
+            None => format!("{label} (no address)"),
+        }
+    }
 }
 
 /// What is left of a window at `x10` tenths used, in whole percent: `29% left`
@@ -290,8 +414,9 @@ fn day_json(day: &HistoryDay) -> Value {
 
 /// The home the environment names, as the backfill reads it ([`account_backfill`]).
 struct Home {
-    /// The label `accounts stats` names it by ([`stats_label`]).
-    label: String,
+    /// The label `accounts stats` reads its records by ([`super::StatsHome::records`]); `None`
+    /// for a home no row holds whose word a row is labelled with, which is no row's home.
+    label: Option<String>,
     /// What its transcripts hold and the newest instant another account was seen on it
     /// ([`account_stats::another_seen`]), or why nothing is booked to it: `not-the-home` (no
     /// block of its label is made, so nothing is read), `several-logins` (the roster lists
@@ -318,8 +443,12 @@ impl Home {
     ) -> Home {
         let profile = home_profile(env);
         let key = profile.as_ref().ok().and_then(|p| p.key);
-        let label = stats_label(env, key, &records.roster);
-        let read = Self::look(env, records, span, (&label, profile.as_ref().ok()), wanted);
+        let label = stats_home(env, key, &records.roster)
+            .records(&records.roster)
+            .map(str::to_owned);
+        let read = label.as_deref().map_or(Err("not-the-home"), |label| {
+            Self::look(env, records, span, (label, profile.as_ref().ok()), wanted)
+        });
         Home { label, read }
     }
 
@@ -381,25 +510,31 @@ struct Block {
 }
 
 impl Block {
-    /// Whether the block holds nothing to go by: no row, no lab key and no series row.
-    fn is_unknown(&self) -> bool {
-        self.who.of.label.is_none()
-            && self.who.of.pk.is_none()
-            && self
-                .series
-                .as_ref()
-                .is_none_or(|(s, _, _)| s.files.is_empty() && s.backfill.is_empty())
-    }
-
-    /// The account's object in `--json`: the lab model's `{label, ac, journal, lines}` and, with
-    /// a series, `span`, `series`, `days`, `backfill` (`{booked, complete, cut, why, closes}`:
-    /// `complete` is `null` where `why` says nothing was read; each close as a series row would
-    /// say it, `src: "backfill"`) and (with `--rows`) `rows`, the stored rows alone; without one,
-    /// `series: false`.
+    /// The account's object in `--json`: `ac` (its key), `slug` and `name` (each `null` where it
+    /// has none; a row with no address has none, and only it has `label`, its one name), the lab
+    /// model's `journal` and `lines` and, with a series, `span`, `series`, `days`, `backfill`
+    /// (`{booked, complete, cut, why, closes}`: `complete` is `null` where `why` says nothing was
+    /// read; each close as a series row would say it, `src: "backfill"`) and (with `--rows`)
+    /// `rows`, the stored rows alone; without one, `series: false`.
     fn json(&self, span: Span, (machine, journal, rows): (&str, bool, bool)) -> Map {
         let mut o = Map::new();
-        o.insert("label".to_owned(), Value::from(self.who.of.label.clone()));
         o.insert("ac".to_owned(), Value::from(self.who.of.pk.clone()));
+        let names = self.who.names.as_ref();
+        o.insert(
+            "slug".to_owned(),
+            Value::from(
+                names
+                    .map(|names| names.slug.clone())
+                    .filter(|slug| !slug.is_empty()),
+            ),
+        );
+        o.insert(
+            "name".to_owned(),
+            Value::from(names.and_then(|names| names.name.clone())),
+        );
+        if names.is_none() {
+            o.insert("label".to_owned(), Value::from(self.who.of.label.clone()));
+        }
         o.insert("journal".to_owned(), Value::from(journal));
         o.insert(
             "lines".to_owned(),
@@ -474,7 +609,7 @@ impl Block {
     fn text(&self, cli: Cli, span: Span, rows: bool, tz_at: fn(i64) -> i64) -> String {
         let mut out = String::new();
         let Some((series, days, booked)) = &self.series else {
-            let _ = writeln!(out, "{}{DOT}{}", self.who.name, cli.id());
+            let _ = writeln!(out, "{}{DOT}{}", self.who.shown(), cli.id());
             if self.lines.is_empty() {
                 out.push_str("  nothing recorded\n");
             }
@@ -487,7 +622,7 @@ impl Block {
         let _ = write!(
             out,
             "{}{DOT}{}{DOT}this Mac{DOT}{} \u{2013} {} ({})",
-            self.who.name,
+            self.who.shown(),
             cli.id(),
             at(span.from),
             at(span.to),
@@ -537,12 +672,6 @@ pub(super) fn run(
         let _ = writeln!(err, "aterm harness accounts history: {why}");
         ExitCode::FAILURE
     };
-    if name.is_some_and(|name| name.contains('@')) {
-        return refuse(
-            err,
-            "an account is named by its label or key, never its address",
-        );
-    }
     let (Some(path), Some(store)) = (env.accounts_roster_for(cli), env.accounts_store_for(cli))
     else {
         return refuse(err, &no_home_for(cli));
@@ -550,29 +679,18 @@ pub(super) fn run(
     let Ok(records) = store.read_account_records(Some(&path), env.now) else {
         return refuse(err, "the account records could not be read consistently");
     };
+    let lab = crate::harness::alab_roster::current();
+    let lab = lab.as_deref();
     let whos: Vec<Who> = match name {
-        Some(name) => {
-            let lab = crate::harness::alab_roster::current();
-            match resolve(cli, name, &records, lab.as_deref()) {
-                Some(who) => vec![who],
-                None => return refuse(err, "no row, lab label or account key goes by that name"),
-            }
-        }
+        Some(word) => match resolve(cli, word, &records, lab) {
+            Ok(who) => vec![who],
+            Err(why) => return refuse(err, &why),
+        },
         None => records
             .roster
             .rows
             .iter()
-            .map(|row| {
-                let pk = alab_seen::row_key(cli, row);
-                Who {
-                    of: HistoryWho {
-                        label: Some(row.label.clone()),
-                        key: key_in(&records.state, Some(&row.label), pk.as_deref()),
-                        pk,
-                    },
-                    name: row.label.clone(),
-                }
-            })
+            .map(|row| Who::of_row(cli, row, &records.state, lab))
             .collect(),
     };
     let span = Span {
@@ -604,6 +722,7 @@ pub(super) fn run(
         vec![Vec::new(); whos.len()]
     };
     let ledger = store.tail(accounts::LEDGER_KEEP_ROWS).unwrap_or_default();
+    let ledger_name = ledger_name(cli, &records, &ledger, lab);
     let seen = alab_seen::current(true);
     let flags = (machine, seen.is_some(), rows);
     // The home the environment names, read only where a block of its label is made.
@@ -618,7 +737,7 @@ pub(super) fn run(
             .as_deref()
             .zip(who.of.pk.as_deref())
             .and_then(|(seen, pk)| seen.accounts.get(pk));
-        let lines = alab_seen::history(&who.asked(), &ledger, journal);
+        let lines = alab_seen::history(&who.asked(), &ledger, journal, &ledger_name);
         let spent = alab_seen::spent(&who.asked(), &ledger);
         let series = home.as_ref().map(|home| {
             let files: Vec<(PathBuf, bool)> = own
@@ -628,7 +747,7 @@ pub(super) fn run(
                 .collect();
             let mut series = gather(&files, &who.of, span, rows, env.now);
             let booked = match &home.read {
-                _ if who.of.label.as_deref() != Some(home.label.as_str()) => Booked {
+                _ if home.label.is_none() || who.of.label != home.label => Booked {
                     booked: 0,
                     cut: None,
                     why: Some("not-the-home"),
@@ -668,16 +787,13 @@ pub(super) fn run(
     };
     if name.is_some() {
         let Some(((who, own), elsewhere)) = whos.into_iter().zip(elsewhere).next() else {
-            return refuse(err, "no row, lab label or account key goes by that name");
+            return refuse(err, "no account was named");
         };
         let block = block_of(who, own, elsewhere);
-        if block.is_unknown() {
-            return refuse(err, "no row, lab label or account key goes by that name");
-        }
         if json {
             let mut doc = Map::new();
             doc.insert("kind".to_owned(), Value::from("account-history"));
-            doc.insert("schema".to_owned(), Value::from(1u64));
+            doc.insert("schema".to_owned(), Value::from(HISTORY_SCHEMA));
             doc.extend(block.json(span, flags));
             let _ = writeln!(
                 out,
@@ -710,7 +826,7 @@ pub(super) fn run(
             .collect();
         let mut doc = Map::new();
         doc.insert("kind".to_owned(), Value::from("account-history"));
-        doc.insert("schema".to_owned(), Value::from(1u64));
+        doc.insert("schema".to_owned(), Value::from(HISTORY_SCHEMA));
         doc.insert("accounts".to_owned(), Value::Array(accounts));
         let _ = writeln!(
             out,

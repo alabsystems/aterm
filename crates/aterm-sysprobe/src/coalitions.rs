@@ -122,9 +122,13 @@ pub fn decode_footprint(raw: &[u64; USAGE_WORDS]) -> Option<u64> {
         .then_some(raw[PHYS_FOOTPRINT])
 }
 
-/// Each swept process's resource coalition id, kept by pid under the pid version it was read at
-/// ([`crate::procs::processes_keeping`]), so a sweep reads the coalition only of a process it has
-/// not read under its current version.
+/// Each swept process's resource coalition id, kept by pid under the pid version it was read at,
+/// and its whole name where its short name is at the cut, kept by pid under that version and the
+/// short name ([`Self::name`]; [`crate::procs::processes_keeping`]). So a sweep reads the
+/// coalition only of a process it has not read under its current version, and the longer names
+/// only of one it has not read under its current version and short name: an exec that lands
+/// between a sweep's short-name read and its version read keeps the name under the old short
+/// name and the new version, so the next sweep reads the longer names again under that version.
 ///
 /// A kept id stays the process's own while its version stays: xnu adopts a task into a coalition
 /// only as it makes the task (`task_create_internal`: a fork, a spawn, or an exec's new task;
@@ -135,7 +139,22 @@ pub fn decode_footprint(raw: &[u64; USAGE_WORDS]) -> Option<u64> {
 pub struct CoalitionIds {
     /// Each pid's kept id: the version it was read under, the id, and the sweep that last asked.
     kept: HashMap<u32, (i32, u64, u64)>,
+    /// Each pid's kept whole name ([`Self::name`]).
+    names: HashMap<u32, KeptName>,
     /// The sweeps begun.
+    sweep: u64,
+}
+
+/// One process's whole name, as [`CoalitionIds::name`] keeps it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct KeptName {
+    /// The pid version it was read under.
+    version: i32,
+    /// The short name it was read for.
+    comm: Box<[u8]>,
+    /// The name.
+    name: String,
+    /// The sweep that last asked.
     sweep: u64,
 }
 
@@ -191,16 +210,62 @@ impl CoalitionIds {
         (id, before)
     }
 
-    /// Ends a sweep: drops every pid it did not ask about (one that ended, or a zombie).
+    /// `pid`'s whole name at pid `version` under the short name `comm`: the name kept under both,
+    /// else `read`'s, kept under them. The sweep asks this only of a short name at its cut, whose
+    /// longer readers name the file the process last exec'd ([`crate::procs::whole_name`]): an
+    /// exec gives the process a new pid version, as a reused pid's new process has, so the name
+    /// is read again. The short name is kept too, since the sweep reads it before the version: a
+    /// name read across an exec (the short name before it, the version after) is not answered
+    /// again once the sweep reads the new program's short name. The kept name is the first read
+    /// for its key: an executable renamed after its exec keeps the name it had then.
+    pub fn name(
+        &mut self,
+        pid: u32,
+        version: i32,
+        comm: &[u8],
+        read: impl FnOnce() -> String,
+    ) -> String {
+        if let Some(kept) = self
+            .names
+            .get_mut(&pid)
+            .filter(|k| k.version == version && *k.comm == *comm)
+        {
+            kept.sweep = self.sweep;
+            return kept.name.clone();
+        }
+        let name = read();
+        self.names.insert(
+            pid,
+            KeptName {
+                version,
+                comm: comm.into(),
+                name: name.clone(),
+                sweep: self.sweep,
+            },
+        );
+        name
+    }
+
+    /// Ends a sweep: drops every pid it did not ask about (one that ended, or a zombie), and every
+    /// name it did not ask for (also one whose short name the cut no longer reaches).
     pub fn end_sweep(&mut self) {
         let sweep = self.sweep;
         self.kept.retain(|_, k| k.2 == sweep);
+        self.names.retain(|_, k| k.sweep == sweep);
     }
 
     /// `pid`'s kept id and the pid version it was read under.
     #[must_use]
     pub fn kept(&self, pid: u32) -> Option<(i32, u64)> {
         self.kept.get(&pid).map(|&(version, id, _)| (version, id))
+    }
+
+    /// `pid`'s kept whole name and the pid version it was read under ([`Self::name`]).
+    #[must_use]
+    pub fn kept_name(&self, pid: u32) -> Option<(i32, &str)> {
+        self.names
+            .get(&pid)
+            .map(|kept| (kept.version, kept.name.as_str()))
     }
 
     /// How many pids' ids are kept.

@@ -14,9 +14,33 @@ use crate::type_scale::TypeStep;
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct UiKey(Arc<str>);
 
+/// `text` as one word of a [`UiKey`]: each whitespace or control character and each `%` written
+/// as its UTF-8 bytes, `%XX`, so a key made from a person's words (a table group's, a fact's
+/// name, a cell's value) is still one `act app/v1` takes: `rack a` is `rack%20a`.
+pub(crate) fn key_word(text: &str) -> String {
+    let mut word = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_whitespace() || ch.is_control() || ch == '%' {
+            for byte in ch.encode_utf8(&mut [0; 4]).bytes() {
+                word.push_str(&format!("%{byte:02X}"));
+            }
+        } else {
+            word.push(ch);
+        }
+    }
+    word
+}
+
 impl UiKey {
+    /// A control's key, which a driver names it by over `act app/v1`: one the wire refuses is a
+    /// defect of the page that made it, caught in every debug build.
     pub(crate) fn new(value: impl Into<Arc<str>>) -> Self {
-        Self(value.into())
+        let value = value.into();
+        debug_assert!(
+            aterm_types::app_inspection::is_wire_ui_key(&value),
+            "UI key {value:?} is no key `act app/v1` takes: no driver could reach its control"
+        );
+        Self(value)
     }
 
     pub(crate) fn as_str(&self) -> &str {
@@ -35,8 +59,15 @@ impl fmt::Debug for UiKey {
 pub(crate) struct ActionId(Arc<str>);
 
 impl ActionId {
+    /// A control's action, which `act app/v1` must name exactly: one the wire refuses is a defect
+    /// of the page that made it, caught in every debug build.
     pub(crate) fn new(value: impl Into<Arc<str>>) -> Self {
-        Self(value.into())
+        let value = value.into();
+        debug_assert!(
+            aterm_types::app_inspection::is_wire_action(&value),
+            "action {value:?} is no action `act app/v1` takes: no driver could press its control"
+        );
+        Self(value)
     }
 
     pub(crate) fn as_str(&self) -> &str {
@@ -6266,14 +6297,7 @@ fn paint_compiled_node_at(
                     w: rect.width,
                     h: rect.height,
                     radius: 4.0,
-                    fill: rgba(
-                        mix_rgb(
-                            roles.elevated,
-                            roles.unwritten,
-                            crate::native_appearance::UNWRITTEN_WASH,
-                        ),
-                        255,
-                    ),
+                    fill: rgba(roles.unwritten_wash, 255),
                 });
                 prims.push(DrawPrim::Panel {
                     x: rect.x,
@@ -9849,7 +9873,7 @@ fn rainbow_banner_sky(roles: &crate::settings::Roles) -> ([u8; 3], [u8; 3]) {
 }
 
 pub(crate) fn readable_secondary(roles: &crate::settings::Roles) -> [u8; 3] {
-    mix_rgb(roles.text_secondary, roles.text_primary, 0.55)
+    crate::native_appearance::readable_secondary(roles.text_secondary, roles.text_primary)
 }
 
 /// A sheet's header ground or its range's wash: the elevated ground lifted at most `most`

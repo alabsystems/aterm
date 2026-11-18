@@ -1072,7 +1072,7 @@ THE DOCTOR
   nobody at the run that renewal never takes the terminal or opens a browser, and it
   waits for the window's upkeep after a failed sign-in or a bot check on record. A
   CLI's own sign-in, approved in a browser, a row no route signs in (its `fix:` names
-  the step, e.g. `aterm harness accounts browser <label>` once), and any sign-in while
+  the step, e.g. `aterm harness accounts browser <account>` once), and any sign-in while
   `[harness] logins = "off"`, it runs only for a person at the terminal. It exits 1 while one someone asked for
   is signed out or not installed (`--read-only` only looks; `--on <host>,…`
   or `--fleet` runs it on other machines over ssh for a person at a terminal).
@@ -1080,27 +1080,29 @@ THE DOCTOR
   machine's own login with no email, account records that cannot be read, or
   `CLAUDE_CONFIG_DIR` set), its `fix:` and the `NEEDS YOU:` line say what a person does
   instead, never `aterm ai login claude`, which says why at a terminal or none.
-  `aterm ai login claude` runs `aterm harness accounts renew <label>`;
+  `aterm ai login claude` runs `aterm harness accounts renew <account>`;
   `aterm ai login codex|kimi` runs `aterm harness
-  accounts renew <label> --cli <cli>` and `aterm ai login grok` runs `aterm harness
-  accounts login <label> --cli grok`, for a person to approve, where this machine keeps
-  that CLI's roster (`accounts-<cli>.toml`). On a Codex build that keeps no row's login
-  its own (OpenAI's, or a codex-alab from before its cd79a420c), the roster's row on
-  this machine's own login signs in by Codex's own login in its default home instead,
-  which `aterm ai login codex` runs for a person while that row is signed out, unless
-  another Mac's warm set keeps it from this Mac (codex rows carry no claims), when
-  nothing here signs it in; where that build serves that row alone, it signs in no
-  other row, and nothing while that row's login works. Where no roster is kept, each
-  runs its own login (grok's `login --device-auth` over SSH). Every CLI here is in
-  atpkg's default set; `[packages] exclude` or `[ai.<cli>] use = false` keeps one off.
+  accounts renew <account> --cli <cli>` and `aterm ai login grok` runs `aterm harness
+  accounts login <account> --cli grok`, for a person to approve, where this machine
+  keeps that CLI's roster (`accounts-<cli>.toml`); each names the row by its account's
+  slug or key, and a row with no address by its label. On a Codex build that keeps no
+  row's login its own (OpenAI's, or a codex-alab from before its cd79a420c), the
+  roster's row on this machine's own login signs in by Codex's own login in its
+  default home instead, which `aterm ai login codex` runs for a person while that row
+  is signed out, unless another Mac's warm set keeps it from this Mac (codex rows
+  carry no claims), when nothing here signs it in; where that build serves that row
+  alone, it signs in no other row, and nothing while that row's login works. Where no
+  roster is kept, each runs its own login (grok's `login --device-auth` over SSH).
+  Every CLI here is in atpkg's default set; `[packages] exclude` or
+  `[ai.<cli>] use = false` keeps one off.
   A Codex or Kimi renewal whose page waits on a person stops `needs-sign-in` and
-  prints `NEEDS YOU: sign <label> in once…`. `aterm harness accounts browser <label>
-  --cli <cli>` opens that row's own browser profile in a window at the vendor's sign-in
-  page.
+  prints `NEEDS YOU: sign <account> in once…`. `aterm harness accounts browser <account>
+  --cli <cli>` opens that account's row's own browser profile in a window at the vendor's
+  sign-in page; it takes the account as `accounts login` does.
   Once a person signs in there, later Codex and Kimi renewals approve the CLI's page in
   it headlessly. accounts.x.ai answers aterm's headless browser with Cloudflare's block
   page, which aterm never works around, so a Grok renewal by hand stops `needs-you`
-  and names `aterm harness accounts login <label> --cli grok`, which a person runs and
+  and names `aterm harness accounts login <account> --cli grok`, which a person runs and
   approves at the desk, and a window starts no Grok renewal in the background (each
   would be an xAI device code and a blocked page); `accounts browser --cli grok` does
   not change that.
@@ -1434,6 +1436,8 @@ store behind it is doing, and it never opens that store.
   aterm file cat <name> [--published]    the table as TSV, this machine's queued writes over
                                          it (--published: the snapshot alone); state on stderr
   aterm file path <name>                 where the TSV is
+  aterm file schema <name>               each column's type, whether it may be empty, and
+                                         the file its cells name rows of; the key
   aterm file status [<name>]             state, why, revision, rows, inert, face
   aterm file get <name> <row> [<column>] one row or one cell
   aterm file rows <name> [--where col=val]... [--join <ref column>]
@@ -1449,6 +1453,10 @@ store behind it is doing, and it never opens that store.
   aterm file revert <name> <operation>
   aterm file resolve <name> <id> mine|theirs
   aterm file outbox [<name>] | outbox drop <id>
+  aterm file open <name>                 open the TSV in an Editor tab; a save there commits it
+  aterm file edit <name>                 open it, wait for the tab to close, commit it
+  aterm file commit <name>               write what the TSV's changed cells say
+  aterm file restore <name>              write the TSV again from the snapshot
 
 Every verb takes `--json`.
 
@@ -1460,6 +1468,18 @@ WRITES
   The three files are owner files: each change is an explicit `aterm file` write. A program's
   statement of its own machine's row is held in `outbox` with "an owner file takes no Mac
   statement", and `resolve <name> <id> theirs` drops it.
+
+THE TSV
+  The TSV is a face of the snapshot: its last header cell, `=pk@<rev>`, names the revision it
+  was written at. Nothing reads it but a commit: a save in an aterm Editor tab, `edit` or
+  `commit` by name. Saved any other way it changes nothing, `status` says `face=edited`, and
+  passes leave it alone until a commit or `restore`. A commit writes only the cells whose text
+  differs from that revision, each compared with what its cell held then (one that changed
+  since is held, never overwritten). A row left out of the TSV changes nothing: `rm`, or `row`
+  set to `retired`, retires one. A new row with its key left empty is added. A bad value writes
+  nothing and is named, `line:column: why`, in `<leaf>.problems` beside the TSV; a TSV whose
+  `=pk@<rev>` is gone, or whose revision this machine no longer keeps, is moved aside to
+  `<leaf>.rejected.tsv` and the TSV written again.
 
 STATE
   live    the snapshot is what this machine's store holds
@@ -1897,7 +1917,7 @@ THE VERBS (`aterm harness --help`; `aterm harness <verb> --help` for one)
 VAULT TOKENS (Claude Code's pool, macOS)
   The token route: a Claude Code account can keep a year-long token (`claude setup-token`) in
   the vault, and a session on that account starts on it instead of its stored login, which
-  then needs no renewal. `aterm harness accounts token <label|email>` makes one in aterm's
+  then needs no renewal. `aterm harness accounts token <account>` makes one in aterm's
   own sign-in window at this Mac's desk, which signs in and authorizes by itself, stores the
   token in the vault and records it, value-free, in the accounts store's `tokens.json` (its
   check in `tokens-check.json`); `--replace` makes a new one while the old is still in use,
@@ -1934,7 +1954,7 @@ VAULT TOKENS (Claude Code's pool, macOS)
   two apart and never verify the token: one made at a terminal then serves only the Mac that
   made it, whose surfaces offer `--replace`. A sign-in wall on a token session is a rejection:
   the session moves back to its stored login, and the token reads `rejected` on that Mac.
-  Off for token rows: renewal (`accounts renew <label>` says the row runs on its vault token
+  Off for token rows: renewal (`accounts renew <account>` says the row runs on its vault token
   and that renewal is off for it), `signin.lock`, and typing `/login` into a token session.
   Where to see it: `aterm harness accounts` (and `--json` under `tokens`), `ctl @self status`
   (`auth=`, `token=`), `ctl survey` (`auth=`, `token=` on session rows; `token=` on account
@@ -2192,7 +2212,7 @@ KEY USAGE (`aterm pkg --help` lists every verb, plumbing included)
                              Trust build N, the one a checkout's trust.lock names, beside
                              `current`, which stays
   aterm pkg list [--porcelain]
-                             installed programs, live builds, builds kept for rollback
+                             installed programs, live builds, older builds still on disk
   aterm pkg doctor [--verbose] [--json]
                              what needs attention (alias `status`; `--verbose`: every check)
   aterm pkg update [program] [--retry]
@@ -2210,7 +2230,8 @@ KEY USAGE (`aterm pkg --help` lists every verb, plumbing included)
                              remove one program, or the whole toolset (`--all` holds until
                              `install --default-set`)
   aterm pkg rollback | pin | unpin <program>
-                             the kept previous build; hold or release the current one
+                             a vendor program's kept previous build (ALab's own programs
+                             are fixed by the next release); hold or release the current one
   aterm pkg gc               reclaim superseded builds and partial downloads
   aterm pkg repair [--json]  restore command links, shell integration, reroute stubs, the
                              rustup `trust` link and exec roots
@@ -2669,7 +2690,7 @@ WHAT IT IS NOT
   `askpass-off` in aterm's state dir; every request then answers `ERR askpass
   refused off`. No verb, config key or environment variable changes it, though
   a process of the same user can change the file.
-  macOS only; after an update, open a new tab to pick up the helper."#,
+  macOS only."#,
         ),
     },
     Topic {
@@ -4307,10 +4328,12 @@ CHANGING THE NAME
   when a save leaves them pending. An aterm that is not your account's own (an isolated
   instance, root, or another HOME) sets no macOS names from either, so there the notice
   only says why. New Random Name draws another noun, and Refresh reads again. LAST CHANGE
-  says what Undo Last Rename gives back, or why it cannot: it takes back the last change
-  as `aterm name undo` does, and only the change the page showed. It is no Settings undo:
+  says what Undo Last Rename gives back, or why it cannot: it takes back the last rename
+  as `aterm name undo` does, and only the rename the page showed. It is no Settings undo:
   Settings' own Undo Last Change (Cmd-Z) undoes a settings edit and never a rename.
-  HISTORY lists the changes `aterm name history` lists, in its lines. Only your own click
+  HISTORY lists the newest 16 writes `aterm name history` lists, in its lines; the page
+  gives its registry read 2 seconds, and past that says History was not read and offers
+  no undo until Refresh reads it. Only your own click
   or key presses Save, Retry Sync, New Random Name and Undo Last Rename: `act`, a control
   client and an accessibility client are refused, so with VoiceOver use Rename This Mac…
   in the menu bar. A failed save is said on the page until its next one, and does not lead
@@ -4341,32 +4364,50 @@ THE NICKNAME
   Name keys use lowercase with whitespace collapsed to a single space; the chosen display
   spelling is remembered. Another known machine's name is refused,
   and `--dry-run` changes no nickname (a first run still makes the
-  name, as any read does). Who asked is kept beside it: an agent when the command runs in
-  an aterm session whose `status` names an agent program or an agent's state, a person
-  otherwise, or when that session does not answer within 2 seconds. A nickname must be non-empty.
+  name, as any read does). The write to this Mac's registry row says who asked, `program`
+  when the command runs in an aterm session whose `status` names an agent program or an
+  agent's state, `person` otherwise or when that session does not answer within 2
+  seconds, as `aterm file outbox` shows it; the registry's history names the Mac that
+  wrote it. A nickname must be non-empty.
 
 UNDO AND HISTORY
-  `aterm name history` lists the newest 16 changes to the name, newest first: when (UTC),
-  why (`first`, the name the first run made; `named`, a number chosen; `nickname`, a word
-  set; `drawn`, a noun drawn again; `undone`, an undo; `registry`, a change that follows this
-  Mac's registry row, which the file takes but no aterm records yet), the name before and
-  after, who made it (person, agent or automatic, and the node), and `(undone)` once an undo
-  took it back. `--json` prints one array of those objects (`at`, `at_ms`, `why`, `from`,
-  `to`, `nick_from`, `nick_to`, `by`, `undone`).
+  History is this Mac's lab registry row's: the registry keeps every write to its `label`
+  and `nickname`, from any Mac, with the Mac that wrote it and when, and every earlier
+  value; `machine-name.toml` keeps none of it. `aterm name history` lists every such
+  write, newest first, one line each: when (UTC), the Mac that wrote it, its kind
+  (`explicit`, an owner's write by a person or a program, a rename, an undo and an
+  `aterm file revert` included, with the operation a revert reverted; `aterm`, a write
+  aterm made itself; `import`; `(carried)` for a write an earlier generation of the
+  registry carried through a roll), and each cell as what it replaced and what it wrote,
+  `(replaced)` after a value that no longer stands and `(concurrent with <op>)` after one
+  written at once with another. A line leads for a cell a write of this Mac's is still
+  sending. It makes no name and reads the registry alone, within 60 seconds; a name kept
+  anywhere but this account's own state has no row, and says so. `--json` prints one
+  object: `row` (the row's key, or null), `pending` (each column a write is still
+  sending) and `writes`, newest first, each with `op`, `at`, `at_ms`, `mac`, `kind`,
+  `reverts`, `carried` and `cells`, each cell with `column`, `value`, `stands`,
+  `replaced` and `unseen`.
 
-  `aterm name undo` takes back the newest change. A change of number goes back to the number
-  it replaced, checked as `set` checks one, so it is refused while another machine holds that
-  number, by any claim, or its vault gives it to another Mac; the number returns as a new
-  `chosen` claim, never the rank it had. The nickname the change replaced returns with it, and
-  a nickname change goes back alone, leaving the number as it is. An undo is not undone, a
-  change is undone once, the first name is not undone, a change that kept both the number and
-  the nickname (a `set` that claims the number this machine already showed, keeping its
-  nickname) has nothing to take back, and no undo leaves this machine `unnumbered`; a name
-  changed since its newest recorded change (by an older aterm, which keeps no history) has
-  nothing to undo. `--dry-run` reports the name it would give, and a real undo publishes as
-  `set` does. An undo takes back only the change it read: if the name changed after it read
-  it, it refuses and changes nothing. On macOS, Settings ▸ This Mac shows the same History
-  and offers the same undo as Undo Last Rename.
+  `aterm name undo` takes back the row's newest rename: the newest `explicit` write, from
+  any Mac, never one aterm or an import made. It writes the values that rename replaced as
+  a new rename of this Mac. A number goes back to the one it replaced, checked as `set`
+  checks one, so it is refused while another machine holds that number, by any claim, or
+  its vault gives it to another Mac; it returns as a new `chosen` claim, and as the
+  owner's, which registration does not write over, never the rank it had. The nickname the
+  rename replaced returns with it, and a nickname rename goes back alone, leaving the
+  number as it is. An undo is a rename like any other, so undoing it again redoes the
+  rename. It refuses, changing nothing, while a write of this Mac's is still on its way to
+  the row, where the row holds another value than the rename left (a later write, or two
+  written at once), where the rename gave this Mac its first number (no undo leaves this
+  machine `unnumbered`), settled two values at once, replaced a label that is no number or
+  a nickname that is no nickname (`aterm file revert <op>` restores that), or predates the
+  registry's roll, and where it changed neither the number nor the nickname. `--dry-run`
+  reports the name it would give, and a real undo publishes as `set` does. An undo takes
+  back only the rename it read: it reads the registry again as it writes, and if another
+  rename, or another value of either the number or the nickname, stands by then, it
+  refuses and changes nothing. On
+  macOS, Settings ▸ This Mac shows the same History and offers the same undo as Undo Last
+  Rename.
 
 THE FIRST RUN
   The first reader to find no `machine-name.toml` makes it, under its lock, so every other
@@ -5727,7 +5768,10 @@ BROADCAST, IDEMPOTENCY, DEADLINES & RECEIPTS
     returning `OK <id> off=<n> dup=1` with the original broker offset.
   * Deadlines (`dl=<ms>`): `post … kind=ask dl=<ms>` synthesizes `kind=expired re=<n>
     dl=<ms>` in your inbox if no reply carrying `re=<n>` arrives in time; a later reply
-    is marked `late=1`.
+    is marked `late=1`. The first on your lane is the verdict: a reply that lands before
+    the `expired` (another Mac's, landing as the deadline passes) wins, and no `expired`
+    follows it; `--wait-ack` answers `ERR expired` where the `expired` came first, else
+    with the newest ack, the receiver's decision as it stands.
   * Watermarks & loss reporting: bare `inbox` marks rows LISTED (`--peek` does not);
     `inbox seen <id>` advances `seen=` and sends a `kind=ack re=<off> verdict=<v>`
     receipt on `ask`/`task` rows. `dropped=` counts evicted/overflow rows; `truncated=1`

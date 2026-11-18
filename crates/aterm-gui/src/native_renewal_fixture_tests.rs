@@ -565,12 +565,16 @@ fn launch_in_tab(launch: NativeRenewalLaunch, root: &Path) -> (Tab, Vec<Vec<Fact
         .collect::<String>();
     for pid in &pids {
         let recorded = root.join(format!("argv-{pid}"));
-        aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(5), || {
-            recorded.exists().then_some(())
-        })
-        .unwrap_or_else(|| {
+        aterm_spec::wait::within_while_working(
+            u32::try_from(*pid).expect("a launched pid fits the progress reader"),
+            MUST_HAPPEN,
+            aterm_spec::wait::WORKING_GUARD,
+            Duration::from_millis(5),
+            || recorded.exists().then_some(()),
+        )
+        .unwrap_or_else(|why| {
             panic!(
-                "run {pid} never ran codex; the tab shows:\n{}",
+                "run {pid} never ran codex: {why:?}; the tab shows:\n{}",
                 tab.output()
             )
         });

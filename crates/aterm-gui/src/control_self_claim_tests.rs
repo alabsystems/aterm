@@ -4021,8 +4021,9 @@ impl LaneService for MetaService {
         let rest = request.line().strip_prefix("meta ").unwrap_or("");
         let master = self.master;
         let alab_image = self.alab_image;
-        let prove =
-            |holder: &str, _: Option<u32>| super::prove_self_claim_by(holder, master, &alab_image);
+        let prove = |holder: &str, _: Option<u32>| {
+            super::prove_self_claim_by(holder, master, &alab_image).map(Into::into)
+        };
         let reply = super::control_session::cmd_meta_supervisor(
             &self.ctx,
             scope,
@@ -5314,8 +5315,14 @@ fn a_scoped_renewal_wakes_for_scope_version_and_vendor_changes() {
     }
     let (_, wakes) = serve("scope=upgrade,relaunch");
     assert_eq!(wakes.len(), 1, "adding a scope wakes the window");
+    let before = ctx.meta.lock().unwrap().supervisor_revision;
     let (_, wakes) = serve("scope=relaunch,upgrade");
     assert!(wakes.is_empty(), "scope word order changes no authority");
+    assert_eq!(
+        ctx.meta.lock().unwrap().supervisor_revision,
+        before,
+        "scope word order keeps the authority revision"
+    );
     assert_eq!(
         meta_changes(ctx)
             .into_iter()
@@ -5323,6 +5330,88 @@ fn a_scoped_renewal_wakes_for_scope_version_and_vendor_changes() {
             .count(),
         1,
         "renewal changes no holder spelling"
+    );
+}
+
+/// A contract 4 renewal can change the unknown or withheld words it asks without changing
+/// its granted authority. It still places the claim and retains the latest canonical request
+/// for a later scope-less record to ask again.
+#[test]
+fn a_scoped_renewal_keeps_authority_while_replacing_its_ungranted_request() {
+    let store = crate::session_store::new_store();
+    let h = crate::session_store::test_handle_on(7550, -1);
+    store.write().unwrap().register(h.clone());
+    let ctx = h.ctx.as_ref();
+    let me = format!("grok-alab@{}", stand_in());
+    let serve = |scopes: &str| {
+        super::meta_wakes_proving_for_test(
+            &store,
+            &h.term,
+            7550,
+            &h.ctx,
+            &format!("set supervisor {me} contract=4 scope={scopes} version=0.3.0 vendor=1.0.70"),
+            Some(4),
+            &|_| Some(running()),
+        )
+    };
+    let (reply, wakes) = serve("relaunch,turn-end,telepathy");
+    assert!(reply.starts_with("OK scope=relaunch revision="), "{reply}");
+    assert!(matches!(
+        wakes.as_slice(),
+        [crate::Wake::MetaChanged { session: 7550 }]
+    ));
+    let (authority, placements) = {
+        let meta = ctx.meta.lock().unwrap();
+        let scoped = meta.live_scoped(crate::metrics::now_us()).expect("scoped");
+        assert_eq!(scoped.claim.scopes.words(), "relaunch");
+        assert_eq!(scoped.claim.claimed, "relaunch,telepathy,turn-end");
+        (
+            meta.supervisor_authority(crate::metrics::now_us()),
+            meta.claim_placements,
+        )
+    };
+    for (n, scopes) in ["walls,telekinesis,relaunch", "telekinesis,relaunch,walls"]
+        .into_iter()
+        .enumerate()
+    {
+        let (reply, wakes) = serve(scopes);
+        assert_eq!(
+            reply,
+            format!("OK scope=relaunch revision={}\n", authority.revision())
+        );
+        assert!(wakes.is_empty(), "the grant is unchanged: {wakes:?}");
+        let meta = ctx.meta.lock().unwrap();
+        assert_eq!(
+            meta.supervisor_authority(crate::metrics::now_us()),
+            authority,
+            "requested words alone change no authority or revision"
+        );
+        assert_eq!(meta.claim_placements, placements + n as u64 + 1);
+        let scoped = meta.live_scoped(crate::metrics::now_us()).expect("scoped");
+        assert_eq!(scoped.claim.scopes.words(), "relaunch");
+        assert_eq!(scoped.claim.claimed, "relaunch,telekinesis,walls");
+    }
+
+    let (reply, wakes) = serve("walls,telekinesis,relaunch,upgrade");
+    assert!(
+        reply.starts_with("OK scope=relaunch,upgrade revision="),
+        "{reply}"
+    );
+    assert!(matches!(
+        wakes.as_slice(),
+        [crate::Wake::MetaChanged { session: 7550 }]
+    ));
+    let meta = ctx.meta.lock().unwrap();
+    assert_ne!(meta.supervisor_revision, authority.revision());
+    assert_eq!(meta.claim_placements, placements + 3);
+    assert_eq!(
+        meta.live_scoped(crate::metrics::now_us())
+            .expect("scoped")
+            .claim
+            .scopes
+            .words(),
+        "relaunch,upgrade",
+        "a real additional duty remains an authority change"
     );
 }
 

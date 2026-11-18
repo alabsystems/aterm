@@ -128,10 +128,13 @@ impl Reader {
             let Ok((state, _)) = store.load(now) else {
                 continue;
             };
-            let stands = state
-                .accounts
-                .values()
-                .any(|account| account.pk.is_some() && account.limited_until(now).is_some());
+            // A model's own weekly wall stands apart from the account's walls
+            // ([`accounts::Account::model_walls`]), and a peer's lift of it lifts it here too.
+            let stands = state.accounts.values().any(|account| {
+                account.pk.is_some()
+                    && (account.limited_until(now).is_some()
+                        || account.model_walls(now).next().is_some())
+            });
             if stands {
                 walled.insert(cli, (store, state));
             }

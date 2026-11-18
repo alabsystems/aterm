@@ -787,9 +787,23 @@ fn login_kimi_renews_its_pool_or_runs_its_own_login_for_a_person() {
         assert_eq!(code, 0, "{who}: {out}{err}");
         let calls = runner.calls();
         assert_eq!(calls.len(), 1, "{who}: {calls:?}");
+        let word = crate::harness::account_names::tests::row_name(
+            crate::harness::accounts::Cli::Kimi,
+            &b.dir.path().join("accounts-kimi.toml"),
+            "kimi-one",
+        )
+        .word;
         assert!(
             calls[0].program == "aterm"
-                && calls[0].args == ["harness", "accounts", "renew", "kimi-one", "--cli", "kimi"],
+                && calls[0].args
+                    == [
+                        "harness",
+                        "accounts",
+                        "renew",
+                        word.as_str(),
+                        "--cli",
+                        "kimi"
+                    ],
             "{who}: {:?}",
             calls[0]
         );
@@ -807,7 +821,7 @@ fn login_kimi_renews_its_pool_or_runs_its_own_login_for_a_person() {
 /// UNDER AN AGENT, WITH NO TERMINAL, THE DOCTOR MAKES ATERM'S OWN FIXES AND HOLDS ONLY A
 /// PERSON'S (no human user): it installs a CLI that is not installed (`aterm
 /// pkg install claude`) and renews a pool row with an email (`aterm harness accounts renew
-/// kimi-one --cli kimi`), starts no CLI's own sign-in (codex has no roster), and says what only
+/// <account> --cli kimi`, by the account's word), starts no CLI's own sign-in (codex has no roster), and says what only
 /// a person can give on one `NEEDS YOU:` line. CONTROL: `--read-only` runs nothing.
 #[test]
 fn the_doctor_makes_aterms_own_fixes_under_an_agent_and_holds_only_a_persons() {
@@ -847,7 +861,20 @@ fn the_doctor_makes_aterms_own_fixes_under_an_agent_and_holds_only_a_persons() {
             args(&["pkg", "install", "claude", atpkg::cli::NO_INIT_FLAG])
         )) && calls.contains(&(
             "aterm".to_string(),
-            args(&["harness", "accounts", "renew", "kimi-one", "--cli", "kimi"])
+            args(&[
+                "harness",
+                "accounts",
+                "renew",
+                crate::harness::account_names::tests::row_name(
+                    crate::harness::accounts::Cli::Kimi,
+                    &b.dir.path().join("accounts-kimi.toml"),
+                    "kimi-one"
+                )
+                .word
+                .as_str(),
+                "--cli",
+                "kimi"
+            ])
         )),
         "{calls:?}"
     );
@@ -1560,7 +1587,10 @@ fn under_a_pin_on_a_row_of_its_own_a_signed_out_default_row_signs_codex_out() {
         .find(&format!("`{}`", default_sign_in()))
         .unwrap_or_else(|| panic!("the sign-in: {mend}"));
     let pin = mend
-        .find(&format!("`{}`", unread_fix(Some("main"))))
+        .find(&format!(
+            "`{}`",
+            unread_fix(Some(&codex_word("own@example.com")))
+        ))
         .unwrap_or_else(|| panic!("the pin: {mend}"));
     assert!(sign_in < pin, "{mend}");
     assert!(health.mends.contains(&mend), "{health:?}");
@@ -1585,6 +1615,37 @@ fn under_a_pin_on_a_row_of_its_own_a_signed_out_default_row_signs_codex_out() {
         err.contains(&mend) && !err.contains(" alone "),
         "CONTROL: {err}"
     );
+}
+
+/// AS ABOVE, WITH `main` HOLDING NO ADDRESS: no word names its account, so the doctor's step is
+/// `main`'s sign-in at a terminal and why no step pins it ([`no_pin_words`]), and it types no
+/// `accounts use`. NEGATIVE CONTROL: with that step offering a pin, it fails on `` "sign `main`
+/// in at a terminal (`aterm ai login codex`), then pin it (`aterm harness accounts use <account>
+/// --cli codex`)" `` (2026-11-16, by hand, then restored).
+///
+/// [`no_pin_words`]: crate::harness::codex_alab::no_pin_words
+#[test]
+fn a_signed_out_default_row_with_no_address_is_signed_in_and_offered_no_pin() {
+    use crate::harness::codex_alab::{default_sign_in, no_pin_words};
+    let now = 1_800_000_000;
+    let b = codex_default_only("");
+    let roster = b.dir.path().join("accounts-codex.toml");
+    let text = std::fs::read_to_string(&roster).expect("codex roster");
+    let unaddressed = text.replacen("email = \"own@example.com\"\n", "", 1);
+    assert_ne!(unaddressed, text, "PRECONDITION: `main` held an address");
+    std::fs::write(&roster, unaddressed).expect("codex roster");
+    pin_codex(&b, "work", now);
+    sign_main_out(&b, now);
+    let env = pooled_env(&b, &[], false);
+    let (row, f, _) = codex_look(&env);
+    assert_eq!(row.state, State::SignedOut, "{}", row.fact);
+    assert_eq!(state::sign_in_then_pin(&f), Some(("main", true)));
+    let mend = row.mend.clone().expect("a person's step");
+    assert!(
+        mend.contains(&format!("`{}`", default_sign_in())) && mend.contains(&no_pin_words("main")),
+        "{mend}"
+    );
+    assert!(!mend.contains("accounts use "), "{mend}");
 }
 
 /// A runner whose terminal runs exit 0 and whose `codex login status` reads signed in with
@@ -1621,7 +1682,7 @@ fn codex_signs_in(b: &Box3) -> FakeRunner {
 /// own) with `main` signed out, the doctor's step is `main`'s sign-in and then its pin; a person
 /// at a terminal runs `aterm ai login codex`, Codex's own login runs and its status reads signed
 /// in, and the run says so, then that a launch is still refused, with the pin that ends it
-/// (`aterm harness accounts use main --cli codex`), and exits 1. CONTROL: with no pin, the same
+/// (`aterm harness accounts use <main's key> --cli codex`), and exits 1. CONTROL: with no pin, the same
 /// sign-in says it signed in, names no pin, and exits 0.
 #[test]
 fn at_a_terminal_a_sign_in_that_leaves_every_launch_refused_names_the_pin() {
@@ -1649,7 +1710,7 @@ fn at_a_terminal_a_sign_in_that_leaves_every_launch_refused_names_the_pin() {
         runner.calls()
     );
     assert!(out.lines().any(|l| l == signed_in), "{out}{err}");
-    let pin = format!("`{}`", unread_fix(Some("main")));
+    let pin = format!("`{}`", unread_fix(Some(&codex_word("own@example.com"))));
     let refused = out
         .lines()
         .find(|l| l.starts_with("codex: its launches stay refused"))
@@ -2206,4 +2267,14 @@ fn a_review_whose_stdin_fails_part_way_is_refused() {
         words_read_from(&[0xff, 0xfe][..]).is_err_and(|w| w.contains("UTF-8")),
         "CONTROL: not text"
     );
+}
+
+/// The word the pin of the Codex account `email` types where no lab names it: its account key.
+fn codex_word(email: &str) -> crate::harness::account_names::Word {
+    crate::harness::account_names::Named {
+        pk: aterm_db::typed::keys::account_pk("codex", email).expect("an account key"),
+        row: None,
+        names: aterm_file::AccountNames::default(),
+    }
+    .word()
 }

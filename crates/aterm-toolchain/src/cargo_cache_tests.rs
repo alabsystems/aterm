@@ -15,6 +15,61 @@ use std::{
 const MUTATE: &str = ".package-cache-mutate";
 
 #[test]
+fn reclamation_excludes_build_readers_and_releases_partial_download_contention() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let download_path = home.path().join(".package-cache");
+    write_owned(&download_path, b"");
+    let reader = SourceCacheGuard::try_acquire(home.path()).unwrap();
+    assert_eq!(
+        SourceCacheReclaimGuard::try_acquire(home.path())
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    drop(reader);
+    let download = exclusive(&download_path).unwrap();
+    assert_eq!(
+        SourceCacheReclaimGuard::try_acquire(home.path())
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    // Failure on the second lock must release the first. Downloads and
+    // ordinary readers remain compatible under Cargo's actual protocol.
+    drop(SourceCacheGuard::try_acquire(home.path()).unwrap());
+    drop(download);
+    let reclaim = SourceCacheReclaimGuard::try_acquire(home.path()).unwrap();
+    reclaim.check_current().unwrap();
+    assert!(SourceCacheGuard::try_acquire(home.path()).is_err());
+    assert!(matches!(
+        exclusive(&download_path),
+        Err(TryLockError::WouldBlock)
+    ));
+    drop(reclaim);
+    drop(SourceCacheGuard::try_acquire(home.path()).unwrap());
+    exclusive(&download_path).unwrap();
+}
+
+#[test]
+fn reclamation_missing_protocol_is_readonly_and_download_identity_stays_bound() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    assert!(SourceCacheReclaimGuard::try_acquire(home.path()).is_err());
+    assert!(std::fs::read_dir(home.path()).unwrap().next().is_none());
+    write_owned(&home.path().join(MUTATE), b"");
+    assert!(SourceCacheReclaimGuard::try_acquire(home.path()).is_err());
+    assert!(!home.path().join(".package-cache").exists());
+    let download = home.path().join(".package-cache");
+    write_owned(&download, b"");
+    let reclaim = SourceCacheReclaimGuard::try_acquire(home.path()).unwrap();
+    std::fs::rename(&download, home.path().join("retained-download-lock")).unwrap();
+    write_owned(&download, b"");
+    assert!(reclaim.check_current().is_err());
+    assert!(SourceCacheGuard::try_acquire(home.path()).is_err());
+    drop(reclaim);
+    drop(SourceCacheReclaimGuard::try_acquire(home.path()).unwrap());
+}
+
+#[test]
 fn original_directory_constraint_keeps_the_actual_cache_lock_until_drop() {
     use std::os::fd::AsFd as _;
     let home = aterm_tempfile::tempdir().unwrap();

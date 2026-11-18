@@ -3,12 +3,15 @@
 
 //! `aterm harness accounts history` ([`crate::harness::cli::history::run`]): one line a local
 //! day from this Mac's readings series with that day's ledger lines beneath, every roster row in
-//! roster order, a renamed row's old series found by its key, JSON that only adds keys, and
-//! nothing written.
+//! roster order, a renamed row's old series found by its key, the account and the ledger's named
+//! by key, slug and name and never by label, and nothing written. Every address is synthetic.
 
 use super::*;
 use crate::harness::account_series::{self, Fig, Said, SeriesRow};
+use crate::harness::alab_roster::{self, Lab};
 use crate::harness::profile::AccountKey;
+use aterm_db::typed::keys;
+use aterm_file::{AccountNames, no_account};
 
 const H: i64 = 3600;
 const D: i64 = 86_400;
@@ -22,22 +25,62 @@ fn west(_: i64) -> i64 {
     -7 * H
 }
 
-/// A pool on `env` of `labels`, in that order, each with a login and a record (`keys` gives a
+/// The address of the roster rows labelled `now` and `work` (`pool`).
+const NOW: &str = "now@x.example";
+const WORK: &str = "work@x.example";
+
+/// The address `pool` gives the row labelled `label`.
+fn address(label: &str) -> String {
+    format!("{label}@x.example")
+}
+
+/// The account key of the Claude account of `email`.
+fn pk_of(email: &str) -> String {
+    keys::account_pk("claude", email).expect("an account key")
+}
+
+/// A pool on `env` of `labels`, in that order, each with a login, its address
+/// ([`address`]) and a record carrying its lab key, as a transaction learns it (`keys` gives a
 /// label's account key); the state's machine id.
 fn pool(tmp: &Tmp, env: &Env, labels: &[&str], keys: &[(&str, AccountKey)]) -> String {
-    let mut text = String::new();
-    for label in labels {
-        let dir = tmp.path().join("logins").join(label);
-        login_made_in(&dir);
-        text = accounts::append_row(&text, label, Class::Preferred, dir.to_str())
-            .expect("the row admits");
-    }
-    std::fs::write(env.accounts_roster().expect("a config dir"), text).expect("write");
+    pool_with(tmp, env, labels, &[], keys)
+}
+
+/// [`pool`], with the rows labelled in `bare` holding no address, and so no lab key.
+fn pool_with(
+    tmp: &Tmp,
+    env: &Env,
+    labels: &[&str],
+    bare: &[&str],
+    keys: &[(&str, AccountKey)],
+) -> String {
+    let rows: Vec<accounts::Row> = labels
+        .iter()
+        .map(|label| {
+            let dir = tmp.path().join("logins").join(label);
+            login_made_in(&dir);
+            accounts::Row {
+                label: (*label).to_owned(),
+                class: Class::Preferred,
+                dir: dir.to_str().map(str::to_owned),
+                email: (!bare.contains(label)).then(|| address(label)),
+                ..Default::default()
+            }
+        })
+        .collect();
+    std::fs::write(
+        env.accounts_roster().expect("a config dir"),
+        accounts::append_rows_for(Cli::Claude, "", &rows).expect("the rows admit"),
+    )
+    .expect("write");
     let mut note = None;
     env.accounts_store()
         .transact(env.now, &mut note, |state| {
             for label in labels {
-                state.accounts.entry((*label).to_owned()).or_default();
+                let record = state.accounts.entry((*label).to_owned()).or_default();
+                if !bare.contains(label) {
+                    record.pk = Some(pk_of(&address(label)));
+                }
             }
             for (label, key) in keys {
                 state.accounts.entry((*label).to_owned()).or_default().key = Some(*key);
@@ -118,6 +161,28 @@ fn history_of(
     String::from_utf8(out).expect("utf-8")
 }
 
+/// What `accounts history <name>` on `env` refuses with, past its prefix; it prints nothing on
+/// stdout.
+fn history_refused(env: &Env, name: &str) -> String {
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = crate::harness::cli::history::run(
+        Cli::Claude,
+        env,
+        (Some(name), false, SPAN, false),
+        |_| 0,
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(code, ExitCode::FAILURE, "`{name}` was taken");
+    assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+    let err = String::from_utf8(err).expect("utf-8");
+    err.trim_end()
+        .strip_prefix("aterm harness accounts history: ")
+        .unwrap_or_else(|| panic!("the verb's prefix: {err}"))
+        .to_owned()
+}
+
 /// The day lines of a text history (two-space indent), with the lines indented under each.
 fn day_lines(text: &str) -> Vec<&str> {
     text.lines()
@@ -166,7 +231,7 @@ fn history_prints_a_line_per_local_day_with_its_ledger_lines() {
     let tmp = tmp_dir("history-days");
     let env = env_at(&tmp);
     seeded_work(&tmp, &env);
-    let text = history_of(&env, Some("work"), (false, false), west);
+    let text = history_of(&env, Some(WORK), (false, false), west);
     assert_eq!(
         day_lines(&text),
         [
@@ -181,8 +246,9 @@ fn history_prints_a_line_per_local_day_with_its_ledger_lines() {
         "(this Mac's ledger only: no lab journal is read in this process)"
     );
     assert!(
-        lines[1].starts_with("work \u{b7} claude \u{b7} this Mac \u{b7} ")
-            && lines[1].ends_with(" (30d) \u{b7} series since Fri Sep 19"),
+        lines[1].starts_with(&format!(
+            "claude {WORK} \u{b7} claude \u{b7} this Mac \u{b7} "
+        )) && lines[1].ends_with(" (30d) \u{b7} series since Fri Sep 19"),
         "{text}"
     );
     let friday = lines
@@ -191,11 +257,11 @@ fn history_prints_a_line_per_local_day_with_its_ledger_lines() {
         .expect("Friday");
     assert_eq!(
         lines[friday + 1],
-        "    2025-09-20T03:00:00Z here auth work",
-        "the ledger line under its local day: {text}"
+        format!("    2025-09-20T03:00:00Z here auth {}", pk_of(WORK)),
+        "the ledger line under its local day, naming the account by its key: {text}"
     );
     assert!(lines[friday + 2].starts_with("  Sat Sep 20"), "{text}");
-    let json = history_of(&env, Some("work"), (true, false), west);
+    let json = history_of(&env, Some(WORK), (true, false), west);
     for printed in [&text, &json] {
         assert!(!printed.contains(SENTINEL), "free text printed: {printed}");
     }
@@ -219,10 +285,10 @@ fn history_prints_a_line_per_local_day_with_its_ledger_lines() {
 
 /// A HISTORY BY KEY FINDS A RENAMED ROW'S SERIES. The row `now` is the account whose key its
 /// record holds; a series kept under its old label `before` carries that key and is read with
-/// it, whether the account is named by its label or by its key (`c-…`), and a third series of
-/// another account is not. Negative control: reading the label's own series alone (no file
-/// found by key in `by_key`) loses the old label's day, `Fri Sep 19`, and the first assertion
-/// fails.
+/// it, whether the account is named by its address or by its key (`ac-…`), and a third series of
+/// another account is not. The record's account key (`c-…`) and the row's label name nothing.
+/// Negative control: reading the label's own series alone (no file found by key in `by_key`)
+/// loses the old label's day, `Fri Sep 19`, and the first assertion fails.
 #[test]
 fn history_by_key_finds_a_renamed_rows_series() {
     let tmp = tmp_dir("history-key");
@@ -250,7 +316,7 @@ fn history_by_key_finds_a_renamed_rows_series() {
         &machine,
         &[reading(now - 3 * D, None, Some((900, week)), Some(other))],
     );
-    let by_label = history_of(&env, Some("now"), (false, false), |_| 0);
+    let by_label = history_of(&env, Some(NOW), (false, false), |_| 0);
     assert_eq!(
         day_lines(&by_label)
             .iter()
@@ -265,26 +331,30 @@ fn history_by_key_finds_a_renamed_rows_series() {
         by_label.contains(" \u{b7} series since Fri Sep 19\n"),
         "{by_label}"
     );
-    let by_key = history_of(&env, Some(&key.to_string()), (false, false), |_| 0);
+    let by_key = history_of(&env, Some(&pk_of(NOW)), (false, false), |_| 0);
     assert_eq!(by_key, by_label, "the key names the same account");
     assert!(
         by_key
             .lines()
             .nth(1)
-            .is_some_and(|l| l.starts_with("now \u{b7} claude"))
+            .is_some_and(|l| l.starts_with(&format!("claude {NOW} \u{b7} claude")))
     );
+    for word in [key.to_string(), "now".to_owned()] {
+        assert_eq!(history_refused(&env, &word), no_account(&word));
+    }
 }
 
 /// A HISTORY WITHOUT A NAME LISTS EVERY ROW, IN ROSTER ORDER. Three rows listed `zeta`, `alpha`,
-/// `mid` print in that order in text and JSON, never sorted, and the row with nothing recorded
-/// says so. Negative control: listing the roster sorted by label puts `alpha` first and the
-/// first assertion fails.
+/// `mid` print in that order in text and JSON, never sorted, each by its account's name, and the
+/// row with nothing recorded says so. `alpha` holds no address, so it has no key and no names:
+/// it is headed by its label marked `(no address)`, and its JSON alone has `label`. Negative
+/// control: listing the roster sorted by label puts `alpha` first and the first assertion fails.
 #[test]
 fn history_without_a_name_lists_every_row_in_roster_order() {
     let tmp = tmp_dir("history-all");
     let env = env_at(&tmp);
     let now = env.now;
-    let machine = pool(&tmp, &env, &["zeta", "alpha", "mid"], &[]);
+    let machine = pool_with(&tmp, &env, &["zeta", "alpha", "mid"], &["alpha"], &[]);
     let week = now + 3 * D;
     write_series(
         &env,
@@ -301,44 +371,179 @@ fn history_without_a_name_lists_every_row_in_roster_order() {
     let text = history_of(&env, None, (false, false), |_| 0);
     let heads: Vec<&str> = text
         .lines()
-        .filter(|l| l.contains(" \u{b7} claude \u{b7} this Mac \u{b7} "))
-        .map(|l| l.split(' ').next().unwrap_or_default())
+        .filter_map(|l| l.split_once(" \u{b7} claude \u{b7} this Mac \u{b7} "))
+        .map(|(head, _)| head)
         .collect();
-    assert_eq!(heads, ["zeta", "alpha", "mid"], "{text}");
+    assert_eq!(
+        heads,
+        [
+            "claude zeta@x.example",
+            "alpha (no address)",
+            "claude mid@x.example"
+        ],
+        "{text}"
+    );
     let alpha = text
         .split("\n\n")
-        .find(|block| block.contains("alpha \u{b7} claude"))
+        .find(|block| block.contains("alpha (no address) \u{b7} claude"))
         .expect("alpha's block");
     assert!(alpha.contains("\n  nothing recorded in 30d"), "{alpha}");
     let doc: Value =
         aterm_json::from_str(history_of(&env, None, (true, false), |_| 0).trim()).expect("JSON");
     assert_eq!(doc["kind"], Value::from("account-history"));
-    assert_eq!(doc["schema"], Value::from(1u64));
-    let labels: Vec<&str> = doc["accounts"]
-        .as_array()
-        .expect("accounts")
+    assert_eq!(doc["schema"], Value::from(2u64));
+    let accounts = doc["accounts"].as_array().expect("accounts");
+    let names: Vec<(&Value, Option<&Value>)> = accounts
         .iter()
-        .map(|a| a["label"].as_str().unwrap_or_default())
+        .map(|a| (&a["name"], a.get("label")))
         .collect();
-    assert_eq!(labels, ["zeta", "alpha", "mid"]);
-    assert_eq!(doc["accounts"][1]["days"], Value::Array(Vec::new()));
+    assert_eq!(
+        names,
+        [
+            (&Value::from("claude zeta@x.example"), None),
+            (&Value::Null, Some(&Value::from("alpha"))),
+            (&Value::from("claude mid@x.example"), None),
+        ]
+    );
+    assert_eq!(accounts[0]["ac"], Value::from(pk_of("zeta@x.example")));
+    assert_eq!(accounts[1]["ac"], Value::Null);
+    assert_eq!(accounts[1]["days"], Value::Array(Vec::new()));
 }
 
-/// A HISTORY'S JSON ONLY ADDS KEYS. The lab model's `{label, ac, journal, lines}` keep their
-/// meaning, `lines` every ledger and journal line as before, one older than the span included;
-/// `kind`, `schema`, `span`, `series` and `days` are added, and `rows` only with `--rows`, each
-/// stored line inside the span exactly as stored. Another CLI's pool says `series: false`.
-/// Negative control: `lines` cut to the span (the `Block::json` lines filtered by
-/// `span.holds`) drops the older line, and the `lines` assertion fails.
+/// A HISTORY NAMES ITS ACCOUNT AND ITS LEDGER'S BY KEY AND SLUG, NEVER BY LABEL. Under a lab
+/// that slugs `work`'s account `claude-work-x` and an account no row here holds
+/// `claude-other-x`, the slug names `work`'s account and the label `work` names nothing. The
+/// header shows the account's name and slug; each ledger line names the account its row is
+/// about by the key the row carried, else by the account the row labelled so holds (its key
+/// and slug), a row with no address by its label marked `(no address)` and a label no row
+/// holds now in words; no line holds a label or an address. The every-row history lists the
+/// no-address row `bare`'s own ledger row in its block. Negative control: printing
+/// `event.account` and `to` as stored (`alab_seen::history` without `name`) prints `here
+/// rotate work to=bare`, and the `lines` assertion fails; with `alab_seen::history` matching a
+/// row by label only where the asked account has a key, `bare`'s block loses its own row and
+/// its assertion fails.
 #[test]
-fn history_json_only_adds_keys() {
+fn history_names_its_account_and_the_ledgers_by_key_and_slug_never_by_label() {
+    const OTHER: &str = "other@x.example";
+    let tmp = tmp_dir("history-names");
+    let env = env_at(&tmp);
+    let now = env.now;
+    pool_with(&tmp, &env, &["work", "bare"], &["bare"], &[]);
+    let slugged = |email: &str, slug: &str| {
+        (
+            pk_of(email),
+            AccountNames {
+                realm: "claude".to_owned(),
+                slug: slug.to_owned(),
+                name: Some(format!("claude {email}")),
+                email: Some(email.to_owned()),
+                login: Some(email.to_owned()),
+                live: true,
+            },
+        )
+    };
+    let lab = Lab {
+        names: [
+            slugged(WORK, "claude-work-x"),
+            slugged(OTHER, "claude-other-x"),
+        ]
+        .into(),
+        ..Lab::default()
+    };
+    let event = |t: i64, kind: accounts::Kind, account: &str, to: &str, pk: Option<String>| {
+        let mut event = accounts::Event::new(t, kind, account);
+        event.to = Some(to.to_owned());
+        event.pk = pk;
+        event
+    };
+    let ledger = vec![
+        accounts::Event::new(now - 4 * H, accounts::Kind::Auth, "bare"),
+        event(now - 3 * H, accounts::Kind::Rotate, "work", "bare", None),
+        event(
+            now - 2 * H,
+            accounts::Kind::Rotate,
+            "gone",
+            "work",
+            Some(pk_of(OTHER)),
+        ),
+        event(now - H, accounts::Kind::Auth, "work", "gone", None),
+    ];
+    env.accounts_store()
+        .transact(now, &mut None, |_| Ok(ledger))
+        .expect("ledger");
+    alab_roster::with_lab(lab, || {
+        assert_eq!(history_refused(&env, "work"), no_account("work"));
+        let doc: Value = aterm_json::from_str(
+            history_of(&env, Some("claude-work-x"), (true, false), |_| 0).trim(),
+        )
+        .expect("JSON");
+        assert_eq!(doc["ac"], Value::from(pk_of(WORK)));
+        assert_eq!(doc["slug"], Value::from("claude-work-x"));
+        let (work, other) = (pk_of(WORK), pk_of(OTHER));
+        let lines = [
+            format!("2025-09-20T21:00:00Z here rotate {work} (claude-work-x) to=bare (no address)"),
+            format!(
+                "2025-09-20T22:00:00Z here rotate {other} (claude-other-x) to={work} \
+                 (claude-work-x)"
+            ),
+            format!(
+                "2025-09-20T23:00:00Z here auth {work} (claude-work-x) to=(a row no longer here)"
+            ),
+        ];
+        assert_eq!(
+            doc["lines"],
+            Value::Array(lines.iter().map(|l| Value::from(l.as_str())).collect())
+        );
+        let text = history_of(&env, Some("claude-work-x"), (false, false), |_| 0);
+        assert!(
+            text.lines().nth(1).is_some_and(|l| l.starts_with(&format!(
+                "claude {WORK} (claude-work-x) \u{b7} claude \u{b7} this Mac \u{b7} "
+            ))),
+            "{text}"
+        );
+        for line in &lines {
+            assert!(
+                text.lines().any(|l| l.trim_start() == line),
+                "{line} in {text}"
+            );
+        }
+        let every = history_of(&env, None, (false, false), |_| 0);
+        let bare = every
+            .split("\n\n")
+            .find(|block| block.starts_with("bare (no address) \u{b7} claude"))
+            .unwrap_or_else(|| panic!("bare's block: {every}"));
+        assert!(
+            bare.lines()
+                .any(|l| l.trim_start() == "2025-09-20T20:00:00Z here auth bare (no address)"),
+            "a row with no address lists its own ledger rows, by its label: {bare}"
+        );
+        for printed in [&text, &every] {
+            for line in printed.lines().filter(|l| l.contains(" here ")) {
+                assert!(!line.contains('@'), "an address: {line}");
+                assert!(
+                    !line.split(' ').any(|word| word == "work" || word == "gone"),
+                    "a label: {line}"
+                );
+            }
+        }
+    });
+}
+
+/// A HISTORY'S JSON NAMES THE ACCOUNT BY ITS KEY, SLUG AND NAME. Schema 2: `ac` (the key),
+/// `slug` (`null` where no lab slugged it) and `name`, and no `label`; the lab model's `journal`
+/// and `lines` keep their meaning, `lines` every ledger and journal line as before, one older
+/// than the span included; `kind`, `schema`, `span`, `series` and `days`, and `rows` only with
+/// `--rows`, each stored line inside the span exactly as stored. Another CLI's pool says
+/// `series: false`. Negative control: `lines` cut to the span (the `Block::json` lines filtered
+/// by `span.holds`) drops the older line, and the `lines` assertion fails.
+#[test]
+fn history_json_names_the_account_by_its_key_slug_and_name() {
     let tmp = tmp_dir("history-json");
     let env = env_at(&tmp);
     let (_, path) = seeded_work(&tmp, &env);
     ledger_row(&env, "work", env.now - 40 * D);
-    let doc: Value =
-        aterm_json::from_str(history_of(&env, Some("work"), (true, false), west).trim())
-            .expect("JSON");
+    let doc: Value = aterm_json::from_str(history_of(&env, Some(WORK), (true, false), west).trim())
+        .expect("JSON");
     let keys: Vec<&str> = doc
         .as_object()
         .expect("an object")
@@ -346,18 +551,21 @@ fn history_json_only_adds_keys() {
         .map(String::as_str)
         .collect();
     let mut want = vec![
-        "ac", "backfill", "days", "journal", "kind", "label", "lines", "schema", "series", "span",
+        "ac", "backfill", "days", "journal", "kind", "lines", "name", "schema", "series", "slug",
+        "span",
     ];
     want.sort_unstable();
     assert_eq!(keys, want);
-    assert_eq!(doc["label"], Value::from("work"));
-    assert_eq!(doc["ac"], Value::Null);
+    assert_eq!(doc["schema"], Value::from(2u64));
+    assert_eq!(doc["ac"], Value::from(pk_of(WORK)));
+    assert_eq!(doc["slug"], Value::Null);
+    assert_eq!(doc["name"], Value::from(format!("claude {WORK}")));
     assert_eq!(doc["journal"], Value::from(false));
     assert_eq!(
         doc["lines"],
         Value::Array(vec![
-            Value::from("2025-08-12T00:00:00Z here auth work"),
-            Value::from("2025-09-20T03:00:00Z here auth work"),
+            Value::from(format!("2025-08-12T00:00:00Z here auth {}", pk_of(WORK))),
+            Value::from(format!("2025-09-20T03:00:00Z here auth {}", pk_of(WORK))),
         ]),
         "every line, as the lab model's history gave them"
     );
@@ -366,7 +574,7 @@ fn history_json_only_adds_keys() {
     assert_eq!(doc["series"]["oldest"], Value::from(env.now - 22 * H));
     assert!(doc["series"]["machine"].as_str().is_some());
     let with_rows: Value =
-        aterm_json::from_str(history_of(&env, Some("work"), (true, true), west).trim())
+        aterm_json::from_str(history_of(&env, Some(WORK), (true, true), west).trim())
             .expect("JSON");
     let stored: Vec<Value> = std::fs::read_to_string(&path)
         .expect("the series")
@@ -374,7 +582,7 @@ fn history_json_only_adds_keys() {
         .map(Value::from)
         .collect();
     assert_eq!(with_rows["rows"], Value::Array(stored));
-    let text = history_of(&env, Some("work"), (false, true), west);
+    let text = history_of(&env, Some(WORK), (false, true), west);
     for line in std::fs::read_to_string(&path).expect("the series").lines() {
         assert!(text.lines().any(|l| l == line), "{line} in {text}");
     }
@@ -382,6 +590,7 @@ fn history_json_only_adds_keys() {
     let codex_roster = env.accounts_roster_for(Cli::Codex).expect("a codex roster");
     let codex = accounts::Row {
         label: "cx".into(),
+        email: Some("cx@x.example".into()),
         ..Default::default()
     };
     std::fs::write(
@@ -394,7 +603,7 @@ fn history_json_only_adds_keys() {
     let code = crate::harness::cli::history::run(
         Cli::Codex,
         &env,
-        (Some("cx"), true, SPAN, false),
+        (Some("oai cx@x.example"), true, SPAN, false),
         west,
         &mut out,
         &mut err,
@@ -402,7 +611,8 @@ fn history_json_only_adds_keys() {
     assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
     let doc: Value = aterm_json::from_slice(&out).expect("JSON");
     assert_eq!(doc["series"], Value::from(false));
-    assert_eq!(doc["label"], Value::from("cx"));
+    assert_eq!(doc["name"], Value::from("oai cx@x.example"));
+    assert!(doc.get("label").is_none());
     assert!(doc["lines"].is_array() && doc.get("days").is_none());
 }
 
@@ -451,7 +661,7 @@ fn history_writes_nothing() {
         "a compaction would store closes"
     );
     let was = listing(tmp.path());
-    for name in [Some("work"), None] {
+    for name in [Some(WORK), None] {
         for flags in [(false, false), (true, false), (false, true), (true, true)] {
             let _ = history_of(&env, name, flags, west);
         }
@@ -531,7 +741,7 @@ fn history_holds_only_the_accounts_own_readings() {
         &machine,
         &[reading(now - 6 * H, None, Some((600, week)), None)],
     );
-    let theirs = history_of(&env, Some("now"), (false, false), |_| 0);
+    let theirs = history_of(&env, Some(NOW), (false, false), |_| 0);
     let friday = day_lines(&theirs)
         .into_iter()
         .find(|l| l.starts_with("  Fri Sep 19"))
@@ -560,7 +770,7 @@ fn history_holds_only_the_accounts_own_readings() {
     ] {
         assert!(!theirs.contains(not_a), "{not_a}: {theirs}");
     }
-    let mine = history_of(&env, Some("work"), (false, false), |_| 0);
+    let mine = history_of(&env, Some(WORK), (false, false), |_| 0);
     assert_eq!(dates(&mine), ["  Fri Sep 19", "  Sat Sep 20"], "{mine}");
     for not_b in [
         "week 70% left",
@@ -573,7 +783,7 @@ fn history_holds_only_the_accounts_own_readings() {
         assert!(!mine.contains(not_b), "{not_b}: {mine}");
     }
     assert!(mine.contains("5h 1 window, lowest 80% left"), "{mine}");
-    let by_key = history_of(&env, Some(&a.to_string()), (false, false), |_| 0);
+    let by_key = history_of(&env, Some(&pk_of(NOW)), (false, false), |_| 0);
     assert_eq!(by_key, theirs, "the key names the same account");
 }
 
@@ -605,7 +815,7 @@ fn history_reads_only_this_macs_series() {
         other,
         &[keyed(now - 30 * H, None, Some((900, now + 3 * D)), a)],
     );
-    let text = history_of(&env, Some("now"), (false, false), |_| 0);
+    let text = history_of(&env, Some(NOW), (false, false), |_| 0);
     assert_eq!(dates(&text), ["  Sat Sep 20"], "{text}");
     assert!(!text.contains("week 10% left"), "{text}");
 }
@@ -672,7 +882,7 @@ fn a_renamed_day_is_counted_once() {
             path.display()
         );
     }
-    let text = history_of(&env, Some("now"), (false, false), |_| 0);
+    let text = history_of(&env, Some(NOW), (false, false), |_| 0);
     assert_eq!(
         day_lines(&text),
         [
@@ -764,7 +974,7 @@ fn a_renamed_day_counts_the_windows_a_file_past_the_bound_holds_by_its_day_row()
                 && matches!(&close.said, Said::Close(c) if c.reset == w1)),
         "PRECONDITION: `before` holds Friday's day row and its last window's close: {rows:?}"
     );
-    let text = history_of(&env, Some("now"), (false, false), |_| 0);
+    let text = history_of(&env, Some(NOW), (false, false), |_| 0);
     assert_eq!(
         day_lines(&text),
         [
@@ -835,7 +1045,7 @@ fn a_window_two_files_closed_on_two_dates_counts_once_on_the_earlier() {
         ("2025-09-19".to_owned(), 1, 1),
         ("2025-09-20".to_owned(), 1, 0),
     ];
-    assert_eq!(windows_by_date(&env, "now"), counted, "from the readings");
+    assert_eq!(windows_by_date(&env, NOW), counted, "from the readings");
     for path in [&before, &after] {
         account_series::compact_locked(path, now, |_| 0).expect("compact");
     }
@@ -850,11 +1060,7 @@ fn a_window_two_files_closed_on_two_dates_counts_once_on_the_earlier() {
         (Some(shared), Some(began)),
         "PRECONDITION: the two files' closes of the shared window end on two dates"
     );
-    assert_eq!(
-        windows_by_date(&env, "now"),
-        counted,
-        "from the stored rows"
-    );
+    assert_eq!(windows_by_date(&env, NOW), counted, "from the stored rows");
 }
 
 /// Writes the series at `path` again with its `day` rows naming no window, as rows were written
@@ -937,7 +1143,7 @@ fn rows_written_before_they_named_their_windows_count_a_shared_window_once() {
         );
     }
     assert_eq!(
-        windows_by_date(&env, "now"),
+        windows_by_date(&env, NOW),
         [("2025-09-19".to_owned(), 2, 1)]
     );
 }
@@ -971,7 +1177,7 @@ fn a_busy_renamed_day_counts_each_window_once() {
         &[keyed(last + H, Some((400, last + 5 * H)), None, a)],
     );
     assert_eq!(
-        windows_by_date(&env, "now"),
+        windows_by_date(&env, NOW),
         [("2025-09-19".to_owned(), 7, 0)]
     );
 }
@@ -1027,7 +1233,7 @@ fn a_window_across_a_rename_counts_once_past_the_close_horizon() {
     let code = crate::harness::cli::history::run(
         Cli::Claude,
         &env,
-        (Some("now"), false, 120 * D, false),
+        (Some(NOW), false, 120 * D, false),
         |_| 0,
         &mut out,
         &mut err,
@@ -1069,7 +1275,7 @@ fn history_puts_the_open_window_on_its_rows_day() {
         },
     };
     write_series(&env, "work", &machine, &[row]);
-    let text = history_of(&env, Some("work"), (false, false), east);
+    let text = history_of(&env, Some(WORK), (false, false), east);
     assert_eq!(
         day_lines(&text),
         ["  Sun Sep 21  5h lowest 60% left, open 60% left"],
@@ -1100,7 +1306,7 @@ fn a_days_low_says_nothing_left_only_for_a_reading_of_100() {
             },
         };
         write_series(&env, "work", &machine, &[row]);
-        let text = history_of(&env, Some("work"), (false, false), east);
+        let text = history_of(&env, Some(WORK), (false, false), east);
         assert_eq!(
             day_lines(&text),
             [format!("  Sun Sep 21  5h lowest {said}, open {said}")],
@@ -1109,14 +1315,14 @@ fn a_days_low_says_nothing_left_only_for_a_reading_of_100() {
     }
 }
 
-/// A HISTORY WITHOUT A NAME FINDS A FORGOTTEN ROW'S KEY. The row `now`, keyed by the lab as
-/// `ac-…`, has no record here, but the record this Mac forgot under that lab key holds the
-/// account key its old series `before` carries: the history of every row finds that series as
-/// the named one does. Negative control: the row's lab key not passed to `key_in` (`None`, as
-/// it was) finds no account key, and the first assertion fails.
+/// A HISTORY WITHOUT A NAME FINDS A FORGOTTEN ROW'S KEY. The row `now`, keyed by its realm and
+/// address as `ac-…`, has no record here, but the record this Mac forgot under that lab key
+/// holds the account key its old series `before` carries: the history of every row finds that
+/// series as the named one does. Negative control: the row's lab key not passed to `key_in`
+/// (`None`, as it was) finds no account key, and the first assertion fails.
 #[test]
 fn history_without_a_name_finds_a_forgotten_rows_key() {
-    const PK: &str = "ac-0123456789abcdef";
+    let pk = pk_of(NOW);
     let tmp = tmp_dir("history-forgotten");
     let env = env_at(&tmp);
     let now = env.now;
@@ -1125,7 +1331,7 @@ fn history_without_a_name_finds_a_forgotten_rows_key() {
     login_made_in(&dir);
     let row = accounts::Row {
         label: "now".into(),
-        email: Some("now@example.test".into()),
+        email: Some(NOW.into()),
         dir: dir.to_str().map(str::to_owned),
         ..Default::default()
     };
@@ -1138,10 +1344,10 @@ fn history_without_a_name_finds_a_forgotten_rows_key() {
     env.accounts_store()
         .transact(env.now, &mut note, |state| {
             state.forgotten.insert(
-                PK.into(),
+                pk.clone(),
                 accounts::Account {
                     key: Some(a),
-                    pk: Some(PK.into()),
+                    pk: Some(pk.clone()),
                     ..Default::default()
                 },
             );
@@ -1155,15 +1361,175 @@ fn history_without_a_name_finds_a_forgotten_rows_key() {
         &machine,
         &[keyed(now - 30 * H, None, Some((200, now + 3 * D)), a)],
     );
-    crate::harness::journal::with_keyer(
-        |_, email| (email == "now@example.test").then(|| PK.to_owned()),
-        || {
-            let every = history_of(&env, None, (false, false), |_| 0);
-            assert_eq!(dates(&every), ["  Fri Sep 19"], "{every}");
-            let named = history_of(&env, Some("now"), (false, false), |_| 0);
-            assert_eq!(every, named, "the named history finds the same");
-        },
+    let every = history_of(&env, None, (false, false), |_| 0);
+    assert_eq!(dates(&every), ["  Fri Sep 19"], "{every}");
+    let named = history_of(&env, Some(NOW), (false, false), |_| 0);
+    assert_eq!(every, named, "the named history finds the same");
+}
+
+/// A HISTORY NAMES A LEDGER ROW'S LABEL BY THE ACCOUNT IT HELD THEN. A rotation row holds the
+/// account it went to by its row's label alone (`to=` carries no key), and a row may hold
+/// another account now than it did. A transaction stamps each ledger row about a label with the
+/// key its record holds then. `two` was Ada's row (its record held Ada's key, and a row about it
+/// written then carries it) before it was edited to its address now: a rotation to it before
+/// the edit names no account, one after (a row about it carries its key since) names its account
+/// now. `three`'s record was keyed to another account at 22:30: a rotation to it before then
+/// names none, one after names it. `four`'s record still carries Ada's key, and `five`'s carries
+/// none: a rotation to either names none. The account the row is about (`one`, which never
+/// changed hands) is named by its key throughout. Negative control: naming a label by the
+/// account its row holds now whatever the record and the ledger say (`held_then` always true)
+/// prints `to=<two's key>` at 18:00, and the assertion fails; taking a record with no key as
+/// agreeing prints `to=<five's key>` at 23:45.
+#[test]
+fn history_names_a_ledger_rows_label_by_the_account_it_held_then() {
+    const ADA: &str = "ada@x.example";
+    let tmp = tmp_dir("history-held-then");
+    let env = env_at(&tmp);
+    let now = env.now;
+    pool(&tmp, &env, &["one", "two", "three", "four", "five"], &[]);
+    let rotate = |t: i64, to: &str| {
+        let mut event = accounts::Event::new(t, accounts::Kind::Rotate, "one");
+        event.to = Some(to.to_owned());
+        event
+    };
+    let auth = |t: i64| accounts::Event::new(t, accounts::Kind::Auth, "two");
+    // Before the edit: `two`'s record holds Ada's key, which its ledger row is stamped with.
+    env.accounts_store()
+        .transact(now - 5 * H, &mut None, |state| {
+            state.accounts.entry("two".to_owned()).or_default().pk = Some(pk_of(ADA));
+            Ok(vec![rotate(now - 6 * H, "two"), auth(now - 5 * H)])
+        })
+        .expect("before the edit");
+    env.accounts_store()
+        .transact(now, &mut None, |state| {
+            state.accounts.entry("two".to_owned()).or_default().pk = Some(pk_of(&address("two")));
+            state
+                .accounts
+                .entry("three".to_owned())
+                .or_default()
+                .keyed_at = Some(now - 90 * 60);
+            state.accounts.entry("four".to_owned()).or_default().pk = Some(pk_of(ADA));
+            state.accounts.entry("five".to_owned()).or_default().pk = None;
+            Ok(vec![
+                auth(now - 4 * H),
+                rotate(now - 3 * H, "two"),
+                rotate(now - 2 * H, "three"),
+                rotate(now - H, "three"),
+                rotate(now - 30 * 60, "four"),
+                rotate(now - 15 * 60, "five"),
+            ])
+        })
+        .expect("after the edit");
+    let ledger = env.accounts_store().tail(64).expect("the ledger");
+    assert_eq!(
+        ledger
+            .iter()
+            .filter(|event| event.account == "two")
+            .map(|event| event.pk.clone())
+            .collect::<Vec<_>>(),
+        [Some(pk_of(ADA)), Some(pk_of(&address("two")))],
+        "each row about `two` carries the key its record held then"
     );
+    let doc: Value =
+        aterm_json::from_str(history_of(&env, Some(&address("one")), (true, false), |_| 0).trim())
+            .expect("JSON");
+    let (one, two, three) = (
+        pk_of(&address("one")),
+        pk_of(&address("two")),
+        pk_of(&address("three")),
+    );
+    let then = "(an account a row here held then)";
+    let lines = [
+        format!("2025-09-20T18:00:00Z here rotate {one} to={then}"),
+        format!("2025-09-20T21:00:00Z here rotate {one} to={two}"),
+        format!("2025-09-20T22:00:00Z here rotate {one} to={then}"),
+        format!("2025-09-20T23:00:00Z here rotate {one} to={three}"),
+        format!("2025-09-20T23:30:00Z here rotate {one} to={then}"),
+        format!("2025-09-20T23:45:00Z here rotate {one} to={then}"),
+    ];
+    assert_eq!(
+        doc["lines"],
+        Value::Array(lines.iter().map(|l| Value::from(l.as_str())).collect())
+    );
+    assert!(!doc.to_string().contains(&pk_of(ADA)), "{doc}");
+}
+
+/// A HISTORY REACHES AN ACCOUNT NO ROW HOLDS. A row was removed: this Mac keeps its record
+/// under `forgotten` by its lab key, with the account key its old series `old` carries. With
+/// no lab, the lab key alone names it (`Candidates::held`): its block is headed by the key, and
+/// its old series' day is found by its keys; the old label, its account key (`c-…`) and its
+/// address name nothing. Under a lab that still slugs it `claude-old-x`, its slug, its key and
+/// its address each name it, headed by its name and slug, with the same day. Negative controls:
+/// with the resolver ignoring `held`, the key with no lab is refused (`no account is named
+/// `ac-…``), and the first history fails on its exit status; with `Who::of_named` looking up
+/// the account key only for an account a row holds, the day is lost: `left: ["  nothing
+/// re"]`.
+#[test]
+fn history_reaches_an_account_no_row_holds_by_its_key_or_slug() {
+    const OLD: &str = "old@x.example";
+    let pk = pk_of(OLD);
+    let tmp = tmp_dir("history-no-row");
+    let env = env_at(&tmp);
+    let now = env.now;
+    let a = AccountKey::claude(UUID).expect("key");
+    let machine = pool(&tmp, &env, &["now"], &[]);
+    env.accounts_store()
+        .transact(now, &mut None, |state| {
+            state.forgotten.insert(
+                pk.clone(),
+                accounts::Account {
+                    key: Some(a),
+                    pk: Some(pk.clone()),
+                    ..Default::default()
+                },
+            );
+            Ok(Vec::new())
+        })
+        .expect("state");
+    write_series(
+        &env,
+        "old",
+        &machine,
+        &[keyed(now - 30 * H, None, Some((200, now + 3 * D)), a)],
+    );
+    let head = |text: &str| text.lines().nth(1).unwrap_or_default().to_owned();
+    let by_key = history_of(&env, Some(&pk), (false, false), |_| 0);
+    assert_eq!(dates(&by_key), ["  Fri Sep 19"], "{by_key}");
+    assert!(
+        head(&by_key).starts_with(&format!("{pk} \u{b7} claude \u{b7} this Mac \u{b7} ")),
+        "{by_key}"
+    );
+    for word in ["old".to_owned(), a.to_string(), OLD.to_owned()] {
+        assert_eq!(history_refused(&env, &word), no_account(&word));
+    }
+    let lab = Lab {
+        names: [(
+            pk.clone(),
+            AccountNames {
+                realm: "claude".to_owned(),
+                slug: "claude-old-x".to_owned(),
+                name: Some(format!("claude {OLD}")),
+                email: Some(OLD.to_owned()),
+                login: Some(OLD.to_owned()),
+                live: true,
+            },
+        )]
+        .into(),
+        ..Lab::default()
+    };
+    alab_roster::with_lab(lab, || {
+        for word in ["claude-old-x".to_owned(), pk.clone(), OLD.to_owned()] {
+            let text = history_of(&env, Some(&word), (false, false), |_| 0);
+            assert_eq!(dates(&text), ["  Fri Sep 19"], "{word}: {text}");
+            assert!(
+                head(&text).starts_with(&format!(
+                    "claude {OLD} (claude-old-x) \u{b7} claude \u{b7} this Mac \u{b7} "
+                )),
+                "{word}: {text}"
+            );
+        }
+        assert_eq!(history_refused(&env, "old"), no_account("old"));
+    });
 }
 
 /// A WEEK REFILLED OR RAISED IS SAID SO, NEVER A RESET USED. The week read 90% used and then, under
@@ -1194,7 +1560,7 @@ fn a_week_refilled_or_raised_is_said_so() {
         &machine,
         &[keyed(now - 30 * H, None, Some((900, week)), a), after],
     );
-    let text = history_of(&env, Some("work"), (false, false), |_| 0);
+    let text = history_of(&env, Some(WORK), (false, false), |_| 0);
     let said = format!(
         "week refilled or raised {}",
         crate::harness::account_stats::hm(refilled, 0)
@@ -1202,7 +1568,7 @@ fn a_week_refilled_or_raised_is_said_so() {
     assert_eq!(text.matches(&said).count(), 1, "{said}: {text}");
     assert!(!text.contains("reset used"), "{text}");
     let doc: Value =
-        aterm_json::from_str(history_of(&env, Some("work"), (true, false), |_| 0).trim())
+        aterm_json::from_str(history_of(&env, Some(WORK), (true, false), |_| 0).trim())
             .expect("JSON");
     let events: Vec<&Value> = doc["days"]
         .as_array()
@@ -1260,7 +1626,7 @@ fn a_five_hour_refill_names_its_window_and_a_spent_reset_says_so() {
             ])
         })
         .expect("the ledger row");
-    let text = history_of(&env, Some("work"), (false, false), |_| 0);
+    let text = history_of(&env, Some(WORK), (false, false), |_| 0);
     let at = |t| crate::harness::account_stats::hm(t, 0);
     let five_words = format!("5h refilled or raised {}", at(five_at));
     assert_eq!(text.matches(&five_words).count(), 1, "{five_words}: {text}");
@@ -1268,7 +1634,7 @@ fn a_five_hour_refill_names_its_window_and_a_spent_reset_says_so() {
     assert_eq!(text.matches(&week_words).count(), 1, "{week_words}: {text}");
     assert!(!text.contains("week refilled or raised"), "{text}");
     let doc: Value =
-        aterm_json::from_str(history_of(&env, Some("work"), (true, false), |_| 0).trim())
+        aterm_json::from_str(history_of(&env, Some(WORK), (true, false), |_| 0).trim())
             .expect("JSON");
     let events: Vec<(&Value, &Value)> = doc["days"]
         .as_array()

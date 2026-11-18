@@ -5244,6 +5244,11 @@ impl<C: Ctl> Session<'_, C> {
                 self.witness_seen = None;
                 let now = self.fx.mono();
                 self.turn_end.restarted(why, true, &r, now);
+                if matches!(why, Restart::Account { .. }) {
+                    // The move's own second dates the limit it left (`TurnEndState::limit_left`):
+                    // a notice written before it is the left account's.
+                    self.turn_end.account_made_at(self.now_unix());
+                }
                 if step.as_deref() == Some("done:fresh") {
                     self.turn_end.relaunched_afresh();
                 }

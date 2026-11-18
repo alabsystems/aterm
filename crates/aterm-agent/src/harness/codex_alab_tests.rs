@@ -13,6 +13,21 @@ fn argv(words: &[&str]) -> Vec<String> {
     words.iter().map(|w| (*w).to_string()).collect()
 }
 
+/// The [`Word`] `text` spells: an account key's or a slug's, which prints back as itself.
+fn word(text: &str) -> Word {
+    account_names::Named {
+        pk: text.to_owned(),
+        row: None,
+        names: aterm_file::AccountNames::default(),
+    }
+    .word()
+}
+
+/// The word the pin of `main` types here: its account key, as a row with no lab slug is named.
+fn main_word() -> Word {
+    word("ac-0123456789abcdef")
+}
+
 const T1: &str = "01a0dc36-1dc1-7ee2-be91-11bc323e377c";
 const T2: &str = "01a0dc3a-5c71-7143-bcee-58def0a15dfd";
 
@@ -779,15 +794,17 @@ fn under_a_pin_the_default_row_serves_only_once_that_pin_ends() {
     let until = 1_800_003_750;
     let walled = DefaultRow::Walled {
         label: "main".into(),
+        word: Some(main_word()),
         window: "five_hour".into(),
         reset: Some(1_800_003_600),
         until,
     };
     let signed_out = DefaultRow::SignedOut {
         label: "main".into(),
+        word: Some(main_word()),
         stored: true,
     };
-    let pin = unread_fix(Some("main"));
+    let pin = unread_fix(Some(&main_word()));
     let ends = crate::harness::usage::rfc3339_utc(until);
     let words = only_default_pinned(&why, "work", &walled);
     assert!(
@@ -820,29 +837,34 @@ fn under_a_pin_the_default_row_serves_only_once_that_pin_ends() {
 #[test]
 fn no_clause_of_a_refusal_starts_with_a_capital() {
     let why = AuthPathUnread::Older(PathBuf::from("/opt/codex-alab/bin/codex"));
-    let defaults = [
-        DefaultRow::Unlisted,
-        DefaultRow::Moved("main".into()),
-        DefaultRow::Serves("main".into()),
-        DefaultRow::Walled {
-            label: "main".into(),
-            window: "five_hour".into(),
-            reset: Some(1_800_003_600),
-            until: 1_800_003_750,
-        },
-        DefaultRow::SignedOut {
-            label: "main".into(),
-            stored: true,
-        },
-        DefaultRow::SignedOut {
-            label: "main".into(),
-            stored: false,
-        },
-        DefaultRow::Other {
-            label: "main".into(),
-            why: "held for another Mac's warm set".into(),
-        },
-    ];
+    let mut defaults = vec![DefaultRow::Unlisted, DefaultRow::Moved("main".into())];
+    // A row with an address and its word, and one with none, which no step pins.
+    for word in [Some(main_word()), None] {
+        defaults.extend([
+            DefaultRow::Serves("main".into(), word.clone()),
+            DefaultRow::Walled {
+                label: "main".into(),
+                word: word.clone(),
+                window: "five_hour".into(),
+                reset: Some(1_800_003_600),
+                until: 1_800_003_750,
+            },
+            DefaultRow::SignedOut {
+                label: "main".into(),
+                word: word.clone(),
+                stored: true,
+            },
+            DefaultRow::SignedOut {
+                label: "main".into(),
+                word,
+                stored: false,
+            },
+        ]);
+    }
+    defaults.extend([DefaultRow::Other {
+        label: "main".into(),
+        why: "held for another Mac's warm set".into(),
+    }]);
     for default in &defaults {
         let words = [
             only_default(&why, None, default),
@@ -862,10 +884,78 @@ fn no_clause_of_a_refusal_starts_with_a_capital() {
     }
 }
 
+/// A DEFAULT ROW WITH NO ADDRESS IS OFFERED NO PIN: no word names its account, so the words for
+/// it serving, walled or signed out, in every way a launch came by its row, type no `accounts
+/// use` but the pin's end (`use --auto`), and where they would have offered its pin (it serves,
+/// or the owner's pin on a row of its own holds every launch) they say why none is offered
+/// ([`no_pin_words`]). CONTROL: the same rows holding an address are offered their pin by its
+/// word. NEGATIVE CONTROL: with `Serves(_, None)` offering the pin of a word it does not have,
+/// it fails on `Serves("main", None)` (2026-11-16, by hand, then restored).
+#[test]
+fn a_default_row_with_no_address_is_offered_no_pin() {
+    let why = AuthPathUnread::Older(PathBuf::from("/opt/codex-alab/bin/codex"));
+    let rows = |word: Option<Word>| {
+        [
+            DefaultRow::Serves("main".into(), word.clone()),
+            DefaultRow::Walled {
+                label: "main".into(),
+                word: word.clone(),
+                window: "five_hour".into(),
+                reset: Some(1_800_003_600),
+                until: 1_800_003_750,
+            },
+            DefaultRow::SignedOut {
+                label: "main".into(),
+                word: word.clone(),
+                stored: true,
+            },
+            DefaultRow::SignedOut {
+                label: "main".into(),
+                word,
+                stored: false,
+            },
+        ]
+    };
+    let unpin = unpin_fix();
+    let pin = unread_fix(Some(&main_word()));
+    let reason = no_pin_words("main");
+    for (word, offered) in [(None, false), (Some(main_word()), true)] {
+        for default in rows(word) {
+            // Where a pin of the default row is the way out: it serves, or the owner's pin holds
+            // every launch to a row this build does not run and the row's wall or sign-in ends.
+            let pinnable = |pinned: bool| match &default {
+                DefaultRow::Serves(..) => !pinned,
+                DefaultRow::Walled { .. } | DefaultRow::SignedOut { .. } => pinned,
+                _ => false,
+            };
+            for (said, pinned) in [
+                (only_default(&why, None, &default), false),
+                (only_default(&why, Some("work"), &default), false),
+                (only_default_pinned(&why, "work", &default), true),
+                (only_default_carried(&why, "work", &default, true), false),
+                (only_default_carried(&why, "work", &default, false), false),
+            ] {
+                let rest = said.replace(&unpin, "");
+                if offered {
+                    if pinnable(pinned) {
+                        assert!(said.contains(&pin), "CONTROL: {default:?}: {said}");
+                    }
+                    continue;
+                }
+                assert!(!rest.contains("accounts use "), "{default:?}: {said}");
+                if pinnable(pinned) {
+                    assert!(said.contains(&reason), "{default:?}: {said}");
+                }
+            }
+        }
+    }
+}
+
 /// SUCH A REFUSAL LEADS WITH WHAT BLOCKS THE LAUNCH AND WHAT MENDS IT, so a stall's attention, which
 /// keeps a long refusal's first clause alone, never loses them to the program's name or a path: the
-/// row and its sign-in, its wall's end, the build that serves, the row's pin, or the pin's end.
-/// CONTROL: the whole of what it said before stays after that clause.
+/// row and its sign-in, its wall's end, the build that serves, the row's pin (by a word short enough
+/// to fit, else the report that lists the row), or the pin's end. CONTROL: the whole of what it
+/// said before stays after that clause, the pin by the account's key included.
 #[test]
 fn a_refusal_on_such_a_codex_leads_with_what_mends_it() {
     let why = AuthPathUnread::Unnamed(PathBuf::from("/Users//someone/.local/share/atpkg/codex"));
@@ -873,23 +963,27 @@ fn a_refusal_on_such_a_codex_leads_with_what_mends_it() {
     let first = |said: String| said.split_once("; ").expect("clauses").0.to_owned();
     let signed_out = DefaultRow::SignedOut {
         label: "main".into(),
+        word: Some(main_word()),
         stored: true,
     };
     let walled = DefaultRow::Walled {
         label: "main".into(),
+        word: Some(main_word()),
         window: "five_hour".into(),
         reset: None,
         until,
     };
     let opens = crate::harness::usage::rfc3339_utc(until);
     let served_by = why.served_by().to_string();
-    let use_main = unread_fix(Some("main"));
+    let use_slug = unread_fix(Some(&word("oai-m")));
+    let report = format!("`{}` lists it", Step::Report(Cli::Codex));
     let sign_in = default_sign_in();
     for (default, says) in [
         (&signed_out, ["`main`", "signed out", sign_in.as_str()]),
         (
             &DefaultRow::SignedOut {
                 label: "main".into(),
+                word: Some(main_word()),
                 stored: false,
             },
             ["`main`", "not signed in here", sign_in.as_str()],
@@ -904,8 +998,16 @@ fn a_refusal_on_such_a_codex_leads_with_what_mends_it() {
             ["no row", "login", served_by.as_str()],
         ),
         (
-            &DefaultRow::Serves("main".into()),
-            ["`main`", "runs this Codex", use_main.as_str()],
+            &DefaultRow::Serves("main".into(), Some(word("oai-m"))),
+            ["`main`", "runs this Codex", use_slug.as_str()],
+        ),
+        (
+            &DefaultRow::Serves("main".into(), Some(main_word())),
+            ["`main`", "runs this Codex", report.as_str()],
+        ),
+        (
+            &DefaultRow::Serves("main".into(), None),
+            ["`main`", "runs this Codex", report.as_str()],
         ),
         (
             &DefaultRow::Other {
@@ -938,10 +1040,11 @@ fn a_refusal_on_such_a_codex_leads_with_what_mends_it() {
 
 /// A LONG LABEL NEVER COSTS A REFUSAL ITS COMMAND: its first clause stays within a stall's room,
 /// the label cut and the command whole, up to the longest label the roster takes. A row's pin must
-/// name its whole label, so one too long to fit gives the report that lists the row. A wall keeps
+/// type its account's whole word, so one too long to fit (an account key) gives the report that
+/// lists the row. A wall keeps
 /// its end whatever its window's word. NEGATIVE CONTROL: before, a pin on `work-2` and a
-/// `personal-mac` row lost their command's end to the bound. CONTROL: a label that fits is whole
-/// and offers its own pin, and the whole words keep the pin of a label that does not.
+/// `personal-mac` row lost their command's end to the bound. CONTROL: a label and a slug that fit
+/// are whole and offer the row's pin, and the whole words keep the pin of a word that does not.
 #[test]
 fn a_long_label_never_costs_a_refusal_its_command() {
     let why = AuthPathUnread::Older(PathBuf::from("/opt/codex-alab/bin/codex"));
@@ -956,6 +1059,7 @@ fn a_long_label_never_costs_a_refusal_its_command() {
             label,
             &DefaultRow::SignedOut {
                 label: "main".into(),
+                word: Some(main_word()),
                 stored: true,
             },
         ));
@@ -966,6 +1070,7 @@ fn a_long_label_never_costs_a_refusal_its_command() {
             (
                 DefaultRow::SignedOut {
                     label: label.to_owned(),
+                    word: Some(main_word()),
                     stored: true,
                 },
                 format!("`{}`", default_sign_in()),
@@ -973,6 +1078,7 @@ fn a_long_label_never_costs_a_refusal_its_command() {
             (
                 DefaultRow::SignedOut {
                     label: label.to_owned(),
+                    word: Some(main_word()),
                     stored: false,
                 },
                 format!("`{}`", default_sign_in()),
@@ -980,6 +1086,7 @@ fn a_long_label_never_costs_a_refusal_its_command() {
             (
                 DefaultRow::Walled {
                     label: label.to_owned(),
+                    word: Some(main_word()),
                     window: "five_hour".into(),
                     reset: None,
                     until,
@@ -989,6 +1096,7 @@ fn a_long_label_never_costs_a_refusal_its_command() {
             (
                 DefaultRow::Walled {
                     label: label.to_owned(),
+                    word: Some(main_word()),
                     window: "rate_limit_reached".into(),
                     reset: None,
                     until,
@@ -1008,10 +1116,14 @@ fn a_long_label_never_costs_a_refusal_its_command() {
             assert!(lead.ends_with(&end), "{default:?}: {lead}");
         }
 
-        let said = only_default(&why, None, &DefaultRow::Serves(label.to_owned()));
+        let said = only_default(
+            &why,
+            None,
+            &DefaultRow::Serves(label.to_owned(), Some(main_word())),
+        );
         let lead = first(&said);
         assert!(lead.len() <= REFUSAL_ROOM, "{} bytes: {lead}", lead.len());
-        let pin = unread_fix(Some(label));
+        let pin = unread_fix(Some(&main_word()));
         assert!(said.contains(&pin), "CONTROL: {said}");
         if lead.contains(&pin) {
             assert_eq!(
@@ -1031,16 +1143,16 @@ fn a_long_label_never_costs_a_refusal_its_command() {
         first(&only_default(
             &why,
             None,
-            &DefaultRow::Serves("work-2".into())
+            &DefaultRow::Serves("work-2".into(), Some(word("oai-w")))
         ))
-        .contains(&unread_fix(Some("work-2"))),
-        "CONTROL: a short label is offered its own pin"
+        .contains(&unread_fix(Some(&word("oai-w")))),
+        "CONTROL: a short label and slug are offered its own pin"
     );
     assert!(
         !first(&only_default(
             &why,
             None,
-            &DefaultRow::Serves(longest.clone())
+            &DefaultRow::Serves(longest.clone(), Some(main_word()))
         ))
         .contains(&longest),
         "a long label is cut"

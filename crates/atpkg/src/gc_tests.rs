@@ -44,7 +44,9 @@ fn live_from_claims_reconciles_the_two_views() {
 }
 
 #[test]
-fn reclaimable_keeps_current_plus_one_rollback() {
+/// The retention rule a vendor-direct program's gc applies: the live build and the highest older
+/// one a signed yank may land on.
+fn reclaimable_keeps_current_plus_the_build_a_yank_lands_on() {
     let rows: [(&[u64], &[u64], &str); 4] = [
         (
             &[16, 17, 18, 19],
@@ -64,7 +66,7 @@ fn reclaimable_keeps_current_plus_one_rollback() {
         ),
     ];
     for (installed, reclaimed, why) in rows {
-        let got = reclaimable(installed, &live("ay", 19), &|_| true);
+        let got = reclaimable(installed, &live("claude", 19), &|_| true);
         assert_eq!(got, reclaimed, "{why}");
         assert!(
             !got.contains(&19),
@@ -120,6 +122,16 @@ fn seed_partial(layout: &Layout, program: &str, build: u64) -> PathBuf {
     dir
 }
 
+/// Keep superseded `build` from reclaim the way a tree's trust.lock does: a resolution within
+/// the keep window. With no rollback build (RL-29), this is how a test holds an older build
+/// on disk to exercise what gc does with one it keeps.
+fn keep_by_lock(layout: &Layout, program: &str, build: u64) {
+    let mark = layout
+        .build_dir(program, build)
+        .with_file_name(format!("{build}{}", crate::trust_lock::LOCKED_SUFFIX));
+    std::fs::write(mark, b"").unwrap();
+}
+
 fn seed_scratch(layout: &Layout, program: &str, name: &str) -> PathBuf {
     let dir = layout.prefix.join("store").join(program).join(name);
     std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -127,22 +139,25 @@ fn seed_scratch(layout: &Layout, program: &str, name: &str) -> PathBuf {
     dir
 }
 
+/// RL-29: a program the signed index serves is fixed forward, so gc keeps its live build and
+/// nothing older, a complete, runnable one just below it included.
 #[test]
-fn run_keeps_current_and_rollback_reclaims_the_rest() {
+fn reclaimable_keeps_only_the_live_build_of_an_index_program() {
     let l = layout("run-keeps");
     for b in [16u64, 17, 18] {
         seed(&l, "ay", b, false);
     }
     seed(&l, "ay", 19, true);
     let report = run(&l, None);
-    assert_eq!(report.reclaimed, vec![("ay".to_string(), vec![16u64, 17])]);
+    assert_eq!(
+        report.reclaimed,
+        vec![("ay".to_string(), vec![16u64, 17, 18])]
+    );
     assert!(report.diverged.is_empty(), "the two views agree");
-    for gone in [16u64, 17] {
+    for gone in [16u64, 17, 18] {
         assert!(!l.build_dir("ay", gone).exists(), "{gone} reclaimed");
     }
-    for keep in [18u64, 19] {
-        assert!(l.build_dir("ay", keep).exists(), "{keep} survives");
-    }
+    assert!(l.build_dir("ay", 19).exists(), "the live build survives");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -164,8 +179,8 @@ fn run_keeps_current_and_rollback_reclaims_the_rest() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// A build a tree's trust.lock resolved within the keep window survives gc though it is
-/// neither current nor the rollback; the same build unmarked, or marked past the window, goes.
+/// A build a tree's trust.lock resolved within the keep window survives gc though it is not
+/// current; the same build unmarked, or marked past the window, goes.
 #[test]
 fn run_keeps_a_build_a_lock_resolved_lately() {
     let l = layout("run-locked");
@@ -178,7 +193,7 @@ fn run_keeps_a_build_a_lock_resolved_lately() {
         .with_file_name(format!("16{}", crate::trust_lock::LOCKED_SUFFIX));
     std::fs::write(&mark, b"").unwrap();
     let report = run(&l, None);
-    assert_eq!(report.reclaimed, vec![("ay".to_string(), vec![17u64])]);
+    assert_eq!(report.reclaimed, vec![("ay".to_string(), vec![17u64, 18])]);
     assert!(l.build_dir("ay", 16).exists(), "the locked build survives");
     let stale = std::time::SystemTime::now()
         - crate::trust_lock::LOCKED_KEEP
@@ -354,7 +369,10 @@ fn two_programs_on_one_channel_are_both_reclaimed() {
     let report = run(&l, None);
     assert_eq!(
         report.reclaimed,
-        vec![("ay".to_string(), vec![16u64, 17])],
+        vec![
+            ("ay".to_string(), vec![16u64, 17, 18]),
+            ("ny".to_string(), vec![6u64])
+        ],
         "ay must still be witnessed after ny was activated"
     );
     assert!(
@@ -362,7 +380,7 @@ fn two_programs_on_one_channel_are_both_reclaimed() {
         "neither program is contested: {:?}",
         report.diverged
     );
-    for keep in [("ay", 18u64), ("ay", 19), ("ny", 6), ("ny", 7)] {
+    for keep in [("ay", 19u64), ("ny", 7)] {
         assert!(
             l.build_dir(keep.0, keep.1).exists(),
             "{}@{} survives",
@@ -420,7 +438,7 @@ fn a_retired_channel_link_is_swept_and_is_never_a_witness() {
     activate_build(&l, &b19).unwrap();
     assert_eq!(
         run(&l, None).reclaimed,
-        vec![("ay".to_string(), vec![17u64])]
+        vec![("ay".to_string(), vec![17u64, 18])]
     );
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
@@ -465,11 +483,11 @@ fn a_shim_into_a_lookalike_store_outside_the_prefix_claims_nothing() {
     let report = run(&l, None);
     assert_eq!(
         report.reclaimed,
-        vec![("ay".to_string(), vec![17u64])],
+        vec![("ay".to_string(), vec![17u64, 18])],
         "a target outside <prefix>/store is not a claim about ay"
     );
     assert!(report.diverged.is_empty(), "{:?}", report.diverged);
-    assert!(l.build_dir("ay", 18).exists() && l.build_dir("ay", 19).exists());
+    assert!(l.build_dir("ay", 19).exists());
     let _ = std::fs::remove_dir_all(&devco);
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
@@ -488,13 +506,11 @@ fn an_unclaimed_partial_tree_is_swept_and_never_counted_as_a_reclaim() {
     assert_eq!(report.swept_partial, vec![("ay".to_string(), vec![20u64])]);
     assert_eq!(
         report.reclaimed,
-        vec![("ay".to_string(), vec![16u64, 17])],
+        vec![("ay".to_string(), vec![16u64, 17, 18])],
         "an ordinary reclaim must not absorb the sweep"
     );
     assert!(report.diverged.is_empty(), "{:?}", report.diverged);
-    for keep in [18u64, 19] {
-        assert!(l.build_dir("ay", keep).exists(), "{keep} survives");
-    }
+    assert!(l.build_dir("ay", 19).exists(), "19 survives");
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
@@ -532,7 +548,6 @@ fn a_live_build_that_lost_its_marker_is_claimed_and_never_swept() {
         report.swept_partial
     );
     assert!(b19.exists(), "the live tree must survive losing its marker");
-    assert!(l.build_dir("ay", 18).exists(), "and so must its rollback");
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
@@ -583,7 +598,6 @@ fn stage_scratch_of_a_killed_install_is_swept_by_name_not_by_build() {
         l.build_dir("ay", 19).exists(),
         "the live build survives the sweep of its own scratch"
     );
-    assert!(l.build_dir("ay", 18).exists());
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
@@ -673,9 +687,9 @@ fn a_lookalike_directory_survives_a_gc_pass() {
 }
 
 #[test]
-fn a_marker_bearing_lookalike_cannot_displace_the_rollback_target() {
+fn a_marker_bearing_lookalike_is_never_taken_for_a_build() {
     let l = layout("lookalike-rollback-slot");
-    let real_rollback = seed(&l, "ay", 17, false);
+    let superseded = seed(&l, "ay", 17, false);
     seed(&l, "ay", 25, true);
     let lookalike = l.prefix.join("store").join("ay").join("+19");
     std::fs::create_dir_all(lookalike.join("bin")).unwrap();
@@ -693,15 +707,13 @@ fn a_marker_bearing_lookalike_cannot_displace_the_rollback_target() {
     let report = run(&l, None);
 
     assert!(
-        real_rollback.exists(),
-        "the real rollback target was reclaimed to make room for a build number that \
-         never existed: {:?}",
-        report.reclaimed
+        !superseded.exists(),
+        "the real superseded build is reclaimed"
     );
-    assert!(
-        report.reclaimed.is_empty(),
-        "nothing here is reclaimable: {:?}",
-        report.reclaimed
+    assert_eq!(
+        report.reclaimed,
+        vec![("ay".to_string(), vec![17u64])],
+        "only the real build is reclaimed"
     );
     assert!(
         lookalike.exists(),
@@ -869,7 +881,6 @@ fn a_tree_parked_by_a_killed_swap_is_moved_back_not_swept() {
         !crate::store::build_is_complete(&build19),
         "recovery must never claim a completeness it cannot prove"
     );
-    assert!(l.build_dir("ay", 18).exists(), "and 18 is untouched");
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
@@ -994,7 +1005,11 @@ fn the_scoped_sweep_touches_only_its_programs() {
     let report = run(&l, None);
     assert!(!resume.exists() && !l.build_dir("ay", 16).exists());
     assert!(!other_partial.exists());
-    assert!(report.reclaimed.contains(&(String::from("ay"), vec![16])));
+    assert!(
+        report
+            .reclaimed
+            .contains(&(String::from("ay"), vec![16, 17]))
+    );
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
@@ -1185,7 +1200,7 @@ fn an_unreadable_process_table_keeps_every_agent_and_toolchain_build() {
     }
     seed(&l, "trust", 9192, true);
     let report = run_with(&l, &|_| None, &|| None);
-    assert_eq!(report.reclaimed, vec![("ay".to_string(), vec![16u64])]);
+    assert_eq!(report.reclaimed, vec![("ay".to_string(), vec![16u64, 17])]);
     assert!(l.build_dir("codex", 18).exists());
     assert!(
         l.build_dir("trust", 8580).exists(),
@@ -1195,7 +1210,7 @@ fn an_unreadable_process_table_keeps_every_agent_and_toolchain_build() {
     assert!(
         report
             .reclaimed
-            .contains(&("trust".to_string(), vec![8580u64])),
+            .contains(&("trust".to_string(), vec![8580u64, 8590])),
         "{:?}",
         report.reclaimed
     );
@@ -1239,6 +1254,8 @@ fn gc_lays_an_unused_toolchain_build_aside_and_never_the_active_one() {
     let live = seed_toolchain(&l, "trust", 9192, true);
     let plain = seed(&l, "ay", 17, false);
     seed(&l, "ay", 18, true);
+    keep_by_lock(&l, "trust", 8590);
+    keep_by_lock(&l, "ay", 17);
     assert_eq!(
         exposed(&l),
         [
@@ -1283,6 +1300,8 @@ fn a_toolchain_build_in_use_leased_or_unaccounted_for_stays_where_it_is() {
     seed_toolchain(&l, "trust", 9192, true);
     let mc = seed_toolchain(&l, "trust-mc", 6, false);
     seed_toolchain(&l, "trust-mc", 7, true);
+    keep_by_lock(&l, "trust", 8590);
+    keep_by_lock(&l, "trust-mc", 6);
 
     let exe = old.join("bin/trust");
     let report = run_with(&l, &|_| None, &|| Some(vec![exe.clone()]));
@@ -1310,7 +1329,15 @@ fn a_toolchain_build_in_use_leased_or_unaccounted_for_stays_where_it_is() {
         report.laid_aside.is_empty() && is_real_dir(&old),
         "a run holds it"
     );
-    assert!(report.leased.is_empty(), "a move reclaims nothing to keep");
+    // Every superseded build is a reclaim candidate (RL-29), so the run's lease is reported.
+    assert_eq!(
+        report.leased,
+        vec![(
+            "trust".to_string(),
+            8590,
+            crate::lease::Holders::Held(vec!["a run in /w".to_string()])
+        )]
+    );
     lease.release();
 
     let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
@@ -1378,6 +1405,7 @@ fn every_resolver_reads_a_build_through_its_link() {
     let oldest = seed_toolchain(&l, "trust", 8580, false);
     let old = seed_toolchain(&l, "trust", 8590, false);
     seed_toolchain(&l, "trust", 9192, true);
+    keep_by_lock(&l, "trust", 8590);
     for dir in [&oldest, &old] {
         crate::store::lay_aside(dir).unwrap();
     }
@@ -1439,7 +1467,10 @@ fn gc_reclaims_a_build_laid_aside_link_and_folder_both() {
     assert!(is_link(&oldest) && is_real_dir(&aside));
 
     let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
-    assert_eq!(report.reclaimed, vec![("trust".to_string(), vec![8580u64])]);
+    assert_eq!(
+        report.reclaimed,
+        vec![("trust".to_string(), vec![8580u64, 8590])]
+    );
     assert!(
         std::fs::symlink_metadata(&oldest).is_err(),
         "the link is gone"
@@ -1459,6 +1490,7 @@ fn gc_puts_a_crashed_aside_in_order() {
     let dangling = seed_toolchain(&l, "trust", 8595, false);
     let partial = seed_toolchain(&l, "trust", 8597, false);
     seed_toolchain(&l, "trust", 9192, true);
+    keep_by_lock(&l, "trust", 8590);
     for dir in [&relinked, &dangling, &partial] {
         crate::store::lay_aside(dir).unwrap();
     }
@@ -1501,7 +1533,10 @@ fn a_leased_build_is_kept_until_its_run_ends() {
     )
     .unwrap();
     let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
-    assert_eq!(report.reclaimed, vec![("trust".to_string(), vec![8580u64])]);
+    assert_eq!(
+        report.reclaimed,
+        vec![("trust".to_string(), vec![8580u64, 8595])]
+    );
     assert!(crate::store::build_is_complete(&l.build_dir("trust", 8590)));
     assert_eq!(
         report.leased,
@@ -1549,11 +1584,13 @@ fn an_unreadable_lease_directory_keeps_every_candidate() {
         "NOT RUN as written: this process reads a 0000 directory (root?)"
     );
     assert!(report.reclaimed.is_empty(), "{:?}", report.reclaimed);
-    assert_eq!(report.leased.len(), 1, "{:?}", report.leased);
-    assert!(matches!(
-        report.leased[0].2,
-        crate::lease::Holders::Unknown(_)
-    ));
+    assert_eq!(report.leased.len(), 2, "{:?}", report.leased);
+    assert!(
+        report
+            .leased
+            .iter()
+            .all(|(_, _, holders)| matches!(holders, crate::lease::Holders::Unknown(_)))
+    );
     assert!(l.build_dir("ay", 16).exists());
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
@@ -1582,7 +1619,7 @@ fn a_live_process_keeps_any_programs_build_and_the_table_is_read_once() {
     assert_eq!(
         report.reclaimed,
         vec![
-            ("ay".to_string(), vec![17u64]),
+            ("ay".to_string(), vec![17u64, 18]),
             ("codex".to_string(), vec![17u64, 18])
         ],
         "16 runs `ay`: kept"
@@ -1603,7 +1640,10 @@ fn a_trust_build_running_from_its_exec_root_is_not_reclaimed() {
     std::fs::create_dir_all(root.join("bin")).unwrap();
     let exe = root.join("bin/trustc");
     let report = run_with(&l, &|_| None, &|| Some(vec![exe.clone()]));
-    assert_eq!(report.reclaimed, vec![("trust".to_string(), vec![8580u64])]);
+    assert_eq!(
+        report.reclaimed,
+        vec![("trust".to_string(), vec![8580u64, 8595])]
+    );
     assert!(l.build_dir("trust", 8590).exists());
     let _ = std::fs::remove_dir_all(&l.prefix);
 }

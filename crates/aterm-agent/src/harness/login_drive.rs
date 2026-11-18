@@ -1390,6 +1390,12 @@ pub struct Request<'a> {
     pub route: &'static Route,
     /// The row.
     pub row: &'a super::accounts::Row,
+    /// The word the steps this sign-in leaves name the row by, among the roster the caller holds
+    /// ([`super::account_names::RowName::word`]: the slug, or the key where a roster row is
+    /// labelled with the slug), so a stop names it as the caller's own lines do; `None` where the
+    /// caller holds no roster, whose stop names the row by its account's key
+    /// ([`super::account_names::key_word_of_row`]).
+    pub word: Option<&'a super::account_names::Word>,
     /// The staging directory: the child's home.
     pub staging: &'a Path,
     /// The CLI's store, whose directory holds the opener-free `PATH`.
@@ -1879,8 +1885,7 @@ pub fn sign_in_live_scoped(
     let program = program_of(req.cli, home);
     let mut approver = super::headless_oauth::VendorApprover::new(
         req.cli,
-        &req.row.label,
-        req.row.email.as_deref(),
+        (req.row, req.word),
         &req.store.shared_dir(),
         Some(home),
     )
@@ -1906,8 +1911,7 @@ pub(in crate::harness) fn sign_in_live_scoped_custody(
     let program = program_of(req.cli, home);
     let mut approver = super::headless_oauth::VendorApprover::new(
         req.cli,
-        &req.row.label,
-        req.row.email.as_deref(),
+        (req.row, req.word),
         &req.store.shared_dir(),
         Some(home),
     )
@@ -2045,7 +2049,7 @@ pub fn off_this_desk(
     })
 }
 
-/// `accounts login <label> --cli <id>`'s command: `req`'s sign-in on this terminal, kept off
+/// `accounts login <account> --cli <id>`'s command: `req`'s sign-in on this terminal, kept off
 /// this machine's desk over SSH (`over_ssh`) as [`off_this_desk`] says, its environment
 /// [`child_env`]'s with the `PATH` that gives; a route that calls back to this machine runs as
 /// the CLI's device route there ([`login_route`]). A Codex browser route runs `codex login`,

@@ -752,8 +752,11 @@ fn a_failing_sync_waits_for_its_inputs_to_change() {
         Err(format!("no fetch in a test: {source}"))
     };
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
-    let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let (cooldown, rediscovery) = (
+        Watched::new("accounts_sync/sync_cooldown", None),
+        Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
+    );
+    let guard = AutoRenewGuard::default().shared();
     let mut fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
     let logged = Arc::new(Mutex::new(Vec::<String>::new()));
     let into = Arc::clone(&logged);
@@ -762,7 +765,7 @@ fn a_failing_sync_waits_for_its_inputs_to_change() {
         upkeep_claude(
             &desk.home,
             &desk.state,
-            (&desk.roster(), now, UpkeepStep::Sync),
+            (&desk.roster(), trace::Now::at(now), UpkeepStep::Sync),
             &fx,
         );
     };

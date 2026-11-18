@@ -13,13 +13,11 @@ use crate::transport::{self, Source};
 use crate::vault_txt::VaultTxt;
 #[cfg(unix)]
 use crate::wake::{Bell, Wake};
-#[cfg(all(target_os = "macos", not(test)))]
+#[cfg(target_os = "macos")]
 use aterm_uds::lan::{self, LanError};
 #[cfg(any(all(test, unix), target_os = "macos"))]
 use aterm_uds::lan::{Event, Instance};
 use std::path::Path;
-#[cfg(unix)]
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(unix)]
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -35,7 +33,7 @@ pub const MAX_CANDIDATES: usize = 16;
 pub const MAX_MEMBERS: usize = 64;
 
 /// The domain every browse and resolve here names: mDNS's own.
-#[cfg(all(target_os = "macos", not(test)))]
+#[cfg(target_os = "macos")]
 const DOMAIN: &str = "local.";
 
 /// One `_alab-vault._tcp` service target resolved on the local network.
@@ -812,10 +810,16 @@ fn holding(service: &str) -> (Duration, usize) {
 /// watch rings only at the add of a member heard once every member but this process's own was
 /// unheard for longer than [`SILENCE`], or before it held any: this Mac back on a LAN, not a
 /// peer's comings and goings. Adds of this process's own instances ring nothing, and nor do those
-/// a browse hears within the watch's settle window. Dropping it ends the browse.
+/// a browse hears within the watch's settle window. Dropping it ends the browse: its thread
+/// makes each of its waits beside the read end of a pipe whose write end the watch holds (a
+/// broker exchange under way finishes first). While its browse runs, and while no broker's
+/// socket is there or the broker there refused this process or speaks another protocol, none of
+/// them has a timer; the rest keep the backoffs [`browse_standing`] names.
 #[cfg(unix)]
 pub struct Watch {
     watched: Arc<Watched>,
+    /// The write end of the standing browse's pipe, where one runs ([`standing`]).
+    closing: Option<std::io::PipeWriter>,
 }
 
 #[cfg(unix)]
@@ -869,7 +873,15 @@ struct Watched {
     peers_from: AtomicUsize,
     /// Where the next [`Watch::alab_holders`] starts its own cut of eligible holders.
     holders_from: AtomicUsize,
-    closed: AtomicBool,
+    /// Each wait its standing browse made ([`browse_standing`]), in order, for a test to read.
+    #[cfg(all(test, target_os = "macos"))]
+    waits: Mutex<Vec<Waited>>,
+    /// Told at each of [`Watched::waits`].
+    #[cfg(all(test, target_os = "macos"))]
+    waited: std::sync::Condvar,
+    /// The first restart backoff its standing browse waits ([`RESTART_FIRST`]; a test's own).
+    #[cfg(all(test, target_os = "macos"))]
+    restart_first: Duration,
     /// What [`Watch::adverts`] resolves through in place of a service resolve, a test's.
     #[cfg(any(test, debug_assertions))]
     resolve: Option<Resolver>,
@@ -914,23 +926,32 @@ impl Watch {
     }
 
     /// A watch of `watched` whose standing browse runs on its own thread on macOS outside a test
-    /// build ([`browse_standing`]); elsewhere, idle.
+    /// build ([`standing`]); elsewhere, idle.
     fn running(watched: Watched) -> Watch {
-        let watch = Watch {
-            watched: Arc::new(watched),
-        };
+        let watched = Arc::new(watched);
         #[cfg(all(target_os = "macos", not(test)))]
-        {
-            let service = watch.watched.service;
-            let watched = Arc::clone(&watch.watched);
-            if let Err(error) = std::thread::Builder::new()
-                .name(format!("browse {service}"))
-                .spawn(move || browse_standing(&watched))
-            {
-                crate::log_line(&format!("could not start browsing {service}: {error}"));
-            }
-        }
-        watch
+        let closing = standing(&watched, |browse| browse());
+        #[cfg(not(all(target_os = "macos", not(test))))]
+        let closing = None;
+        Watch { watched, closing }
+    }
+
+    /// Seam: [`Watch::start_for`] whose standing browse runs in a test build too, inside `run`,
+    /// which is handed the browse to run on the watch's thread (under the test's LAN broker,
+    /// `aterm_uds::lan::seam_here`), its first restart backoff `restart_first`.
+    #[cfg(all(test, target_os = "macos"))]
+    fn browsing(
+        service: &'static str,
+        bell: &Arc<Bell>,
+        own: &[&str],
+        restart_first: Duration,
+        run: impl FnOnce(&dyn Fn()) + Send + 'static,
+    ) -> Watch {
+        let mut watched = Watched::new(service, Some(service.to_owned()), bell, own);
+        watched.restart_first = restart_first;
+        let watched = Arc::new(watched);
+        let closing = standing(&watched, run);
+        Watch { watched, closing }
     }
 
     /// An `_alab-vault._tcp` watch that runs no browse ([`Watch::idle_for`]).
@@ -945,6 +966,7 @@ impl Watch {
     pub fn idle_for(service: &'static str, bell: &Arc<Bell>, own: &[&str]) -> Watch {
         Watch {
             watched: Arc::new(Watched::new(service, Some(service.to_owned()), bell, own)),
+            closing: None,
         }
     }
 
@@ -962,6 +984,7 @@ impl Watch {
         watched.resolve = Some(Box::new(resolve));
         Watch {
             watched: Arc::new(watched),
+            closing: None,
         }
     }
 
@@ -979,6 +1002,7 @@ impl Watch {
         watched.resolve_vaults = Some(Box::new(resolve));
         Watch {
             watched: Arc::new(watched),
+            closing: None,
         }
     }
 
@@ -1228,7 +1252,12 @@ impl Watched {
             found_from: AtomicUsize::new(0),
             peers_from: AtomicUsize::new(0),
             holders_from: AtomicUsize::new(0),
-            closed: AtomicBool::new(false),
+            #[cfg(all(test, target_os = "macos"))]
+            waits: Mutex::new(Vec::new()),
+            #[cfg(all(test, target_os = "macos"))]
+            waited: std::sync::Condvar::new(),
+            #[cfg(all(test, target_os = "macos"))]
+            restart_first: RESTART_FIRST,
             #[cfg(any(test, debug_assertions))]
             resolve: None,
             #[cfg(test)]
@@ -1355,68 +1384,195 @@ impl Watched {
 
 #[cfg(unix)]
 impl Drop for Watch {
-    /// The standing browse sees the watch closed within [`LOOK_CLOSED_EVERY`] and ends its
-    /// request to the broker.
+    /// Close the standing browse's pipe: its thread, which makes each of its waits beside the
+    /// read end ([`browse_standing`]), ends at its wait, and with it its request to the broker.
     fn drop(&mut self) {
-        self.watched.closed.store(true, Ordering::SeqCst);
+        drop(self.closing.take());
     }
 }
 
-/// The first pause before a standing browse that ended (or could not start for a reason other
-/// than the broker's absence) starts again, doubled each time it ends within [`RESTART_LONGEST`]
-/// of its start, up to that.
+/// Run `watched`'s standing browse ([`browse_standing`]) on a thread of its own, inside `run`
+/// (which is handed the browse to run), beside the read end of a pipe whose write end it returns
+/// for the watch to hold: dropping that end ends the browse. `None`, said in the log, where the
+/// pipe or the thread could not be made.
+#[cfg(target_os = "macos")]
+fn standing(
+    watched: &Arc<Watched>,
+    run: impl FnOnce(&dyn Fn()) + Send + 'static,
+) -> Option<std::io::PipeWriter> {
+    use std::os::fd::AsFd as _;
+    let service = watched.service;
+    let (closing, open) = match aterm_uds::pipe() {
+        Ok(ends) => ends,
+        Err(error) => {
+            crate::log_line(&format!("could not start browsing {service}: {error}"));
+            return None;
+        }
+    };
+    let watched = Arc::clone(watched);
+    let spawned = std::thread::Builder::new()
+        .name(format!("browse {service}"))
+        .spawn(move || run(&|| browse_standing(&watched, closing.as_fd())));
+    match spawned {
+        Ok(_) => Some(open),
+        Err(error) => {
+            crate::log_line(&format!("could not start browsing {service}: {error}"));
+            None
+        }
+    }
+}
+
+/// The first pause before a standing browse that ended (or could not start, a broker there that
+/// could not answer it) starts again, doubled each time it ends within [`RESTART_LONGEST`] of its
+/// start, up to that.
 #[cfg(any(all(test, unix), target_os = "macos"))]
 const RESTART_FIRST: Duration = Duration::from_secs(5);
 #[cfg(any(all(test, unix), target_os = "macos"))]
 const RESTART_LONGEST: Duration = Duration::from_secs(60);
 
-/// How often a standing browse asks again while the LAN broker is unavailable: its socket is
-/// what it waits for (setup's Mac password installs it), and a browse starts as soon as it
-/// answers, never on the doubled backoff of a browse that ran and ended.
-#[cfg(any(all(test, unix), target_os = "macos"))]
+/// How long a standing browse that found no broker waits before it asks again, where it cannot
+/// watch the broker's socket for one to arrive ([`lan::Arrivals`]); and the most it sleeps where
+/// poll(2) itself cannot be asked ([`Standing::wait`]).
+#[cfg(target_os = "macos")]
 const BROKER_PAUSE: Duration = Duration::from_secs(2);
-
-/// How long the standing browse waits for an event before it looks whether its watch was
-/// dropped.
-#[cfg(all(target_os = "macos", not(test)))]
-const LOOK_CLOSED_EVERY: Duration = Duration::from_secs(1);
 
 /// How a standing browse's last start went ([`restart_pause`]).
 #[cfg(any(all(test, unix), target_os = "macos"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Started {
-    /// The LAN broker was unavailable: nothing started.
+    /// No broker answered in a way only its next generation ends ([`waits_for_broker`]):
+    /// nothing started.
     NoBroker,
-    /// It started (and ran this long before it ended), or failed for another reason.
+    /// It started (and ran this long before it ended), or a broker there could not answer it.
     Ran(Duration),
 }
 
 /// How long a standing browse waits before it starts again after `last`, given the backoff
-/// `pause` it holds, and the backoff the next end gets: the broker's absence waits
-/// [`BROKER_PAUSE`] and leaves the backoff at [`RESTART_FIRST`]; another end waits `pause`
-/// (reset to [`RESTART_FIRST`] once a browse ran [`RESTART_LONGEST`]) and doubles it, up to that.
+/// `pause` it holds, and the backoff the next end gets: the broker's absence waits for a broker
+/// to arrive, with no timer of its own (`None`, [`Standing::wait_for_broker`]), and leaves the
+/// backoff at [`RESTART_FIRST`]; another end waits `pause` (reset to [`RESTART_FIRST`] once a
+/// browse ran [`RESTART_LONGEST`]) and doubles it, up to that.
 #[cfg(any(all(test, unix), target_os = "macos"))]
-fn restart_pause(last: Started, pause: Duration) -> (Duration, Duration) {
+fn restart_pause(last: Started, pause: Duration) -> (Option<Duration>, Duration) {
     match last {
-        Started::NoBroker => (BROKER_PAUSE, RESTART_FIRST),
+        Started::NoBroker => (None, RESTART_FIRST),
         Started::Ran(ran) => {
             let pause = if ran >= RESTART_LONGEST {
                 RESTART_FIRST
             } else {
                 pause
             };
-            (pause, pause.saturating_mul(2).min(RESTART_LONGEST))
+            (Some(pause), pause.saturating_mul(2).min(RESTART_LONGEST))
         }
     }
 }
 
+/// Whether a browse that could not start for `error` waits for its broker's next generation
+/// ([`Standing::wait_for_broker`]) rather than out the restart backoff: every broker that did not
+/// answer but one that did not judge this process (its code check did not finish, or it was
+/// serving its most connections) and an exchange that failed, which a live broker can pass with
+/// nothing heard. A socket there that refuses connections is a broker that went, which leaves its
+/// socket behind (one that starts clears it and binds its socket again), or one between its bind
+/// and its listen, which [`lan::Arrivals`] asks again on its own backoff while that generation
+/// stays unanswered.
+#[cfg(target_os = "macos")]
+fn waits_for_broker(error: &LanError) -> bool {
+    !matches!(
+        error,
+        LanError::Unavailable(aterm_uds::lan::Unavailable::Unchecked(_)) | LanError::Io(_)
+    )
+}
+
+/// What a standing browse's thread waits for ([`Standing::wait`]).
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Why {
+    /// The running browse's next frame, beside its connection.
+    Frames,
+    /// The end of a restart's backoff, beside the broker's arrivals where they are watched.
+    Restart,
+    /// A broker's arrival, beside the events of its socket's folder where they are watched, and
+    /// a change of macOS's record of this process's Local Network allowance where it has one.
+    Broker,
+}
+
+/// macOS's record of this process's Local Network allowance ([`lan::direct::record`]), heard by a
+/// [`aterm_uds::file_watch::FileWatch`] that rings a doorbell at each change of it: an Allow
+/// given while no broker answers (to a program in a tab, which macOS holds aterm responsible for)
+/// opens this process's direct path, which a browse asked again takes. The watch's first look
+/// rings too, so the browse is asked once more after the watch is armed, and an Allow given
+/// between the browse that found no broker and the arming is not lost.
+#[cfg(target_os = "macos")]
+struct Allowance {
+    rung: Arc<aterm_uds::ready::Doorbell>,
+    _watch: aterm_uds::file_watch::FileWatch,
+}
+
+#[cfg(target_os = "macos")]
+impl Allowance {
+    /// A watch of this thread's allowance record, for the browse of `service`: `None` where this
+    /// process has no direct path or its path names no record, and, said in the log, where the
+    /// watch could not start.
+    fn watch(service: &str) -> Option<Self> {
+        let record = lan::direct::record()?;
+        let watched = aterm_uds::ready::Doorbell::new().and_then(|rung| {
+            let rung = Arc::new(rung);
+            let ringing = Arc::clone(&rung);
+            let watch = aterm_uds::file_watch::FileWatch::platform(
+                &format!("allowance {service}"),
+                Box::new(move |_| ringing.ring()),
+            )?;
+            watch.watch(0, record);
+            Ok(Self {
+                rung,
+                _watch: watch,
+            })
+        });
+        watched
+            .inspect_err(|error| {
+                crate::log_line(&format!(
+                    "browsing {service}: macOS's Local Network allowance is not watched: {error}"
+                ));
+            })
+            .ok()
+    }
+}
+
+/// One wait of a standing browse's thread ([`Standing::wait`]), noted in order for a test: what
+/// it waited for, and the very timeout it handed poll(2), `None` for none. Every one is beside
+/// the watch's pipe.
+#[cfg(all(test, target_os = "macos"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Waited(Why, Option<Duration>);
+
+#[cfg(all(test, target_os = "macos"))]
+impl Watched {
+    /// Note one wait of the standing browse.
+    fn waited(&self, waited: Waited) {
+        self.waits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(waited);
+        self.waited.notify_all();
+    }
+}
+
 /// Browse `<type> local.` (the watch's [`Watched::browsed`] type) through the LAN broker for
-/// `watched` until the watch is dropped, starting it again whenever it ends (mDNSResponder
-/// restarted, or the broker did) or cannot start (no broker yet: [`restart_pause`]), and hand it
-/// each event. A browse that ended heard nothing more, so what it heard is forgotten, and the
-/// next one's settle window begins with it. A watch with no type to browse browses nothing.
-#[cfg(all(target_os = "macos", not(test)))]
-fn browse_standing(watched: &Watched) {
+/// `watched` until `closing` (the read end of the watch's pipe, [`standing`]) is readable,
+/// starting it again whenever it ends (mDNSResponder restarted, or the broker did) or cannot
+/// start, and hand it each event. Every wait goes through [`Standing::wait`], beside `closing`. A
+/// running browse waits for its next frame with no timer. One that found no broker waits for a
+/// broker to arrive ([`Standing::wait_for_broker`]): with no timer where no socket is there or
+/// the broker there refused this process or speaks another protocol, on the broker arrivals' own
+/// backoff (1 s doubling to 30 s) where a socket there has not answered its hello, and
+/// [`BROKER_PAUSE`] where the socket's folder cannot be watched. One that ended, or that a broker
+/// there could not answer, waits out its backoff ([`restart_pause`], 5 s doubling to 60 s)
+/// beside the broker's arrivals, so a broker whose socket is made again meanwhile is browsed at
+/// once. A browse that ended heard
+/// nothing more, so what it heard is forgotten, and the next one's settle window begins with it.
+/// A watch with no type to browse browses nothing.
+#[cfg(target_os = "macos")]
+fn browse_standing(watched: &Watched, closing: std::os::fd::BorrowedFd<'_>) {
     let Some(browsed) = watched.browsed.as_deref() else {
         crate::log_line(&format!(
             "not browsing {}: {LAB_VAULT_SERVICE_ENV} names no lab service",
@@ -1424,31 +1580,202 @@ fn browse_standing(watched: &Watched) {
         ));
         return;
     };
-    let mut pause = RESTART_FIRST;
-    while !watched.closed.load(Ordering::SeqCst) {
-        let started = Instant::now();
-        let last = match lan::browse(browsed, DOMAIN) {
-            Ok(mut events) => {
-                watched.begin(Duration::ZERO);
-                while !watched.closed.load(Ordering::SeqCst) {
-                    match events.next_within(LOOK_CLOSED_EVERY) {
-                        Ok(Some(event)) => watched.hear_event(&event, Instant::now()),
-                        Ok(None) => {}
-                        Err(_) => break,
+    Standing {
+        watched,
+        closing,
+        arrivals: lan::Arrivals::new(),
+        allowance: None,
+    }
+    .run(browsed);
+}
+
+/// A standing browse's thread ([`browse_standing`]).
+#[cfg(target_os = "macos")]
+struct Standing<'a> {
+    watched: &'a Watched,
+    /// Readable, at its end, once the watch is dropped.
+    closing: std::os::fd::BorrowedFd<'a>,
+    /// What says a broker arrived: a new generation of its socket that answered its checked
+    /// hello. Asked before each browse, so the generation a browse meets is answered, and only a
+    /// generation made since ends a wait.
+    arrivals: lan::Arrivals,
+    /// What says macOS's Local Network allowance for this process changed, armed at the first
+    /// browse that found no broker.
+    allowance: Option<Allowance>,
+}
+
+#[cfg(target_os = "macos")]
+impl Standing<'_> {
+    /// Browse `browsed` until the watch is dropped.
+    fn run(&mut self, browsed: &str) {
+        #[cfg(test)]
+        let mut pause = self.watched.restart_first;
+        #[cfg(not(test))]
+        let mut pause = RESTART_FIRST;
+        loop {
+            // Armed before each attempt, as aterm-gui's browse of the network's moves is: a
+            // broker made again during the attempt, or the wait after it, remains owed to that
+            // wait.
+            let _ = self.arrivals.poll();
+            let started = Instant::now();
+            let last = match lan::browse(browsed, DOMAIN) {
+                Ok(mut events) => {
+                    self.watched.begin(Duration::ZERO);
+                    let dropped = self.hear(&mut events);
+                    self.watched.forget();
+                    if dropped {
+                        return;
                     }
+                    Started::Ran(started.elapsed())
                 }
-                watched.forget();
-                Started::Ran(started.elapsed())
+                Err(error) if waits_for_broker(&error) => Started::NoBroker,
+                Err(_) => Started::Ran(started.elapsed()),
+            };
+            let (wait, next) = restart_pause(last, pause);
+            pause = next;
+            let dropped = match wait {
+                Some(wait) => self.restart_after(wait),
+                None => self.wait_for_broker(),
+            };
+            if dropped {
+                return;
             }
-            Err(LanError::Unavailable(_)) => Started::NoBroker,
-            Err(LanError::Io(_)) => Started::Ran(started.elapsed()),
-        };
-        let (wait, next) = restart_pause(last, pause);
-        pause = next;
-        let sleep_start = Instant::now();
-        while !watched.closed.load(Ordering::SeqCst) && sleep_start.elapsed() < wait {
-            let rem = wait.saturating_sub(sleep_start.elapsed());
-            std::thread::sleep(Duration::from_secs(1).min(rem));
+        }
+    }
+
+    /// Wait beside the watch's pipe and `others` for at most `within` (`None`: with no timeout),
+    /// noting the wait and that very timeout for a test: `None` once the watch was dropped, else
+    /// which of `others` are ready (none: the timeout came). Where poll(2) cannot be asked it
+    /// sleeps `within`, at most [`BROKER_PAUSE`], beside nothing, and answers that the timeout
+    /// came.
+    fn wait(
+        &self,
+        why: Why,
+        others: &[std::os::fd::BorrowedFd<'_>],
+        within: Option<Duration>,
+    ) -> Option<Vec<usize>> {
+        #[cfg(test)]
+        self.watched.waited(Waited(why, within));
+        #[cfg(not(test))]
+        let _ = why;
+        let mut fds = Vec::with_capacity(1 + others.len());
+        fds.push(self.closing);
+        fds.extend_from_slice(others);
+        let deadline = within.and_then(|within| Instant::now().checked_add(within));
+        match aterm_uds::ready::any(&fds, deadline) {
+            Ok(ready) if ready.contains(&0) => None,
+            Ok(ready) => Some(ready.into_iter().map(|index| index - 1).collect()),
+            Err(_) => {
+                std::thread::sleep(within.map_or(BROKER_PAUSE, |within| within.min(BROKER_PAUSE)));
+                Some(Vec::new())
+            }
+        }
+    }
+
+    /// Hand the watch each event `events` hear, waiting for each frame with no timeout, until the
+    /// request ends or the watch is dropped: whether it was. A frame already read off the
+    /// connection is taken with no wait.
+    fn hear(&self, events: &mut lan::Events) -> bool {
+        use std::os::fd::AsFd as _;
+        loop {
+            if !events.buffered() && self.wait(Why::Frames, &[events.as_fd()], None).is_none() {
+                return true;
+            }
+            match events.next_beside(self.closing) {
+                Ok(Some(event)) => self.watched.hear_event(&event, Instant::now()),
+                Ok(None) => return true,
+                Err(_) => return false,
+            }
+        }
+    }
+
+    /// Wait out a restart's backoff `pause` beside the broker's arrivals, or until the watch is
+    /// dropped: whether it was. A new generation of the broker's socket that answers its checked
+    /// hello ends the wait early ([`lan::Arrivals::poll`]); an event of the folder that brings
+    /// none waits on to the same end, and an ask the arrivals' own backoff calls for is made on
+    /// the way.
+    fn restart_after(&mut self, pause: Duration) -> bool {
+        let mut until: Option<Instant> = None;
+        loop {
+            let watched = match self.arrivals.poll() {
+                Ok(true) => return false,
+                Ok(false) => true,
+                Err(_) => false,
+            };
+            let now = Instant::now();
+            let left = match until {
+                Some(until) => until.saturating_duration_since(now),
+                None => {
+                    until = Some(now + pause);
+                    pause
+                }
+            };
+            if left.is_zero() {
+                return false;
+            }
+            let arriving = if watched {
+                self.arrivals.watch_fd()
+            } else {
+                None
+            };
+            let within = match arriving {
+                Some(_) => self.arrivals.wait_for(left),
+                None => left,
+            };
+            let others: Vec<_> = arriving.into_iter().collect();
+            if self.wait(Why::Restart, &others, Some(within)).is_none() {
+                return true;
+            }
+        }
+    }
+
+    /// Wait for a broker to answer, or for the watch to be dropped: whether it was. A new
+    /// generation of the broker's socket that answers its checked hello ends the wait
+    /// ([`lan::Arrivals::poll`]), heard by the events of its socket's folder, with no timer;
+    /// where a hello could not be judged (a socket nothing answers yet, a broker that did not
+    /// judge this process) it is asked again on the arrivals' own backoff
+    /// ([`lan::Arrivals::wait_for`], 1 s doubling to 30 s), and a generation that answered, or
+    /// refused this process, or speaks another protocol, is asked nothing more until the socket
+    /// is made again. Where the folder cannot be watched it waits [`BROKER_PAUSE`]. A change of
+    /// macOS's record of this process's Local Network allowance ([`Allowance`]) ends the wait too,
+    /// so the browse is asked again, and takes this process's direct path once macOS allowed it.
+    fn wait_for_broker(&mut self) -> bool {
+        if self.allowance.is_none() {
+            self.allowance = Allowance::watch(self.watched.service);
+        }
+        loop {
+            let arriving = match self.arrivals.poll() {
+                Ok(true) => return false,
+                Ok(false) => self.arrivals.watch_fd(),
+                Err(_) => None,
+            };
+            let within = match arriving {
+                Some(_) => {
+                    let retry = self.arrivals.wait_for(Duration::MAX);
+                    (retry != Duration::MAX).then_some(retry)
+                }
+                None => Some(BROKER_PAUSE),
+            };
+            let allowance = self.allowance.as_ref();
+            let others: Vec<_> = arriving
+                .into_iter()
+                .chain(allowance.map(|allowance| allowance.rung.fd()))
+                .collect();
+            match self.wait(Why::Broker, &others, within) {
+                None => return true,
+                // macOS's allowance record changed: ask the browse again.
+                Some(ready)
+                    if allowance.is_some_and(|allowance| {
+                        ready.contains(&(others.len() - 1)) && allowance.rung.clear()
+                    }) =>
+                {
+                    return false;
+                }
+                // The pause where the folder cannot be watched came: ask again.
+                Some(_) if arriving.is_none() => return false,
+                // The folder changed, or the next ask is due.
+                Some(_) => {}
+            }
         }
     }
 }

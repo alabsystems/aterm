@@ -419,9 +419,10 @@ pub enum Cleared {
     Outage(Outage),
 }
 
-/// HOW A CONDITION'S CLEARING IS KNOWN ([`cleared_text`]): measured (the reset it named passed, the
-/// accounts probe or the login says it cleared, or the session moved off it), or tried blind on a
-/// back-off, where it named no reset.
+/// HOW A CONDITION'S CLEARING IS KNOWN ([`cleared_text`]): measured (the reset it named passed, or
+/// the accounts probe or the login says it cleared), or tried blind on a back-off, where it named
+/// no reset. A session that moved off the condition says so instead ([`MOVED_TEXT`],
+/// [`LOGIN_MOVED_TEXT`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Clearing {
     /// The clearing was seen: *has cleared*.
@@ -469,7 +470,30 @@ pub const fn cleared_text(cleared: Cleared, clearing: Clearing) -> &'static str 
     }
 }
 
-/// Whether `text` opens on one of [`cleared_text`]'s lines.
+/// THE ONE LINE THE RESUME AN ACCOUNT MOVE MADE AT A WALL OWES TYPES
+/// ([`TurnEndState::account_resume_owed`]): the turn stopped at the limit or the lost login of
+/// the account the session left, and the relaunch resumed its conversation under another
+/// account, so the line says that, never that the condition cleared (it did not: the session
+/// moved off it). Like a [`cleared_text`] line it delivers the prompt the condition cut again
+/// and says nothing of Cruise's or Land's prompt. It names no account: a roster's label is this
+/// Mac's own name for a row, which says nothing true to the agent, and the line goes into the
+/// conversation, its provider's transcript and every survey's excerpt of it.
+pub const MOVED_TEXT: &str = concat!(
+    harness_mark!(),
+    " This session moved to another account; continue where you stopped."
+);
+
+/// THE ONE LINE A LIMIT'S RESUME OWED TO A LOGIN MOVED ELSEWHERE TYPES
+/// ([`TurnEndState::login_resume_owed`]): the session's login now belongs to another account
+/// than the one its limit was read under, so the limit binds it no longer, though it never
+/// cleared. Like [`MOVED_TEXT`] it names no account.
+pub const LOGIN_MOVED_TEXT: &str = concat!(
+    harness_mark!(),
+    " This session's login moved to another account; continue where you stopped."
+);
+
+/// Whether `text` opens on one of [`cleared_text`]'s lines, or on [`MOVED_TEXT`] or
+/// [`LOGIN_MOVED_TEXT`].
 #[must_use]
 pub fn is_cleared_line(text: &str) -> bool {
     const CLEARED: [Cleared; 6] = [
@@ -481,11 +505,14 @@ pub fn is_cleared_line(text: &str) -> bool {
         Cleared::Outage(Outage::Connection),
     ];
     let text = text.trim_start();
-    CLEARED.iter().any(|&c| {
-        [Clearing::Measured, Clearing::Blind]
-            .iter()
-            .any(|&how| text.starts_with(cleared_text(c, how)))
-    })
+    [MOVED_TEXT, LOGIN_MOVED_TEXT]
+        .iter()
+        .any(|line| text.starts_with(line))
+        || CLEARED.iter().any(|&c| {
+            [Clearing::Measured, Clearing::Blind]
+                .iter()
+                .any(|&how| text.starts_with(cleared_text(c, how)))
+        })
 }
 
 /// The condition a resume of `rule` types past ([`cleared_text`]): the consent a model's limit
@@ -519,6 +546,28 @@ fn cleared_of(state: &TurnEndState, reading: &TurnEndReading, rule: &str) -> Opt
         }
         _ => Cleared::UsageLimit,
     })
+}
+
+/// THE ONE LINE A RESUME OF `rule` TYPES PAST ITS CONDITION: for a limit's resume an account
+/// move made at a wall owes ([`TurnEndState::account_resume_owed`]), the move's own
+/// ([`MOVED_TEXT`]); for one a login moved elsewhere owes ([`TurnEndState::login_resume_owed`]),
+/// the login's ([`LOGIN_MOVED_TEXT`]); otherwise [`cleared_text`]'s for the condition
+/// [`cleared_of`] reads. `None` where `rule` reads no condition ([`cleared_of`]).
+fn resume_line(
+    state: &TurnEndState,
+    reading: &TurnEndReading,
+    rule: &str,
+    clearing: Clearing,
+) -> Option<&'static str> {
+    if rule == RULE_LIMIT_RESUME {
+        if state.account.is_some() && state.account_resume {
+            return Some(MOVED_TEXT);
+        }
+        if state.login_resume {
+            return Some(LOGIN_MOVED_TEXT);
+        }
+    }
+    cleared_of(state, reading, rule).map(|c| cleared_text(c, clearing))
 }
 
 const CARRY_ON: &str = concat!(
@@ -705,7 +754,12 @@ pub(crate) fn is_wall_retry(rule: &str) -> bool {
             | RULE_LOGIN_BACK
     )
 }
-/// A continuation past a usage window's reset.
+/// A LIMIT'S RESUME: the one line a turn a usage or model limit stopped is continued with
+/// ([`resume_line`]), past its reset, the accounts probe's word that it cleared or a blind try on
+/// its back-off ([`cleared_text`]); past the limit or lost login an account move made at the
+/// wall left ([`MOVED_TEXT`]: the rule the move's continuation is typed under, which the ledger's
+/// usage attempts and the acts' readers key on); or past a limit whose login moved to another
+/// account ([`LOGIN_MOVED_TEXT`]).
 pub const RULE_LIMIT_RESUME: &str = "usage-resume@v1";
 /// The agent relaunched on the fallback model on a model bucket.
 pub const RULE_MODEL_FALLBACK: &str = "model-fallback@v1";
@@ -1232,6 +1286,11 @@ pub enum RosterWord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ready {
     pub label: String,
+    /// The word `accounts use` names the row's account by, which the pin a notice asks for types
+    /// (`crate::harness::account_names::word_of_row`: its slug, else its key, never its label,
+    /// which names nothing); `None` for a row with no address, which no word names, so no step
+    /// pins it ([`super::exception`]'s `limit_use`).
+    pub word: Option<String>,
 }
 
 /// WHY THE ROSTER DOES NOT MOVE A TAB AT ITS USAGE LIMIT ONTO A ROW READY ([`RosterWord::Row`]'s `held`).
@@ -3882,6 +3941,13 @@ pub struct TurnEndState {
     /// showed none): the resumed transcript closes it too, so at the restart's first point only
     /// another prompt answered is a turn under the move ([`Self::account_answer_unseen`]).
     account_closed: Option<u64>,
+    /// THE SECOND THE STANDING MOVE WAS MADE (unix seconds, the loop's clock), told by the loop
+    /// ([`Self::account_made_at`]): where it booked the move, or the second of the ledger row a
+    /// later loop took the move up from. A limit notice written before it was written before the
+    /// session moved, under the account the move left ([`Self::limit_left`]); one written at it
+    /// or after is the moved-to account's, whichever of its processes wrote it. `None`: not told,
+    /// and no limit is judged left.
+    account_made: Option<i64>,
     account_resume: bool,
     account_resume_seed: bool,
     /// A LIMIT'S RESUME OWED TO A LOGIN MOVED ELSEWHERE
@@ -4196,6 +4262,7 @@ impl TurnEndState {
             account_told: false,
             account_startup: false,
             account_closed: None,
+            account_made: None,
             account_resume: false,
             account_resume_seed: false,
             login_resume: false,
@@ -4370,6 +4437,9 @@ impl TurnEndState {
             self.account_told = told;
             self.account_startup = told || !asked;
             self.account_closed = None;
+            // The loop tells the second of the ledger row it took the move up from
+            // ([`Self::account_made_at`]).
+            self.account_made = None;
             self.account_resume = at == AccountAt::Wall && !asked && !told;
             self.account_resume_seed = self.account_resume;
         }
@@ -8189,6 +8259,11 @@ impl TurnEndState {
                 && !(self.awaiting.is_some() && reading.worked.is_none()))
             .then_some(AccountAnswer::Bad(AccountBad::SignedOut));
         }
+        // The limit the move left answered a prompt the left account was asked, never a turn
+        // under the move: neither its wall nor that prompt answers the move.
+        if self.limit_left(reading) {
+            return None;
+        }
         if self.account_told {
             let worked = reading.worked.is_some() || self.limit_went_on(reading, None);
             return (reading.wall.is_none()
@@ -8239,8 +8314,12 @@ impl TurnEndState {
     /// under the move, and its answer is the move's the same way. At the restart's first point the
     /// screen is the resumed transcript, whose prompts the login before the move answered: a
     /// prompt counts there only against the one the move's own point closed, and nothing does
-    /// where that point closed none. `None` where a read saw work, nothing answered under the
-    /// move, or no move awaits its answer.
+    /// where that point closed none. A prompt the limit a move left answered
+    /// ([`Self::limit_left`]: its notice written before the move was made) was
+    /// answered under the left account, whichever prompt it is (one the old process took up after
+    /// the move's point read its screen, or the same one drawn again otherwise), so it answers
+    /// nothing of the move's. `None` where a read saw work, nothing answered under the move, or
+    /// no move awaits its answer.
     #[must_use]
     pub fn account_answer_unseen(
         &self,
@@ -8310,6 +8389,50 @@ impl TurnEndState {
             && self.account.as_ref().is_some_and(|m| m.wall)
             && !self.account_asked
             && !self.account_told
+    }
+
+    /// THE LIMIT A MOVE LEFT: `reading` shows a usage or model limit
+    /// ([`Self::left_limit_of`]) written before the standing account move was made. The resumed
+    /// transcript draws again the limit the left account met; the session no longer runs on that
+    /// account. It is no wall of this session's: it opens no track, answers no move, asks no
+    /// account point and owes no limit's act; the move's own continuation goes on past it
+    /// ([`MOVED_TEXT`]). The host's recorder refuses the same row for the same reason
+    /// (`accounts::record_wall`'s `NotThisProcess`). A limit the moved-to account meets is
+    /// written after the move, and walls it as any limit does, whatever process wrote it: a
+    /// relaunch since the move (a memory or model restart, a crash's, a later loop's) changes
+    /// nothing of whose limit it is.
+    #[must_use]
+    pub fn limit_left(&self, reading: &TurnEndReading) -> bool {
+        reading.wall.is_some_and(|kind| self.left_limit_of(kind))
+    }
+
+    /// [`Self::limit_left`] for a wall of `kind` whose transcript notice is the one the last
+    /// decision read ([`Self::notice_written`]): a usage or model limit, written before the
+    /// second the standing account move was made ([`Self::account_made_at`]). The move's own
+    /// second dates it, never a process start: the host's snapshot may name the ended process
+    /// for a while after a relaunch, may name the moved-to one before the loop books the move,
+    /// and may name a later relaunch of it. `false` where either second is unknown (a program
+    /// whose transcript the loop does not read dates no notice), or no move stands.
+    #[must_use]
+    pub fn left_limit_of(&self, kind: WallKind) -> bool {
+        matches!(
+            kind,
+            WallKind::UsageSession | WallKind::UsageWeekly | WallKind::ModelBucket { .. }
+        ) && self.account.is_some()
+            && self
+                .notice_unix
+                .zip(self.account_made)
+                .is_some_and(|(written, made)| written < made)
+    }
+
+    /// THE SECOND THE STANDING ACCOUNT MOVE WAS MADE (unix seconds, the loop's clock): the loop
+    /// tells it where it books the move ([`Self::restarted`]), and a later loop the second of the
+    /// ledger row it took the move up from ([`Self::seed_account`]). It dates the limit the move
+    /// left ([`Self::limit_left`]). Nothing where no move stands.
+    pub const fn account_made_at(&mut self, unix: i64) {
+        if self.account.is_some() {
+            self.account_made = Some(unix);
+        }
     }
 
     const fn login_drew(&self, reading: &TurnEndReading) -> bool {
@@ -8502,7 +8625,9 @@ impl TurnEndState {
         {
             return None;
         }
-        let shown = reading.wall.filter(|_| !self.bucket_left(reading));
+        let shown = reading
+            .wall
+            .filter(|_| !self.bucket_left(reading) && !self.limit_left(reading));
         let wall = shown.or_else(|| {
             let t = self.wall.as_ref()?;
             left_named(t, reading)
@@ -8633,10 +8758,13 @@ impl TurnEndState {
                 WallKind::UsageSession | WallKind::UsageWeekly | WallKind::ModelBucket { .. }
             )
         };
-        let walled = reading.wall.or_else(|| {
-            let t = self.wall.as_ref()?;
-            left_named(t, reading).map(|n| n.kind)
-        });
+        let walled = reading
+            .wall
+            .filter(|_| !self.limit_left(reading))
+            .or_else(|| {
+                let t = self.wall.as_ref()?;
+                left_named(t, reading).map(|n| n.kind)
+            });
         if !walled.is_some_and(usage) {
             return self.probe_gate(reading, cfg, now);
         }
@@ -8971,9 +9099,11 @@ impl TurnEndState {
         }
         let left_login = self.login_left(reading) && !self.ran_under_move(reading);
         let left_bucket = self.bucket_left(reading);
+        // The limit a move left is the left account's ([`Self::limit_left`]): no track of it.
+        let left_limit = self.limit_left(reading);
         self.fallback_unasked = left_bucket;
         let unwalled;
-        let reading = if left_login || left_bucket {
+        let reading = if left_login || left_bucket || left_limit {
             unwalled = TurnEndReading {
                 wall: None,
                 wall_message: String::new(),
@@ -10277,6 +10407,7 @@ impl TurnEndState {
         let startup = std::mem::take(&mut self.account_startup);
         if std::mem::take(&mut self.account_resume_seed)
             && !left_login
+            && !left_limit
             && !matches!(
                 reading.wall,
                 Some(WallKind::UsageSession | WallKind::UsageWeekly | WallKind::ModelBucket { .. })
@@ -11550,6 +11681,8 @@ impl TurnEndState {
                 self.account_told = false;
                 self.account_startup = true;
                 self.account_closed = reading.answered.map(|a| a.prompt);
+                // The loop tells the second it booked the move ([`Self::account_made_at`]).
+                self.account_made = None;
                 self.account_resume = *at == AccountAt::Wall && owed;
                 self.account_unmade = None;
                 self.account_ahead_unmade = None;
@@ -12642,6 +12775,21 @@ fn decide_unridden(
         note(trace, "bucket-left", None, || Outcome::Passed);
         return decide_unridden(state, &plain, cfg, now, trace);
     }
+    // THE LIMIT A MOVE LEFT ([`TurnEndState::limit_left`]) is the left account's, never the
+    // moved-to one's: the point is decided as with no wall, where the move's own continuation is
+    // owed (`account-resume`) and typed in the move's words ([`MOVED_TEXT`]), never as the
+    // limit's act.
+    if state.limit_left(reading) {
+        let plain = TurnEndReading {
+            wall: None,
+            wall_message: String::new(),
+            reset_at: None,
+            resumes_by_itself: false,
+            ..reading.clone()
+        };
+        note(trace, "limit-left-by-move", None, || Outcome::Passed);
+        return decide_unridden(state, &plain, cfg, now, trace);
+    }
     if reading.upgrading {
         match reading.wall {
             None if state.after.is_none() => {
@@ -12949,11 +13097,12 @@ fn act_at_point(
             act
         }
     };
-    // A RESUME PAST A CONDITION TYPES ITS ONE LINE ([`cleared_text`]), never Cruise's or Land's
-    // prompt (v6 §14.17.5): those are typed at the agent's own turn end. A compaction's owed
-    // continuation is the mode's own ([`cleared_of`]), and so is a resume under Land before Land's
-    // instruction was given: the instruction is the one prompt, never a line and then it. A
-    // person's own exchange at the wall is theirs, which Land leaves to them
+    // A RESUME PAST A CONDITION TYPES ITS ONE LINE ([`resume_line`]: [`cleared_text`]'s, an
+    // account move's [`MOVED_TEXT`] or a login move's [`LOGIN_MOVED_TEXT`]), never Cruise's or
+    // Land's prompt (v6 §14.17.5): those are typed at the agent's own turn end. A compaction's
+    // owed continuation is the mode's own ([`cleared_of`]), and so is a resume under Land before
+    // Land's instruction was given: the instruction is the one prompt, never a line and then it.
+    // A person's own exchange at the wall is theirs, which Land leaves to them
     // ([`TurnEndState::exchange_at_wall`]): its resume is the line, so their request goes on.
     let continue_as = |rule: &'static str, clearing: Clearing| {
         if rule == RULE_LIMIT_RESUME
@@ -12961,16 +13110,17 @@ fn act_at_point(
         {
             return act;
         }
-        let text = match (cleared_of(state, reading, rule), reading.autopilot) {
-            (Some(cleared), Autopilot::Land) if !state.land.typed && state.exchange_at_wall() => {
-                with_rules(cleared_text(cleared, clearing), reading.rules.as_deref())
+        let text = match (
+            resume_line(state, reading, rule, clearing),
+            reading.autopilot,
+        ) {
+            (Some(line), Autopilot::Land) if !state.land.typed && state.exchange_at_wall() => {
+                with_rules(line, reading.rules.as_deref())
             }
             (_, Autopilot::Land) if !state.land.typed => {
                 land_words(state, reading, state.needs_ack_owed()).0
             }
-            (Some(cleared), _) => {
-                with_rules(cleared_text(cleared, clearing), reading.rules.as_deref())
-            }
+            (Some(line), _) => with_rules(line, reading.rules.as_deref()),
             (None, Autopilot::Land) => land_words(state, reading, state.needs_ack_owed()).0,
             // The person's key holds the go-ahead, and the continuation's word that it is no need;
             // so does a park answers off leave to the person. This arm is the continuation a
@@ -13325,6 +13475,7 @@ fn act_past_walls(
     let (cont, check) = restore_or_continue(state, reading, cfg, now, budgeted);
     if let Some(to) = move_ahead(state, reading, cfg, now)
         && !matches!(cont, TurnEndAction::Escalate { .. })
+        && !switch_keeps_its_account(state, reading, now, to)
     {
         return ended_at(trace, "account-ahead", ahead_to(to, cont));
     }
@@ -13428,6 +13579,39 @@ fn move_ahead<'a>(
     }
 }
 
+/// WHETHER THE SESSION'S SWITCH ONTO [`FABLE_FALLBACK`] HOLDS IT ON ITS ACCOUNT AT A TURN END
+/// (owner, 2026-11-11: "no, keep the same account and switch from fable to opus."): while the
+/// switch stands ([`TurnEndState::model_switch`], its return not yet due: no
+/// [`ModelSwitch::back_at`], or one ahead of `now`), an advised move `to` another account is not
+/// made ahead of the turn end's own act. The account relaunch keeps the line's `--model`, so that move would leave the
+/// session running Opus on another account until its own account's Fable reset. Fable's bucket
+/// on record ranks the account after every account with no model's wall (the roster's
+/// `Rank::model_walled`), so the advice past the fallback is often that move. A move to the session's own row's renewed login
+/// (`login_label`) is not another account and still goes. A move by which the session yields an
+/// account that is another Mac's to use (F19, `yields`) still goes too, as does a move at a
+/// wall the fallback cannot answer ([`account_first`]: Opus's own limit, the account's session
+/// or week). Past the return's due, the move goes ahead of the return
+/// ([`act_past_walls`]).
+fn switch_keeps_its_account(
+    state: &TurnEndState,
+    reading: &TurnEndReading,
+    now: Instant,
+    to: &str,
+) -> bool {
+    state
+        .model
+        .as_ref()
+        .is_some_and(|m| m.back_at.is_none_or(|at| now < at))
+        && reading.login_label.as_deref() != Some(to)
+        && !matches!(
+            reading.advised(),
+            Some(AccountAdvice::Move {
+                yields: Some(_),
+                ..
+            })
+        )
+}
+
 fn ahead_to(to: &str, otherwise: TurnEndAction) -> TurnEndAction {
     TurnEndAction::Restart {
         why: Restart::Account {
@@ -13526,14 +13710,61 @@ pub const fn has_fable_fallback(program: Program) -> bool {
 /// from fable to opus."): a Claude Code session at Fable's own usage limit (`from`, the alias its
 /// notice names, [`bucket_model`]) whose launch names no model or names Fable
 /// ([`LaunchModel::admits_fallback`]) is relaunched on [`FABLE_FALLBACK`], on the same account and
-/// the same conversation. Every other model, a launch that names another model, a launch whose
-/// model the host did not read and every other program: `None`, and the limit is waited out.
+/// the same conversation, and no account move the host advises goes ahead of it
+/// ([`relaunches_onto_fallback`], [`keeps_its_account`], [`switch_keeps_its_account`]). Every other
+/// model, a launch that names another model, a launch whose model the host did not read and every
+/// other program: `None`, and the limit is waited out, or moved from where the host advises
+/// another account ([`account_first`]).
 #[must_use]
 pub fn fallback_for(reading: &TurnEndReading, from: Option<&str>) -> Option<&'static str> {
     (has_fable_fallback(reading.program)
         && from == Some(FABLE)
         && reading.launch_model.admits_fallback())
     .then_some(FABLE_FALLBACK)
+}
+
+/// WHETHER `act` IS THE FALLBACK'S RELAUNCH onto [`FABLE_FALLBACK`] ([`fallback_for`]), which
+/// keeps the session on its own account (owner, 2026-11-11, rejecting a move onto another
+/// account: "no, keep the same account and switch from fable to opus."; 2026-11-15: "claude alab
+/// needs to continue when fable runs out and should fall back to opus"). At Fable's wall
+/// ([`wall_action`]), no account move the host advises goes ahead of it or takes its place. A wait
+/// or an ask again never cuts a relaunch short there ([`account_first`]). A measured clearing of
+/// the limit (a resume) still types the limit's resume unless it was typed since, since Fable
+/// serves again then. Under usage credits that carry Fable's requests it is
+/// [`keeps_its_account`]'s, and past the switch [`switch_keeps_its_account`]'s.
+fn relaunches_onto_fallback(act: &TurnEndAction) -> bool {
+    matches!(
+        act,
+        TurnEndAction::Restart {
+            why: Restart::Model { .. },
+            rule_id: RULE_MODEL_FALLBACK,
+            ..
+        }
+    )
+}
+
+/// WHETHER THE CREDITS HOLD `hold` ([`credits_hold`]), THE FALLBACK'S RELAUNCH where usage
+/// credits carry Fable's requests ([`relaunches_onto_fallback`]), STANDS ON ITS OWN ACCOUNT over
+/// the host's `advised` move ([`held_by_credits`]): a move that does not yield neither goes
+/// ahead of the relaunch nor takes its place, and where the turn end's own act types nothing that
+/// act stands, as with no advice. The one move that still goes first, the relaunch or the act its
+/// otherwise, is the one by which the session yields an account that is another Mac's to use
+/// (`docs/DESIGN-fluid-swarm-2026-10-28.md` F19, [`AccountAdvice::Move`]'s `yields`): that account
+/// is not this Mac's to run Opus on either. The host names a yield only at a turn end
+/// (`crate::harness::accounts::effective_ranking_point` ranks no wall for one). A hold of such an
+/// account ([`AccountAdvice::Hold`]) holds the relaunch until its instant, as it holds every act
+/// that relaunches ([`account_hold`]). An account move made at a wall the fallback cannot answer
+/// (the account's own session or week, which Opus meets too) is not held here, and goes ahead as
+/// before.
+fn keeps_its_account(hold: &TurnEndAction, advised: Option<&AccountAdvice>) -> bool {
+    relaunches_onto_fallback(hold)
+        && !matches!(
+            advised,
+            Some(AccountAdvice::Move {
+                yields: Some(_),
+                ..
+            })
+        )
 }
 
 fn held_by_credits(
@@ -13552,6 +13783,10 @@ fn held_by_credits(
                 | TurnEndAction::Escalate { .. }
         )
     };
+    let ahead = |hold: TurnEndAction| match move_ahead(state, reading, cfg, now) {
+        Some(to) => ahead_to(to, hold),
+        None => hold,
+    };
     match act {
         act if !types(&act) => act,
         TurnEndAction::Restart {
@@ -13562,15 +13797,26 @@ fn held_by_credits(
                 },
             rule_id,
             otherwise,
-        } => TurnEndAction::Restart {
-            why,
-            rule_id,
-            otherwise: Box::new(if types(&otherwise) { hold } else { *otherwise }),
-        },
-        _ => match move_ahead(state, reading, cfg, now) {
-            Some(to) => ahead_to(to, hold),
-            None => hold,
-        },
+        } => {
+            // Credits that carry Fable's requests: the fallback onto Opus in place of the move, or
+            // the turn end's own act where that types nothing, as with no advice.
+            let keeps = keeps_its_account(&hold, reading.advised());
+            let hold = if types(&otherwise) { hold } else { *otherwise };
+            if keeps {
+                return hold;
+            }
+            TurnEndAction::Restart {
+                why,
+                rule_id,
+                otherwise: Box::new(hold),
+            }
+        }
+        TurnEndAction::Restart {
+            why: Restart::Account { .. },
+            ..
+        } => ahead(hold),
+        _ if keeps_its_account(&hold, reading.advised()) => hold,
+        _ => ahead(hold),
     }
 }
 
@@ -14216,8 +14462,10 @@ const fn limit_conversation_known(t: &WallTrack, reading: &TurnEndReading) -> bo
     )
 }
 
-/// The limit's resume where its clearing was measured: its reset, the accounts probe, a login or an
-/// account move ([`Clearing::Measured`]).
+/// The limit's resume where its clearing was measured: its reset, the accounts probe or a login
+/// ([`Clearing::Measured`]); after an account move made at the wall, the move's own line
+/// ([`MOVED_TEXT`], [`resume_line`]), and after a login moved elsewhere the login's
+/// ([`LOGIN_MOVED_TEXT`]), since neither limit cleared.
 fn resume_limit(continue_as: &dyn Fn(&'static str, Clearing) -> TurnEndAction) -> TurnEndAction {
     continue_as(RULE_LIMIT_RESUME, Clearing::Measured)
 }
@@ -14366,6 +14614,12 @@ fn login_move(
     reading.login_label.as_deref() == Some(to) && login_follows(state, reading, cfg)
 }
 
+/// THE HOST'S ACCOUNT ADVICE AT A USAGE OR MODEL WALL ([`wall_action`]) over the wall's own act
+/// `today`, where `today` waits or relaunches (or retries past the wall's first try) and the
+/// session's accounts rotate: an advised move goes first, `today` its otherwise, within
+/// [`ACCOUNT_MOVES_PER_WINDOW`]; a wait or an ask again cuts a later wait short; a resume types
+/// the limit's resume unless it was typed since. Fable's own limit with its fallback to take
+/// reaches this only under a resume ([`relaunches_onto_fallback`]).
 fn account_first(
     state: &TurnEndState,
     reading: &TurnEndReading,
@@ -14719,6 +14973,14 @@ fn wall_action(
             // before it is moved from or waited out.
             if let Some(act) = reset_continuation(state, cfg, now, continue_as) {
                 return act;
+            }
+            // Fable's own limit goes on with Opus on the same account; only a wall the
+            // fallback cannot answer is moved from, and a measured clearing still types the
+            // limit's resume ([`relaunches_onto_fallback`]).
+            if relaunches_onto_fallback(&today)
+                && !matches!(reading.advised(), Some(AccountAdvice::Resume { .. }))
+            {
+                return today;
             }
             let attempts = state.wall_attempts(kind).unwrap_or(0);
             account_first(state, reading, cfg, now, attempts, today, continue_as)

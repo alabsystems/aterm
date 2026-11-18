@@ -31,8 +31,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use super::account_history::{HistoryDay, HistoryRead, HistoryWho};
+use super::account_names::{self, Named, Word};
 use super::accounts::{self, Cli, Logins, Roster, Row, State};
 use super::ai_pool::{self, Pool, SlotWhy};
+use super::alab_roster::Lab;
 use super::alab_seen::{self, AccountSeen, Journal};
 use super::claims::{self, LeaseKey};
 use super::outlook::{self, Figure, Offsets};
@@ -609,6 +611,12 @@ impl LoginHere {
 pub struct AccountCard {
     /// The account.
     pub who: Who,
+    /// The word a step a person types names the account by ([`Named::word_among`]: its slug, else
+    /// its key, the key where another roster row here is labelled with its slug), the one
+    /// `accounts history` takes for the card's pool: for a roster row with an address, named as
+    /// [`account_names::names_of_row`] names it. `None` for an outside login, a row with no
+    /// address and an account nothing names; never a roster label.
+    pub word: Option<Word>,
     /// Each roster row's shown name, by label: what a label in a record is shown as.
     pub names: BTreeMap<String, String>,
     /// How many accounts this Mac's roster lists.
@@ -658,6 +666,9 @@ pub struct Inputs<'a> {
     pub cli: Cli,
     /// Its roster.
     pub roster: &'a Roster,
+    /// The lab as the process holds it ([`super::alab_roster::current`]), which slugs the
+    /// account's word ([`AccountCard::word`]); `None` where it holds none.
+    pub lab: Option<&'a Lab>,
     /// Its accounts state.
     pub state: &'a State,
     /// The rows whose login is made on this Mac.
@@ -914,15 +925,13 @@ fn model_name(win: &super::account_stats::Win) -> Option<String> {
 
 /// A wall's window in words, for one no figure row says.
 fn wall_window(id: &str) -> String {
-    use super::profile::Bucket;
     match id {
         accounts::SESSION_LIMIT => "5-hour".to_owned(),
         accounts::WEEK_LIMIT => "week".to_owned(),
         accounts::MONTH_LIMIT => "month".to_owned(),
-        id if id == Bucket::Fable.id() => "Fable week".to_owned(),
-        id if id == Bucket::SevenDaySonnet.id() => "Sonnet week".to_owned(),
-        id if id == Bucket::SevenDayOpus.id() => "Opus week".to_owned(),
-        _ => "another".to_owned(),
+        id => accounts::model_week_name(id)
+            .unwrap_or("another")
+            .to_owned(),
     }
 }
 
@@ -1218,6 +1227,26 @@ pub fn build(inputs: &Inputs<'_>) -> AccountCard {
             Figure::login(&condition, inputs.signing_in == Some(label)) == Some(Figure::SigningIn)
         })
     });
+    let word = who
+        .label()
+        .and_then(|label| roster.row(label))
+        .and_then(|row| account_names::names_of_row(inputs.cli, row, inputs.lab))
+        .map(|(pk, names)| {
+            Named {
+                pk,
+                row: None,
+                names,
+            }
+            .word_among(
+                inputs.cli,
+                &account_names::Candidates {
+                    roster: &roster.rows,
+                    logins: &[],
+                    lab: inputs.lab,
+                    held: &[],
+                },
+            )
+        });
     let (home, used_day) = home_of(inputs, &who);
     let machine = Machine {
         home,
@@ -1251,6 +1280,7 @@ pub fn build(inputs: &Inputs<'_>) -> AccountCard {
             now,
         ),
         who,
+        word,
         names: roster
             .rows
             .iter()

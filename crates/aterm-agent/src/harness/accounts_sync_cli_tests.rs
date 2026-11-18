@@ -507,8 +507,9 @@ fn a_sync_that_syncs_nothing_names_the_sheets_conflicts() {
 }
 
 /// `aterm harness accounts sync` SAYS THE SHEET'S CONFLICTS, Claude Code's and `--cli`'s, plain
-/// and `--json`: the CLI and its rows, never the address, so a Mac with no window learns why an
-/// account is missing. CONTROL: a sheet whose rows agree says none. NEGATIVE CONTROL: before,
+/// and `--json`: the CLI and its rows, never the address (the receipt names each roster row it
+/// lists by its account, address and all), so a Mac with no window learns why an account is
+/// missing. CONTROL: a sheet whose rows agree says none. NEGATIVE CONTROL: before,
 /// only the window's digest said it.
 #[test]
 #[cfg(unix)]
@@ -557,10 +558,8 @@ fn an_accounts_sync_names_the_sheets_conflicting_rows() {
             let said = format!("conflicting assignments ({} rows 2, 3)", cli.id());
             assert_eq!(err.contains(&said), conflicted, "{cli:?} {json}: {err}");
             assert!(
-                !format!("{out}{err}")
-                    .to_ascii_lowercase()
-                    .contains("new@example.test"),
-                "{cli:?}: no address is said: {out}{err}"
+                !err.to_ascii_lowercase().contains("new@example.test"),
+                "{cli:?}: the conflict says no address: {err}"
             );
             if json {
                 let report: Value = aterm_json::from_str(out.trim()).unwrap();
@@ -569,6 +568,13 @@ fn an_accounts_sync_names_the_sheets_conflicting_rows() {
                     listed.map(Vec::len),
                     Some(1),
                     "{cli:?}: the report lists the conflict: {out}"
+                );
+                assert!(
+                    !report["sheet_conflicts"]
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .contains("new@example.test"),
+                    "{cli:?}: the listed conflict says no address: {out}"
                 );
             }
         }
@@ -591,7 +597,7 @@ fn the_upkeep_logs_a_sheet_conflict_once_per_change() {
         );
     };
     let lines = Arc::new(Mutex::new(Vec::<String>::new()));
-    let rediscovery = Mutex::new(Rediscovery::default());
+    let rediscovery = Watched::new("accounts_sync/rediscovery", Rediscovery::default());
     let upkeep_once = || {
         let into = Arc::clone(&lines);
         let log: SignInLog = Arc::new(move |line: &str| into.lock().unwrap().push(line.to_owned()));
@@ -604,7 +610,7 @@ fn the_upkeep_logs_a_sheet_conflict_once_per_change() {
                 &bed.state,
                 (
                     &bed.config.join(accounts::ACCOUNTS_FILE),
-                    NOW,
+                    trace::Now::at(NOW),
                     UpkeepStep::Sync,
                 ),
                 fx,
@@ -659,7 +665,7 @@ fn the_upkeep_tells_an_unread_sheet_from_rows_that_agree() {
     let conflict = "email,computer,kimi,notes\nother@example.test,m16,global,\n\
                     new@example.test,m16,global,\nNEW@example.test,m22,global,\n";
     let lines = Arc::new(Mutex::new(Vec::<String>::new()));
-    let rediscovery = Mutex::new(Rediscovery::default());
+    let rediscovery = Watched::new("accounts_sync/rediscovery", Rediscovery::default());
     let upkeep_once = || {
         let into = Arc::clone(&lines);
         let log: SignInLog = Arc::new(move |line: &str| into.lock().unwrap().push(line.to_owned()));
@@ -672,7 +678,7 @@ fn the_upkeep_tells_an_unread_sheet_from_rows_that_agree() {
                 &bed.state,
                 (
                     &bed.config.join(accounts::ACCOUNTS_FILE),
-                    NOW,
+                    trace::Now::at(NOW),
                     UpkeepStep::Sync,
                 ),
                 fx,
@@ -1026,7 +1032,7 @@ fn background_signins_refuse_unknown_records_before_dispatch_or_locks() {
             };
             let roster = Roster::parse_for(cli, &format!("[[account]]\nlabel='main'\nclass='dedicated'\nemail='owner@example.test'\nbrowser='Main'\n{region}")).unwrap();
             let row = roster.row("main").unwrap().clone();
-            let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+            let guard = AutoRenewGuard::default().shared();
             let before = Bed::tree(bed._dir.path());
             let dispatch = spawn_row_renewal(
                 cli,
@@ -1237,6 +1243,64 @@ fn the_sheets_columns_fill_each_pool_and_a_vendor_note_drops_that_vendor_alone()
     );
 }
 
+/// A KIMI CODE ROW THE SHEET PLACES IN NO REGION (a bare `1`, `kimi-m16-4`) is held, and a
+/// person's `accounts sync --cli kimi` names it by its label marked `(no region)` in its words and
+/// by its label alone in its `--json` (`ac`, `slug` and `name` null), since Kimi Code's two
+/// regions are separate account systems and no key names an address in neither
+/// ([`Naming::listed_shown`], [`Naming::listed_json`]). The row it added (`kimi-m16`) is named by
+/// its account, and no line says its label. NEGATIVE CONTROL (2026-11-17, a mutation run, then
+/// restored from HEAD): with `Naming::listed_shown` naming a source's row by its bare label, the
+/// `held` line says `kimi-m16-4` alone.
+#[test]
+#[cfg(unix)]
+fn a_held_kimi_row_is_named_by_its_label_marked_no_region() {
+    let bed = Bed::new("kimi-held-names");
+    bed.keep_roster(Cli::Kimi);
+    bed.secret(ACCOUNTS_CSV_FILE, SHEET);
+    let env = quiet_env(&bed.home, &bed.state, &bed.aterm_toml(), NOW);
+    let run = |json: bool| {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_cli_accounts_sync_with(
+            Cli::Kimi,
+            (&env, None),
+            (None, None, json),
+            (&mut out, &mut err),
+            &read_named,
+        );
+        let (out, err) = (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        );
+        assert_eq!(code, ExitCode::SUCCESS, "{err}");
+        out
+    };
+    // The first sync adds `kimi-m16`; each holds `kimi-m16-4`.
+    let words = run(false);
+    let doc: Value = aterm_json::from_str(run(true).trim()).unwrap();
+    assert_eq!(
+        doc["held"],
+        aterm_json::json!([{ "ac": null, "slug": null, "name": null, "label": "kimi-m16-4" }]),
+        "{doc}"
+    );
+    let added = crate::harness::account_names::tests::row_name(
+        Cli::Kimi,
+        &bed.roster(Cli::Kimi),
+        "kimi-m16",
+    );
+    assert!(
+        words.lines().any(|line| line
+            == "held (the sheet names no region; write `global` or `mainland-cn` in its cell): \
+                kimi-m16-4 (no region)"),
+        "{words}"
+    );
+    assert!(words.contains(&added.shown), "{words}");
+    assert_eq!(
+        crate::harness::account_names::tests::labels_said(&words, &["kimi-m16"]),
+        Vec::<&str>::new(),
+        "{words}"
+    );
+}
+
 /// The vault's sheet as the ALab vault publishes it (`ai-accounts.csv`, 2026-10-26): its xAI
 /// column is headed `x`, between `kimi` and `notes`, after a blank-headed machine column.
 const VAULT_SHEET: &str = "\
@@ -1442,7 +1506,7 @@ fn the_resync_source_check_keeps_each_pools_policy_and_reports_refused_sources()
         let _ = cli;
         let bed = Bed::new("resync-pool-source");
         let roster = bed.config.join(accounts::ACCOUNTS_FILE);
-        let read = Mutex::new(Rediscovery::default());
+        let read = Watched::new("accounts_sync/rediscovery", Rediscovery::default());
         let probe = || read_resync_with(&bed.home, &bed.state, &roster, NOW, &read);
         assert_eq!(probe(), ResyncRead::NoSource);
         #[cfg(unix)]
@@ -1524,7 +1588,7 @@ fn a_pools_converge_read_names_what_its_sync_adds_and_nothing_once_it_ran() {
     let bed = Bed::new("pool-due");
     bed.keep_roster(Cli::Kimi);
     bed.secret(&cli_fleet_file(Cli::Kimi), KIMI_FLEET);
-    let read = Mutex::new(Rediscovery::default());
+    let read = Watched::new("accounts_sync/rediscovery", Rediscovery::default());
     let probe = || {
         read_resync_with(
             &bed.home,
@@ -1639,7 +1703,7 @@ fn a_default_pools_converge_read_matches_the_syncs_admission() {
             &bed.state,
             &claude_roster(&bed),
             NOW,
-            &Mutex::new(Rediscovery::default()),
+            &Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
         );
         assert!(
             if admitted {
@@ -1663,14 +1727,14 @@ fn a_default_pools_converge_read_matches_the_syncs_admission() {
                         &bed.state,
                         &claude_roster(&bed),
                         NOW,
-                        &Mutex::new(Rediscovery::default()),
+                        &Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
                     ),
                     ResyncRead::Current,
                     "{tag}: the applied rows are no longer due"
                 );
             }
             CliSync::Unlisted { .. } if tag == "unlisted" => {}
-            CliSync::Left { label } if !admitted => assert_eq!(Some(label.as_str()), retained),
+            CliSync::Left { label, .. } if !admitted => assert_eq!(Some(label.as_str()), retained),
             outcome => panic!("{tag}: unexpected sync outcome {outcome:?}"),
         }
         if !admitted {
@@ -1700,7 +1764,7 @@ fn a_default_pools_converge_read_reports_recovery_before_its_source_gate() {
             &bed.state,
             &claude_roster(&bed),
             NOW,
-            &Mutex::new(Rediscovery::default()),
+            &Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
         ),
         ResyncRead::Due(_)
     ));
@@ -1742,7 +1806,11 @@ fn upkeep_over(bed: &Bed, step: UpkeepStep) -> usize {
         let _ = upkeep(
             &bed.home,
             &bed.state,
-            (&bed.config.join(accounts::ACCOUNTS_FILE), NOW, step),
+            (
+                &bed.config.join(accounts::ACCOUNTS_FILE),
+                trace::Now::at(NOW),
+                step,
+            ),
             fx,
         );
     });
@@ -1761,7 +1829,7 @@ fn with_effects<R>(
     with_logged_effects(
         (spawn, fetch),
         (
-            &Mutex::new(Rediscovery::default()),
+            &Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
             std::sync::Arc::new(|_: &str| {}),
         ),
         run,
@@ -1771,11 +1839,11 @@ fn with_effects<R>(
 /// [`with_effects`] keeping what the upkeep remembers in `rediscovery` and logging to `log`.
 fn with_logged_effects<R>(
     (spawn, fetch): (&SpawnRenewal<'_>, &Fetch<'_>),
-    (rediscovery, log): (&Mutex<Rediscovery>, SignInLog),
+    (rediscovery, log): (&Watched<Rediscovery>, SignInLog),
     run: impl FnOnce(&UpkeepEffects<'_>) -> R,
 ) -> R {
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
-    let cooldown = Mutex::new(None);
+    let guard = AutoRenewGuard::default().shared();
+    let cooldown = Watched::new("accounts_sync/sync_cooldown", None);
     let lifetime = crate::harness::account_work::Lifetime::default();
     let fx = UpkeepEffects {
         scope: lifetime.enter(),
@@ -1864,7 +1932,7 @@ fn harness_accounts_off_turns_every_automatic_sync_off() {
             upkeep(
                 &bed.home,
                 &bed.state,
-                (&roster_path(&bed), NOW, UpkeepStep::Sync),
+                (&roster_path(&bed), trace::Now::at(NOW), UpkeepStep::Sync),
                 fx,
             )
         });
@@ -2396,167 +2464,115 @@ fn codex_by_default_writes_nothing_where_the_fleet_lists_no_row_of_this_macs() {
     assert!(!bed.roster(Cli::Codex).exists());
 }
 
-/// THE QUIET RULE: once the window's upkeep found the fleet lists no Codex row of this
-/// machine's, it does not read the same sheet and config again (nor ask the host's name) until
-/// [`REDISCOVER_EVERY`] passes. CONTROL: a changed input (this machine named m16, which the sheet
-/// lists, in an `aterm.toml` kept as a link, as dotfiles keep it) syncs at the next upkeep, and
-/// the hold is forgotten once rows are written.
+/// One whole syncing pass of the window's upkeep over `bed` (`UpkeepStep::Sync`), keeping what
+/// it remembers between passes in `rediscovery` as a window does: how many pool syncs it ran.
+fn pool_syncs_of_a_pass(bed: &Bed, rediscovery: &Watched<Rediscovery>) -> u64 {
+    let before = crate::harness::accounts_upkeep_counts::counts_here().pool_syncs;
+    with_logged_effects(
+        (&|_work| Ok(()), &read_named),
+        (rediscovery, std::sync::Arc::new(|_: &str| {})),
+        |fx| {
+            let _ = upkeep(
+                &bed.home,
+                &bed.state,
+                (&claude_roster(bed), trace::Now::at(NOW), UpkeepStep::Sync),
+                fx,
+            );
+        },
+    );
+    crate::harness::accounts_upkeep_counts::counts_here().pool_syncs - before
+}
+
+/// AN UNLISTED MAC SYNCS ITS POOLS AGAIN ONLY ONCE WHAT THEIR SYNC READ MOVES. On the keeper's
+/// thread (`trace::keeper`), every read judged settled as of a minute past the clock, the
+/// window's upkeep over a home whose sheet lists no row of this machine's (`m9`, named in an
+/// `aterm.toml` kept as a link, as dotfiles keep it) syncs the three pools that sync by default,
+/// writes no roster of Codex's, and keeps each sync as its duty's verdict: the next pass over
+/// the same inputs syncs no pool. CONTROL: the same `aterm.toml` naming m16, which the sheet
+/// lists, syncs at the next pass and writes Codex's rows; and over a home whose `ai-pool.toml`
+/// warms another Mac, an edit that warms this one does the same. Over that home the first pass
+/// also records each pool's source (`source-policy.json` in each store), so its syncs are not
+/// kept and the next pass syncs the three again, finding them recorded; the pass after it syncs
+/// none.
+///
+/// NEGATIVE CONTROL (2026-11-16): `upkeep_pools` making each pool's sync as it is (its work
+/// called directly in place of through `duty(fx, Duty::PoolSync(cli), …)`), so no verdict is
+/// kept for it: `the same inputs sync no pool` fails, left 3, right 0. Restored, the file
+/// touched.
 #[cfg(unix)]
 #[test]
-fn an_unlisted_mac_syncs_codex_again_only_once_its_inputs_change() {
-    let bed = Bed::new("codex-unlisted-quiet");
+fn an_unlisted_mac_syncs_its_pools_again_only_once_what_their_sync_read_moves() {
+    let bed = Bed::new("codex-unlisted-verdict");
     let dotfile = bed.home.join("dotfiles-aterm.toml");
     aterm_uds::atomic_file::write(&dotfile, b"[fleet]\nmachine = \"m9\"\n", 0o600).unwrap();
     fs::remove_file(bed.aterm_toml()).unwrap();
     std::os::unix::fs::symlink(&dotfile, bed.aterm_toml()).unwrap();
     bed.secret(ACCOUNTS_CSV_FILE, SHEET);
-    let inputs = || cli_sync_inputs(Cli::Codex, &bed.home, &bed.state, &bed.aterm_toml());
-    with_effects(&|_work| Ok(()), &read_named, |fx| {
-        let upkeep_pools_now = || {
-            upkeep_pools(
-                &bed.home,
-                &bed.state,
-                (&claude_roster(&bed), NOW, UpkeepStep::Sync),
-                fx,
-            );
-        };
-        assert!(!default_sync_holds(fx.rediscovery, Cli::Codex, &inputs()));
-        upkeep_pools_now();
-        assert!(!bed.roster(Cli::Codex).exists());
-        assert!(
-            default_sync_holds(fx.rediscovery, Cli::Codex, &inputs()),
-            "the same inputs are held back"
-        );
-
-        fs::write(&dotfile, "[fleet]\nmachine = \"m16\"\n").unwrap();
-        assert!(
-            !default_sync_holds(fx.rediscovery, Cli::Codex, &inputs()),
-            "CONTROL: changed inputs are not held"
-        );
-        upkeep_pools_now();
-        assert_eq!(
-            codex_labels(&bed),
-            [ACCOUNTS_OWN_LABEL, "codex-m16", "codex-m16-2"]
-        );
-        assert!(
-            !fx.rediscovery
-                .lock()
-                .unwrap()
-                .default_held
-                .contains_key(&Cli::Codex),
-            "a sync that wrote rows forgets the hold"
-        );
-    });
-
-    let pool_bed = Bed::new("codex-unlisted-ai-pool-quiet");
+    let pool_bed = Bed::new("codex-unlisted-ai-pool-verdict");
     crate::test_config::write(pool_bed.aterm_toml(), "[fleet]\nmachine = \"m9\"\n").unwrap();
     pool_bed.secret(
         super::super::ai_pool::AI_POOL_FILE,
         "version = 1\n\n[[account]]\nprovider = \"codex\"\nemail = \"codex-one@example.com\"\nwarm = [\"m16\"]\n",
     );
-    let pool_inputs = || {
-        cli_sync_inputs(
-            Cli::Codex,
-            &pool_bed.home,
-            &pool_bed.state,
-            &pool_bed.aterm_toml(),
-        )
-    };
-    with_effects(&|_work| Ok(()), &read_named, |fx| {
-        let upkeep_pools_now = || {
-            upkeep_pools(
-                &pool_bed.home,
-                &pool_bed.state,
-                (&claude_roster(&pool_bed), NOW, UpkeepStep::Sync),
-                fx,
+    trace::keeper(|| {
+        trace::read_as_if_later(Duration::from_secs(60), || {
+            let rediscovery = Watched::new("accounts_sync/rediscovery", Rediscovery::default());
+            assert_eq!(
+                pool_syncs_of_a_pass(&bed, &rediscovery),
+                3,
+                "the first pass"
             );
-        };
-        upkeep_pools_now();
-        assert!(!pool_bed.roster(Cli::Codex).exists());
-        assert!(default_sync_holds(
-            fx.rediscovery,
-            Cli::Codex,
-            &pool_inputs()
-        ));
+            assert!(!bed.roster(Cli::Codex).exists());
+            assert_eq!(
+                pool_syncs_of_a_pass(&bed, &rediscovery),
+                0,
+                "the same inputs sync no pool"
+            );
 
-        pool_bed.secret(
-            super::super::ai_pool::AI_POOL_FILE,
-            "version = 1\n\n[[account]]\nprovider = \"codex\"\nemail = \"codex-one@example.com\"\nwarm = [\"m9\"]\n",
-        );
-        assert!(
-            !default_sync_holds(fx.rediscovery, Cli::Codex, &pool_inputs()),
-            "ai-pool.toml edits lift the default sync hold"
-        );
-        upkeep_pools_now();
-        assert_eq!(codex_labels(&pool_bed), [ACCOUNTS_OWN_LABEL, "codex-m9"]);
+            fs::write(&dotfile, "[fleet]\nmachine = \"m16\"\n").unwrap();
+            assert!(
+                pool_syncs_of_a_pass(&bed, &rediscovery) > 0,
+                "CONTROL: a changed input syncs"
+            );
+            assert_eq!(
+                codex_labels(&bed),
+                [ACCOUNTS_OWN_LABEL, "codex-m16", "codex-m16-2"]
+            );
+
+            let rediscovery = Watched::new("accounts_sync/rediscovery", Rediscovery::default());
+            assert_eq!(pool_syncs_of_a_pass(&pool_bed, &rediscovery), 3);
+            assert!(!pool_bed.roster(Cli::Codex).exists());
+            assert_eq!(
+                pool_syncs_of_a_pass(&pool_bed, &rediscovery),
+                3,
+                "the pass after one that recorded each pool's source"
+            );
+            assert_eq!(
+                pool_syncs_of_a_pass(&pool_bed, &rediscovery),
+                0,
+                "the same ai-pool.toml syncs no pool"
+            );
+            pool_bed.secret(
+                super::super::ai_pool::AI_POOL_FILE,
+                "version = 1\n\n[[account]]\nprovider = \"codex\"\nemail = \"codex-one@example.com\"\nwarm = [\"m9\"]\n",
+            );
+            assert!(
+                pool_syncs_of_a_pass(&pool_bed, &rediscovery) > 0,
+                "CONTROL: an ai-pool.toml edit syncs"
+            );
+            assert_eq!(codex_labels(&pool_bed), [ACCOUNTS_OWN_LABEL, "codex-m9"]);
+        });
     });
-}
-
-#[test]
-#[cfg(unix)]
-fn retired_provider_sources_do_not_lift_retry_holds() {
-    use crate::harness::alab_roster::{SourceSnapshot, TestSourceOverride};
-    let _source = TestSourceOverride::new(SourceSnapshot::Absent);
-    for cli in OTHER_CLIS {
-        let bed = Bed::new("retired-retry-inputs");
-        let store = accounts::Store::at_for(&bed.state, cli, &bed.home);
-        let inputs = || cli_sync_inputs(cli, &bed.home, &bed.state, &bed.aterm_toml());
-        let legacy = cli_fleet_file(cli);
-        bed.secret(&legacy, "account=[]\n");
-        let initial = inputs();
-        bed.secret(&legacy, "# changed legacy\naccount=[]\n");
-        let eligible = inputs();
-        assert_ne!(eligible, initial, "an eligible source lifts the hold");
-
-        let held = store.acquire().unwrap();
-        store.retire_source_held(&held, NOW).unwrap();
-        drop(held);
-        let retired = inputs();
-        assert_ne!(
-            retired, eligible,
-            "retirement invalidates the old observation"
-        );
-        let rediscovery = Mutex::new(Rediscovery::default());
-        note_default_sync(&rediscovery, cli, Some(retired));
-        bed.secret(&legacy, "unparseable retired bytes");
-        assert!(default_sync_holds(&rediscovery, cli, &inputs()));
-        bed.secret(&legacy, "");
-        assert!(default_sync_holds(&rediscovery, cli, &inputs()));
-
-        let member = csv_columns(cli)[0];
-        let value = if cli == Cli::Kimi { "global" } else { "1" };
-        bed.secret(
-            ACCOUNTS_CSV_FILE,
-            &format!("email,computer,{member}\nnew@example.test,m16,{value}\n"),
-        );
-        assert!(!default_sync_holds(&rediscovery, cli, &inputs()));
-        let env = quiet_env(&bed.home, &bed.state, &bed.aterm_toml(), NOW);
-        let table = load_cli_fleet(cli, &env, &bed.home, None, &read_named)
-            .unwrap()
-            .unwrap();
-        assert_eq!(table.roster.accounts[0].email, "new@example.test");
-
-        let policy = fs::read(store.source_policy_file()).unwrap();
-        let valid = inputs();
-        fs::remove_file(store.source_policy_file()).unwrap();
-        let refused = inputs();
-        assert_ne!(refused, valid, "a lost policy lifts the old retry hold");
-        assert!(load_cli_fleet(cli, &env, &bed.home, None, &read_named).is_err());
-        bed.secret(&legacy, "another retired edit while policy is refused");
-        assert_eq!(inputs(), refused, "refused policy reads no source bytes");
-        note_default_sync(&rediscovery, cli, Some(refused));
-        fs::write(store.source_policy_file(), policy).unwrap();
-        assert_eq!(inputs(), valid);
-        assert!(!default_sync_holds(&rediscovery, cli, &inputs()));
-    }
 }
 
 /// A MAC THAT LEFT CODEX'S POOL stays out: one that kept `accounts-codex.toml` and removed it,
 /// its store still holding the records of a row the sync would add (`main`, or the sheet's
-/// `codex-m16`), takes nothing by default ([`CliSync::Left`], naming that row) where the sync
-/// would otherwise refuse at every pass, writes nothing, is not due for init's probe, and the
-/// window's upkeep holds it. CONTROL: the records of a row the sync would not add (`retired`)
-/// leave the default sync free.
+/// `codex-m16`), takes nothing by default ([`CliSync::Left`], naming that row and the address the
+/// sheet lists it at) where the sync would otherwise refuse at every pass, writes nothing, is not
+/// due for init's probe, and the window's upkeep writes nothing either. A person's `accounts sync
+/// --cli codex` says so, naming the row by its account (`main`, which has no address, by its label
+/// marked so) and saying its label only as the row a restored roster writes. CONTROL: the records
+/// of a row the sync would not add (`retired`) leave the default sync free.
 #[test]
 #[cfg(unix)]
 fn a_mac_that_removed_its_codex_roster_stays_out_of_the_pool() {
@@ -2579,10 +2595,58 @@ fn a_mac_that_removed_its_codex_roster_stays_out_of_the_pool() {
         let codex = init.iter().find(|(cli, _)| *cli == Cli::Codex);
         if left {
             assert!(!due.contains(&Cli::Codex), "{label}: {due:?}");
+            let listed =
+                (label != ACCOUNTS_OWN_LABEL).then(|| (None, "one@example.com".to_owned()));
             assert!(
-                matches!(codex, Some((_, Ok(CliSync::Left { label: held }))) if held == label),
+                matches!(codex, Some((_, Ok(CliSync::Left { label: held, listed: at })))
+                    if held == label && *at == listed),
                 "{label}: {init:?}"
             );
+            let env = quiet_env(&bed.home, &bed.state, &bed.aterm_toml(), NOW);
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = run_cli_accounts_sync_with(
+                Cli::Codex,
+                (&env, None),
+                (None, None, false),
+                (&mut out, &mut err),
+                &read_named,
+            );
+            let err = String::from_utf8(err).unwrap();
+            assert_eq!(code, ExitCode::FAILURE, "{label}: {err}");
+            let row = listed.map_or_else(
+                || format!("{label} (no address)"),
+                |(region, email)| {
+                    let (pk, names) = crate::harness::account_names::names_of_listed(
+                        Cli::Codex,
+                        region,
+                        &email,
+                        None,
+                    )
+                    .expect("an account");
+                    crate::harness::account_names::Named {
+                        pk,
+                        row: None,
+                        names,
+                    }
+                    .shown()
+                },
+            );
+            assert!(
+                err.contains(&format!(
+                    "its store still holds the records of {row}, a row the sync would add"
+                )) && err.trim_end().ends_with(&format!(
+                    "restore accounts-codex.toml with the rows it held, the row labelled \
+                     `{label}` among them"
+                )),
+                "{label}: {err}"
+            );
+            if label != ACCOUNTS_OWN_LABEL {
+                assert_eq!(
+                    err.matches(label).count(),
+                    1,
+                    "{label}: the label only as the row to restore: {err}"
+                );
+            }
             assert!(!bed.roster(Cli::Codex).exists());
             assert_eq!(
                 Bed::tree(&store.dir),
@@ -2593,13 +2657,16 @@ fn a_mac_that_removed_its_codex_roster_stays_out_of_the_pool() {
                 upkeep_pools(
                     &bed.home,
                     &bed.state,
-                    (&claude_roster(&bed), NOW, UpkeepStep::Sync),
+                    (&claude_roster(&bed), trace::Now::at(NOW), UpkeepStep::Sync),
                     fx,
                 );
-                let inputs = cli_sync_inputs(Cli::Codex, &bed.home, &bed.state, &bed.aterm_toml());
-                assert!(default_sync_holds(fx.rediscovery, Cli::Codex, &inputs));
             });
             assert!(!bed.roster(Cli::Codex).exists());
+            assert_eq!(
+                Bed::tree(&store.dir),
+                before,
+                "{label}: the upkeep leaves Codex's store unchanged"
+            );
         } else {
             assert_eq!(due, [Cli::Codex, Cli::Grok, Cli::Kimi], "CONTROL: {label}");
             assert!(
@@ -2616,7 +2683,10 @@ fn a_mac_that_removed_its_codex_roster_stays_out_of_the_pool() {
 
 /// `accounts sync --cli` names the sign-in of each row it added by the verb that signs it in
 /// (`Cli::sign_in_verb`): a Kimi row's renewal, once a person has opened its browser, and a Grok
-/// row's `accounts login`, since its renewals stop at accounts.x.ai's block page.
+/// row's `accounts login`, since its renewals stop at accounts.x.ai's block page. Its line names
+/// the row by its account: with sign-ins off (`[harness] logins = false`), the Kimi row's says the
+/// setting that keeps them off and the renewal that runs one now, and the Grok row's says the block
+/// page and the step a person runs. No line says a label of a row with an address.
 #[test]
 #[cfg(unix)]
 fn a_sync_names_each_added_rows_sign_in_by_its_verb() {
@@ -2626,19 +2696,29 @@ label = \"grok-1\"
 email = \"grok-one@example.com\"
 machines = [\"m16\"]
 ";
-    for (cli, fleet, step) in [
+    for (cli, fleet, step, off) in [
         (
             Cli::Kimi,
             KIMI_FLEET,
-            "`aterm harness accounts renew kimi-1 --cli kimi`",
+            Some("`aterm harness accounts renew {} --cli kimi`"),
+            false,
         ),
         (
-            Cli::Grok,
-            GROK_FLEET,
-            "`aterm harness accounts login <label> --cli grok`",
+            Cli::Kimi,
+            KIMI_FLEET,
+            Some("`aterm harness accounts renew {} --cli kimi`"),
+            true,
         ),
+        (Cli::Grok, GROK_FLEET, None, false),
     ] {
         let bed = Bed::new("sync-step");
+        if off {
+            crate::test_config::write(
+                bed.aterm_toml(),
+                "[fleet]\nmachine = \"m16\"\n[harness]\nlogins = false\n",
+            )
+            .unwrap();
+        }
         bed.keep_roster(cli);
         bed.secret(&cli_fleet_file(cli), fleet);
         let env = quiet_env(&bed.home, &bed.state, &bed.aterm_toml(), NOW);
@@ -2650,11 +2730,54 @@ machines = [\"m16\"]
             String::from_utf8(err).unwrap(),
         );
         assert_eq!(code, ExitCode::SUCCESS, "{cli:?}: {err}");
-        assert!(out.contains(step), "{cli:?}: {out}");
+        // A Kimi row's renewal types its account's word; Grok's step names the account a person
+        // chooses.
+        let step = match step {
+            Some(step) => step.replace(
+                "{}",
+                super::super::account_names::tests::row_name(cli, &bed.roster(cli), "kimi-1")
+                    .word
+                    .as_str(),
+            ),
+            None => "`aterm harness accounts login <account> --cli grok`".to_owned(),
+        };
+        assert!(out.contains(&step), "{cli:?}: {out}");
         assert!(!out.contains("by itself"), "{cli:?}: {out}");
-        assert!(
-            out.contains(if cli == Cli::Kimi { "kimi-1" } else { "grok-1" }),
-            "{cli:?}: {out}"
+        // The row it added is named by its account, never by its label.
+        let label = if cli == Cli::Kimi { "kimi-1" } else { "grok-1" };
+        let shown =
+            super::super::account_names::tests::row_name(cli, &bed.roster(cli), label).shown;
+        let line = out
+            .lines()
+            .find(|line| line.starts_with(&format!("not signed in yet: {shown}; ")))
+            .unwrap_or_else(|| panic!("{cli:?}: no line names {shown}: {out}"));
+        let product = cli.connector().product;
+        match (cli, off) {
+            (Cli::Kimi, true) => assert_eq!(
+                line,
+                format!(
+                    "not signed in yet: {shown}; `[harness] logins = false` keeps aterm's \
+                     unattended sign-ins off here ({step} runs one now)"
+                ),
+                "{out}"
+            ),
+            (Cli::Grok, _) => assert_eq!(
+                line,
+                format!(
+                    "not signed in yet: {shown}; {product}'s sign-in page answers aterm's \
+                     headless browser with a block page, so a person signs each in: {step}"
+                ),
+                "{out}"
+            ),
+            _ => {}
+        }
+        assert_eq!(
+            super::super::account_names::tests::labels_said(
+                &format!("{out}{err}"),
+                &["kimi-1", "kimi-22", "grok-1"]
+            ),
+            Vec::<&str>::new(),
+            "{cli:?}: {out}{err}"
         );
         assert_eq!(
             out.contains("accounts renew"),
@@ -2691,8 +2814,11 @@ fn the_dashboard_shows_a_card_per_kept_pool_and_none_where_none_is_kept() {
     assert!(html.contains("<h2>Kimi Code CLI Accounts</h2>"), "{html}");
     assert!(html.contains("<code>kimi-1</code>"), "{html}");
     assert!(html.contains("global"), "{html}");
+    let word =
+        super::super::account_names::tests::row_name(Cli::Kimi, &bed.roster(Cli::Kimi), "kimi-1")
+            .word;
     assert!(
-        html.contains("aterm harness accounts renew kimi-1 --cli kimi"),
+        html.contains(&format!("aterm harness accounts renew {word} --cli kimi")),
         "{html}"
     );
     assert!(!html.contains("Codex CLI"), "only kept pools: {html}");
@@ -2712,10 +2838,15 @@ fn the_dashboard_shows_a_card_per_kept_pool_and_none_where_none_is_kept() {
         &cli_pools(&bed.aterm_toml(), &bed.state, &bed.home, NOW),
         NOW,
     );
+    // The row with an address by its account's word; the row with none by its label.
+    let grok_1 =
+        super::super::account_names::tests::row_name(Cli::Grok, &bed.roster(Cli::Grok), "grok-1")
+            .word;
     assert!(
-        html.contains("aterm harness accounts login grok-1 --cli grok")
+        html.contains(&format!("aterm harness accounts login {grok_1} --cli grok"))
             && html.contains("aterm harness accounts login grok-2 --cli grok")
-            && !html.contains("renew grok-"),
+            && !html.contains("renew grok-")
+            && !html.contains(&format!("renew {grok_1}")),
         "{html}"
     );
     // A Kimi row with no email: `login`, beside its emailed row's renewal.
@@ -2730,8 +2861,11 @@ fn the_dashboard_shows_a_card_per_kept_pool_and_none_where_none_is_kept() {
         &cli_pools(&bed.aterm_toml(), &bed.state, &bed.home, NOW),
         NOW,
     );
+    let kimi_1 =
+        super::super::account_names::tests::row_name(Cli::Kimi, &bed.roster(Cli::Kimi), "kimi-1")
+            .word;
     assert!(
-        html.contains("aterm harness accounts renew kimi-1 --cli kimi")
+        html.contains(&format!("aterm harness accounts renew {kimi_1} --cli kimi"))
             && html.contains("aterm harness accounts login kimi-2 --cli kimi")
             && !html.contains("renew kimi-2"),
         "{html}"
@@ -2810,7 +2944,7 @@ fn pool_inventory_recovers_an_admitted_login_before_reading_the_card() {
 /// `PERSON_BACKOFF`. A Grok row with an email, a headless browser installed, is
 /// `RenewalDispatch::Failed` and nothing is handed off or attributed; a saved selection of one
 /// (a menu click) is cancelled by the window's upkeep, which starts nothing for it. A person's
-/// `accounts login <label> --cli grok` signs it in. CONTROL: a Kimi row with an email, the same
+/// `accounts login <account> --cli grok` signs it in. CONTROL: a Kimi row with an email, the same
 /// headless browser installed, still starts, directly and from its saved selection, and a Kimi
 /// row with no email starts nothing.
 #[test]
@@ -2840,7 +2974,7 @@ fn a_grok_rows_background_renewal_hands_off_nothing_and_a_kimi_rows_still_starts
         *count.lock().unwrap() += 1;
         Ok(())
     };
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let logins = accounts::Logins::default();
     let renew = |cli: Cli, roster: &Roster, label: &str| {
         spawn_vendor_renewal(
@@ -2959,7 +3093,7 @@ fn interrupted_vendor_staging_renewal_recovers_binding_and_proof_only_when_compl
         ),
     )
     .unwrap();
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
 
     // CONTROL 1: a checkpoint written for another CLI is never adopted by Kimi's pool.
     let wrong_cli = store.claim_staging_dir("kimi-1").unwrap();
@@ -3102,7 +3236,7 @@ region = \"global\"
         *count.lock().unwrap() += 1;
         Ok(())
     };
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
 
     // 1. Contended `signin.lock` returns Held without stamping `last_attempt` cooldown.
     let held_lock = store.signin_now().unwrap().expect("signin lock free");
@@ -3216,15 +3350,15 @@ region = \"global\"
             Ok(Vec::new())
         })
         .unwrap();
-    let fresh_guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
-    let cooldown = Mutex::new(None);
+    let fresh_guard = AutoRenewGuard::default().shared();
+    let cooldown = Watched::new("accounts_sync/sync_cooldown", None);
     let fetch = |_: &Env, s: &str| -> Result<String, String> { Err(s.to_owned()) };
     let fx = UpkeepEffects {
         scope: None,
         fetch: &fetch,
         spawn_renewal: &spawn,
         sync_cooldown: &cooldown,
-        rediscovery: &Mutex::new(Rediscovery::default()),
+        rediscovery: &Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
         renew_guard: &fresh_guard,
         find_browser: &|_: &Path| false,
         vault_sync: |_: &Path, _scope| crate::harness::sign_in_ladder::Vault::NotMember,
@@ -3301,14 +3435,14 @@ region = \"global\"
                 Ok(accounts::note_wrong_account(logins, "kimi-1", now - ago))
             })
             .unwrap();
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
-        let cooldown = Mutex::new(None);
+        let guard = AutoRenewGuard::default().shared();
+        let cooldown = Watched::new("accounts_sync/sync_cooldown", None);
         let fx = UpkeepEffects {
             scope: None,
             fetch: &fetch,
             spawn_renewal: &spawn,
             sync_cooldown: &cooldown,
-            rediscovery: &Mutex::new(Rediscovery::default()),
+            rediscovery: &Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
             renew_guard: &guard,
             find_browser: &|_: &Path| false,
             vault_sync: |_: &Path, _scope| crate::harness::sign_in_ladder::Vault::NotMember,
@@ -3348,14 +3482,14 @@ region = \"global\"
 
 /// The upkeep's renewal of Kimi's pool over `bed` at `now` ([`pool_upkeep_of`]).
 #[cfg(unix)]
-fn kimi_pool_upkeep(bed: &Bed, guard: &Arc<Mutex<AutoRenewGuard>>, now: i64) -> bool {
+fn kimi_pool_upkeep(bed: &Bed, guard: &Arc<Watched<AutoRenewGuard>>, now: i64) -> bool {
     pool_upkeep_of(bed, Cli::Kimi, guard, now)
 }
 
 /// The upkeep's renewal of `cli`'s pool over `bed` at `now` ([`renew_pool_due`]) under `guard`,
 /// its renewals started by a seam that runs nothing; whether one started.
 #[cfg(unix)]
-fn pool_upkeep_of(bed: &Bed, cli: Cli, guard: &Arc<Mutex<AutoRenewGuard>>, now: i64) -> bool {
+fn pool_upkeep_of(bed: &Bed, cli: Cli, guard: &Arc<Watched<AutoRenewGuard>>, now: i64) -> bool {
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
     with_pool_effects(guard, &spawn, |fx| {
         renew_pool_due(cli, &bed.home, &bed.state, &bed.roster(cli), now, &fx)
@@ -3648,7 +3782,7 @@ fn bot_check_of(cli: Cli) -> super::super::login_drive::Outcome {
 /// `at`.
 #[cfg(unix)]
 fn restarted_upkeep_tries(bed: &Bed, cli: Cli, label: &str, at: i64) -> bool {
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     pool_upkeep_of(bed, cli, &guard, at);
     let held = guard.lock().unwrap();
     held.last_attempt
@@ -3676,7 +3810,7 @@ fn a_pool_rows_bot_check_holds_it_with_no_clock_past_the_cooldown_and_a_restart(
     // One background try of `kimi-1` that ended `end`, run and put on record by
     // `renew_one_for`, then the upkeep `ago` seconds later.
     let try_again =
-        |bed: &Bed, guard: &Arc<Mutex<AutoRenewGuard>>, end: Renewal, now: i64, ago: u64| {
+        |bed: &Bed, guard: &Arc<Watched<AutoRenewGuard>>, end: Renewal, now: i64, ago: u64| {
             assert!(kimi_pool_upkeep(bed, guard, now), "the first try starts");
             let outcome = if end == Renewal::BotCheck {
                 kimi_bot_check()
@@ -3731,7 +3865,7 @@ fn a_pool_rows_bot_check_holds_it_with_no_clock_past_the_cooldown_and_a_restart(
         assert!(logins.get("kimi-1").and_then(|b| b.sign_in_task).is_none());
 
         for (ago, again) in [(600, false), (901, true)] {
-            let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+            let guard = AutoRenewGuard::default().shared();
             assert_eq!(
                 try_again(&bed, &guard, Renewal::Failed, now, ago),
                 again,
@@ -3739,7 +3873,7 @@ fn a_pool_rows_bot_check_holds_it_with_no_clock_past_the_cooldown_and_a_restart(
             );
         }
 
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         assert!(
             !try_again(&bed, &guard, Renewal::BotCheck, now, 901),
             "the bot check, then the upkeep 901 s later (bound here: {bound})"
@@ -3815,7 +3949,7 @@ fn a_pool_rows_bot_check_holds_it_with_no_clock_past_the_cooldown_and_a_restart(
             &bed.roster(Cli::Kimi),
             request,
             now,
-            &Arc::new(Mutex::new(AutoRenewGuard::default())),
+            &AutoRenewGuard::default().shared(),
             &spawn,
             None,
             None,
@@ -3958,7 +4092,7 @@ pub(super) fn a_vendor_rows_stop_is_tried(
     )
 }
 
-/// Who runs `accounts renew <label> --cli <id>` ([`VendorDesk`]).
+/// Who runs `accounts renew <account> --cli <id>` ([`VendorDesk`]).
 #[cfg(unix)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Who {
@@ -4030,19 +4164,19 @@ fn renew_vendor_row(
 ) -> (ExitCode, usize, String) {
     renew_vendor_row_as(
         bed,
-        (cli, "row-1", "row-one@example.com"),
+        (cli, "row-one@example.com"),
         who,
         (outcome, &|| {}),
         at,
     )
 }
 
-/// [`renew_vendor_row`] of `cli`'s row `label`, signed in as `email`, whose sign-in ends
-/// `outcome` once `during` has run.
+/// [`renew_vendor_row`] of `cli`'s row of the account `email`, which the renewal names it by and
+/// its sign-in signs in as, whose sign-in ends `outcome` once `during` has run.
 #[cfg(unix)]
 fn renew_vendor_row_as(
     bed: &Bed,
-    (cli, label, email): (Cli, &str, &'static str),
+    (cli, email): (Cli, &'static str),
     who: Who,
     (outcome, during): (super::super::login_drive::Outcome, &dyn Fn()),
     at: i64,
@@ -4065,7 +4199,7 @@ fn renew_vendor_row_as(
         &super::super::cli::AccountsOf {
             cli,
             form: super::super::cli::AccountsCmd::Renew {
-                labels: vec![label.to_owned()],
+                accounts: vec![email.to_owned()],
                 due: false,
                 on: None,
             },
@@ -4119,7 +4253,7 @@ fn vendor_bot_check_holds_until_a_person_signs_in(cli: Cli) {
             "row-one@example.com",
         );
         let key = format!("{}:row-1", cli.id());
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         assert!(
             pool_upkeep_of(&bed, cli, &guard, now),
             "{cli:?}: the first try starts"
@@ -4220,11 +4354,15 @@ fn vendor_bot_check_holds_until_a_person_signs_in(cli: Cli) {
                 "{cli:?} {who:?}: {said}"
             );
             assert!(
-                said.contains(&super::super::cli::left_words(cli, "row-1"))
-                    && said.contains(&format!(
-                        "a person runs `aterm harness accounts login row-1 --cli {}`",
-                        cli.id()
-                    )),
+                said.contains(&super::super::cli::left_words(
+                    cli,
+                    &super::super::account_names::tests::row_name(cli, &bed.roster(cli), "row-1")
+                )) && said.contains(&format!(
+                    "a person runs `aterm harness accounts login {} --cli {}`",
+                    super::super::account_names::tests::row_name(cli, &bed.roster(cli), "row-1")
+                        .word,
+                    cli.id()
+                )),
                 "{cli:?} {who:?}: it names the person's step: {said}"
             );
         }
@@ -4270,13 +4408,13 @@ fn vendor_bot_check_holds_until_a_person_signs_in(cli: Cli) {
 /// [`pool_upkeep_of`]'s effects, its renewals started by `spawn`, handed to `run`.
 #[cfg(unix)]
 fn with_pool_effects<T>(
-    guard: &Arc<Mutex<AutoRenewGuard>>,
+    guard: &Arc<Watched<AutoRenewGuard>>,
     spawn: &SpawnRenewal<'_>,
     run: impl FnOnce(UpkeepEffects<'_>) -> T,
 ) -> T {
     let fetch = |_: &Env, s: &str| -> Result<String, String> { Err(s.to_owned()) };
-    let cooldown = Mutex::new(None);
-    let rediscovery = Mutex::new(Rediscovery::default());
+    let cooldown = Watched::new("accounts_sync/sync_cooldown", None);
+    let rediscovery = Watched::new("accounts_sync/rediscovery", Rediscovery::default());
     run(UpkeepEffects {
         scope: None,
         fetch: &fetch,
@@ -4339,7 +4477,7 @@ fn pool_bot_check_holds_the_pool(cli: Cli) {
         "{cli:?}"
     );
     for later in [901, PERSON_BACKOFF_SECS + 60, 25 * 3_600] {
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         assert!(
             !pool_upkeep_of(&bed, cli, &guard, now + later),
             "{cli:?}: the upkeep {later} s on starts no row of the pool"
@@ -4361,7 +4499,7 @@ fn pool_bot_check_holds_the_pool(cli: Cli) {
             spawned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         };
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         assert_eq!(
             (
                 renew_requested_pin_at(
@@ -4386,7 +4524,7 @@ fn pool_bot_check_holds_the_pool(cli: Cli) {
     }
     let (code, ran, said) = renew_vendor_row_as(
         &bed,
-        (cli, "row-2", "row-two@example.com"),
+        (cli, "row-two@example.com"),
         Who::Agent,
         (bot_check_of(cli), &|| {}),
         at,
@@ -4395,14 +4533,18 @@ fn pool_bot_check_holds_the_pool(cli: Cli) {
     assert!(
         said.contains(&super::super::cli::held_words(
             cli,
-            "row-2",
-            &PersonHold::Pool("row-1".to_owned())
+            &super::super::account_names::tests::row_name(cli, &bed.roster(cli), "row-2"),
+            &PersonHold::Pool("row-1".to_owned()),
+            &accounts::Roster::load_for(cli, &bed.roster(cli))
+                .expect("the roster")
+                .rows,
+            super::super::cli::Reader::Person,
         )),
         "{cli:?}: an agent's renewal names row-1's stop and the person's step: {said}"
     );
     let (code, ran, said) = renew_vendor_row_as(
         &bed,
-        (cli, "row-1", "row-one@example.com"),
+        (cli, "row-one@example.com"),
         Who::Person,
         (
             Outcome::SignedIn {
@@ -4506,11 +4648,7 @@ fn an_earlier_builds_ledger_line_of_a_bot_check_holds_a_vendor_row_on_no_clock()
                     (&bed.home, &bed.state, &bed.roster(Cli::Kimi)),
                     request,
                     at,
-                    (
-                        &Arc::new(Mutex::new(AutoRenewGuard::default())),
-                        &spawn,
-                        None
-                    ),
+                    (&AutoRenewGuard::default().shared(), &spawn, None),
                     None,
                     false,
                 ),
@@ -4559,7 +4697,7 @@ fn a_check_met_by_a_renewal_whose_record_did_not_land_is_recorded_alone() {
         };
         let (code, ran, said) = renew_vendor_row_as(
             &bed,
-            (cli, "row-1", "row-one@example.com"),
+            (cli, "row-one@example.com"),
             Who::Agent,
             (outcome, &during),
             now,
@@ -4661,7 +4799,7 @@ fn a_next_selection_starts_no_row_a_bot_protection_stopped() {
         let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
         let at = now + 25 * 3_600;
         let request = store.request_next(at).unwrap();
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         let owner = ManualSelectionOwner::claim(
             &guard,
             &store,
@@ -4723,7 +4861,7 @@ fn a_vendor_rows_unrecorded_check_holds_it_until_a_pass_writes_it() {
         "kimi-one@example.com",
     );
     let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     assert!(kimi_pool_upkeep(&bed, &guard, now), "the first try starts");
     let roster_path = bed.roster(Cli::Kimi);
     let records = store.read_account_records(Some(&roster_path), now).unwrap();
@@ -4839,7 +4977,7 @@ region = \"global\"
             )
             .unwrap();
         let task_logins = store.load_logins(now).unwrap().0;
-        let restarted_guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let restarted_guard = AutoRenewGuard::default().shared();
         assert_eq!(
             spawn_vendor_renewal(
                 Cli::Kimi,
@@ -4895,15 +5033,15 @@ region = \"global\"
             },
         )
         .unwrap();
-    let pool_guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
-    let cooldown = Mutex::new(None);
+    let pool_guard = AutoRenewGuard::default().shared();
+    let cooldown = Watched::new("accounts_sync/sync_cooldown", None);
     let fetch = |_: &Env, s: &str| -> Result<String, String> { Err(s.to_owned()) };
     let fx = UpkeepEffects {
         scope: None,
         fetch: &fetch,
         spawn_renewal: &spawn,
         sync_cooldown: &cooldown,
-        rediscovery: &Mutex::new(Rediscovery::default()),
+        rediscovery: &Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
         renew_guard: &pool_guard,
         find_browser: &|_: &Path| false,
         vault_sync: |_: &Path, _scope| crate::harness::sign_in_ladder::Vault::NotMember,
@@ -4940,7 +5078,7 @@ region = \"global\"
 
     // 3. Negative controls: `accounts browser` ending with `no-session` or `interrupted
     // session-unknown` keeps `kimi-1` held even on an in-memory parked guard.
-    let live_guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let live_guard = AutoRenewGuard::default().shared();
     note_background_end(
         &live_guard,
         "kimi:kimi-1",
@@ -5056,7 +5194,7 @@ region = \"global\"
         .at,
         now,
     );
-    let slept_guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let slept_guard = AutoRenewGuard::default().shared();
     note_background_end(
         &slept_guard,
         "kimi:kimi-1",
@@ -5132,18 +5270,18 @@ region = \"global\"
         *count.lock().unwrap() += 1;
         Ok(())
     };
-    let cooldown = Mutex::new(None);
+    let cooldown = Watched::new("accounts_sync/sync_cooldown", None);
     let fetch = |_: &Env, s: &str| -> Result<String, String> { Err(s.to_owned()) };
 
     // CONTROL 1: while `main` is healthy (`Unseen`), unenrolled `kimi-1` and `kimi-2` stay idle
     // and `accounts renew --cli kimi --due` reports nothing due.
-    let idle_guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let idle_guard = AutoRenewGuard::default().shared();
     let idle_fx = UpkeepEffects {
         scope: None,
         fetch: &fetch,
         spawn_renewal: &spawn,
         sync_cooldown: &cooldown,
-        rediscovery: &Mutex::new(Rediscovery::default()),
+        rediscovery: &Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
         renew_guard: &idle_guard,
         find_browser: &|_: &Path| false,
         vault_sync: |_: &Path, _scope| crate::harness::sign_in_ladder::Vault::NotMember,
@@ -5174,7 +5312,7 @@ region = \"global\"
         &super::super::cli::AccountsOf {
             cli: Cli::Kimi,
             form: super::super::cli::AccountsCmd::Renew {
-                labels: Vec::new(),
+                accounts: Vec::new(),
                 due: true,
                 on: None,
             },
@@ -5211,13 +5349,13 @@ region = \"global\"
             Ok(Vec::new())
         })
         .unwrap();
-    let wall_guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let wall_guard = AutoRenewGuard::default().shared();
     let wall_fx = UpkeepEffects {
         scope: None,
         fetch: &fetch,
         spawn_renewal: &spawn,
         sync_cooldown: &cooldown,
-        rediscovery: &Mutex::new(Rediscovery::default()),
+        rediscovery: &Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
         renew_guard: &wall_guard,
         find_browser: &|_: &Path| false,
         vault_sync: |_: &Path, _scope| crate::harness::sign_in_ladder::Vault::NotMember,
@@ -5295,7 +5433,7 @@ fn a_pin_request_on_a_default_codex_row_with_no_login_file_is_not_pinned() {
     .unwrap();
     let now = crate::supervise::limit::unix_now().max(NOW);
     let store = accounts::Store::at_for(&bed.state, Cli::Codex, &bed.home);
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let noop_spawn = |_: Box<dyn FnOnce() + Send>| Ok(());
     let renew = |request| {
         renew_requested_pin_for(
@@ -5400,7 +5538,7 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
     assert!(any_pending_pin(&bed.state, now));
 
     // Hold global admission via an in-flight Claude permit (`wake_pending = Some(bed.state)`).
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let mut claude_permit = AutoRenewPermit::claim(&guard, "m16", Instant::now(), false).unwrap();
     claude_permit.wake_pending = Some(bed.state.clone());
     let _ = fs::remove_file(codex_store.wake_path());
@@ -5472,7 +5610,7 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
         &codex_store.load_logins(now + 1).unwrap().0,
     )
     .unwrap();
-    let cooldown = Mutex::new(None);
+    let cooldown = Watched::new("accounts_sync/sync_cooldown", None);
     let fetch = |_: &Env, s: &str| -> Result<String, String> { Err(s.to_owned()) };
     let finish = |work: Box<dyn FnOnce() + Send>| {
         work();
@@ -5484,7 +5622,7 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
         fetch: &fetch,
         spawn_renewal: &finish,
         sync_cooldown: &cooldown,
-        rediscovery: &Mutex::new(Rediscovery::default()),
+        rediscovery: &Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
         renew_guard: &guard,
         find_browser: &|_: &Path| false,
         vault_sync: |_: &Path, _scope| crate::harness::sign_in_ladder::Vault::NotMember,
@@ -5503,7 +5641,7 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
         &bed.state,
         (
             &bed.config.join(accounts::ACCOUNTS_FILE),
-            now + 2,
+            trace::Now::at(now + 2),
             UpkeepStep::Renew,
         ),
         &fx,
@@ -5560,14 +5698,14 @@ fn harness_accounts_off_stops_window_upkeep_sign_ins_as_well_as_sync() {
         let fetch = |_: &Env, source: &str| -> Result<String, String> {
             Err(format!("unexpected fetch: {source}"))
         };
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
-        let cooldown = Mutex::new(None);
+        let guard = AutoRenewGuard::default().shared();
+        let cooldown = Watched::new("accounts_sync/sync_cooldown", None);
         let fx = UpkeepEffects {
             scope: None,
             fetch: &fetch,
             spawn_renewal: &spawn,
             sync_cooldown: &cooldown,
-            rediscovery: &Mutex::new(Rediscovery::default()),
+            rediscovery: &Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
             renew_guard: &guard,
             find_browser: &|_: &Path| true,
             vault_sync: |_: &Path, _scope| crate::harness::sign_in_ladder::Vault::NotMember,
@@ -5584,7 +5722,7 @@ fn harness_accounts_off_stops_window_upkeep_sign_ins_as_well_as_sync() {
         let upkept = upkeep(
             &bed.home,
             &bed.state,
-            (&claude_roster, NOW + 10, UpkeepStep::Both),
+            (&claude_roster, trace::Now::at(NOW + 10), UpkeepStep::Both),
             &fx,
         );
         let spawned = queued.lock().unwrap().len();
@@ -5666,7 +5804,7 @@ fn published_kimi_refresh_schedules_without_a_browser_and_keeps_identity_retry_h
                 .unwrap();
         }
         let records = store.read_account_records(Some(&path), NOW).unwrap();
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         assert!(!guard_reads(&guard).has_browser(&bed.home));
         let handed = Arc::new(Mutex::new(0));
         let counted = handed.clone();

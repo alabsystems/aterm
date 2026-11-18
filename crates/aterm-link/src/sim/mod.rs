@@ -226,13 +226,13 @@ impl Core {
             readers.remove(i)
         };
         let mut reader = reader;
-        let read =
-            crate::bridge::next_took(&mut reader.sub, &reader.closer, std::time::Duration::ZERO);
+        let read = crate::bridge::next_took(&mut reader.sub, &reader.closer, None);
         let what = match &read {
             Ok(Some(crate::bridge::Took::Record((off, subject, _), _))) => {
                 format!("@{off} {subject}")
             }
             Ok(Some(crate::bridge::Took::Gap(g))) => format!("gap {}..{}", g.from, g.to),
+            Ok(Some(crate::bridge::Took::Mark(next))) => format!("mark {next}"),
             Ok(None) => "end".to_string(),
             Err(e) => format!("err {:?}", e.kind()),
         };
@@ -247,7 +247,7 @@ impl Core {
             reader.generation,
             &reader.closer,
             self.now(),
-            std::time::Duration::ZERO,
+            Some(std::time::Duration::ZERO),
         );
         if on {
             lock(&self.readers).push(reader);
@@ -379,12 +379,13 @@ impl Process {
         closer: Arc<BusCloser>,
         source: Source,
         mailbox: Arc<Mailbox>,
+        marks: bool,
     ) {
         let conn = match &*closer {
             BusCloser::Sim(c) => c.conn(),
             BusCloser::Os(_) => unreachable!("a simulated process dials simulated connections"),
         };
-        let generation = mailbox.broker_generation(source);
+        let generation = mailbox.reader_starts(source, marks);
         self.core
             .note(format!("reader {source:?} conn={conn} gen={generation}"));
         lock(&self.core.readers).push(Reader {

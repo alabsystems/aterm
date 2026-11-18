@@ -3958,7 +3958,7 @@ fn serious_mode_shows_the_words_alone() {
         };
         assert_eq!(spec.audit_id, crate::native_ui::SYSTEM_STATE_BRAND_AUDIT);
         assert_eq!(
-            LockupPaint::parse(spec.paint.as_deref()).spec.kitty,
+            LockupPaint::parse(spec.paint.as_deref()).spec.road,
             !serious
         );
         let mut prims = Vec::new();
@@ -3968,10 +3968,10 @@ fn serious_mode_shows_the_words_alone() {
             spec.paint.as_deref(),
             &crate::settings::Roles::from_theme(aterm_render::Theme::default()),
         );
-        let kitty = prims
+        let road = prims
             .iter()
             .any(|prim| matches!(prim, crate::widget::DrawPrim::Image { .. }));
-        assert_eq!(kitty, !serious, "serious: {serious}");
+        assert_eq!(road, !serious, "serious: {serious}");
     }
 }
 

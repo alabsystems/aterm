@@ -157,19 +157,31 @@ fn paths(names: &[&str]) -> BTreeSet<PathBuf> {
         .collect()
 }
 
-/// The indexing state is read only from exactly one recognized line of a run that succeeded.
-/// NEGATIVE CONTROL: both lines, neither line, another sentence and a failed run are errors,
-/// never "disabled".
+/// The indexing state is the data volume's block of a run that succeeded, read by the one
+/// `mdutil -s` parser: `mdutil -s -a`'s form, another volume off, reads the data volume alone.
+/// NEGATIVE CONTROL: both lines, neither line, another sentence, a block of another volume only,
+/// a block whose lines disagree and a failed run are errors, never "disabled".
 #[test]
 fn indexing_requires_one_recognized_state() {
     let mac = Mac::alice();
     assert_eq!(indexing(&mac), Ok(true));
     mac.prints(Ok("/System/Volumes/Data:\n\tIndexing disabled.\n"));
     assert_eq!(indexing(&mac), Ok(false));
+    mac.prints(Ok(
+        "/:\n\tIndexing disabled. \n/System/Volumes/Data:\n\tIndexing enabled. \n",
+    ));
+    assert_eq!(indexing(&mac), Ok(true));
+    mac.prints(Ok(
+        "/System/Volumes/Data:\n\tIndexing and searching disabled. \n",
+    ));
+    assert_eq!(indexing(&mac), Ok(false));
     for unread in [
         Ok("Spotlight server is disabled."),
         Ok("Indexing enabled.\nIndexing disabled."),
         Ok(""),
+        Ok("/:\n\tIndexing enabled.\n"),
+        Ok("/System/Volumes/Data:\n\tIndexing enabled.\n\tIndexing disabled.\n"),
+        Ok("/System/Volumes/Data:\n\tError: unknown indexing state.\n"),
         Err("Spotlight status: exit 1"),
     ] {
         mac.prints(unread);
@@ -241,7 +253,7 @@ fn state_goes_by_the_receipt() {
         Ok(State::Indexed(paths(&["Developer", "Downloads"])))
     );
 
-    mac.prints(Ok("Indexing disabled."));
+    mac.prints(Ok("/System/Volumes/Data:\n\tIndexing disabled.\n"));
     assert_eq!(state(&mac, home), Ok(State::Disabled));
 }
 
@@ -273,7 +285,12 @@ fn only_the_console_account_whose_home_was_never_scoped_is_owed() {
     assert!(!automatic_owed(&unread) && !owed(&unread));
 
     let disabled = Mac::alice();
-    disabled.prints(Ok("Indexing disabled."));
+    disabled.prints(Ok("/System/Volumes/Data:\n\tIndexing disabled.\n"));
+    assert_eq!(
+        indexing(&disabled),
+        Ok(false),
+        "the disabled arm, not the unread"
+    );
     assert!(!automatic_owed(&disabled) && !owed(&disabled));
 
     let elsewhere = Mac::alice();

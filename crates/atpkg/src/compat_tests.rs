@@ -1036,6 +1036,13 @@ fn gc_reclaims_a_superseded_root_and_sweeps_orphans_without_following_links() {
     std::fs::write(elsewhere.join("bin").join("keep"), b"not atpkg's").unwrap();
     std::os::unix::fs::symlink(&elsewhere, dir.join("9001")).unwrap();
     std::fs::create_dir_all(dir.join(".8595.tmp-77")).unwrap();
+    // A recent trust.lock resolution keeps 8590 on disk though it is superseded (RL-29: no
+    // rollback build is kept), so it is laid aside with its root standing.
+    let mark = fx
+        .layout
+        .build_dir("trust", 8590)
+        .with_file_name(format!("8590{}", crate::trust_lock::LOCKED_SUFFIX));
+    std::fs::write(mark, b"").unwrap();
 
     let report = crate::gc::run(&fx.layout, None);
     assert_eq!(report.reclaimed, vec![("trust".to_string(), vec![8589])]);
@@ -1044,10 +1051,10 @@ fn gc_reclaims_a_superseded_root_and_sweeps_orphans_without_following_links() {
         assert!(root_dir(&fx.layout, n).is_dir(), "{n}'s root stands");
     }
     if cfg!(target_os = "macos") {
-        let rollback = fx.layout.build_dir("trust", 8590);
+        let kept = fx.layout.build_dir("trust", 8590);
         assert!(
-            aterm_toolchain::layout::is_linked_aside(&rollback),
-            "the unused rollback went aside, and its root stood: {report:?}"
+            aterm_toolchain::layout::is_linked_aside(&kept),
+            "the unused kept build went aside, and its root stood: {report:?}"
         );
         assert_eq!(inspect(&fx.layout, 8590).map(|i| i.is_ok()), Some(true));
         assert!(

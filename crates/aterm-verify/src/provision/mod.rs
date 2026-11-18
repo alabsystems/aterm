@@ -156,7 +156,8 @@ pub struct Machine {
     pub tooling: PathBuf,
     /// The browser lane's cache.
     pub browser: PathBuf,
-    /// The checkout, whose stock pin the rustup row puts in place ([`stock::stock_pin`]).
+    /// The checkout, whose stock pin ([`stock::stock_pin`]) and release chain's stock toolchain
+    /// (its `trust.lock`'s, [`stock::release_toolchain`]) the rustup row puts in place.
     pub repo: PathBuf,
     /// rustup's home and how the `rustup` row is resolved (its copy looked for in `tooling`).
     pub homes: stock::Homes,
@@ -250,9 +251,11 @@ row copies the pinned rustup-init in as `rustup` (its self-install never runs, a
 nothing is written to CARGO_HOME), then has that copy add the checkout's stock pin
 (aterm_toolchain::rustup::STOCK_PIN, the release publish/config.sh's wasm32 clause
 builds on) with clippy (and off macOS llvm-tools, whose llvm-nm the win32 oracles
-read Windows import libraries with) and every cell's std, and the release chain's stable with its
-x86_64 slice's std on a Mac, to rustup's own home where they are missing (auto-install
-off first in a home it never ran in); no dev lane rides stable. It reads the network.
+read Windows import libraries with) and every cell's std, and the release chain's stock toolchain
+(the checkout's trust.lock `[stock] toolchain`) with its x86_64 slice's std on a Mac, to rustup's
+own home where they are missing (auto-install off first in a home it never ran in); nothing rides
+rustup's floating stable. A checkout with no trust.lock (a public snapshot) has no release-chain
+part, which --release refuses. It reads the network.
 
   (no ROW)    the rows every checkout needs
   --linux     and the Linux lane's VM: lima, Ubuntu's pinned image for its own VM, and
@@ -487,7 +490,7 @@ pub fn check_for(row: &Row, opts: &Options, machine: &Machine, host: &dyn Host) 
         return State::NotPinned(not_pinned(row, machine));
     };
     if matches!(row.install, Install::Rustup { .. }) {
-        return rustup_check(&t, opts.linux, machine, host);
+        return rustup_check(&t, opts, machine, host);
     }
     if complete(&t) {
         State::Present(t.dir.join(&t.exe))
@@ -518,23 +521,42 @@ fn not_complete(name: &str, t: &Target) -> String {
 
 /// The rustup row, read only: its copy `t`, then what rustup's home lacks of the stock pin and
 /// the release chain's toolchain, read through the rustup the `rustup` row resolves (where none
-/// does, what a run reads once it is placed); `linux` holds the stock pin to the Linux lane's
-/// targets too.
-fn rustup_check(t: &Target, linux: bool, machine: &Machine, host: &dyn Host) -> State {
+/// does, what a run reads once it is placed); `--linux` holds the stock pin to the Linux lane's
+/// targets too, and `--release` refuses a checkout with no `trust.lock`, which elsewhere has no
+/// release-chain part ([`stock::release_toolchain`]).
+fn rustup_check(t: &Target, opts: &Options, machine: &Machine, host: &dyn Host) -> State {
     let pin = match stock::stock_pin(&machine.repo) {
         Ok(pin) => pin,
         Err(refused) => return State::Missing(format!("rustup: the stock pin — {refused}")),
+    };
+    let release = match stock::release_toolchain(&machine.repo, opts.release) {
+        Ok(release) => release,
+        Err(refused) => {
+            return State::Missing(format!(
+                "rustup: the release chain's stock toolchain — {refused}"
+            ));
+        }
     };
     let mut lacks = Vec::new();
     let placed = complete(t);
     if !placed {
         lacks.push(format!("place {}", not_complete("rustup", t)));
     }
-    match stock::missing(&machine.homes, host.rustup(), Some(&pin), linux) {
+    match stock::missing(
+        &machine.homes,
+        host.rustup(),
+        Some(&pin),
+        release.as_deref(),
+        opts.linux,
+    ) {
         Ok(steps) => lacks.extend(steps),
         Err(_) if !placed => lacks.push(format!(
-            "then read {} for the stock pin and the release chain's stable",
-            machine.homes.rustup_home.display()
+            "then read {} for the stock pin{}",
+            machine.homes.rustup_home.display(),
+            release
+                .as_ref()
+                .map(|r| format!(" and the release chain's stock toolchain {r}"))
+                .unwrap_or_default()
         )),
         Err(absent) => lacks.push(absent.why),
     }
@@ -566,7 +588,7 @@ pub fn provide_for(
         return State::NotPinned(not_pinned(row, machine));
     };
     if matches!(row.install, Install::Rustup { .. }) {
-        return rustup_row(row, &t, opts.linux, machine, host, say);
+        return rustup_row(row, &t, opts, machine, host, say);
     }
     let exe = t.dir.join(&t.exe);
     if complete(&t) {
@@ -654,12 +676,12 @@ fn managed_row(
 pub(crate) const RUSTUP_PROXIES: [&str; 2] = ["cargo", "rustc"];
 
 /// The rustup row: its copy `t` placed ([`place_rustup`]) where it is not complete, then
-/// [`stock::run`] with the rustup the `rustup` row resolves; `linux` adds the Linux lane's
-/// targets to the stock pin.
+/// [`stock::run`] with the rustup the `rustup` row resolves; `--linux` adds the Linux lane's
+/// targets to the stock pin, and `--release` refuses a checkout with no `trust.lock`.
 fn rustup_row(
     row: &Row,
     t: &Target,
-    linux: bool,
+    opts: &Options,
     machine: &Machine,
     host: &dyn Host,
     say: &mut dyn FnMut(&str),
@@ -677,7 +699,14 @@ fn rustup_row(
         }
         true
     };
-    match stock::run(&machine.repo, &machine.homes, host.rustup(), linux, say) {
+    match stock::run(
+        &machine.repo,
+        &machine.homes,
+        host.rustup(),
+        opts.linux,
+        opts.release,
+        say,
+    ) {
         Ok(acquired) if acquired.is_empty() && !placed => State::Present(exe),
         Ok(_) => State::Placed(exe),
         Err(why) => State::Failed(format!("{}: {why}", row.name)),

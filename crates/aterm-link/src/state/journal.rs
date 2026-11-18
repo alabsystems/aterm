@@ -26,10 +26,12 @@
 //! reader that refused them would refuse journals that open today). A reservation and a record
 //! in flight carry their heads there ([`PublishPin::at`], [`InFlight::at`]: `at <n>`, and
 //! `pin-at <n>` for an entry's pin; `any` for [`super::Head::Anywhere`], which a build before
-//! ATERM-KI-1114-1414 cannot read), the one fact this build adds to the B19 record, so a
-//! journal this build wrote reads the same, record for record, to a build of the journal before
-//! it, whose parse of a body is strict (aterm-link B05 review). A tail this build cannot read
-//! is no head: the record reads without one, and is not read back before it is published again.
+//! ATERM-KI-1114-1414 cannot read, and `own<n>` for [`super::Head::OwnFrom`], every keyed
+//! re-post's own head, which a build before it cannot), the one fact
+//! this build adds to the B19 record, so a journal this build wrote reads the same, record for
+//! record, to a build of the journal before it, whose parse of a body is strict (aterm-link B05
+//! review). A tail this build cannot read is no head: the record reads without one, and is not
+//! read back before it is published again.
 //!
 //! ONE CODEC, MORE THAN ONE JOURNAL: what a fact's record is ([`Record`]) and what a run of them
 //! says ([`Replay`]) are the only things a journal of its own supplies; the framing, the read

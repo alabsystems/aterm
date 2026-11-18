@@ -19312,6 +19312,16 @@ fn a_claim_is_proven_under_the_contract_it_names_or_stands_on() {
         assert_eq!(held_contract(&h.ctx, standing), Some(contract));
         assert_eq!(held_contract(&h.ctx, "kimi-alab@4242"), None);
         release_connection_claims_of(&h, 10);
+        // A contract 4 claim outlives its connection by the re-exec grace; a release ends it.
+        if contract == UNIVERSAL {
+            assert_eq!(held_contract(&h.ctx, standing), Some(contract));
+            assert!(crate::session_timeline::release_supervisor(
+                &h.ctx,
+                Some(10),
+                crate::metrics::now_us(),
+                aterm_slog::Actor::Ctl,
+            ));
+        }
         assert_eq!(held_contract(&h.ctx, standing), None);
     }
 }

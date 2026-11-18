@@ -3025,6 +3025,17 @@ fn rbsr_round(
     receiver: &Replica,
     repairs: &mut [Repair; 2],
 ) -> [Result<Report>; 2] {
+    rbsr_round_observed(sender, receiver, repairs, || ()).map(|(result, _)| result)
+}
+
+/// The same one-session fixture, with observations on each exchange's own thread before and
+/// after it runs. Thread-local counters must be read on both sides, not only the initiator.
+fn rbsr_round_observed<T: Send>(
+    sender: &Replica,
+    receiver: &Replica,
+    repairs: &mut [Repair; 2],
+    observe: fn() -> T,
+) -> [(Result<Report>, (T, T)); 2] {
     let (mut left, right) = std::os::unix::net::UnixStream::pair().unwrap();
     for stream in [&left, &right] {
         stream
@@ -3038,11 +3049,16 @@ fn rbsr_round(
     thread::scope(|threads| {
         let worker = threads.spawn(move || {
             let mut right = right;
-            receiver.exchange(&mut right, sender.actor, Side::Responder, &mut server[0])
+            let before = observe();
+            let result =
+                receiver.exchange(&mut right, sender.actor, Side::Responder, &mut server[0]);
+            (result, (before, observe()))
         });
+        let before = observe();
         let result = sender.exchange(&mut left, receiver.actor, Side::Initiator, &mut client[0]);
+        let observed = (result, (before, observe()));
         drop(left);
-        [result, worker.join().unwrap()]
+        [observed, worker.join().unwrap()]
     })
 }
 

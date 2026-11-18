@@ -4,6 +4,7 @@
 //! The Fable limit's move onto Opus and its return at the reset, at the turn-end policy.
 
 use super::*;
+use crate::harness::accounts;
 use crate::supervise::policy::exception::{Exception, Urgency, exception_for};
 use crate::supervise::policy::outlook::ExceptionKind;
 use alab_policy::config::{MIN_WORK, TurnEndTiming};
@@ -245,13 +246,6 @@ fn advised(r: &TurnEndReading, to: &str) -> TurnEndReading {
             to: to.to_string(),
             yields: None,
         }),
-        ..r.clone()
-    }
-}
-
-fn advised_wait(r: &TurnEndReading, until: Instant) -> TurnEndReading {
-    TurnEndReading {
-        account: Some(AccountAdvice::Wait { until }),
         ..r.clone()
     }
 }
@@ -1324,51 +1318,396 @@ fn a_fable_bucket_under_consent_falls_back_unless_credits_carry_it_and_opus_wait
     assert_eq!(st.model_switch(), None);
 }
 
+/// `r` under the host's `advice` about its account.
+fn advised_as(r: &TurnEndReading, advice: AccountAdvice) -> TurnEndReading {
+    TurnEndReading {
+        account: Some(advice),
+        ..r.clone()
+    }
+}
+
+/// Any move onto another account, anywhere in the act or its otherwise.
+fn any_account_move(a: &TurnEndAction) -> bool {
+    match a {
+        TurnEndAction::Restart {
+            why: Restart::Account { .. },
+            ..
+        } => true,
+        TurnEndAction::Restart { otherwise, .. } => any_account_move(otherwise),
+        _ => false,
+    }
+}
+
+/// The unix second the clock `t` stands for, where the roster's advice is turned into the
+/// policy's ([`AccountAdvice::of_roster_at`]).
+const NOW_S: i64 = 1_800_000_000;
+
+/// The roster's `advice` as the policy takes it at a wall (`at_wall`) or a turn end, `past` the
+/// advice past a probe, the clock `t` standing for [`NOW_S`].
+fn of_roster(
+    advice: &accounts::Advice,
+    past: Option<&accounts::Advice>,
+    at_wall: bool,
+    t: Instant,
+) -> AccountAdvice {
+    AccountAdvice::of_roster_at(
+        advice,
+        past,
+        &accounts::State::default(),
+        None,
+        at_wall,
+        NOW_S,
+        t,
+    )
+    .expect("the roster's advice")
+}
+
+/// The roster's move to `work-2`, yielding until `yields` seconds past [`NOW_S`] where it names
+/// one.
+fn roster_move(yields: Option<i64>) -> accounts::Advice {
+    accounts::Advice::Move {
+        to: "work-2".to_string(),
+        ahead: yields.is_some(),
+        rotates: true,
+        takes_canary: false,
+        yields: yields.map(|s| NOW_S + s),
+    }
+}
+
+/// THE ADVICE THE HOST GIVES AT A WALL, each naming `work-2` or a time within the limit's own
+/// reset, built as the host builds it ([`AccountAdvice::of_roster_at`] at a wall, and the wall
+/// ladder's ask, [`AccountAdvice::or_wall_rung`]). A wall's advice carries no yield: the roster
+/// ranks only a turn end for one (`accounts::effective_ranking_point`). A probe at a wall is the
+/// advice past it, and a roster wait there a wait, never a hold. A resume is the next test's.
+fn advice_at_a_wall(t: Instant) -> Vec<(&'static str, AccountAdvice)> {
+    vec![
+        ("a move", of_roster(&roster_move(None), None, true, t)),
+        (
+            "a probe whose otherwise is a move",
+            of_roster(&accounts::Advice::Probe, Some(&roster_move(None)), true, t),
+        ),
+        (
+            "a wait",
+            of_roster(
+                &accounts::Advice::Wait {
+                    until: NOW_S + 30 * 60,
+                },
+                None,
+                true,
+                t,
+            ),
+        ),
+        (
+            "the wall ladder's ask again",
+            AccountAdvice::or_wall_rung(None, t + 30 * MIN).expect("the rung's ask"),
+        ),
+    ]
+}
+
+/// A yield of an account that is another Mac's to use (F19): the roster's move to `work-2` at a
+/// turn end, the only point the roster names one at.
+fn yielding(r: &TurnEndReading, t: Instant) -> TurnEndReading {
+    advised_as(r, of_roster(&roster_move(Some(30 * 60)), None, false, t))
+}
+
+/// FABLE'S OWN LIMIT GOES ON WITH OPUS ON THE SAME ACCOUNT (owner, 2026-11-11, rejecting a move
+/// onto another account: "no, keep the same account and switch from fable to opus."): whatever the
+/// host advises at the wall about the account (a move to another one, a probe past which it moves,
+/// a wait, the wall ladder's ask again), the act is the fallback's relaunch the wall asks with no
+/// advice, and no account move stands anywhere in it, not even ahead of the fallback with the
+/// fallback as its otherwise. The consent box is answered first where credits are on, and the
+/// fallback follows it, still on the account. NEGATIVE CONTROL: the fallback itself, with no
+/// advice.
 #[test]
-fn a_fable_bucket_moves_account_first_and_the_fallback_is_its_otherwise() {
+fn a_fable_wall_keeps_its_account_and_goes_on_with_opus_whatever_the_advice() {
     let t = t0();
     let r = fable(Some(t + 120 * MIN));
     let fallback = at(&mut TurnEndState::default(), &r, t);
     assert!(falls_back(&fallback), "{fallback:?}");
-    let moved = at(&mut TurnEndState::default(), &advised(&r, "work-2"), t);
     assert!(
-        restarts(&moved, &to_account("work-2", AccountAt::Wall), RULE_ACCOUNT),
-        "{moved:?}"
+        waits_until(otherwise_of(&fallback), t + 120 * MIN + GRACE),
+        "{fallback:?}"
     );
-    assert_eq!(otherwise_of(&moved), &fallback);
-    assert_eq!(
-        at(
-            &mut TurnEndState::default(),
-            &advised_wait(&r, t + 30 * MIN),
-            t
+    let consent_box = |worked: Duration| {
+        walled(
+            WallKind::ModelBucket { consent: true },
+            "Fable limit reached · continuing on Sonnet uses usage credits, and the prompt to \
+             confirm",
+            Some(worked),
+        )
+    };
+    let consent = consent_box(3 * MIN);
+    let consent_fallback = at(&mut TurnEndState::default(), &consent, t);
+    assert!(falls_back(&consent_fallback), "{consent_fallback:?}");
+    let mut wrong = Vec::new();
+    for (name, advice) in advice_at_a_wall(t) {
+        for (case, wall, today) in [
+            ("the plain wall", &r, &fallback),
+            (
+                "the consent box with credits off",
+                &consent,
+                &consent_fallback,
+            ),
+        ] {
+            let a = at(
+                &mut TurnEndState::default(),
+                &advised_as(wall, advice.clone()),
+                t,
+            );
+            if &a != today || any_account_move(&a) {
+                wrong.push(format!("{case}, {name}: {a:?}"));
+            }
+        }
+        let credits = credits_on();
+        let boxed = advised_as(&consent, advice.clone());
+        let mut st = TurnEndState::default();
+        let a = at_under(&mut st, &boxed, t, &credits);
+        if a != typed(RULE_CONSENT) {
+            wrong.push(format!("the consent box with credits on, {name}: {a:?}"));
+        }
+        st.acted(&a, &boxed, t);
+        let again = advised_as(&consent_box(Duration::from_secs(5)), advice.clone());
+        let a = at_under(&mut st, &again, t + MIN, &credits);
+        if !falls_back(&a) || any_account_move(&a) {
+            wrong.push(format!(
+                "the consent box answered once with credits on, {name}: {a:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    let mut st = TurnEndState::default();
+    let a = act(&mut st, &advised(&r, "work-2"), t);
+    assert!(falls_back(&a), "{a:?}");
+    assert_eq!(st.account_move(), None, "no account move made");
+    assert!(st.model_switch().is_some(), "the switch made");
+}
+
+/// A MEASURED CLEARING AT FABLE'S WALL TYPES THE LIMIT'S RESUME, as before the fallback stood on
+/// its account: a resume moves no account, and Fable serves again, so the session goes on with
+/// Fable rather than Opus. A resume already typed since that clearing falls back as with no
+/// advice ([`account_first`]). NEGATIVE CONTROL: the same wall with no advice falls back.
+#[test]
+fn a_resume_at_a_fable_wall_types_the_resume_unless_typed_since() {
+    let t = t0();
+    let r = fable(Some(t + 120 * MIN));
+    assert!(falls_back(&at(&mut TurnEndState::default(), &r, t)));
+    let cleared = advised_as(
+        &r,
+        of_roster(
+            &accounts::Advice::Resume {
+                cleared_at: NOW_S - 60,
+            },
+            None,
+            true,
+            t,
         ),
-        fallback,
-        "another account's later window yields to the move onto Opus now"
     );
-    let consent = walled(
-        WallKind::ModelBucket { consent: true },
-        "Fable limit reached · continuing on Sonnet uses usage credits, and the prompt to confirm",
-        Some(3 * MIN),
+    let a = at(&mut TurnEndState::default(), &cleared, t);
+    assert_eq!(a, typed(RULE_LIMIT_RESUME), "{a:?}");
+    let mut st = TurnEndState::default();
+    st.seed_account_resumed(NOW_S - 30);
+    let a = at(&mut st, &cleared, t);
+    assert!(falls_back(&a), "the resume typed since: {a:?}");
+    assert!(!any_account_move(&a), "{a:?}");
+}
+
+/// AFTER THE FALLBACK, THE SESSION STAYS ON ITS ACCOUNT UNTIL THE SWITCH'S RETURN IS DUE
+/// ([`switch_keeps_its_account`]): Fable's wall on record ranks the account after every account
+/// with no model's wall, so a later turn end gets a move ahead to another account. Made, it would
+/// carry `--model claude-opus-5-5` there, on an account where Fable may serve. That move is not
+/// made, and the turn end's act is the one it gets with no advice. NEGATIVE CONTROLS: a yield
+/// (F19) still moves ahead, a move to the session's own row's renewed login still goes, and past
+/// the return's due the move is asked ahead of the return
+/// (`an_account_move_is_asked_ahead_of_the_models_return`).
+#[test]
+fn after_the_fallback_a_move_ahead_waits_for_the_switchs_return() {
+    let t = t0();
+    let reset = t + 120 * MIN;
+    let mut st = TurnEndState::default();
+    assert!(falls_back(&act(&mut st, &fable(Some(reset)), t)));
+    act(&mut st, &idle("", None), t + MIN);
+    let later = idle("Stage 3 done.", Some(30 * MIN));
+    let now = t + 40 * MIN;
+    let plain = at(&mut st.clone(), &later, now);
+    assert!(!any_account_move(&plain), "{plain:?}");
+    let a = at(&mut st.clone(), &advised(&later, "work-2"), now);
+    assert_eq!(a, plain, "no move ahead of the switch's return");
+    assert!(!any_account_move(&a), "{a:?}");
+    let a = at(&mut st.clone(), &yielding(&later, now), now);
+    assert!(
+        restarts(&a, &to_account("work-2", AccountAt::Ahead), RULE_ACCOUNT),
+        "the yield: {a:?}"
     );
-    let moved = at(
+    let own = TurnEndReading {
+        login_label: Some("work-1".to_string()),
+        ..advised(&later, "work-1")
+    };
+    let a = at(&mut st.clone(), &own, now);
+    assert!(
+        restarts(&a, &to_account("work-1", AccountAt::Ahead), RULE_ACCOUNT),
+        "the session's own row's login: {a:?}"
+    );
+}
+
+/// A WALL THE FALLBACK CANNOT ANSWER IS MOVED FROM where the host advises another account
+/// ([`account_first`]): a launch nobody read or one naming another model, Sonnet's own limit, the
+/// fallback's relaunch not made, and Opus's own limit on the fallback each move to `work-2`
+/// first, the wait their otherwise, since another account is the only way the session goes on.
+/// NEGATIVE CONTROL: each wall with no advice waits, and the same Fable wall with a move falls
+/// back on its account (the test before).
+#[test]
+fn a_wall_the_fallback_cannot_answer_moves_to_the_advised_account() {
+    let t = t0();
+    let reset = t + 120 * MIN;
+    let r = fable(Some(reset));
+    let wall = to_account("work-2", AccountAt::Wall);
+    let moved_from = |name: &str, st: &TurnEndState, r: &TurnEndReading, now: Instant| {
+        let today = at(&mut st.clone(), r, now);
+        assert!(
+            !any_model_move(&today) && !any_account_move(&today),
+            "{name}: no advice: {today:?}"
+        );
+        let a = at(&mut st.clone(), &advised(r, "work-2"), now);
+        assert!(restarts(&a, &wall, RULE_ACCOUNT), "{name}: {a:?}");
+        assert_eq!(otherwise_of(&a), &today, "{name}");
+    };
+    moved_from(
+        "a launch nobody read",
+        &TurnEndState::default(),
+        &launched(&r, LaunchModel::Unread),
+        t,
+    );
+    moved_from(
+        "a launch naming Sonnet",
+        &TurnEndState::default(),
+        &launched(&r, LaunchModel::Named("claude-sonnet-4-6".to_string())),
+        t,
+    );
+    moved_from(
+        "Sonnet's own limit",
+        &TurnEndState::default(),
+        &bucket_of("You've reached your Sonnet limit.", Some(reset)),
+        t,
+    );
+    let mut unmade = TurnEndState::default();
+    unmade.observe(&r, t);
+    unmade.restarted(&to_opus(), false, &r, t);
+    moved_from("the fallback's relaunch not made", &unmade, &r, t + MIN);
+    let mut st = TurnEndState::default();
+    assert!(falls_back(&act(&mut st, &r, t)));
+    act(&mut st, &idle("", None), t + MIN);
+    moved_from(
+        "Opus's own limit on the fallback",
+        &st,
+        &bucket_of("You've reached your Opus limit.", Some(t + 90 * MIN)),
+        t + 5 * MIN,
+    );
+}
+
+/// USAGE CREDITS THAT CARRY FABLE'S REQUESTS GO ON WITH OPUS ON THE SAME ACCOUNT, as Fable's wall
+/// does ([`keeps_its_account`]): at a turn end and at the wall, an advised move to another account
+/// neither goes ahead of the fallback nor takes its place. A turn end whose own act types nothing
+/// (a short turn's back-off) keeps that act under the move, as with no advice. At a turn end, the
+/// move by which the session yields an account that is another Mac's (F19) goes first, the
+/// fallback or the turn end's own act its otherwise, and a hold of such an account holds the
+/// relaunch until its instant ([`account_hold`]). NEGATIVE CONTROLS: credits that carry the
+/// session, no model named, still move ahead to the advised account, and so does an account-wide
+/// wall the fallback cannot answer (the next test).
+#[test]
+fn fables_usage_credits_go_on_with_opus_on_the_same_account_whatever_the_move() {
+    let t = t0();
+    let reset = t + 90 * MIN;
+    let end = idle("Stage 2 done.", Some(JOB));
+    let ahead = to_account("work-2", AccountAt::Ahead);
+    for (name, r) in [
+        ("a turn end", on_model_credits(&end, "fable", Some(reset))),
+        (
+            "Fable's wall",
+            on_model_credits(&fable(Some(reset)), "fable", Some(reset)),
+        ),
+    ] {
+        let fallback = at(&mut TurnEndState::default(), &r, t);
+        assert!(falls_back(&fallback), "{name}: {fallback:?}");
+        let a = at(&mut TurnEndState::default(), &advised(&r, "work-2"), t);
+        assert_eq!(a, fallback, "{name}");
+        assert!(!any_account_move(&a), "{name}: {a:?}");
+    }
+    let r = on_model_credits(&end, "fable", Some(reset));
+    let a = at(&mut TurnEndState::default(), &yielding(&r, t), t);
+    assert!(restarts(&a, &ahead, RULE_ACCOUNT), "the yield: {a:?}");
+    assert!(falls_back(otherwise_of(&a)), "the yield: {a:?}");
+    let held = advised_as(
+        &r,
+        of_roster(
+            &accounts::Advice::Wait {
+                until: NOW_S + 30 * 60,
+            },
+            None,
+            false,
+            t,
+        ),
+    );
+    let a = at(&mut TurnEndState::default(), &held, t);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { until, why, .. }
+            if *until == t + 30 * MIN && why.contains("this account cannot run here")),
+        "a hold of the account: {a:?}"
+    );
+    // A short turn's back-off: the turn end's own act types nothing.
+    let short = on_model_credits(
+        &idle("Stage 2 done.", Some(Duration::from_secs(5))),
+        "fable",
+        Some(reset),
+    );
+    let mut backing_off = TurnEndState::default();
+    backing_off.seed_short(2);
+    let own = at(&mut backing_off.clone(), &short, t);
+    assert!(
+        matches!(&own, TurnEndAction::WaitUntil { why, .. } if why.contains("short turn(s)")),
+        "the back-off: {own:?}"
+    );
+    let a = at(&mut backing_off.clone(), &advised(&short, "work-2"), t);
+    assert_eq!(a, own, "the back-off under a move");
+    assert!(!any_account_move(&a), "{a:?}");
+    let a = at(&mut backing_off.clone(), &yielding(&short, t), t);
+    assert!(
+        restarts(&a, &ahead, RULE_ACCOUNT),
+        "the yield over the back-off: {a:?}"
+    );
+    assert_eq!(otherwise_of(&a), &own, "the yield over the back-off");
+    let a = at(
         &mut TurnEndState::default(),
-        &advised(&consent, "work-2"),
+        &advised(&on_credits(&end, Some(reset)), "work-2"),
         t,
     );
     assert!(
-        restarts(&moved, &to_account("work-2", AccountAt::Wall), RULE_ACCOUNT),
-        "{moved:?}"
+        restarts(&a, &ahead, RULE_ACCOUNT),
+        "credits naming no model: {a:?}"
     );
-    assert!(falls_back(otherwise_of(&moved)), "{moved:?}");
-    assert_eq!(
-        at_under(
-            &mut TurnEndState::default(),
-            &advised(&consent, "work-2"),
-            t,
-            &credits_on()
-        ),
-        typed(RULE_CONSENT)
+    assert!(!any_model_move(&a), "{a:?}");
+}
+
+/// AN ACCOUNT-WIDE WALL UNDER FABLE'S CREDITS STILL MOVES FIRST: the account's session limit,
+/// which Opus meets too, read while usage credits carry Fable's requests, moves ahead to the
+/// advised account, the fallback onto Opus its otherwise ([`held_by_credits`]), never the
+/// fallback alone onto a walled account: the fallback answers only Fable's own limit.
+/// NEGATIVE CONTROL: with no advice the wall waits for its own reset, and moves no model.
+#[test]
+fn an_account_wide_wall_under_fables_credits_still_moves_first() {
+    let t = t0();
+    let reset = t + 90 * MIN;
+    let r = on_model_credits(&session_wall(t), "fable", Some(reset));
+    let own = at(&mut TurnEndState::default(), &r, t);
+    assert!(
+        matches!(own, TurnEndAction::WaitUntil { .. }) && !any_model_move(&own),
+        "{own:?}"
     );
+    let a = at(&mut TurnEndState::default(), &advised(&r, "work-2"), t);
+    assert!(
+        restarts(&a, &to_account("work-2", AccountAt::Ahead), RULE_ACCOUNT),
+        "{a:?}"
+    );
+    assert!(falls_back(otherwise_of(&a)), "{a:?}");
 }
 
 /// AN ACCOUNT MOVE MADE KEEPS THE SWITCH AND ITS RETURN: the account's relaunch keeps the line's

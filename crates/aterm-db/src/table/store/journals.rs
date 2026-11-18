@@ -177,14 +177,36 @@ const _: () = {
     kept::<Kept>();
 };
 
-/// What one read of a table journal gave: its identified records, and the refusal that stopped
-/// their identification, if any.
+/// What one read of a table journal gave: its identified records, the refusal that stopped
+/// their identification, if any, and the witness that stands for the read, if one does.
 pub(super) struct Read {
     links: Arc<Vec<Linked>>,
     refused: Option<Error>,
+    seen: Option<JournalSeen>,
+}
+
+/// What a store kept across sessions keeps of the read of its journal it last stood on
+/// (`super::kept`): its identified records, and the witness that stands for that read. Like what
+/// this process keeps of a journal, and under the same witness, but kept by the store, so a table
+/// whose records do not fit the process's bounds is still answered with nothing read again
+/// ([`read_held`]).
+#[derive(Clone)]
+pub(super) struct Held {
+    seen: JournalSeen,
+    links: Arc<Vec<Linked>>,
 }
 
 impl Read {
+    /// What a kept store keeps of this read ([`Held`]): nothing where no witness stands for it, or
+    /// a record was refused.
+    pub(super) fn held(&self) -> Option<Held> {
+        let seen = self.seen.filter(|_| self.refused.is_none())?;
+        Some(Held {
+            seen,
+            links: Arc::clone(&self.links),
+        })
+    }
+
     /// The witnessed operation IDs, without copying wires or authenticating their envelopes.
     /// Only repair ordering hints may use these unclassified IDs.
     pub(super) fn repair_ids(
@@ -229,6 +251,33 @@ pub(super) fn read(dir: &Path, anchor: &[u8], limits: Limits) -> Result<Read> {
         return own.read_at(dir, anchor, limits, now);
     }
     JOURNALS.read_at(dir, anchor, limits, now)
+}
+
+/// [`read`], answered from `held`, a read of this journal a kept store holds ([`Held`]), with
+/// nothing opened, read or hashed where the journal's folder and files stand as that read's
+/// witness showed them: a fresh read then would open the same files and read the same bytes,
+/// as for what this process keeps ([`JournalSeen::stands_for`]). The kept store reads afresh
+/// every so many reopens (`super::kept`'s `REVALIDATE`), which stands for a fault no witness
+/// moves, as this process's every so many asks do.
+///
+/// # Errors
+/// As [`read`], where the journal does not stand as `held` saw it.
+pub(super) fn read_held(
+    dir: &Path,
+    anchor: &[u8],
+    limits: Limits,
+    held: Option<&Held>,
+) -> Result<Read> {
+    if let Some(held) = held
+        && JournalSeen::of(dir, NAME) == Some(held.seen)
+    {
+        return Ok(Read {
+            links: Arc::clone(&held.links),
+            refused: None,
+            seen: Some(held.seen),
+        });
+    }
+    read(dir, anchor, limits)
 }
 
 /// The time an ask's witness is judged settled by: the clock, and in a test as much later as
@@ -347,6 +396,7 @@ impl Journals {
                 return Ok(Read {
                     links: Arc::clone(&kept.links),
                     refused: None,
+                    seen,
                 });
             }
             list.slots
@@ -409,7 +459,11 @@ impl Journals {
                 known,
             );
         }
-        Ok(Read { links, refused })
+        Ok(Read {
+            links,
+            refused,
+            seen: witnessed,
+        })
     }
 
     /// The table kept for `dir`, `anchor` and `limits`, listed now if it was not, and the count of

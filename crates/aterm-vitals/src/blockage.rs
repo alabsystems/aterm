@@ -6,9 +6,8 @@
 //!
 //! - **Zombies** come from the process sweep every whole reading already takes (each process's
 //!   status and parent, other users' included), grouped by parent in the model's [`ZombieBook`].
-//!   The jobs engine keeps a book of the same type, noted only at its own passes (every 2 s or
-//!   30 s), so `sys jobs` may name a pile later than this row, or miss a zombie reaped between
-//!   its passes. A zombie counts once it has been one for
+//!   Jobs reads immutable [`ZombieFacts`] from that same observation, without a second history
+//!   or a different aging cutoff. A zombie counts once it has been one for
 //!   [`ZOMBIE_AGE_MS`], so a child its parent is about to reap counts nowhere. No tab filter:
 //!   another app's pile is the machine's (§6.4).
 //! - **Uninterruptible waits**: on macOS, every live process's BSD status reads running, so only
@@ -48,8 +47,8 @@ pub const PILE_GROWS_MS: u64 = 60_000;
 
 /// Every zombie the sweeps have seen: when each was first seen and under which parent, when
 /// each parent's pile began, and which left a standing pile while one first seen as it left
-/// would still count as new. The Processes row reads the model's, noted at every whole reading;
-/// the jobs engine's findings read their own, noted at each of its passes.
+/// would still count as new. The model notes every whole reading; consumers share its immutable
+/// observation facts rather than keeping another history at their own cadence.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ZombieBook {
     seen: HashMap<u32, (u64, u32)>,
@@ -149,6 +148,107 @@ impl ZombieBook {
 #[must_use]
 pub fn per_min_deci(count: u32, elapsed_ms: u64) -> u64 {
     u64::from(count) * 600_000 / elapsed_ms.max(60_000)
+}
+
+/// One canonical aged parent pile at a model observation, independent of display limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ZombiePile {
+    parent: u32,
+    count: u32,
+    since_ms: u64,
+    elapsed_ms: u64,
+    per_min_deci: u64,
+    growing: bool,
+}
+
+impl ZombiePile {
+    /// The parent retaining these zombies.
+    #[must_use]
+    pub const fn parent(&self) -> u32 {
+        self.parent
+    }
+
+    /// All of this parent's zombies aged at the canonical observation.
+    #[must_use]
+    pub const fn count(&self) -> u32 {
+        self.count
+    }
+
+    /// When this parent's standing pile began, on [`Sample::mono_ms`]'s clock.
+    #[must_use]
+    pub const fn since_ms(&self) -> u64 {
+        self.since_ms
+    }
+
+    /// The pile's elapsed time at the canonical observation, never reconstructed from its rate.
+    #[must_use]
+    pub const fn elapsed_ms(&self) -> u64 {
+        self.elapsed_ms
+    }
+
+    /// Its rate, evaluated at the same observation as its count.
+    #[must_use]
+    pub const fn per_min_deci(&self) -> u64 {
+        self.per_min_deci
+    }
+
+    /// Growth after the model's whole-sweep and cap-recovery qualification.
+    #[must_use]
+    pub const fn growing(&self) -> bool {
+        self.growing
+    }
+}
+
+/// Immutable facts of a supported current process census, after the sole model book notes it.
+/// These contain every aged parent pile, with no display cap and no mutable history.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ZombieFacts {
+    seq: u64,
+    at_ns: u64,
+    mono_ms: u64,
+    whole: bool,
+    piles: Vec<ZombiePile>,
+}
+
+impl ZombieFacts {
+    /// The existing model snapshot sequence that produced these facts.
+    #[must_use]
+    pub const fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// The original sample's timestamp, not a later assessment's clock.
+    #[must_use]
+    pub const fn at_ns(&self) -> u64 {
+        self.at_ns
+    }
+
+    /// The canonical time at which the model judged age and pile rates.
+    #[must_use]
+    pub const fn mono_ms(&self) -> u64 {
+        self.mono_ms
+    }
+
+    /// Whether the source process census reached its end without a cap.
+    #[must_use]
+    pub const fn whole(&self) -> bool {
+        self.whole
+    }
+
+    /// Every canonical aged parent pile, ordered by parent PID.
+    #[must_use]
+    pub fn piles(&self) -> &[ZombiePile] {
+        &self.piles
+    }
+
+    /// A parent's complete observed pile, rather than a job's child-membership subset.
+    #[must_use]
+    pub fn parent_pile(&self, parent: u32) -> Option<&ZombiePile> {
+        self.piles
+            .binary_search_by_key(&parent, ZombiePile::parent)
+            .ok()
+            .map(|index| &self.piles[index])
+    }
 }
 
 /// Whether the host's process sweep reads each process's state, which the zombie count needs.
@@ -525,6 +625,8 @@ impl BlockageBox {
 #[derive(Debug, Default)]
 pub(crate) struct Book {
     zombies: ZombieBook,
+    /// Only this absorb's supported census; an absent input cannot renew an old observation.
+    current_zombie_facts: Option<Arc<ZombieFacts>>,
     /// The newest sweep's zombies and when it ran (ms on [`Sample::mono_ms`]'s clock).
     zombies_view: Option<(u64, ZombiesView)>,
     /// Whether the newest sweep stopped at its cap.
@@ -546,12 +648,17 @@ impl Book {
     /// processes' scopes, one per process), and its census pass or `procs_blocked`.
     pub(crate) fn absorb(
         &mut self,
+        seq: u64,
         s: &Sample,
         membership: Option<&[Membership]>,
     ) -> (Zombies, DState) {
         let at = s.mono_ms;
+        self.current_zombie_facts = None;
         if let Some(procs) = s.procs.as_deref() {
             self.note_sweep(at, procs, membership, &s.tabs, !s.procs_truncated);
+            if s.zombie_read == ZombieRead::Sweep {
+                self.current_zombie_facts = self.zombie_facts(seq, s).map(Arc::new);
+            }
         }
         let zombies = match s.zombie_read {
             ZombieRead::Unsupported => Zombies::Unread(Unread::Unsupported),
@@ -588,6 +695,40 @@ impl Book {
             },
         };
         (zombies, dstate)
+    }
+
+    pub(crate) fn current_zombie_facts(&self) -> Option<Arc<ZombieFacts>> {
+        self.current_zombie_facts.as_ref().map(Arc::clone)
+    }
+
+    fn zombie_facts(&self, seq: u64, s: &Sample) -> Option<ZombieFacts> {
+        let at = s.mono_ms;
+        let whole = !s.procs_truncated;
+        let judged = whole && at >= self.zombies_grow_from;
+        let piles = self
+            .zombies
+            .piles(at)
+            .into_iter()
+            .map(|(parent, count)| {
+                let since_ms = self.zombies.pile_since(parent)?;
+                let elapsed_ms = at.saturating_sub(since_ms);
+                Some(ZombiePile {
+                    parent,
+                    count,
+                    since_ms,
+                    elapsed_ms,
+                    per_min_deci: per_min_deci(count, elapsed_ms),
+                    growing: judged && self.zombies.grows(parent, at),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(ZombieFacts {
+            seq,
+            at_ns: s.at_ns,
+            mono_ms: at,
+            whole,
+            piles,
+        })
     }
 
     fn census_view(&self, at: u64) -> DState {

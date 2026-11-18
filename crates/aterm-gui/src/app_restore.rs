@@ -1762,8 +1762,11 @@ impl App {
         self.hand_restored_agents();
         self.settle_carried_settings_drafts();
         // Every session the launch brings back is registered: the table's budget may judge which
-        // rows live sessions protect (tracker ST-15).
-        table.sessions_settled();
+        // rows live sessions protect (tracker ST-15), and the harness host's accounts' session
+        // reconcile, which waits for it, which sessions live.
+        if table.sessions_settled() {
+            crate::harness_host::ring();
+        }
     }
 
     /// Re-grid every window's panes to its layout once the restore has placed all of its tabs. A

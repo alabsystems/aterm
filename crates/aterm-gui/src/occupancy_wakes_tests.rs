@@ -1509,6 +1509,7 @@ fn the_parked_wait_returns_its_answer_or_its_end_and_unparks() {
             hung_up,
             exited: &never,
             arm_slots: &unarmed,
+            arm_split: &unarmed,
         }
     }
     let soon = Instant::now() + Duration::from_secs(60);
@@ -1544,6 +1545,37 @@ fn the_parked_wait_returns_its_answer_or_its_end_and_unparks() {
         }
     );
     assert_eq!(status_fields(None), "waits=0 waits_ready=0");
+}
+
+/// A parked wait on a wake naming `spotlight` arms the split by coalition that alone reads the
+/// family, whether the term is its `when=` or its `need=`, with no Deck asking for splits.
+/// CONTROL: a parked wait on a wake naming no spotlight arms none.
+#[test]
+fn a_parked_wait_on_a_spotlight_wake_arms_the_split() {
+    let armed_by = |declared: &str| {
+        let rig = Rig::new(Occupancy::Observe);
+        let host = WakeHost::default();
+        let a = seat_a();
+        assert!(
+            host.wake(&rig, &a, Some(400), declared).starts_with("OK"),
+            "{declared}"
+        );
+        let split = std::cell::Cell::new(0u32);
+        let hung_up = || true;
+        let never = || false;
+        let waits = Waits {
+            deadline: Instant::now() + Duration::from_secs(60),
+            hung_up: &hung_up,
+            exited: &never,
+            arm_slots: &|| (),
+            arm_split: &|| split.set(split.get() + 1),
+        };
+        await_wake(&host, &rig, &a, Some(400), 1, &waits);
+        split.get()
+    };
+    assert_eq!(armed_by("label=s when=spotlight=idle"), 1);
+    assert_eq!(armed_by("label=s when=in:1m need=spotlight!=indexing"), 1);
+    assert_eq!(armed_by("label=t when=in:1m"), 0, "the control");
 }
 
 /// A carried row of `wakes`, its next ordinal past theirs.

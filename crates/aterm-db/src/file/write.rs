@@ -3,7 +3,9 @@
 
 //! The write verbs of `aterm file` (docs/DESIGN-shared-files-2026-11-11.md §3, §4):
 //! `set <name> <row> <column> [<value> | --stdin]` (or several cells of one row as one write,
-//! `set <name> <row> <column>=<value>…`), `add`, `rm`, `revert` and `resolve`. Each
+//! `set <name> <row> <column>=<value>…`), `add`, `rm`, `revert`, `resolve`, and the face's
+//! `commit` and `edit` (`super::face`, which reads the face's changed cells as the same drafts).
+//! Each
 //! reads the owner's words against what this Mac's last snapshot showed (its baseline: every
 //! cell's candidates), queues one intent (`aterm_file::File::write`, which opens no custody),
 //! gives the publisher two seconds ([`publish::INLINE`]) and answers `published <operation>`,
@@ -36,7 +38,7 @@ use aterm_secrets::client::Paths;
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 /// Who runs a verb, and how long its own publication attempt may take.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct Env<'a> {
     /// Who says they ran it: `person`, or a program's word.
     pub by: &'a str,
@@ -51,6 +53,11 @@ pub struct Env<'a> {
     pub json: bool,
     /// What the verb's standard input held, for `set … --stdin`; `None` where it was not read.
     pub stdin: Option<&'a str>,
+    /// Open a face in an Editor tab with the caret on a 1-based line, and when asked to wait,
+    /// return once the tab is closed (`edit`).
+    pub editor: &'a dyn Fn(&Path, usize, bool) -> Result<(), String>,
+    /// Tell the person something while a verb still runs (`edit`'s problems between rounds).
+    pub say: &'a dyn Fn(&str),
 }
 
 /// Why a verb wrote nothing.
@@ -66,18 +73,18 @@ fn usage(why: impl Into<String>) -> Refusal {
     Refusal::Usage(why.into())
 }
 
-fn problem(why: impl ToString) -> Refusal {
+pub(super) fn problem(why: impl ToString) -> Refusal {
     Refusal::Problem(why.to_string())
 }
 
 /// The file a verb names, and what this Mac holds of it.
-struct Target {
-    file: &'static Type,
+pub(super) struct Target {
+    pub(super) file: &'static Type,
     /// The collection the file projects: a catalog table's, the only kind an owner's verb
     /// writes.
-    collection: &'static Collection,
-    held: File,
-    name: Name,
+    pub(super) collection: &'static Collection,
+    pub(super) held: File,
+    pub(super) name: Name,
     /// This Mac's intents, read before [`Self::rev`]: an intent a marker here calls seen is in
     /// the snapshot a pass recorded before that read, so in the baseline at any later revision.
     outbox: Outbox,
@@ -88,16 +95,21 @@ struct Target {
 }
 
 impl Target {
-    fn of(paths: &Paths, name: &str) -> Result<Self, Refusal> {
+    pub(super) fn of(paths: &Paths, name: &str) -> Result<Self, Refusal> {
         let name = Name::parse(name).map_err(|error| usage(error.to_string()))?;
         let Some(file) = super::find(&name) else {
             return Err(usage(format!("{name}: no such shared file in this build")));
         };
-        // Each Mac states its own rows of a Mac file through its journal, and nobody writes a
-        // view: no verb of a person's writes either.
-        let Some((_, collection)) = file.table() else {
+        // Each Mac states its own rows of a Mac file through its journal, each Mac's program
+        // appends its own log entries, and nobody writes a view: no verb of a person's writes
+        // either.
+        let Some((_, collection)) = file.edited() else {
             return Err(usage(match file.class {
                 super::Class::Derived => format!("{name} is a view: nothing writes it"),
+                super::Class::Owner | super::Class::Mac if file.table().is_some() => format!(
+                    "{name} is a log: each machine's program appends its own entries, and \
+                     nobody edits one"
+                ),
                 super::Class::Owner | super::Class::Mac => {
                     format!("{name} is written by each Mac's harness, never by a verb")
                 }
@@ -127,8 +139,9 @@ impl Target {
             ))
         };
         let bytes = self.held.baseline(rev).ok_or_else(stale)?;
-        let value: Value = aterm_json::from_slice(&bytes).map_err(|_| stale())?;
-        let base = Base::from_json(&value).map_err(|_| stale())?;
+        let base = super::face::Baseline::decode(&bytes)
+            .ok_or_else(stale)?
+            .grid;
         let collection = att::find(&base.table)
             .and_then(|compiled| compiled.collection(&base.collection))
             .map_err(|_| stale())?;
@@ -226,7 +239,7 @@ fn hex(digests: &[astream_wire::sync::Digest]) -> Vec<String> {
 }
 
 /// `edit` as the outbox keeps it.
-fn kept(column: &Column, edit: grid::Edit, born: bool) -> Edit {
+pub(super) fn kept(column: &Column, edit: grid::Edit, born: bool) -> Edit {
     let text = match (&column.ty, &edit.elem) {
         // A set's whole cell, as the owner typed it.
         (Ty::Set(_), Some(_)) => edit.mine.clone(),
@@ -248,8 +261,7 @@ fn kept(column: &Column, edit: grid::Edit, born: bool) -> Edit {
 /// expects. `None` where no baseline reads there.
 pub(super) fn candidates_at(held: &File, rev: u64, edit: &Edit) -> Option<Vec<String>> {
     let bytes = held.baseline(rev)?;
-    let value: Value = aterm_json::from_slice(&bytes).ok()?;
-    let base = Base::from_json(&value).ok()?;
+    let base = super::face::Baseline::decode(&bytes)?.grid;
     let mut now = base
         .rows
         .iter()
@@ -273,10 +285,15 @@ pub(super) fn candidates_at(held: &File, rev: u64, edit: &Edit) -> Option<Vec<St
 /// register that still waits, or that was published and is not in that baseline yet
 /// (`intent:<id>`). The publisher compares the edit with what that intent left in the register.
 fn follow(target: &Target, edits: &mut [Edit]) {
+    follow_at(&target.held, &target.outbox, target.rev, edits);
+}
+
+/// [`follow`] for edits read against the baseline at revision `rev` of `held`, with `outbox`
+/// this Mac's intents: a face's commit reads against the revision its header names.
+pub(super) fn follow_at(held: &File, outbox: &Outbox, rev: u64, edits: &mut [Edit]) {
     // Only the frontier the snapshot at the baseline's revision was projected from says what
     // that baseline holds: a snapshot a pass wrote before its status is a later one.
-    let frontier = target.held.projected_at(target.rev);
-    let outbox = &target.outbox;
+    let frontier = held.projected_at(rev);
     let same = |a: &Edit, b: &Edit| a.key == b.key && a.column == b.column && a.elem == b.elem;
     for edit in edits {
         let waiting = outbox
@@ -493,7 +510,7 @@ fn again(target: &Target, held: &aterm_file::Intent) -> Result<Draft, Refusal> {
 
 /// What a write verb did, as it prints.
 #[derive(Debug)]
-enum Said {
+pub(super) enum Said {
     Published { id: String, op: Option<String> },
     Queued { id: String, why: String },
     Held { id: String, why: String },
@@ -502,7 +519,8 @@ enum Said {
 }
 
 /// What a write verb did: the text or JSON `aterm file` prints for it with its exit code, and
-/// the intent it queued, published, held or dropped, by id (`None` where it changed nothing).
+/// the intent it queued, published, held or dropped, by id (`None` where it changed nothing, and
+/// for a face's `commit` and `edit`, which queue one intent per row and name each in the text).
 #[derive(Debug)]
 pub struct Wrote {
     text: String,
@@ -519,10 +537,26 @@ impl Wrote {
     }
 
     /// The intent the verb queued, published, held or dropped; `None` where the file already
-    /// said what it asked.
+    /// said what it asked, and for a face's commit, whose text names each intent it queued.
     #[must_use]
     pub fn id(&self) -> Option<&str> {
         self.id.as_deref()
+    }
+
+    /// What a face's `commit` or `edit` did: `text` and `code` over every intent it queued,
+    /// which `text` names (no one [`Self::id`]; each intent's flush note is in `text`).
+    pub(super) const fn of_face(text: String, code: u8) -> Self {
+        Self {
+            text,
+            code,
+            id: None,
+            unflushed: None,
+        }
+    }
+
+    /// The text or JSON to print.
+    pub(super) fn text(&self) -> &str {
+        &self.text
     }
 
     /// Why the outbox folder's flush failed after the intent was written, where it did.
@@ -534,7 +568,7 @@ impl Wrote {
 
 /// `said` for `name`, with `unflushed` (the outbox holds the intent, but its folder's flush
 /// failed): the text or JSON to print and the exit code. A held intent is a conflict recorded.
-fn answer(name: &Name, said: Said, unflushed: Option<&str>, json: bool) -> Wrote {
+pub(super) fn answer(name: &Name, said: Said, unflushed: Option<&str>, json: bool) -> Wrote {
     let wrote = |(text, code)| Wrote {
         text,
         code,
@@ -595,18 +629,35 @@ fn printed(name: &Name, said: &Said, unflushed: Option<&str>, json: bool) -> (St
 
 /// Give the publisher its bound for the intent `id`, and say what became of it.
 fn attempt(paths: &Paths, config: &Path, target: &Target, id: &str, env: &Env<'_>) -> Said {
-    let id = id.to_owned();
+    attempt_all(paths, config, target, &[id.to_owned()], env)
+        .pop()
+        .unwrap_or(Said::Queued {
+            id: id.to_owned(),
+            why: "the publisher has not reached it".to_owned(),
+        })
+}
+
+/// Give the publisher one bound for the intents `ids`, and say what became of each, in order.
+pub(super) fn attempt_all(
+    paths: &Paths,
+    config: &Path,
+    target: &Target,
+    ids: &[String],
+    env: &Env<'_>,
+) -> Vec<Said> {
     if env.attempt.is_zero() {
-        return Said::Queued {
-            id,
-            why: "a later pass publishes it".to_owned(),
-        };
+        return ids
+            .iter()
+            .map(|id| Said::Queued {
+                id: id.clone(),
+                why: "a later pass publishes it".to_owned(),
+            })
+            .collect();
     }
-    said_of(
-        &target.held,
-        &offer(paths, config, &target.name, env.attempt, env.now_ms),
-        id,
-    )
+    let outcomes = offer(paths, config, &target.name, env.attempt, env.now_ms);
+    ids.iter()
+        .map(|id| said_of(&target.held, &outcomes, id.clone()))
+        .collect()
 }
 
 /// Offer what this Mac queued for `name` to the publisher for `attempt` ([`offer`]), and say
@@ -730,7 +781,10 @@ pub(crate) fn draft_set(
 /// Whether `word` is a write verb of `aterm file`.
 #[must_use]
 pub fn is_verb(word: &str) -> bool {
-    matches!(word, "set" | "add" | "rm" | "revert" | "resolve")
+    matches!(
+        word,
+        "set" | "add" | "rm" | "revert" | "resolve" | "commit" | "edit"
+    )
 }
 
 /// One write verb over `paths`, and what it did ([`Wrote`]).
@@ -745,15 +799,16 @@ pub fn verb(
 ) -> Result<Wrote, Refusal> {
     #[expect(
         clippy::disallowed_methods,
-        reason = "the explicit `aterm file` verb: set, add, rm, revert and resolve (this fn's \
-                  own clippy.toml row lets only `aterm file`'s entry and `rename` run it)"
+        reason = "the explicit `aterm file` verb: set, add, rm, revert, resolve, commit and edit \
+                  (this fn's own clippy.toml row lets only `aterm file`'s entry and `rename` run \
+                  it)"
     )]
     let act = OwnerAct::verb(env.by, env.session)
         .ok_or_else(|| usage("--by takes one word [a-z][a-z0-9-]{0,19}"))?;
     let word = |at: usize, what: &str| -> Result<&str, Refusal> {
         words.get(at).map(String::as_str).ok_or_else(|| usage(what))
     };
-    let verb = word(0, "set|add|rm|revert|resolve <name> ...")?;
+    let verb = word(0, "set|add|rm|revert|resolve|commit|edit <name> ...")?;
     let queued = |target: &Target, draft: Draft| -> Result<Wrote, Refusal> {
         let accepted = target
             .held
@@ -876,6 +931,103 @@ pub fn verb(
                 _ => Err(usage(what)),
             }
         }
-        _ => Err(usage("set|add|rm|revert|resolve <name> ...")),
+        "commit" => {
+            let what = "commit <name>";
+            let target = Target::of(paths, word(1, what)?)?;
+            if words.len() != 2 {
+                return Err(usage(what));
+            }
+            super::face::commit(paths, config, &target, &act, env)
+        }
+        "edit" => {
+            let what = "edit <name>";
+            let target = Target::of(paths, word(1, what)?)?;
+            if words.len() != 2 {
+                return Err(usage(what));
+            }
+            edit(paths, config, &target, &act, env)
+        }
+        _ => Err(usage("set|add|rm|revert|resolve|commit|edit <name> ...")),
+    }
+}
+
+/// `edit <name>`: open the face in an Editor tab and wait for it to close, then commit it. A
+/// face with problems is opened again at the first one's line, until a commit takes it or the
+/// tab closes with nothing changed since the last round.
+///
+/// In an aterm window a save in the tab has committed already (the hook the executable
+/// installs), so the commit after the tab closes may find nothing left to ask for: then what
+/// the tab's commits did is said instead, a refusal by the copy of the face it kept aside.
+fn edit(
+    paths: &Paths,
+    config: &Path,
+    target: &Target,
+    act: &OwnerAct,
+    env: &Env<'_>,
+) -> Result<Wrote, Refusal> {
+    let face = target.held.face_path();
+    if !face.exists() {
+        return Err(problem(format!(
+            "{}: no face here; `aterm file restore {}` writes one",
+            target.name, target.name
+        )));
+    }
+    let mut line = 1;
+    let opened = target.held.face_bytes().ok().flatten();
+    let kept_before = target.held.rejected_kept();
+    let mut last = opened.clone();
+    loop {
+        (env.editor)(&face, line, true).map_err(problem)?;
+        let now = target.held.face_bytes().ok().flatten();
+        let unchanged = now == last;
+        let committed = super::face::commit(paths, config, target, act, env);
+        let nothing_left = committed.as_ref().is_ok_and(|wrote| {
+            wrote.text() == answer(&target.name, Said::Unchanged, None, env.json).text()
+        });
+        if nothing_left {
+            let kept: Vec<_> = target
+                .held
+                .rejected_kept()
+                .into_iter()
+                .filter(|copy| !kept_before.contains(copy))
+                .collect();
+            if let Some((copy, _)) = kept.last() {
+                return Err(problem(format!(
+                    "{}: the Editor tab's commit refused the face and wrote it again from the \
+                     snapshot; your face is kept at {} (`aterm file status {}` says why)",
+                    target.name,
+                    copy.display(),
+                    target.name
+                )));
+            }
+            if now != opened {
+                let text = if env.json {
+                    let mut object = aterm_json::Map::new();
+                    object.insert("file".to_owned(), Value::from(target.name.to_string()));
+                    object.insert("committed_by".to_owned(), Value::from("editor"));
+                    format!("{}\n", Value::Object(object))
+                } else {
+                    format!(
+                        "{}: the Editor tab's save committed it (`aterm file outbox {}` and \
+                         `history` show its writes)\n",
+                        target.name, target.name
+                    )
+                };
+                return Ok(Wrote::of_face(text, exit::OK));
+            }
+        }
+        match committed {
+            Err(Refusal::Problem(why))
+                if !unchanged && target.held.root().problems(&target.name).exists() =>
+            {
+                (env.say)(&why);
+                line = std::fs::read_to_string(target.held.root().problems(&target.name))
+                    .ok()
+                    .and_then(|text| text.split(':').next()?.parse().ok())
+                    .unwrap_or(1);
+                last = now;
+            }
+            said => return said,
+        }
     }
 }

@@ -15,7 +15,8 @@ use aterm_session::SessionId;
 pub use aterm_types::control_verbs::Requester;
 use aterm_types::control_verbs::{POST_OPTIONS_END, is_post_option, post_options};
 use aterm_types::fabric_grammar::{
-    DeadReason, KINDS, MirrorState, VERDICTS, is_principal, is_topic, parse_bus_offset, via_ok,
+    ANSWER_KINDS, DeadReason, KINDS, MirrorState, VERDICTS, is_principal, is_topic,
+    parse_bus_offset, via_ok,
 };
 
 use aterm_gui_timing::now_ms;
@@ -880,6 +881,14 @@ pub struct Inbox {
     /// records none.
     dedup: VecDeque<(u64, bool)>,
     dedup_set: HashSet<u64>,
+    /// THE FIRST VERDICT ON EACH ASK THIS SESSION WAS HANDED ONE FOR (ATERM-KI-1115-7889), by
+    /// the ask's offset: the offset of the lowest answer (an [`ANSWER_KINDS`] row) or `expired`
+    /// delivered for it, and which. A deadline's verdict is the first of them in lane order: an
+    /// `expired` above an answer was published after the answer landed and says nothing (it
+    /// takes no row), and an answer above an `expired` is late ([`deliver_row`]). Kept apart
+    /// from the ring, which can evict the rows, at most [`DEDUP_CAP`], the lowest asks going
+    /// first; forgotten past a fork as the offsets are ([`Inbox::forget_bus_offsets`]).
+    verdicts: BTreeMap<u64, (u64, Verdict)>,
     /// The marks a seamless update carried ([`FabricCarry::marked`]): offsets the carried log
     /// already marks delivered, which this successor's bridge offers again. Each is taken back into
     /// the ring once, with no second mark.
@@ -912,6 +921,64 @@ pub struct Inbox {
     closed: bool,
     /// When the newest row arrived, for the handler tally (a parked `await inbox`'s wake).
     arrived: handler_tally::Stamp,
+}
+
+/// What settled an ask ([`Inbox::verdicts`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    /// A reply of an [`ANSWER_KINDS`] kind.
+    Answer,
+    /// The bridge's `kind=expired`.
+    Expired,
+}
+
+/// What [`deliver_row`] makes of a delivered record against [`Inbox::verdicts`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Against {
+    /// No verdict, or a record that is none: kept as delivered.
+    Kept,
+    /// An `expired` above an answer to its ask: no row.
+    Moot,
+    /// An answer above an `expired` of its ask: late, whatever the line says.
+    Late,
+}
+
+impl Inbox {
+    /// What a delivered record of `kind` at `off`, answering the ask at `re`, is against the
+    /// first verdict handed for that ask ([`Inbox::verdicts`]); a broadcast is no verdict.
+    fn against_verdict(&self, addressed: bool, kind: &str, re: Option<u64>, off: u64) -> Against {
+        let (Some(re), true) = (re, addressed) else {
+            return Against::Kept;
+        };
+        match (self.verdicts.get(&re), verdict_of(kind)) {
+            (Some((at, Verdict::Answer)), Some(Verdict::Expired)) if *at < off => Against::Moot,
+            (Some((at, Verdict::Expired)), Some(Verdict::Answer)) if *at < off => Against::Late,
+            _ => Against::Kept,
+        }
+    }
+
+    /// Keep the lower of the verdict on the ask at `re` and a record of `kind` at `off`.
+    fn note_verdict(&mut self, addressed: bool, kind: &str, re: Option<u64>, off: u64) {
+        let (Some(re), Some(verdict), true) = (re, verdict_of(kind), addressed) else {
+            return;
+        };
+        let first = self.verdicts.entry(re).or_insert((off, verdict));
+        if off < first.0 {
+            *first = (off, verdict);
+        }
+        while self.verdicts.len() > DEDUP_CAP {
+            self.verdicts.pop_first();
+        }
+    }
+}
+
+/// The verdict a row of `kind` gives its ask, `None` for a kind that settles none.
+fn verdict_of(kind: &str) -> Option<Verdict> {
+    if kind == "expired" {
+        Some(Verdict::Expired)
+    } else {
+        ANSWER_KINDS.contains(&kind).then_some(Verdict::Answer)
+    }
 }
 
 /// Records the broker's retention gave up: offsets `from..to` of the log, and `records` of them
@@ -1440,6 +1507,7 @@ impl Inbox {
         }
         self.dedup.retain(|(off, _)| kept(*off));
         self.dedup_set.retain(|off| kept(*off));
+        self.verdicts.retain(|re, (off, _)| kept(*re) && kept(*off));
         self.carried_marks.retain(|off| kept(*off));
         self.oldest_on_bus = self.oldest_on_bus.filter(|off| kept(*off));
         self.given_up = self.given_up.filter(|g| g.to <= fork);
@@ -2755,12 +2823,26 @@ struct LogClock {
 
 impl LogClock {
     /// Below which offset a session whose clock is `held` keeps what it holds: the fork, for
-    /// `was` itself or a generation between `was` and `ident`; `None` (keep nothing) for any
-    /// other clock, or none.
+    /// `was` itself or a generation between `was` and `ident`; and, across a proved move from
+    /// another log, an earlier generation of `ident`'s own log or a later one of `was`'s, each
+    /// told by an attach whose witness then never moved. `None` (keep nothing) for any other
+    /// clock, or none.
+    ///
+    /// A later generation of `was` is kept because of what such a session holds, not because
+    /// the proof bounds its fork (it does not): the bridge still names `was` only while the
+    /// attach that told the move to that generation was refused before it took the log, its
+    /// witness left on `was`. That tell made the session forget everything at or past the
+    /// move's cut, and nothing has been delivered on the generation since (the bridge delivers
+    /// on no log its witness does not name, and an attach that takes the generation makes it
+    /// `was`). So the session holds only offsets below that cut, where the generation holds
+    /// `was`'s records, and the new log holds `was`'s records below the proved fork: every
+    /// offset kept names the same record on all three, whichever bound is lower.
     fn keep_below(&self, held: Option<LogIdentity>) -> Option<u64> {
         let (was, fork) = self.continues?;
         let held = held?;
-        let in_chain = held == was || (held.continues_from(was) && self.ident.continues_from(held));
+        let in_chain = held == was
+            || (self.ident.continues_from(held) && (held.id != was.id || held.continues_from(was)))
+            || (held.id != self.ident.id && held.continues_from(was));
         in_chain.then_some(fork)
     }
 }
@@ -5795,6 +5877,18 @@ fn deliver_row(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> Strin
             None => "OK 0\n".to_string(),
         };
     }
+    // THE FIRST VERDICT IN LANE ORDER STANDS (ATERM-KI-1115-7889): the bridge hands no `expired`
+    // it published after its ask's answer landed, nor an answer after an `expired` unmarked;
+    // this holds the session to that whatever bridge delivered the two ([`Inbox::verdicts`]).
+    // A moot `expired` is remembered as taken, so a bridge that offers it again is answered.
+    let late = match inbox.against_verdict(topic.is_none(), &kind, re, off) {
+        Against::Moot => {
+            remember_offset(&mut inbox, off, false);
+            return "OK 0\n".to_string();
+        }
+        Against::Late => true,
+        Against::Kept => late,
+    };
     if let Some(t) = topic.as_deref()
         && !ctx.fabric().opted_into(t)
     {
@@ -5852,6 +5946,7 @@ fn deliver_row(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> Strin
         on_log: true,
     };
     evict_for(&mut inbox);
+    inbox.note_verdict(is_addressed, &kind, re, off);
     inbox.rows.push_back(row);
     inbox.arrived = handler_tally::stamp();
     inbox.bus_head = inbox.bus_head.max(off);
@@ -6871,13 +6966,32 @@ fn wait_receipt_on_log(
         if !post.on_log() {
             return format!("ERR log-replaced id={id} off={off}\n");
         }
-        let reply = guard.rows.iter().rev().find(|r| {
-            r.on_log && r.re == Some(off) && matches!(r.kind.as_str(), "ack" | "expired")
+        // THE FIRST VERDICT ON THE LANE DECIDES (ATERM-KI-1115-7889): the lowest offset of an ack
+        // or an `expired` of the post, whenever the wait reads it, so a waiter that woke at an
+        // `expired` and one that came after a late ack answer alike. The verdict the ring evicted
+        // is remembered ([`Inbox::verdicts`]). Where an ack came first, the NEWEST ack answers:
+        // its receiver sends one each time its decision changes (`inbox seen <id> <verdict>`),
+        // so a post deferred, then handled, reads `ack=handled`.
+        let receipt = |r: &&InboxRow| r.on_log && r.re == Some(off);
+        let first = guard
+            .rows
+            .iter()
+            .filter(receipt)
+            .filter(|r| matches!(r.kind.as_str(), "ack" | "expired"))
+            .min_by_key(|r| r.off);
+        let expired_first = guard.verdicts.get(&off).is_some_and(|(at, verdict)| {
+            *verdict == Verdict::Expired && first.is_none_or(|row| *at <= row.off)
         });
-        if let Some(row) = reply {
-            if row.kind == "expired" {
-                return format!("ERR expired id={id} off={off}\n");
-            }
+        if expired_first || first.is_some_and(|row| row.kind == "expired") {
+            return format!("ERR expired id={id} off={off}\n");
+        }
+        let newest = guard
+            .rows
+            .iter()
+            .filter(receipt)
+            .filter(|r| r.kind == "ack")
+            .max_by_key(|r| r.off);
+        if let Some(row) = newest {
             let verdict = row.verdict.as_deref().unwrap_or("-");
             return format!("OK {id} off={off}{dup} ack={verdict} msg={}\n", row.id);
         }

@@ -4,7 +4,7 @@
 //! Content identity of the universal release's Rust and Apple toolchains and SDK, sealed once per
 //! release run.
 //!
-//! The identity [`current`] returns is `atpkg::input_seal`'s identity of the release's input
+//! The identity [`current_with_sdk`] returns is `atpkg::input_seal`'s identity of the release's input
 //! roots (`machine_roots`) under the release's schemas ([`SCHEMA`], [`SEAL_SCHEMA`]): a SHA-256
 //! over both schemas, the content digest of every input root (each file read in full) and this
 //! machine's facts (its OS build, its model, the SDK's settings and the Trust build). Reading every
@@ -18,9 +18,9 @@
 //! state, and every child it starts is handed the kept seal's path ([`SEAL_ENV`]), which the child
 //! adopts once the same recheck holds.
 
-#[cfg(any(test, target_os = "macos"))]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use crate::trust_lock::CompilerInputs;
 
 #[cfg(any(test, target_os = "macos"))]
 use atpkg::input_seal::{self, Report};
@@ -49,30 +49,180 @@ const SCHEMAS: input_seal::Schema = input_seal::Schema {
     seal: SEAL_SCHEMA,
 };
 
-/// This machine's build-input identity: the selected drivers, the Rust and Apple toolchain
-/// bin/lib trees and the macOS SDK by content, with the OS build, the model and the SDK's
-/// settings. The first call in a process adopts a handed or kept seal whose recheck holds, or
-/// takes one; each later call rechecks the seal by status and takes a new one only on a
-/// difference. Each call says on stderr, and in the log [`arm`] named, what it did (`inputs:
-/// hashed …` or `inputs: rechecked by stat …`, and one `release-event:` line). Linux's native
-/// handoff has its own compiler provenance protocol.
-/// # Errors
-/// A compiler or SDK cannot be resolved or read, an input changed while it was hashed, or this
-/// is not a macOS host.
-pub fn current() -> Result<String, String> {
-    let _timing = crate::cut_timing::Timer::new("inputs seal recheck");
+/// The system-selected SDK used both as a seal root and as compiler input DATA.
+/// Never recover this selection from a caller's `SDKROOT` override.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AppleSdk {
+    #[cfg(target_os = "macos")]
+    root: PathBuf,
+}
+
+impl AppleSdk {
+    pub(crate) fn capture() -> Result<Self, String> {
+        #[cfg(target_os = "macos")]
+        {
+            Ok(Self {
+                root: Self::selected()?,
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        Ok(Self {})
+    }
+
+    #[cfg(target_os = "macos")]
+    fn selected() -> Result<PathBuf, String> {
+        let root = input_seal::macos_sdk()?
+            .canonicalize()
+            .map_err(|error| format!("canonical macOS SDK: {error}"))?;
+        if !root.is_dir() {
+            return Err("the selected macOS SDK is not a directory".into());
+        }
+        Ok(root)
+    }
+
+    /// Refuse a moved system selection instead of relabelling a command's captured inputs.
+    pub(crate) fn verify(&self) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        self.verify_selected(Self::selected()?)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn verify_selected(&self, selected: PathBuf) -> Result<(), String> {
+        if selected != self.root {
+            return Err("the system macOS SDK selection changed after capture".into());
+        }
+        Ok(())
+    }
+
+    /// Apply after environment scrubbing, including to the command mirror used as evidence.
+    pub(crate) fn apply(&self, command: &mut aterm_uds::spawnfd::Command) {
+        if let Some((name, value)) = self.environment() {
+            command.env(name, value);
+        }
+    }
+
+    pub(crate) fn environment(&self) -> Option<(&'static str, &std::ffi::OsStr)> {
+        #[cfg(target_os = "macos")]
+        return Some(("SDKROOT", self.root.as_os_str()));
+        #[cfg(not(target_os = "macos"))]
+        None
+    }
+}
+
+/// The build-input identity under already validated and leased candidate compiler roles.
+/// Resolves neither role from this process's ambient toolchain selection.
+pub(crate) fn current_for(compiler: &CompilerInputs) -> Result<String, String> {
+    let _timing = crate::cut_timing::Timer::new("candidate inputs seal recheck");
     #[cfg(target_os = "macos")]
     {
-        on_this_machine(false)
+        on_this_machine(Some(compiler), &AppleSdk::capture()?, false)
     }
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = compiler;
         Err("universal release build input identity requires the macOS SDK; native Linux handoffs use their own provenance protocol".into())
     }
 }
 
+/// The identity under the SDK captured before constructing the compiler command.
+pub(crate) fn current_with_sdk(sdk: &AppleSdk) -> Result<String, String> {
+    sdk.verify()?;
+    #[cfg(target_os = "macos")]
+    {
+        on_this_machine(None, sdk, false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    Err("universal release build input identity requires the macOS SDK; native Linux handoffs use their own provenance protocol".into())
+}
+
+/// Exact candidate roles and the same SDK input DATA that its command receives.
+pub(crate) fn current_for_with_sdk(
+    compiler: &CompilerInputs,
+    sdk: &AppleSdk,
+) -> Result<String, String> {
+    sdk.verify()?;
+    #[cfg(target_os = "macos")]
+    {
+        on_this_machine(Some(compiler), sdk, false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    current_for(compiler)
+}
+
+/// A native instrument's Trust and SDK identity. It deliberately observes no stock compiler,
+/// foreign standard library or stock sysroot, and uses a separate seal domain from a product.
+pub(crate) fn current_native_with_sdk(
+    compiler: Option<&CompilerInputs>,
+    sdk: &AppleSdk,
+) -> Result<String, String> {
+    sdk.verify()?;
+    #[cfg(target_os = "macos")]
+    {
+        static NATIVE: std::sync::Mutex<input_seal::Process> =
+            std::sync::Mutex::new(input_seal::Process::unstarted(input_seal::Schema {
+                walk: b"aterm-release-native-inputs-v1",
+                seal: "aterm-release-native-inputs-seal-v1",
+            }));
+        let mut roots = || {
+            let trust = match compiler {
+                Some(compiler) => {
+                    if !compiler.bin.is_absolute()
+                        || compiler.bin.canonicalize().map_err(|e| e.to_string())? != compiler.bin
+                    {
+                        return Err(
+                            "native compiler inputs require the canonical absolute Trust bin"
+                                .into(),
+                        );
+                    }
+                    compiler.bin.clone()
+                }
+                None => crate::gates::trust_stage2_bin().map_err(|e| e.to_string())?,
+            };
+            let sysroot = input_seal::trust_sysroot(&trust)?;
+            let host = input_seal::trust_host(&trust)?;
+            let mut roots = input_seal::trust_roots(trust, &sysroot, &host)?;
+            roots.extend(input_seal::apple_roots(sdk.root.clone())?);
+            Ok(roots)
+        };
+        NATIVE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .identity(
+                &mut input_seal::Sources {
+                    roots: &mut roots,
+                    facts: &mut |roots| facts_under(compiler, roots),
+                    open: &mut crate::durable::open_regular_file,
+                    now: &mut input_seal::now_ns,
+                    stopped: &|| crate::interrupt::caught().is_some(),
+                    report: &mut |said| report(None, said),
+                },
+                false,
+            )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = compiler;
+        Err("native SDK input identity requires macOS".into())
+    }
+}
+
+/// Resolve and hold the exact source's compiler roles before sealing their actual inputs.
+/// Candidate release callers already holding a context use `current_for` directly.
+pub fn for_commit(git: &dyn crate::ledger::GitRunner, commit: &str) -> Result<String, String> {
+    current_for(&crate::trust_lock::inputs_at(git, commit)?)
+}
+
+/// Observe exact-source inputs without installing an unavailable compiler.
+pub(crate) fn available_for_commit(
+    git: &dyn crate::ledger::GitRunner,
+    commit: &str,
+) -> Result<String, String> {
+    current_for(&crate::trust_lock::available_inputs_at(git, commit)?)
+}
+
 /// Whether the seal this process holds is `identity` and its roots, facts and every entry's
-/// status are still the ones it hashed. Unlike [`current`] it opens no input file to hash it,
+/// status are still the ones it hashed. Unlike [`current_with_sdk`] it opens no input file to hash it,
 /// takes, adopts and keeps no seal, and finishes its walk after an interrupt was caught; it still
 /// resolves the roots (running the compilers and `xcrun`) and reads the facts, the SDK's settings
 /// files among them, as `current`'s recheck does. A cut told to stop asks this once its verifier
@@ -81,11 +231,24 @@ pub fn current() -> Result<String, String> {
 /// it also answers a process that holds no seal, roots that cannot be resolved, and every host
 /// but macOS.
 #[must_use]
-pub fn held(identity: &str) -> bool {
+pub(crate) fn held(sdk: &AppleSdk, identity: &str) -> bool {
+    held_under(None, sdk, identity)
+}
+
+/// Whether the held seal still stands under these exact candidate compiler roles.
+#[must_use]
+pub(crate) fn held_for(compiler: &CompilerInputs, sdk: &AppleSdk, identity: &str) -> bool {
+    held_under(Some(compiler), sdk, identity)
+}
+
+fn held_under(compiler: Option<&CompilerInputs>, sdk: &AppleSdk, identity: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
-        let mut roots = machine_roots;
-        let mut facts = input_seal::machine_facts;
+        if sdk.verify().is_err() {
+            return false;
+        }
+        let mut roots = || roots_under(compiler, sdk);
+        let mut facts = |roots: &[input_seal::Root]| facts_under(compiler, roots);
         let mut open = crate::durable::open_regular_file;
         let mut now = input_seal::now_ns;
         // `holds` walks to its end whatever this says.
@@ -104,7 +267,7 @@ pub fn held(identity: &str) -> bool {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = identity;
+        let _ = (compiler, sdk, identity);
         false
     }
 }
@@ -163,19 +326,51 @@ pub fn handed_path() -> Option<PathBuf> {
     }
 }
 
-/// The kept seal prepared under `state_dir` when it authenticates `expected` for this
-/// machine's resolved input roots. The caller may hand this file to another process; that
-/// process still rechecks every root, fact and status before it adopts the seal.
+/// The kept seal for these candidate roles. Its receiver must still recheck every input.
 #[must_use]
-pub(crate) fn prefrozen_seal(state_dir: &std::path::Path, expected: &str) -> Option<PathBuf> {
+pub(crate) fn prefrozen_for(
+    compiler: &CompilerInputs,
+    state_dir: &std::path::Path,
+    expected: &str,
+) -> Option<PathBuf> {
+    prefrozen_for_with_sdk(compiler, &AppleSdk::capture().ok()?, state_dir, expected)
+}
+
+/// The kept seal prepared under `state_dir` for these captured SDK roots. Its receiver
+/// still rechecks every root, fact and status before adopting it.
+#[must_use]
+pub(crate) fn prefrozen_with_sdk(
+    sdk: &AppleSdk,
+    state_dir: &Path,
+    expected: &str,
+) -> Option<PathBuf> {
+    prefrozen_under(None, sdk, state_dir, expected)
+}
+
+pub(crate) fn prefrozen_for_with_sdk(
+    compiler: &CompilerInputs,
+    sdk: &AppleSdk,
+    state_dir: &Path,
+    expected: &str,
+) -> Option<PathBuf> {
+    prefrozen_under(Some(compiler), sdk, state_dir, expected)
+}
+
+fn prefrozen_under(
+    compiler: Option<&CompilerInputs>,
+    sdk: &AppleSdk,
+    state_dir: &std::path::Path,
+    expected: &str,
+) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        let roots = machine_roots().ok()?;
+        sdk.verify().ok()?;
+        let roots = roots_under(compiler, sdk).ok()?;
         input_seal::matching_kept(SCHEMAS, &state_dir.join("inputs-seal"), expected, &roots)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (state_dir, expected);
+        let _ = (compiler, sdk, state_dir, expected);
         None
     }
 }
@@ -184,7 +379,7 @@ pub(crate) fn prefrozen_seal(state_dir: &std::path::Path, expected: &str) -> Opt
 /// with `recheck`, adopt or recheck the kept one (hashing only on a difference); print the
 /// identity on stdout.
 /// # Errors
-/// What [`current`] refuses, and no HOME.
+/// What [`current_with_sdk`] refuses, and no HOME.
 pub fn measure(recheck: bool) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -192,13 +387,16 @@ pub fn measure(recheck: bool) -> Result<(), String> {
             .filter(|home| !home.is_empty())
             .ok_or("HOME is not set")?;
         arm(&crate::release_steps::release_state(Path::new(&home)), None);
-        println!("{}", on_this_machine(!recheck)?);
+        println!(
+            "{}",
+            on_this_machine(None, &AppleSdk::capture()?, !recheck)?
+        );
         Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = recheck;
-        current().map(drop)
+        current_with_sdk(&AppleSdk::capture()?).map(drop)
     }
 }
 
@@ -249,9 +447,13 @@ fn sealed() -> std::sync::MutexGuard<'static, Held> {
 /// This process's identity from this machine's roots and facts; `fresh` takes a new seal
 /// whatever is held or kept.
 #[cfg(target_os = "macos")]
-fn on_this_machine(fresh: bool) -> Result<String, String> {
-    let mut roots = machine_roots;
-    let mut facts = input_seal::machine_facts;
+fn on_this_machine(
+    compiler: Option<&CompilerInputs>,
+    sdk: &AppleSdk,
+    fresh: bool,
+) -> Result<String, String> {
+    let mut roots = || roots_under(compiler, sdk);
+    let mut facts = |roots: &[input_seal::Root]| facts_under(compiler, roots);
     let mut open = crate::durable::open_regular_file;
     let mut now = input_seal::now_ns;
     let mut held = sealed();
@@ -346,65 +548,137 @@ fn report(log: Option<&Path>, said: Report<'_>) {
     );
 }
 
+#[cfg(target_os = "macos")]
+fn roots_under(
+    compiler: Option<&CompilerInputs>,
+    sdk: &AppleSdk,
+) -> Result<Vec<input_seal::Root>, String> {
+    match compiler {
+        Some(compiler) => candidate_roots_with(compiler, |trust, stock| {
+            let captured = compiler.stock()?;
+            if captured.toolchain() != stock {
+                return Err("the captured stock role differs from the source compiler pin".into());
+            }
+            machine_roots_from(trust.to_path_buf(), captured, sdk)
+        }),
+        None => machine_roots(sdk),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn facts_under(compiler: Option<&CompilerInputs>, roots: &[input_seal::Root]) -> input_seal::Facts {
+    let facts = input_seal::machine_facts(roots);
+    match compiler {
+        Some(compiler) => candidate_facts(compiler, facts),
+        None => facts,
+    }
+}
+
+/// A domain-separated, length-framed identity of the complete source declaration. This is
+/// a seal fact, not a replacement for the caller's validation and retained compiler lease.
+#[cfg(any(test, target_os = "macos"))]
+fn compiler_role(compiler: &CompilerInputs) -> String {
+    let mut hash = aterm_digest::Sha256::new();
+    hash.update(b"aterm-release-candidate-compiler-inputs/1\0");
+    hash.update(compiler.pin.build.to_be_bytes());
+    for field in [
+        &compiler.pin.tree_root,
+        &compiler.pin.compiler_commit,
+        &compiler.pin.receipt,
+        &compiler.pin.stock_toolchain,
+    ] {
+        hash.update((field.len() as u64).to_be_bytes());
+        hash.update(field.as_bytes());
+    }
+    aterm_codec::hex::encode_lower(&hash.finalize())
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn candidate_facts(compiler: &CompilerInputs, mut facts: input_seal::Facts) -> input_seal::Facts {
+    let observed = match &facts.trust_build {
+        Some(value) => format!("some {}:{value}", value.len()),
+        None => "none".into(),
+    };
+    facts.trust_build = Some(format!(
+        "candidate/1 {} {observed}",
+        compiler_role(compiler)
+    ));
+    facts
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn candidate_roots_with(
+    compiler: &CompilerInputs,
+    resolve: impl FnOnce(&Path, &str) -> Result<Vec<input_seal::Root>, String>,
+) -> Result<Vec<input_seal::Root>, String> {
+    if !compiler.bin.is_absolute()
+        || compiler
+            .bin
+            .canonicalize()
+            .map_err(|error| error.to_string())?
+            != compiler.bin
+    {
+        return Err("candidate compiler inputs require the canonical absolute Trust bin".into());
+    }
+    let mut roots = resolve(&compiler.bin, &compiler.pin.stock_toolchain)?;
+    let stock = roots
+        .iter_mut()
+        .find(|(label, _)| label == "stock/bin")
+        .ok_or("candidate compiler inputs have no stock bin root")?;
+    // Kept filenames are keyed by roots. Bind the declaration there as well as in facts,
+    // so a pre-freeze lookup cannot offer another pin's file even with identical inputs.
+    stock.0 = format!("candidate/{}/stock/bin", compiler_role(compiler));
+    Ok(roots)
+}
+
 /// The resolved input roots of this machine's universal build, labelled: the selected Trust
-/// build's (`atpkg::input_seal::trust_roots`), upstream stable's proxies, `bin` and the
+/// build's (`atpkg::input_seal::trust_roots`), the checkout's declared stock proxies, `bin` and the
 /// libraries of its host and x86_64 targets, and the Apple roots
 /// (`atpkg::input_seal::apple_roots`). They resolve in the release's order: the Trust sysroot,
-/// HOME, the rustup shim, RUSTUP_HOME and PATH, the stable sysroot, the Trust and then the
-/// stable host, the SDK, the Trust and then the stable libraries, the Apple tools. So where
+/// HOME, the rustup shim, RUSTUP_HOME and PATH, the declared stock sysroot, the Trust and then the
+/// stable host, the SDK, the Trust and then the stock libraries, the Apple tools. So where
 /// more than one fails, the first error is the one it was before the protocol moved to atpkg,
-/// and a Trust that cannot name its sysroot fails before rustup's `stable` proxy runs.
+/// and a Trust that cannot name its sysroot fails before the declared stock proxy runs.
 #[cfg(target_os = "macos")]
-fn machine_roots() -> Result<Vec<input_seal::Root>, String> {
+fn machine_roots(sdk: &AppleSdk) -> Result<Vec<input_seal::Root>, String> {
+    let trust = crate::gates::trust_stage2_bin().map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME").ok_or("compiler identity requires HOME")?;
+    let stock =
+        crate::buildplan::Stock::under(&home, &crate::trust_lock::checkout_stock_toolchain()?)?;
+    machine_roots_from(trust, &stock, sdk)
+}
+
+#[cfg(target_os = "macos")]
+fn machine_roots_from(
+    trust: PathBuf,
+    stock: &crate::buildplan::Stock,
+    sdk: &AppleSdk,
+) -> Result<Vec<input_seal::Root>, String> {
     use aterm_uds::spawnfd::command;
 
-    let trust = crate::gates::trust_stage2_bin().map_err(|e| e.to_string())?;
     let trust_sysroot = input_seal::trust_sysroot(&trust)?;
-    let home = std::env::var_os("HOME").ok_or("compiler identity requires HOME")?;
-    let shim = crate::buildplan::release_rustup_shim_dir()?;
-    let rustup_home = atpkg::seam::rustup_home_with(
-        std::env::var_os("RUSTUP_HOME").as_deref(),
-        Some(Path::new(&home)),
-    )
-    .filter(|path| path.is_absolute())
-    .ok_or("compiler identity requires an absolute RUSTUP_HOME")?;
-    let path = std::env::join_paths([
-        shim.as_path(),
-        Path::new("/usr/bin"),
-        Path::new("/bin"),
-        Path::new("/usr/sbin"),
-        Path::new("/sbin"),
-    ])
-    .map_err(|e| format!("compiler identity PATH: {e}"))?;
-    let stable_root = input_seal::output_path(
-        // STOCK EXCEPTION: the universal release's x86_64 slice uses upstream stable.
-        command(shim.join("rustc"))
-            .env_clear()
-            .env("HOME", &home)
-            .env("PATH", path)
-            .env("RUSTUP_HOME", rustup_home)
-            .env("RUSTUP_TOOLCHAIN", "stable")
-            .args(["--print", "sysroot"])
-            .current_dir("/"),
-        "stable sysroot",
+    let stock_toolchain = stock.toolchain();
+    let shim = stock.shim()?.to_path_buf();
+    let stock_root = input_seal::output_path(
+        stock.command("rustc")?.args(["--print", "sysroot"]),
+        &format!("{stock_toolchain} sysroot"),
     )?;
     let trust_host = input_seal::trust_host(&trust)?;
-    let stable_host = input_seal::output_host(
-        command(stable_root.join("bin/rustc")).arg("-vV"),
-        "stable host",
+    let stock_host = input_seal::output_host(
+        command(stock_root.join("bin/rustc")).arg("-vV"),
+        &format!("{stock_toolchain} host"),
     )?;
-    let sdk = input_seal::macos_sdk()?;
     let mut roots = input_seal::trust_roots(trust, &trust_sysroot, &trust_host)?;
     roots.extend([
-        ("stable/proxies".to_string(), shim),
-        ("stable/bin".to_string(), stable_root.join("bin")),
+        ("stock/proxies".into(), shim),
+        ("stock/bin".into(), stock_root.join("bin")),
     ]);
     roots.extend(input_seal::rust_library_roots(
-        "stable",
-        &stable_root,
-        &[&stable_host, "x86_64-apple-darwin"],
+        "stock",
+        &stock_root,
+        &[&stock_host, "x86_64-apple-darwin"],
     )?);
-    roots.extend(input_seal::apple_roots(sdk)?);
+    roots.extend(input_seal::apple_roots(sdk.root.clone())?);
     Ok(roots)
 }
 

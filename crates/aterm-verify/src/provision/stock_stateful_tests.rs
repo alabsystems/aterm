@@ -152,6 +152,13 @@ fn pin() -> String {
     stock_pin(&repo()).unwrap()
 }
 
+/// The release chain's toolchain the checkout's `trust.lock` names.
+fn release() -> String {
+    release_toolchain(&repo(), true)
+        .unwrap()
+        .expect("the checkout carries a trust.lock")
+}
+
 /// A scratch account's homes: nothing on `$PATH`, no `$ATERM_TEST_RUSTUP`, and the row's
 /// copy looked for in the scratch's own tooling cache.
 pub(super) fn homes(dir: &Path) -> Homes {
@@ -186,7 +193,7 @@ fn placed(homes: &Homes) -> PathBuf {
 /// The release chain's install line on this host.
 fn release_install() -> String {
     let targets = RELEASE_TARGETS.iter().map(|t| (*t).to_string()).collect();
-    argv(&Step::ReleaseToolchain(targets)).join(" ")
+    argv(&Step::ReleaseToolchain(release(), targets)).join(" ")
 }
 
 fn position(calls: &[String], prefix: &str) -> usize {
@@ -201,14 +208,14 @@ fn a_bare_home_gets_auto_install_off_then_the_pin_by_name() {
     let tmp = aterm_tempfile::tempdir().unwrap();
     let homes = homes(tmp.path());
     let rustup = FakeRustup::default();
-    let refused = run(&repo(), &homes, &rustup, false, &mut |_| {}).unwrap_err();
+    let refused = run(&repo(), &homes, &rustup, false, false, &mut |_| {}).unwrap_err();
     assert!(
         refused.contains("no rustup to drive") && refused.contains("verify provision"),
         "{refused}"
     );
     assert!(rustup.calls().is_empty(), "{:#?}", rustup.calls());
     let copy = placed(&homes);
-    let acquired = run(&repo(), &homes, &rustup, false, &mut |_| {}).unwrap();
+    let acquired = run(&repo(), &homes, &rustup, false, false, &mut |_| {}).unwrap();
     assert!(!acquired.is_empty());
     let calls = rustup.calls();
     assert!(
@@ -228,14 +235,18 @@ fn a_bare_home_gets_auto_install_off_then_the_pin_by_name() {
             CELL_TARGETS.join(" ")
         ),
     );
-    let release = release_install();
+    let install = release_install();
     assert_eq!(
         calls
             .iter()
-            .filter(|c| c.contains("stable"))
+            .filter(|c| c.starts_with("rustup ") && c.contains(&release()))
             .collect::<Vec<_>>(),
-        [&release],
-        "rustup's floating stable gets the release chain's toolchain alone: {calls:#?}"
+        [&install],
+        "the lock's release gets the release chain's install alone: {calls:#?}"
+    );
+    assert!(
+        !calls.iter().any(|c| c.contains("stable")),
+        "nothing asks rustup's floating stable: {calls:#?}"
     );
     assert!(
         rustup.0.borrow().auto_installed.is_empty(),
@@ -252,44 +263,82 @@ fn a_bare_home_gets_auto_install_off_then_the_pin_by_name() {
         .run(&homes, &copy, &add, None)
         .expect("the pin was installed by name");
     assert_eq!(
-        missing(&homes, &rustup, Some(&pin), false),
+        missing(&homes, &rustup, Some(&pin), Some(&release()), false),
         Ok(Vec::<String>::new())
     );
     assert_eq!(
-        run(&repo(), &homes, &rustup, false, &mut |_| {}),
+        run(&repo(), &homes, &rustup, false, false, &mut |_| {}),
         Ok(Vec::new())
     );
 }
 
-/// The release chain builds its x86_64 compat slice on rustup's `stable`: a bare home gets
-/// it by name, with that slice's std on a Mac, and a second run finds it in place.
+/// The release chain builds its x86_64 compat slice on the release the checkout's `trust.lock`
+/// names: a bare home gets it by name, with that slice's std on a Mac, and a second run finds it
+/// in place.
 #[test]
-fn a_bare_home_gets_the_release_chains_stable_with_its_slice_std() {
+fn a_bare_home_gets_the_release_chains_locked_toolchain_with_its_slice_std() {
     let tmp = aterm_tempfile::tempdir().unwrap();
     let homes = homes(tmp.path());
     let rustup = FakeRustup::default();
     placed(&homes);
-    run(&repo(), &homes, &rustup, false, &mut |_| {}).unwrap();
+    run(&repo(), &homes, &rustup, false, false, &mut |_| {}).unwrap();
     let calls = rustup.calls();
-    let release = release_install();
-    position(&calls, &release);
+    let install = release_install();
+    position(&calls, &install);
     if cfg!(target_os = "macos") {
         assert!(
-            release.contains(" --target x86_64-apple-darwin "),
-            "{release}"
+            install.contains(" --target x86_64-apple-darwin "),
+            "{install}"
         );
     }
     {
         let state = rustup.0.borrow();
-        let stable = &state.toolchains[&format!("stable-{HOST}")];
+        let locked = &state.toolchains[&format!("{}-{HOST}", release())];
         for t in RELEASE_TARGETS {
-            assert!(stable.iter().any(|s| s == t), "{stable:?}");
+            assert!(locked.iter().any(|s| s == t), "{locked:?}");
         }
+        assert!(!state.toolchains.keys().any(|t| t.starts_with("stable")));
         assert!(state.auto_installed.is_empty());
     }
     assert_eq!(
-        run(&repo(), &homes, &rustup, false, &mut |_| {}),
+        run(&repo(), &homes, &rustup, false, false, &mut |_| {}),
         Ok(Vec::new())
+    );
+}
+
+#[test]
+fn coincident_roles_keep_both_target_sets_and_components_after_the_real_plan() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let homes = homes(tmp.path());
+    let checkout = tmp.path().join("checkout");
+    std::fs::create_dir(&checkout).unwrap();
+    let pin = stock_pin(&checkout).unwrap();
+    let mut lock = aterm_toolchain::trust_lock::read(&repo().join("trust.lock")).unwrap();
+    lock.stock_toolchain.clone_from(&pin);
+    std::fs::write(
+        checkout.join("trust.lock"),
+        aterm_toolchain::trust_lock::render_body(&lock),
+    )
+    .unwrap();
+    let rustup = FakeRustup::default();
+    placed(&homes);
+    run(&checkout, &homes, &rustup, false, true, &mut |_| {}).unwrap();
+    let calls = rustup.calls();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|line| line.starts_with(&format!("rustup toolchain install {pin} ")))
+            .count(),
+        1,
+        "a second install must not erase the first role's targets or components: {calls:#?}",
+    );
+    assert_eq!(
+        missing(&homes, &rustup, Some(&pin), Some(&pin), false),
+        Ok(Vec::<String>::new()),
+    );
+    assert_eq!(
+        run(&checkout, &homes, &rustup, false, true, &mut |_| {}),
+        Ok(Vec::new()),
     );
 }
 
@@ -317,7 +366,7 @@ fn a_toolchain_install_never_self_updates_into_cargo_home() {
     let bare = homes(bare.path());
     placed(&bare);
     let rustup = FakeRustup::default();
-    let acquired = run(&repo(), &bare, &rustup, false, &mut |_| {}).unwrap();
+    let acquired = run(&repo(), &bare, &rustup, false, false, &mut |_| {}).unwrap();
     assert!(
         acquired
             .iter()
@@ -330,7 +379,15 @@ fn a_toolchain_install_never_self_updates_into_cargo_home() {
     let own = homes(own.path());
     let copy = placed(&own);
     stub(&own.cargo_home.join("bin/rustup"));
-    run(&repo(), &own, &FakeRustup::default(), false, &mut |_| {}).unwrap();
+    run(
+        &repo(),
+        &own,
+        &FakeRustup::default(),
+        false,
+        false,
+        &mut |_| {},
+    )
+    .unwrap();
     assert_eq!(entries(&own.cargo_home.join("bin")), ["rustup"]);
 
     {
@@ -367,8 +424,9 @@ fn stub(path: &Path) {
 }
 
 /// A PIN MISSING A PIECE GETS IT ON THE PIN ALONE, WHATEVER STABLE HOLDS: where `stable`
-/// carries every cell's std and clippy and the pin only its host's std, the probe and the
-/// run name the pin's missing stds and components, and nothing of `stable`.
+/// carries every cell's std and clippy, the pin only its host's std and the release chain's
+/// toolchain its slice's, the probe and the run name the pin's missing stds and components, and
+/// nothing of `stable`.
 #[test]
 fn a_pin_missing_a_piece_gets_it_on_the_pin_alone() {
     let tmp = aterm_tempfile::tempdir().unwrap();
@@ -386,6 +444,13 @@ fn a_pin_missing_a_piece_gets_it_on_the_pin_alone() {
         );
         s.toolchains
             .insert(format!("{pin}-{HOST}"), vec![HOST.into()]);
+        s.toolchains.insert(
+            format!("{}-{HOST}", release()),
+            std::iter::once(HOST)
+                .chain(RELEASE_TARGETS.iter().copied())
+                .map(str::to_string)
+                .collect(),
+        );
     }
     std::fs::create_dir_all(&homes.rustup_home).unwrap();
     std::fs::write(homes.rustup_home.join(SETTINGS), "").unwrap();
@@ -401,11 +466,11 @@ fn a_pin_missing_a_piece_gets_it_on_the_pin_alone() {
         PIN_COMPONENTS.join(" ")
     );
     assert_eq!(
-        missing(&homes, &rustup, Some(&pin), false),
+        missing(&homes, &rustup, Some(&pin), Some(&release()), false),
         Ok(vec![add.clone(), clippy.clone()]),
         "the read-only probe names what a run adds"
     );
-    run(&repo(), &homes, &rustup, false, &mut |_| {}).unwrap();
+    run(&repo(), &homes, &rustup, false, false, &mut |_| {}).unwrap();
     let calls = rustup.calls();
     position(&calls, &add);
     position(&calls, &clippy);
@@ -423,7 +488,7 @@ fn a_pin_missing_a_piece_gets_it_on_the_pin_alone() {
     );
     assert!(rustup.0.borrow().auto_installed.is_empty());
     assert_eq!(
-        missing(&homes, &rustup, Some(&pin), false),
+        missing(&homes, &rustup, Some(&pin), Some(&release()), false),
         Ok(Vec::<String>::new())
     );
 
@@ -431,13 +496,13 @@ fn a_pin_missing_a_piece_gets_it_on_the_pin_alone() {
     // adds it to the pin alone.
     let musl = format!("rustup target add --toolchain {pin} aarch64-unknown-linux-musl");
     assert_eq!(
-        missing(&homes, &rustup, Some(&pin), true),
+        missing(&homes, &rustup, Some(&pin), Some(&release()), true),
         Ok(vec![musl.clone()])
     );
-    let acquired = run(&repo(), &homes, &rustup, true, &mut |_| {}).unwrap();
+    let acquired = run(&repo(), &homes, &rustup, true, false, &mut |_| {}).unwrap();
     assert_eq!(acquired, [musl]);
     assert_eq!(
-        missing(&homes, &rustup, Some(&pin), true),
+        missing(&homes, &rustup, Some(&pin), Some(&release()), true),
         Ok(Vec::<String>::new())
     );
 }

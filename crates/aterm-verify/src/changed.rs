@@ -12,6 +12,7 @@ use crate::scope::Scope;
 use crate::toolchain::Toolchain;
 
 mod exclusions;
+mod graph;
 
 /// One workspace member reported by the resolved dependency graph.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,6 +144,8 @@ impl<S: Into<String>> FromIterator<S> for Manifests {
 /// Outcome of change-cone selection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Selection {
+    /// Required graph evidence could not be read; no scope or check is authorized.
+    Unavailable(String),
     /// The cone widened to the entire workspace for the given reason.
     Widened(String),
     /// The cone narrowed to the seeds and what each reaches ([`Reach`]).
@@ -488,7 +491,7 @@ pub fn select(
 ) -> Selection {
     use crate::own_tests::Observed;
     if members.is_empty() {
-        return Selection::Widened("`targo tree` returned no workspace members".to_string());
+        return Selection::Unavailable("`targo tree` returned no workspace members".to_string());
     }
     let names = members.names();
 
@@ -738,9 +741,12 @@ pub fn forks_touched(paths: &[String], forks: &[(String, String)]) -> BTreeSet<S
 }
 
 /// Convert a [`Selection`] into a check [`Scope`] and summary line.
-#[must_use]
-pub fn cone(base: &str, sel: &Selection) -> (Scope, String) {
-    match sel {
+///
+/// # Errors
+/// An unavailable graph cannot authorize a scope; retains its original diagnostics.
+pub fn cone(base: &str, sel: &Selection) -> Result<(Scope, String), String> {
+    Ok(match sel {
+        Selection::Unavailable(why) => return Err(why.clone()),
         Selection::Widened(why) => (
             Scope::workspace(),
             format!("the whole workspace (the change cone widened: {why})"),
@@ -778,7 +784,7 @@ pub fn cone(base: &str, sel: &Selection) -> (Scope, String) {
                 format!("the change cone since {base}: {}{more}", named.join(" ")),
             )
         }
-    }
+    })
 }
 
 /// Default git base ref for change-cone comparison when `--base` is omitted.
@@ -803,7 +809,7 @@ pub fn default_base(root: &Path, path_env: &OsStr) -> String {
 #[must_use]
 pub fn resolve(root: &Path, tools: &Toolchain, path_env: &OsStr, base: &str) -> Selection {
     if !tools.have_targo() {
-        return Selection::Widened(
+        return Selection::Unavailable(
             "targo is absent, so the dependency graph cannot be read".to_string(),
         );
     }
@@ -847,7 +853,10 @@ fn resolve_reading(
     reading: &[String],
     from: Option<&str>,
 ) -> Selection {
-    let members = read_members(root, tools, path_env);
+    let members = match read_members(root, tools, path_env) {
+        Ok(members) => members,
+        Err(why) => return Selection::Unavailable(why),
+    };
     // Shared-input discovery can only add crates. Once a changed compiler/configuration
     // input already demands every crate, that scan cannot change the selection. Archive
     // merges can owe tens of thousands of paths: do not cross them with every source file
@@ -905,13 +914,22 @@ fn resolve_reading(
         base: from.unwrap_or(merge_base),
         listed: &listed,
     };
-    select(
+    let failure = std::cell::RefCell::new(None);
+    let selected = select(
         &paths,
         &readers,
         &manifests,
         &members,
-        &|| read_path_packages(root, tools, path_env, &members),
-        &|c| invert(root, &tools.targo, path_env, members.spec(c), &members),
+        &|| {
+            graph_value(&failure, || {
+                read_path_packages(root, tools, path_env, &members)
+            })
+        },
+        &|c| {
+            graph_value(&failure, || {
+                invert(root, &tools.targo, path_env, members.spec(c), &members)
+            })
+        },
         &|p| replan_of(root, path_env, merge_base, p, &members),
         // A member is alone where its own changed files and its readers are confined to it.
         &|member, owned| {
@@ -974,7 +992,26 @@ fn resolve_reading(
             }
             observed
         },
-    )
+    );
+    failure
+        .into_inner()
+        .map_or(selected, Selection::Unavailable)
+}
+
+fn graph_value<T>(
+    failure: &std::cell::RefCell<Option<String>>,
+    read: impl FnOnce() -> Result<T, String>,
+) -> Option<T> {
+    if failure.borrow().is_some() {
+        return None;
+    }
+    match read() {
+        Ok(value) => Some(value),
+        Err(why) => {
+            *failure.borrow_mut() = Some(why);
+            None
+        }
+    }
 }
 
 /// What a round of `verify land` names of the merge it judges ([`resolve_round`]), as its words
@@ -1050,12 +1087,24 @@ pub fn resolve_round(
         readers,
         mechanical.then_some(judged.as_str()),
     );
+    if matches!(shared, Selection::Unavailable(_)) {
+        return shared;
+    }
     if unowned && *mechanical && readers.is_empty() {
         return shared;
     }
     let whole = resolve(root, tools, path_env, base);
+    if matches!(whole, Selection::Unavailable(_)) {
+        return whole;
+    }
     let since = resolve(root, tools, path_env, judged);
-    let members = read_members(root, tools, path_env);
+    if matches!(since, Selection::Unavailable(_)) {
+        return since;
+    }
+    let members = match read_members(root, tools, path_env) {
+        Ok(members) => members,
+        Err(why) => return Selection::Unavailable(why),
+    };
     meet(whole, &[since, shared], &|names| members.any_has_lib(names))
 }
 
@@ -1086,7 +1135,17 @@ pub fn meet(
     reached: &[Selection],
     any_lib: &dyn Fn(&[String]) -> bool,
 ) -> Selection {
+    if matches!(whole, Selection::Unavailable(_)) {
+        return whole;
+    }
+    if let Some(Selection::Unavailable(why)) = reached
+        .iter()
+        .find(|selection| matches!(selection, Selection::Unavailable(_)))
+    {
+        return Selection::Unavailable(why.clone());
+    }
     let (seeds, crates, had_lib, alone) = match whole {
+        unavailable @ Selection::Unavailable(_) => return unavailable,
         widened @ Selection::Widened(_) => return widened,
         Selection::Narrowed {
             seeds,
@@ -1099,6 +1158,7 @@ pub fn meet(
     let mut widened = false;
     for selection in reached {
         match selection {
+            Selection::Unavailable(why) => return Selection::Unavailable(why.clone()),
             Selection::Widened(_) => widened = true,
             Selection::Narrowed { crates, .. } => {
                 keep.extend(
@@ -1940,21 +2000,14 @@ fn flag_hidden_edits(root: &Path, path_env: &OsStr) -> Option<Vec<String>> {
     Some(gone)
 }
 
-fn stdout_of(cmd: &mut Command, root: &Path, path_env: &OsStr) -> Option<String> {
-    let out = cmd.current_dir(root).env("PATH", path_env).output().ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// One `cargo tree` read, in plain text whatever colour the environment or a cargo config asks for
-/// ([`reached`] reads its prefixes by column).
-fn targo_tree(root: &Path, targo: &Path, path_env: &OsStr, args: &[&str]) -> Option<String> {
-    stdout_of(
-        Command::new(targo).args(args).args(["--color", "never"]),
-        root,
-        path_env,
-    )
+/// One bounded, cancellable original `targo tree` child.
+fn targo_tree(
+    root: &Path,
+    targo: &Path,
+    path_env: &OsStr,
+    args: &[&str],
+) -> Result<graph::Read, String> {
+    graph::tree(root, targo, path_env, args)
 }
 
 /// Parse `(name, manifest_dir)` entries from `cargo tree` output.
@@ -2006,8 +2059,12 @@ fn normalize_manifest_dir(dir: String) -> String {
     }
 }
 
-pub(crate) fn read_members(root: &Path, tools: &Toolchain, path_env: &OsStr) -> Members {
-    let Some(out) = targo_tree(
+pub(crate) fn read_members(
+    root: &Path,
+    tools: &Toolchain,
+    path_env: &OsStr,
+) -> Result<Members, String> {
+    let read = targo_tree(
         root,
         &tools.targo,
         path_env,
@@ -2021,10 +2078,17 @@ pub(crate) fn read_members(root: &Path, tools: &Toolchain, path_env: &OsStr) -> 
             "--format",
             "{p}",
         ],
-    ) else {
-        return Members::default();
-    };
+    )?;
+    let out = read.text()?;
+    if out.trim().is_empty() {
+        return Err(read.refusal("graph child succeeded but stdout is empty"));
+    }
     let prefix = tree_root_prefix(root);
+    if parse_graph_entries(out, &prefix).is_empty() {
+        return Err(read.refusal(
+            "graph child succeeded but its output contains no parseable workspace members",
+        ));
+    }
     let shared = crate::read_regular_text(root.join("Cargo.lock"))
         .map(|lock| lock_shared_names(&lock))
         .unwrap_or_default();
@@ -2036,8 +2100,8 @@ pub(crate) fn read_members(root: &Path, tools: &Toolchain, path_env: &OsStr) -> 
             (name, spec)
         })
         .collect();
-    Members::new(
-        parse_graph_entries(&out, &prefix)
+    Ok(Members::new(
+        parse_graph_entries(out, &prefix)
             .into_iter()
             .map(|(name, dir)| {
                 let dir = normalize_manifest_dir(dir);
@@ -2049,7 +2113,7 @@ pub(crate) fn read_members(root: &Path, tools: &Toolchain, path_env: &OsStr) -> 
             })
             .collect(),
     )
-    .with_specs(specs)
+    .with_specs(specs))
 }
 
 /// Parse `name -> version` mappings for in-repo packages from `cargo tree` output.
@@ -2088,6 +2152,19 @@ pub fn lock_shared_names(lock: &str) -> BTreeSet<String> {
     shared
 }
 
+/// A workspace tree must name a package even when it has no outside paths.
+/// Inverse trees deliberately have a different empty-output contract.
+fn required_workspace_text(read: &graph::Read) -> Result<&str, String> {
+    let text = read.text()?;
+    if text.trim().is_empty() {
+        return Err(read.refusal("graph child succeeded but stdout is empty"));
+    }
+    if !text.lines().any(|line| tree_package(line).is_some()) {
+        return Err(read.refusal("graph child succeeded but named no parseable workspace packages"));
+    }
+    Ok(text)
+}
+
 /// The path packages outside the workspace, on any target's graph ([`outside_packages`]): a change
 /// to one this host's graph does not hold is still a seed, which [`select`] then widens on.
 fn read_path_packages(
@@ -2095,8 +2172,8 @@ fn read_path_packages(
     tools: &Toolchain,
     path_env: &OsStr,
     members: &Members,
-) -> Option<Vec<(String, String)>> {
-    let out = targo_tree(
+) -> Result<Vec<(String, String)>, String> {
+    let read = targo_tree(
         root,
         &tools.targo,
         path_env,
@@ -2113,7 +2190,12 @@ fn read_path_packages(
             "all",
         ],
     )?;
-    outside_packages(&out, &tree_root_prefix(root), members)
+    outside_packages(
+        required_workspace_text(&read)?,
+        &tree_root_prefix(root),
+        members,
+    )
+    .ok_or_else(|| read.refusal("cannot parse path-package graph"))
 }
 
 /// Of one `cargo tree --format {p}` printout, the in-repo packages whose directory is no member's,
@@ -2159,8 +2241,8 @@ fn invert(
     path_env: &OsStr,
     crate_name: &str,
     members: &Members,
-) -> Option<Reach> {
-    let out = targo_tree(
+) -> Result<Reach, String> {
+    let read = targo_tree(
         root,
         targo,
         path_env,
@@ -2177,7 +2259,8 @@ fn invert(
             "normal,build,dev",
         ],
     )?;
-    reached(&out, &tree_root_prefix(root), members)
+    reached(read.text()?, &tree_root_prefix(root), members)
+        .ok_or_else(|| read.refusal("cannot parse inverse dependency graph"))
 }
 
 /// The `name vX.Y.Z` that opens a `cargo tree` entry, or `None` when it opens with anything else.
@@ -2441,26 +2524,28 @@ pub fn outside_graph(
 }
 
 /// The `-p` specs of `specs` this host cannot build ([`Foreign`]), each with its consumers. An
-/// unanswered graph read refuses nothing: cargo then judges the specs itself.
-#[must_use]
+/// unavailable graph read is a refusal retaining its original child diagnostics.
+///
+/// # Errors
+/// Required graph collection or parsing failed; retains the original child diagnostics.
 pub fn foreign_specs(
     root: &Path,
     tools: &Toolchain,
     path_env: &OsStr,
     specs: &[String],
-) -> Vec<Foreign> {
+) -> Result<Vec<Foreign>, String> {
     let Ok(lock) = std::fs::read_to_string(root.join("Cargo.lock")) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let lock = lock_packages(&lock);
     if !specs
         .iter()
         .any(|spec| lock.iter().any(|(n, v)| spec_matches(spec, n, v)))
     {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let tree = |args: &[&str]| targo_tree(root, &tools.targo, path_env, args);
-    let Some(graph) = tree(&[
+    let graph = tree(&[
         "tree",
         "--workspace",
         "--prefix",
@@ -2469,10 +2554,9 @@ pub fn foreign_specs(
         "{p}",
         "--edges",
         "normal,build,dev",
-    ]) else {
-        return Vec::new();
-    };
-    outside_graph(specs, &lock, &parse_tree_packages(&graph))
+    ])?;
+    let packages = parse_tree_packages(required_workspace_text(&graph)?);
+    outside_graph(specs, &lock, &packages)
         .into_iter()
         .map(|spec| {
             let consumers = tree(&[
@@ -2490,10 +2574,11 @@ pub fn foreign_specs(
                 "{p}",
                 "--edges",
                 "normal,build,dev",
-            ])
-            .map(|out| direct_dependents(&out))
-            .unwrap_or_default();
-            Foreign { spec, consumers }
+            ])?;
+            Ok(Foreign {
+                spec,
+                consumers: direct_dependents(consumers.text()?),
+            })
         })
         .collect()
 }

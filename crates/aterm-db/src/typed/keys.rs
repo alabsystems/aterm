@@ -382,8 +382,10 @@ pub fn account_name(realm: &str, claims_email: &str) -> Option<String> {
 /// so an xAI account's handle holds at most 19. The bound also keeps a slug a vault name inside
 /// `claude-code-<label>-oauth`, the entry the vault keeps a roster row's sign-in snapshot under
 /// (`aterm_secrets::envelope`'s grammar, `[a-z0-9][a-z0-9-]{0,62}`, leaves 45 bytes there), as
-/// it keeps the [`reserved_slug`] a new row is labelled by.
-pub const MAX_SLUG: usize = 39;
+/// it keeps the [`reserved_slug`] a new row is labelled by. aterm-file holds the value, so a
+/// reader of the shared files alone checks a slug against the same bound
+/// (`aterm_file::account::is_slug`).
+pub const MAX_SLUG: usize = aterm_file::account::MAX_SLUG;
 
 /// The most bytes of the word a slug starts with: every provider word ([`provider_word`];
 /// `google` and `kimicn` are the longest), and an unknown realm's, which is cut to fit.

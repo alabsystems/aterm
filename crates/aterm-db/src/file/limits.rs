@@ -55,7 +55,7 @@ const WINDOWS: [(&str, &str); 3] = [
 /// hour (a `/usage` screen's "Resets 1pm"), and the journal's own fold of the same readings
 /// takes an hour-resolution reset to agree within an hour (`alab::journal::seen`'s tolerance).
 /// Every window is five hours or longer, so an hour never joins two instances of one window.
-/// SF-08b measures the agreement across the fleet's readings and sets this from it.
+/// SF-08c measures the agreement across the fleet's `ai/usage` readings and sets this from it.
 pub const SAME_RESET_MS: u64 = 3_600_000;
 
 /// One Mac's reading of one account or sub-account, as its `ai/usage` row states it.

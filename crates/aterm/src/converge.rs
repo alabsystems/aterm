@@ -6,13 +6,15 @@
 //!
 //! `sync.fabric` turns on a fabric the person never turned off with `aterm fabric on`'s own steps
 //! ([`aterm_link::enable::turn_on_by_default_with`]; never under CI), and renews a broker that
-//! runs a build an update replaced, or brings up the job `on` installed where it serves none, with
-//! `on`'s broker step alone ([`aterm_link::enable::renew_replaced_broker_with`]). With the mesh on
-//! (`aterm_types::mesh_switch::MESH`, read once into [`Live`]) it installs, renews and restarts no
-//! broker job: the node service (`systems.alab.aterm-node`) hosts `bus.log` and renews it, and
-//! retires the job an earlier build installed, so the turn-on's steps write no job and the
-//! renewal reads left as it is. `sync.peers` joins
-//! the open ALab vault from the window's pass with System State's own join
+//! runs a build an update replaced or that is gone, or brings up the job `on` installed where it
+//! serves none, with `on`'s own steps ([`aterm_link::enable::renew_replaced_broker_with`]); the
+//! job's program and a `[fabric] command` aterm wrote that name no file are rewritten to the
+//! installed app (the program `sync.node` runs, [`Live::installed_program`]), the job restarted,
+//! and one that names a file is left as it is, whatever file it is. With the mesh on (`aterm_types::mesh_switch::MESH`, read once into
+//! [`Live`]) it installs, renews and restarts no broker job: the node service
+//! (`systems.alab.aterm-node`) hosts `bus.log` and renews it, and retires the job an earlier build
+//! installed, so the turn-on's steps write no job and the renewal rewrites only such a command.
+//! `sync.peers` joins the open ALab vault from the window's pass with System State's own join
 //! ([`aterm_machines::sync::peers`]), on macOS, where System State runs. `sync.shared-data` founds
 //! an open vault's Commons on its only admin ([`aterm_secrets::client::commons_foundable`]).
 //! `sync.requests` runs this Mac's pass over the lab's credential requests, and the custodian's
@@ -1950,12 +1952,7 @@ impl Live {
         }
         let home = aterm_types::dirs::home_dir().ok_or("no user home directory")?;
         let state = self.state_dir().ok_or("no state directory")?;
-        let current_exe = std::env::current_exe().and_then(|p| p.canonicalize()).ok();
-        let program = aterm_agent::node_service::resolve_installed_program(
-            current_exe.as_deref(),
-            self.installed_release(),
-            &home,
-        );
+        let program = self.installed_program_in(&home);
         port(
             &home,
             &state,
@@ -1965,9 +1962,38 @@ impl Live {
             aterm_agent::node_service::supervisor_here(),
         )
     }
+
+    /// The installed app's `aterm` under `home`, the program `sync.node`'s job runs
+    /// ([`aterm_agent::node_service::resolve_installed_program`]): this process's own executable
+    /// where it is the installed release, else the app's lasting path; `None` where none is.
+    fn installed_program_in(&self, home: &Path) -> Option<PathBuf> {
+        let current_exe = std::env::current_exe().and_then(|p| p.canonicalize()).ok();
+        aterm_agent::node_service::resolve_installed_program(
+            current_exe.as_deref(),
+            self.installed_release(),
+            home,
+        )
+    }
+
+    /// The program `sync.fabric` points the broker job and a `[fabric] command` aterm wrote at
+    /// where the program they name is gone: the one `sync.node` runs
+    /// ([`Self::installed_program_in`]).
+    /// `None` where this process is not a shell of the account's own
+    /// ([`aterm_types::dirs::not_own_account`]: a private state root, root, or another `HOME`) or
+    /// there is no home: such a pass points no fabric at the account's app, and only reads a
+    /// program that is gone as left where it is.
+    fn installed_program(&self) -> Option<PathBuf> {
+        if aterm_types::dirs::not_own_account().is_some() {
+            return None;
+        }
+        self.installed_program_in(&aterm_types::dirs::home_dir()?)
+    }
 }
 
 impl Ports for Live {
+    fn identity_result_requested(&self) -> bool {
+        aterm_secrets::converge::identity_result_requested()
+    }
     /// Every thread of the pass held as it starts where its starter ran the pass, so the fleet
     /// book's lock lifts its holder to the default class while the rest of the pass yields: the
     /// vault subscriber's, its runner having left the subscriber's band
@@ -2551,6 +2577,22 @@ impl Ports for Live {
         )
     }
 
+    fn observe_empty_repositories(
+        &self,
+        execution: Option<aterm_machines::sync::repository_refresh::Execution>,
+    ) -> Result<Option<aterm_machines::init_github::RepositoryReadback>, String> {
+        let state = self
+            .state_dir()
+            .ok_or("no state directory holds the repositories' converge state")?;
+        let sys = aterm_machines::port::Live::new();
+        let ctx = repository_context(&sys)?;
+        let intent = aterm_machines::init::OwedCloneIntent::capture(&sys, &state, &setup_holds())?;
+        let (inputs, current) = repository_capture(&state, &sys, &ctx, intent, execution)?;
+        aterm_machines::init_github::observe_empty_repositories_captured(
+            &sys, &ctx, inputs, current,
+        )
+    }
+
     fn clone_owed(
         &self,
         execution: Option<aterm_machines::sync::repository_refresh::Execution>,
@@ -2690,8 +2732,11 @@ impl Ports for Live {
     fn fabric(&self) -> Result<FabricRead, String> {
         use aterm_link::enable::{BrokerRenewal, Renew};
         Ok(
-            match aterm_link::enable::renew_replaced_broker_with(Renew::Look, self.fabric_service)?
-            {
+            match aterm_link::enable::renew_replaced_broker_with(
+                Renew::Look,
+                self.fabric_service,
+                self.installed_program().as_deref(),
+            )? {
                 BrokerRenewal::Off => fabric_unset(
                     aterm_link::enable::unset_state()?,
                     under_ci(),
@@ -2704,7 +2749,9 @@ impl Ports for Live {
                 ),
                 BrokerRenewal::Current(now) => FabricRead::Current(now),
                 BrokerRenewal::Kept(why) => FabricRead::NotApplicable(why),
-                BrokerRenewal::Due(which) | BrokerRenewal::Renewed(which) => FabricRead::Due(which),
+                BrokerRenewal::Due { from, to } => FabricRead::Due { from, to },
+                // A look steps nothing; what a renewal said is what the fabric is now.
+                BrokerRenewal::Renewed(said) => FabricRead::Current(said),
             },
         )
     }
@@ -2712,11 +2759,14 @@ impl Ports for Live {
     fn renew_broker(&self) -> Result<String, String> {
         use aterm_link::enable::{BrokerRenewal, Renew};
         Ok(
-            match aterm_link::enable::renew_replaced_broker_with(Renew::Apply, self.fabric_service)?
-            {
-                BrokerRenewal::Renewed(said) => format!("renewed the broker on this build: {said}"),
+            match aterm_link::enable::renew_replaced_broker_with(
+                Renew::Apply,
+                self.fabric_service,
+                self.installed_program().as_deref(),
+            )? {
+                BrokerRenewal::Renewed(said) => format!("renewed: {said}"),
                 BrokerRenewal::Off => format!("nothing renewed: {FABRIC_OFF}"),
-                BrokerRenewal::Current(now) | BrokerRenewal::Due(now) => {
+                BrokerRenewal::Current(now) | BrokerRenewal::Due { from: now, .. } => {
                     format!("nothing renewed: {now}")
                 }
                 BrokerRenewal::Kept(why) => format!("left as it is: {why}"),

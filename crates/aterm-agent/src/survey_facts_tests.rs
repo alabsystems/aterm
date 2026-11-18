@@ -1927,6 +1927,7 @@ fn a_mac_with_no_vault_says_no_token_state_on_its_account_lines() {
             &view::Places {
                 store: &store,
                 roster: Some(&roster),
+                lab: None,
                 logins: &[],
                 now: env.now,
                 offers: view::OFFERED_HERE,

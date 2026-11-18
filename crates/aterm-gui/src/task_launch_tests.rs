@@ -2554,6 +2554,20 @@ impl CodexPool {
         }
     }
 
+    /// `main`'s row with the address `email`, which the word that pins its account needs: a row
+    /// with no address has no word.
+    fn address_main(&self, email: &str) {
+        let path = self.cfg.join("accounts-codex.toml");
+        let roster = std::fs::read_to_string(&path).expect("roster");
+        let addressed = roster.replacen(
+            "label = \"main\"\n",
+            &format!("label = \"main\"\nemail = \"{email}\"\n"),
+            1,
+        );
+        assert_ne!(addressed, roster, "main's row");
+        std::fs::write(&path, addressed).expect("roster");
+    }
+
     fn seat(&self, now: i64) -> aterm_agent::harness::accounts_pool::Seat<'_> {
         aterm_agent::harness::accounts_pool::Seat {
             config_dir: &self.cfg,
@@ -2603,7 +2617,8 @@ impl CodexPool {
         super::pooled_starter_in(starter, Cli::Codex, &self.seat(now), &read, 1)
     }
 
-    /// The owner's pin (`aterm harness accounts use <label> --cli codex`) at `now`.
+    /// The owner's pin of the row labelled `label` (`aterm harness accounts use <account> --cli
+    /// codex`) at `now`.
     fn pin(&self, label: &str, now: i64) -> Result<(), String> {
         use aterm_agent::harness::accounts::{self, Cli};
         let seat = self.seat(now);
@@ -2815,18 +2830,23 @@ fn a_pin_on_a_row_of_its_own_on_a_program_that_ignores_codex_auth_path_reads_the
     use aterm_agent::harness::codex_alab::{DefaultRow, unpin_fix, unread_fix};
     use aterm_agent::harness::usage::rfc3339_utc;
     let pool = CodexPool::new();
+    pool.address_main("main@x.example");
     let old = aterm_agent::harness::codex_alab::lay_package(&pool.root.join("store/old"), false);
     pool.pin("work", POOL_NOW).expect("the owner pins `work`");
     let refused = pool
         .launch(&old, POOL_NOW + 1, MainReads::Walled)
         .expect_err("a pin on a row of its own does not run on an older build");
     assert!(refused.contains("five_hour"), "{refused}");
-    let Ok(DefaultRow::Walled { until, .. }) =
-        aterm_agent::harness::accounts_pool::default_row_now(&pool.seat(POOL_NOW + 1), Cli::Codex)
+    let Ok(DefaultRow::Walled {
+        until,
+        word: Some(word),
+        ..
+    }) = aterm_agent::harness::accounts_pool::default_row_now(&pool.seat(POOL_NOW + 1), Cli::Codex)
     else {
-        panic!("the read put `main`'s wall on record: {refused}");
+        panic!("the read put `main`'s wall on record, with the word that pins it: {refused}");
     };
-    let pin = unread_fix(Some("main"));
+    assert!(word.as_str().starts_with("ac-"), "main's key: {word}");
+    let pin = unread_fix(Some(&word));
     assert!(
         refused.contains(&pin) && refused.contains(&rfc3339_utc(until)),
         "the pin of `main`, for once the wall ends: {refused}"
@@ -2836,10 +2856,11 @@ fn a_pin_on_a_row_of_its_own_on_a_program_that_ignores_codex_auth_path_reads_the
 
 /// CONTROL: A PROGRAM THAT KEEPS `CODEX_AUTH_PATH`'S LOGIN ITS OWN still rotates past the walled
 /// default onto `work`. On one that does not, the owner's pin on `work` is refused, and since
-/// `main` can serve, the answer is the pin of `main`.
+/// `main` can serve, the answer is the pin of `main`'s account, by its word.
 #[test]
 fn a_program_that_keeps_codex_auth_path_still_rotates_to_work() {
     let pool = CodexPool::new();
+    pool.address_main("main@x.example");
     let reads = aterm_agent::harness::codex_alab::lay_package(&pool.root.join("store/new"), true);
     let old = aterm_agent::harness::codex_alab::lay_package(&pool.root.join("store/old"), false);
     let started = pool
@@ -2852,8 +2873,20 @@ fn a_program_that_keeps_codex_auth_path_still_rotates_to_work() {
     let refused = pool
         .launch(&old, later + 1, MainReads::Empty)
         .expect_err("a pin on a row of its own does not run on an older build");
+    let main = aterm_agent::harness::accounts::Row {
+        label: "main".to_owned(),
+        email: Some("main@x.example".to_owned()),
+        ..aterm_agent::harness::accounts::Row::default()
+    };
+    let word = aterm_agent::harness::account_names::word_of_row(
+        aterm_agent::harness::accounts::Cli::Codex,
+        &main,
+        &[],
+        None,
+    )
+    .expect("an address");
     assert!(
-        refused.contains("aterm harness accounts use main --cli codex"),
+        refused.contains(&format!("aterm harness accounts use {word} --cli codex")),
         "{refused}"
     );
 }

@@ -21,6 +21,9 @@ pub(crate) struct Scripted {
     pub(crate) probes: std::sync::Mutex<Vec<Probe>>,
     pub(crate) probed: Arc<AtomicU32>,
     pub(crate) applies: Arc<AtomicU32>,
+    pub(crate) guards: Arc<AtomicU32>,
+    pub(crate) observations: Arc<AtomicU32>,
+    pub(crate) observation: Option<Result<(), String>>,
     pub(crate) apply_result: Result<(), String>,
     pub(crate) family: &'static str,
     pub(crate) id: &'static str,
@@ -32,6 +35,9 @@ impl Scripted {
             probes: std::sync::Mutex::new(probes),
             probed: Arc::new(AtomicU32::new(0)),
             applies: Arc::new(AtomicU32::new(0)),
+            guards: Arc::new(AtomicU32::new(0)),
+            observations: Arc::new(AtomicU32::new(0)),
+            observation: None,
             apply_result,
             family: "test",
             id: "test.scripted",
@@ -67,6 +73,16 @@ impl Item for Scripted {
     fn apply(&self) -> Result<(), String> {
         self.applies.fetch_add(1, Ordering::SeqCst);
         self.apply_result.clone()
+    }
+    fn stands_aside(&self) -> Option<StoodAside> {
+        self.guards.fetch_add(1, Ordering::SeqCst);
+        None
+    }
+    fn observe(&self) -> Option<Result<(), String>> {
+        self.observation.as_ref().map(|result| {
+            self.observations.fetch_add(1, Ordering::SeqCst);
+            result.clone()
+        })
     }
     fn explain(&self, probe: &Probe) -> Explain {
         explained(probe)
@@ -1918,4 +1934,99 @@ fn the_engine_ends_each_row_after_the_last_thing_it_does_with_it() {
         *events.lock().unwrap(),
         ["probe planned", "ended planned", "row planned"]
     );
+}
+
+/// Remote observation is not a mutation: only the proposal that survives it enters the
+/// change journal. A failed observation cannot authorize an apply, and a plan or foreign
+/// account starts no observation at all.
+#[test]
+fn observations_resolve_uncertainty_before_the_change_journal_and_respect_admission() {
+    for case in [
+        "verified",
+        "change",
+        "failed",
+        "plan",
+        "foreign",
+        "excluded",
+        "already-ok",
+        "no-observation",
+        "selected",
+        "selected-change",
+        "standing-aside",
+        "selected-standing-aside",
+        "still-change",
+    ] {
+        let probes = match case {
+            "change" | "selected-change" => vec![change(), change(), ok()],
+            "still-change" => vec![change()],
+            "already-ok" => vec![ok()],
+            _ => vec![change(), ok()],
+        };
+        let mut item = Scripted::new(probes, Ok(()));
+        if case != "no-observation" {
+            item.observation = Some(if case == "failed" {
+                Err("the remote observation failed".into())
+            } else {
+                Ok(())
+            });
+        }
+        let guarded = Arc::clone(&item.guards);
+        let observed = Arc::clone(&item.observations);
+        let applied = Arc::clone(&item.applies);
+        let mut items: Vec<Box<dyn Item>> = vec![Box::new(item)];
+        if case.ends_with("standing-aside") {
+            items = crate::scope::standing_aside(
+                items,
+                &StoodAside::Lock("another pass holds it".into()),
+            );
+        }
+        if case.starts_with("selected") {
+            let (selected, unmatched) = crate::scope::select(items, &["test.scripted".into()]);
+            assert!(unmatched.is_empty());
+            items = selected;
+        }
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut journal = Recorded {
+            events: Arc::clone(&events),
+            refuses: &[],
+        };
+        let scope = Scope {
+            not_own_account: (case == "foreign").then_some("different account"),
+            applies: if case == "excluded" {
+                &[]
+            } else {
+                Scope::EVERY_CLASS
+            },
+            ..Scope::EVERY
+        };
+        let mode = if case == "plan" {
+            Mode::Plan
+        } else {
+            Mode::Apply
+        };
+        let rows = run_scoped(&items, mode, scope, &mut journal, &mut |_| {}).unwrap();
+        let row = &rows[0];
+        let (outcome, guards, observations, applies, records) = match case {
+            "verified" | "selected" => (Outcome::Ok, 1, 1, 0, 0),
+            "change" | "selected-change" => (Outcome::Changed, 2, 1, 1, 1),
+            "still-change" => (Outcome::Failed, 2, 1, 1, 1),
+            "no-observation" => (Outcome::Changed, 1, 0, 1, 1),
+            "failed" => (Outcome::Failed, 1, 1, 0, 0),
+            "plan" | "excluded" => (Outcome::Planned, 0, 0, 0, 0),
+            "foreign" | "standing-aside" | "selected-standing-aside" => {
+                (Outcome::Blocked, 0, 0, 0, 0)
+            }
+            "already-ok" => (Outcome::Ok, 0, 0, 0, 0),
+            _ => unreachable!(),
+        };
+        assert_eq!(row.outcome, outcome, "{case}: {rows:?}");
+        assert_eq!(
+            guarded.load(Ordering::SeqCst),
+            guards,
+            "{case}: one admission per proposal"
+        );
+        assert_eq!(observed.load(Ordering::SeqCst), observations, "{case}");
+        assert_eq!(applied.load(Ordering::SeqCst), applies, "{case}");
+        assert_eq!(events.lock().unwrap().len(), records, "{case}");
+    }
 }

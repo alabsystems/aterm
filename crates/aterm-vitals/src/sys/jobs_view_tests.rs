@@ -157,6 +157,7 @@ fn view(rows: Vec<JobRow>) -> JobsView {
         lanes_off: Vec::new(),
         parked_tabs: Vec::new(),
         at_ms: 0,
+        zombie_facts: None,
     }
 }
 
@@ -184,9 +185,15 @@ fn a_scope_reads_only_its_sessions_rows_live_first() {
 fn rows_print_the_engines_words_and_json_keeps_the_contract() {
     let v = view(vec![stuck("a40977", 7)]);
     let rows = rows_in(&v, &[7]);
-    let lines = row_lines(&v, &rows, &Findings::default(), true, 8, &|k| {
-        (k == 7).then_some(1)
-    });
+    let lines = row_lines(
+        &v,
+        &rows,
+        &Findings::default(),
+        true,
+        8,
+        &|k| (k == 7).then_some(1),
+        &|k| (k == 7).then(|| "s-seven".to_owned()),
+    );
     assert_eq!(lines.len(), 2);
     assert_eq!(lines[1].text, "finding kind=process-table own=0");
     assert!(
@@ -195,8 +202,11 @@ fn rows_print_the_engines_words_and_json_keeps_the_contract() {
         lines[0].text
     );
     assert!(lines[0].text.contains(" remote=127.0.0.1:47811"));
-    assert!(lines[0].text.ends_with(" verdict=stuck tab=1"));
-    let j = row_json(rows[0], Some(1));
+    assert!(lines[0].text.ends_with(" verdict=stuck tab=1 sid=s-seven"));
+    let j = row_json(rows[0], Some(1), &|k| {
+        (k == 7).then(|| "s-seven".to_owned())
+    });
+    assert_eq!(j.get("sid"), Some(&Jv::s("s-seven")));
     assert!(contract_violations(&j).is_empty(), "{:?}", j.to_text());
     assert_eq!(j.get("phi_m"), Some(&Jv::Int(8_338)));
     assert_eq!(j.get("kind"), Some(&Jv::s("agent_call")));
@@ -212,7 +222,7 @@ fn json_preserves_the_active_descendant_that_qualifies_a_quiet_wrapper() {
     wrapper.class = Class::Polling;
     wrapper.working_descendant = Some((72956, 1_793_213_706_219_818));
     let wire = wrapper.wire();
-    let json = row_json(&wrapper, Some(1));
+    let json = row_json(&wrapper, Some(1), &|_| None);
     assert!(wire.contains(" working_descendant=72956 "));
     assert_eq!(json.get("working_descendant"), Some(&Jv::Int(72956)));
     assert_eq!(
@@ -224,7 +234,7 @@ fn json_preserves_the_active_descendant_that_qualifies_a_quiet_wrapper() {
     assert!(contract_violations(&json).is_empty());
 
     wrapper.working_descendant = None;
-    let json = row_json(&wrapper, Some(1));
+    let json = row_json(&wrapper, Some(1), &|_| None);
     assert!(json.get("working_descendant").is_none());
     assert!(json.get("working_descendant_start").is_none());
 }
@@ -447,6 +457,6 @@ fn a_finding_prints_only_where_the_scope_reaches_unless_global() {
         }],
         ..Findings::default()
     };
-    let lines = row_lines(&view(Vec::new()), &[], &odd, false, 8, &|_| None);
+    let lines = row_lines(&view(Vec::new()), &[], &odd, false, 8, &|_| None, &|_| None);
     assert_eq!(lines[0].text, "finding kind=stopped pid=12 exe=-");
 }

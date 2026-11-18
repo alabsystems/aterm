@@ -852,7 +852,7 @@ pub(in crate::harness) fn unmanaged(
 pub fn run(
     env: &Env,
     host: &dyn AccountsHost,
-    label: &str,
+    word: &str,
     request: [u8; 16],
     authority: &dyn Authority,
     out: &mut dyn Write,
@@ -884,6 +884,31 @@ pub fn run(
     ) else {
         return ExitCode::from(1);
     };
+    // The word names the row by its account ([`crate::harness::account_names::row_named`]):
+    // the root's grant binds the row's address, never its label, so only the lookup is the
+    // word's. Every line after names the row as a message names its account.
+    let lab = crate::harness::alab_roster::current();
+    let candidates = crate::harness::account_names::Candidates {
+        roster: &records.raw_roster.rows,
+        lab: lab.as_deref(),
+        ..crate::harness::account_names::Candidates::default()
+    };
+    let label = match crate::harness::account_names::row_named(
+        Cli::Claude,
+        word,
+        &candidates,
+        "nothing was run",
+    ) {
+        Ok(row) => row.label.clone(),
+        Err(why) => {
+            let _ = writeln!(err, "shared renewal: {why}");
+            return ExitCode::from(1);
+        }
+    };
+    let label = label.as_str();
+    let named =
+        super::RowName::of_label(Cli::Claude, label, &records.raw_roster.rows, lab.as_deref());
+    let shown = named.shown.as_str();
     let Some(row) = records.roster.row(label) else {
         let _ = writeln!(err, "shared renewal requires an existing local row");
         return ExitCode::from(1);
@@ -899,7 +924,8 @@ pub fn run(
         let _ = writeln!(err, "shared renewal cannot check its login: {why}");
         return ExitCode::from(1);
     }
-    let (lock, waited) = match signin_guard(&store, host, label, "shared-renew", out, err) {
+    let (lock, waited) = match signin_guard(&store, host, (label, shown), "shared-renew", out, err)
+    {
         Ok(taken) => taken,
         Err(_) => return ExitCode::from(1),
     };
@@ -958,7 +984,7 @@ pub fn run(
     let now = host.now().max(env.now);
     let Ok(begun) = super::begin_sign_in(
         super::person_sign_in(Cli::Claude, label),
-        (Cli::Claude, label),
+        (Cli::Claude, label, shown),
         (&store, lock),
         now,
         ("shared-renew", err),

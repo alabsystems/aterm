@@ -428,6 +428,15 @@ pub(crate) fn until_cancelled(
     }
 }
 
+/// [`until_cancelled`] for reading with no deadline: blocks until `fd` is readable, at its end or
+/// in error, or `cancel` is. A readable `cancel` wins, whatever `fd` holds, and neither is read.
+pub(crate) fn readable_cancelled(fd: BorrowedFd<'_>, cancel: BorrowedFd<'_>) -> io::Result<()> {
+    if either(fd, cancel)?.second {
+        return Err(cancelled());
+    }
+    Ok(())
+}
+
 pub(crate) fn check_cancelled(cancel: Option<BorrowedFd<'_>>) -> io::Result<()> {
     if let Some(cancel) = cancel
         && !any_now(&[cancel])?.is_empty()

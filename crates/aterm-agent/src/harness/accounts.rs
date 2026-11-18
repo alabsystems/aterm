@@ -3,7 +3,11 @@
 
 //! AI CLI account roster admission, usage/wall tracking, rotation advice, and state store: Claude
 //! Code's pool, and one per pooled CLI ([`Cli`]) through the same parser, store and advice.
+//!
+//! Traced by the accounts keeper: what this file reads of the file system itself, it reads
+//! through `aterm_uds::trace::fs` (census `traced-reads`).
 
+use super::account_names::Word;
 use super::account_sync_error::SyncError;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,6 +17,7 @@ use std::path::{Path, PathBuf};
 use alab_policy::vocab::ResetKind;
 use aterm_json::{Map, Value};
 use aterm_phase::ResetDrawn;
+use aterm_uds::trace;
 
 pub use crate::ai::connector::Cli;
 use crate::ai::connector::{Flow, Region, RowKeys, Seam};
@@ -26,6 +31,10 @@ pub mod outbox;
 #[path = "accounts_auth_route.rs"]
 mod auth_route;
 pub use auth_route::{AuthRoute, TokenEntry};
+
+#[path = "accounts_tokens_here.rs"]
+mod tokens_here;
+pub use tokens_here::{TOKENS_HERE_LOCK_FILE, TokensHereHolder};
 
 #[path = "accounts_signin_queue.rs"]
 mod signin_queue;
@@ -151,10 +160,16 @@ pub(super) use sync_commit::{Admits, FleetTarget, SyncTarget, usage_target};
 
 #[path = "accounts_directory.rs"]
 mod directory;
+#[path = "accounts_live_sessions.rs"]
+mod live_sessions;
 pub(super) use directory::canonical_directory;
 pub(super) use directory::retained_directory_owner_at;
 pub(super) use directory::{
     lists_directory, naming_row, retained_directory_owner, shared_staging_retained,
+};
+pub use live_sessions::{
+    LiveSessions, Liveness, OverReads, Owner, SESSION_KEEP_S, SESSION_OVER_GRACE_S,
+    SessionsReconciled, drop_unanswered_sessions, reconcile_sessions, record_reconciled,
 };
 
 #[cfg_attr(
@@ -352,9 +367,6 @@ pub const RESET_BELIEVED_S: i64 = 8 * 24 * 3600;
 /// ([`note_wall`]): the longest month and a day.
 pub const MONTH_RESET_BELIEVED_S: i64 = 32 * 24 * 3600;
 
-/// A session's row older than this is dropped when the state is saved ([`drop_stale_sessions`]).
-pub const SESSION_KEEP_S: i64 = 30 * 24 * 3600;
-
 /// How often a session's loop says again what its screen says of usage while that shows unchanged.
 pub const CREDITS_RETELL_S: i64 = 10 * 60;
 
@@ -527,7 +539,7 @@ pub const PROFILE_KEYS: &[&str] = &[
 /// `accounts.toml` keeps it as the `class` word older builds read ([`Class::legacy_word`]), so a
 /// roster read between syncs keeps the order and the installed release that shares the file
 /// still loads it. The word is a serialization only: no reader takes it as a claim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum Class {
     /// This Mac prefers it: tried before the others.
     #[default]
@@ -570,7 +582,7 @@ impl Class {
 }
 
 /// Admitted `accounts.toml` row, optionally bound to a renewed login directory via [`bound`].
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Row {
     /// The only name the account has anywhere.
     pub label: String,
@@ -597,7 +609,7 @@ pub struct Row {
 
 /// A roster row's vendor keys, each admitted only by the CLI that takes it ([`RowKeys`],
 /// [`Roster::parse_for`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Vendor {
     /// `region` (Kimi Code): the account system the row's email belongs to.
     pub region: Option<Region>,
@@ -1352,8 +1364,13 @@ pub fn row_inline(label: &str, class: Class, dir: Option<&str>) -> Option<String
     })
 }
 
-/// What a row's `email` is written as in a row to add by hand ([`row_inline_of`]).
-pub const EMAIL_BY_HAND: &str = "<the --email you gave>";
+/// What a row's `email` is written as in a row to add by hand ([`row_inline_of`]): the address
+/// its login signs in with, which the person named and no refusal prints.
+pub const EMAIL_BY_HAND: &str = "<its login's address>";
+
+/// What a row's `identity_email` is written as in a row to add by hand ([`row_inline_of`]): the
+/// account's own address, where the login signs in with an alias of it.
+pub const IDENTITY_BY_HAND: &str = "<the account's address>";
 
 fn row_inline_of(row: &Row) -> Option<String> {
     if row_refusal(row).is_some() {
@@ -1377,7 +1394,10 @@ fn row_inline_of(row: &Row) -> Option<String> {
         ));
     }
     if row.identity_email.is_some() {
-        out.push_str(", identity_email = \"<the --identity-email you gave>\"");
+        out.push_str(&format!(
+            ", identity_email = {}",
+            aterm_toml::Value::from(IDENTITY_BY_HAND)
+        ));
     }
     if let Some(browser) = &row.browser {
         out.push_str(&format!(
@@ -1598,27 +1618,19 @@ pub fn login_made(dir: &Path) -> bool {
     login_made_checked(dir).unwrap_or(false)
 }
 
-/// The same footprint decision, retaining I/O uncertainty when no entry proves presence.
+/// The same footprint decision, retaining I/O uncertainty: the directory is listed whole
+/// ([`trace::fs::read_dir`]), so an entry that cannot be read leaves the answer unknown.
 /// # Errors
-/// The directory or an entry cannot be read and no known entry establishes a footprint.
+/// The directory or an entry of it cannot be read.
 pub(super) fn login_made_checked(dir: &Path) -> io::Result<bool> {
-    let entries = match std::fs::read_dir(dir) {
+    let entries = match trace::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    let mut unavailable = None;
-    for entry in entries {
-        match entry {
-            Ok(entry) => {
-                if !login_bookkeeping(&entry.file_name()) {
-                    return Ok(true);
-                }
-            }
-            Err(error) => unavailable = Some(error),
-        }
-    }
-    unavailable.map_or(Ok(false), Err)
+    Ok(entries
+        .iter()
+        .any(|entry| !login_bookkeeping(&entry.file_name())))
 }
 
 /// Whether `name` is a file aterm keeps beside a login, which holds nobody's: a renewal's checkpoint
@@ -1751,6 +1763,66 @@ pub(super) fn names_another_login(name: &str, value: &str) -> bool {
             && !lab_route(name, value))
 }
 
+/// Whether a variable named `name`, whatever its value, can say which login or route a Claude
+/// Code process runs on: [`LOGIN_ENV`], [`HOME_ENV`], the vault token's descriptor, marker and
+/// minted time ([`super::token_route`]), and every credential, profile or route variable
+/// ([`names_another_login`]). [`ProcessLogin::of_env`] reads no variable outside it, so a
+/// process whose environment holds none of them runs on its stored login in its default home;
+/// a child that must start so, whatever environment its parent inherited, takes each one out
+/// ([`InheritNoLogin`], a test and debug seam).
+#[must_use]
+pub fn names_a_login_or_route(name: &str) -> bool {
+    use super::token_route::{DESCRIPTOR_ENV, MARKER_ENV, MINTED_ENV};
+    [LOGIN_ENV, HOME_ENV, DESCRIPTOR_ENV, MARKER_ENV, MINTED_ENV].contains(&name)
+        || LaunchEnv::routes(name)
+}
+
+/// A test's child that starts on its stored login in its default home, whatever shell the test
+/// binary runs from: before the test sets the child's own variables, the child's command takes
+/// out each variable this process's environment holds that names a login or route
+/// ([`names_a_login_or_route`], each name judged by its lossy spelling, as an exec environment is
+/// read). Every test helper whose child's exec environment the code under test judges
+/// ([`ProcessLogin::of_exec_env`]) starts it so, in every crate. A token session's shell, for
+/// one, hands its children the wrapper's marker without the descriptor Claude Code consumed,
+/// which reads as [`AuthRoute::Outside`] (2026-11-16: seven upgrade tests red there, green with
+/// the marker unset); a landing check's cleared environment holds none of them. A test and debug
+/// seam.
+#[cfg(any(test, debug_assertions))]
+pub trait InheritNoLogin {
+    /// Takes the inherited login and route variables out of the child's environment.
+    fn inherit_no_login(&mut self) -> &mut Self;
+}
+
+/// The names [`InheritNoLogin`] takes out: this process's own variables that name a login or
+/// route.
+#[cfg(any(test, debug_assertions))]
+fn inherited_login_env() -> impl Iterator<Item = std::ffi::OsString> {
+    std::env::vars_os()
+        .map(|(name, _)| name)
+        .filter(|name| names_a_login_or_route(&name.to_string_lossy()))
+}
+
+#[cfg(any(test, debug_assertions))]
+impl InheritNoLogin for aterm_uds::spawnfd::Command {
+    fn inherit_no_login(&mut self) -> &mut Self {
+        for name in inherited_login_env() {
+            self.env_remove(name);
+        }
+        self
+    }
+}
+
+/// [`InheritNoLogin`] for a child started on a pty (`aterm_pty::spawn_session_leader_on_pty`).
+#[cfg(any(test, debug_assertions))]
+impl InheritNoLogin for aterm_uds::spawnfd::StdCommand {
+    fn inherit_no_login(&mut self) -> &mut Self {
+        for name in inherited_login_env() {
+            self.env_remove(name);
+        }
+        self
+    }
+}
+
 /// Returns the vendor profile store's `configs` directory for a process with environment `env`:
 /// its `ANTHROPIC_CONFIG_DIR`, else `XDG_CONFIG_HOME/anthropic`, else `.config/anthropic` under the
 /// home `os.homedir()` reads ([`HOMEDIR_ENV`]: `USERPROFILE` on Windows, where `HOME` is not it).
@@ -1780,13 +1852,11 @@ pub fn profile_configs_dir<'a>(
 /// Returns whether the vendor profile `configs` directory contains any `.json` profile entry.
 #[must_use]
 pub fn profile_configured(configs: &Path) -> bool {
-    match std::fs::read_dir(configs) {
-        Ok(entries) => entries.into_iter().any(|entry| {
-            entry.is_ok_and(|e| {
-                Path::new(&e.file_name())
-                    .extension()
-                    .is_some_and(|x| x == "json")
-            })
+    match trace::fs::read_dir(configs) {
+        Ok(entries) => entries.iter().any(|entry| {
+            Path::new(&entry.file_name())
+                .extension()
+                .is_some_and(|x| x == "json")
         }),
         Err(e) => e.kind() != io::ErrorKind::NotFound,
     }
@@ -1863,8 +1933,9 @@ impl LaunchEnv {
     }
 
     /// Whether admission reads variable `name`: the login and home selectors, the directories
-    /// the home check and [`profile_configs_dir`] read, and every variable
-    /// [`ProcessLogin::of_env`] judges a login by.
+    /// the home check and [`profile_configs_dir`] read, and every credential, profile or route
+    /// variable [`ProcessLogin::of_env`] judges a login by. The wrapper's marker and minted time
+    /// are not among them: the wrapper makes them afresh, so a record never keeps them.
     #[must_use]
     pub fn reads(name: &str) -> bool {
         [LOGIN_ENV, HOME_ENV, HOMEDIR_ENV, "XDG_CONFIG_HOME", "HOME"].contains(&name)
@@ -1936,6 +2007,8 @@ impl ProcessLogin {
     ///   admits apart, [`super::netwatch::LAB_ROUTE_SEAM`]; never in a shipped binary), or the
     ///   descriptor or the marker is set without the other, or the marker names no token entry;
     /// - [`AuthRoute::Stored`] otherwise.
+    ///
+    /// It reads only the variables [`names_a_login_or_route`] names.
     #[must_use]
     pub fn of_env<'a>(env: impl IntoIterator<Item = (&'a str, &'a str)>) -> ProcessLogin {
         use super::token_route::{DESCRIPTOR_ENV, MARKER_ENV};
@@ -1947,6 +2020,10 @@ impl ProcessLogin {
             route: AuthRoute::Stored,
         };
         for (name, value) in env {
+            // Every name below is one: a variable it does not name judges nothing.
+            if !names_a_login_or_route(name) {
+                continue;
+            }
             if name == LOGIN_ENV {
                 match login {
                     None => login = Some(value),
@@ -2492,9 +2569,9 @@ impl RenewalParent {
         if self.matches(logins, label) {
             Ok(())
         } else {
-            Err(format!(
-                "account `{label}` login changed during sign-in; nothing recorded"
-            ))
+            // The caller's prefix names the row; a label here would name a row with an address
+            // by a word no verb takes for it.
+            Err("the account's login changed during sign-in; nothing recorded".to_owned())
         }
     }
 }
@@ -2759,7 +2836,7 @@ fn write_checkpoint_with_parent(
     parent: RenewalParent,
 ) -> io::Result<()> {
     let staging = Path::new(staging_text);
-    std::fs::canonicalize(staging)?;
+    trace::fs::canonicalize(staging)?;
     let native_grant = enrollment
         .map(|request| logins.enrollment.checkpoint_reference(request))
         .transpose()
@@ -2913,7 +2990,7 @@ pub(super) fn read_renewal_checkpoint_checked_for(
         actual_dir,
         now,
         aterm_uds::regular_file::open,
-        |path| std::fs::canonicalize(path),
+        |path| trace::fs::canonicalize(path),
         native_google_digest_checked,
     )
 }
@@ -3139,7 +3216,7 @@ pub(super) fn checkpoint_unreferenced(
                 .flat_map(|entry| entry.dir.iter().chain(entry.was.iter().flatten())),
         )
         .any(|held| {
-            Path::new(held) == dir || std::fs::canonicalize(held).is_ok_and(|path| path == actual)
+            Path::new(held) == dir || trace::fs::canonicalize(held).is_ok_and(|path| path == actual)
         })
 }
 
@@ -3401,26 +3478,27 @@ impl SignInAction {
         }
     }
 
-    /// The next step for this action on `label` in `cli`'s pool: a browser profile signed in
-    /// once is a step only where a renewal can then approve the page in it
-    /// ([`Cli::renews_headlessly`]), so a task of one stored for a CLI whose renewals stop for a
-    /// person names its sign-in on a terminal ([`Cli::sign_in_verb`]). A renewal is run at a
-    /// terminal on this Mac, where a person can complete a check in aterm's sign-in window.
+    /// The next step for this action on a row of `cli`'s pool, each step naming it by `word`
+    /// ([`super::account_names::sign_in_word`]): a browser profile signed in once is a step only
+    /// where a renewal can then approve the page in it ([`Cli::renews_headlessly`]), so a task of
+    /// one stored for a CLI whose renewals stop for a person names its sign-in on a terminal
+    /// ([`Cli::sign_in_verb`]). A renewal is run at a terminal on this Mac, where a person can
+    /// complete a check in aterm's sign-in window.
     #[must_use]
-    pub fn next_step(self, cli: Cli, label: &str) -> String {
+    pub fn next_step(self, cli: Cli, word: &Word) -> String {
         use super::accounts_step::Step;
         match self {
             Self::Renew => format!(
                 "Run {} in a terminal on this Mac",
-                Step::Renew(cli, label.to_owned())
+                Step::renew(cli, word.clone())
             ),
             Self::Browser if cli.renews_headlessly() => format!(
                 "Run {}, then {}",
-                Step::Browser(cli, label.to_owned()),
-                Step::Renew(cli, label.to_owned())
+                Step::Browser(cli, word.clone()),
+                Step::renew(cli, word.clone())
             ),
             Self::Browser | Self::Login => {
-                format!("Run {}", Step::Login(cli, label.to_owned()))
+                format!("Run {}", Step::Login(cli, word.clone()))
             }
         }
     }
@@ -3781,12 +3859,14 @@ impl Logins {
         aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| String::from("{}"))
     }
 
-    /// Deserializes and validates `logins.json` against `now`.
+    /// Deserializes and validates `logins.json` against `now`, comparing through it
+    /// ([`trace::Now`]): no stamp is read as later than `now`.
     /// # Errors
     ///
     /// As [`State::from_json`]: [`Unread::Torn`] for text that is not JSON,
     /// [`Unread::NotOurs`] for another schema or invalid identity structure.
-    pub fn from_json(text: &str, now: i64) -> Result<Logins, Unread> {
+    pub fn from_json(text: &str, now: impl Into<trace::Now>) -> Result<Logins, Unread> {
+        let by_now = Cap::at(now.into());
         let doc: Value = aterm_json::from_str(text)
             .map_err(|e| Unread::Torn(format!("not JSON ({})", shown(&e.to_string()))))?;
         if !doc.is_object() {
@@ -3882,7 +3962,7 @@ impl Logins {
                             "binding `{label}` has a sign-in task with no step"
                         ))
                     })?;
-                    let at = stamp(task.get("at"), now).ok_or_else(|| {
+                    let at = stamp(task.get("at"), by_now).ok_or_else(|| {
                         Unread::NotOurs(format!("binding `{label}` has no sign-in task timestamp"))
                     })?;
                     SignInAction::parse(step).map(|action| SignInTask { action, at })
@@ -3893,7 +3973,7 @@ impl Logins {
             // reads as none, which holds as a bot protection does
             // ([`SignInAttempt::waits_for_a_person`]).
             let sign_in_attempt = v.get("sign_in_attempt").and_then(|tried| {
-                let since = stamp(tried.get("since"), now)?;
+                let since = stamp(tried.get("since"), by_now)?;
                 Some(SignInAttempt {
                     outcome: tried
                         .get("outcome")
@@ -3901,7 +3981,7 @@ impl Logins {
                         .and_then(AttemptOutcome::parse)?,
                     routes: one_line(tried.get("routes")?.as_str()?, ROUTES_MAX),
                     since,
-                    tried_at: stamp(tried.get("tried_at"), now).unwrap_or(since),
+                    tried_at: stamp(tried.get("tried_at"), by_now).unwrap_or(since),
                     stop: tried
                         .get("stop")
                         .and_then(Value::as_str)
@@ -3910,7 +3990,7 @@ impl Logins {
             });
             let binding = Binding {
                 dir,
-                renewed_at: stamp(v.get("renewed_at"), now),
+                renewed_at: stamp(v.get("renewed_at"), by_now),
                 renewal_generation: match v.get("renewal_generation") {
                     None if legacy => 0,
                     value => value.and_then(Value::as_u64).ok_or_else(|| {
@@ -3931,11 +4011,11 @@ impl Logins {
                     .unwrap_or(LIFETIME_START_S)
                     .clamp(LIFETIME_MIN_S, LIFETIME_MAX_S),
                 notice_end: int(v.get("notice_end")),
-                ended_at: stamp(v.get("ended_at"), now),
-                served_at: stamp(v.get("served_at"), now),
+                ended_at: stamp(v.get("ended_at"), by_now),
+                served_at: stamp(v.get("served_at"), by_now),
                 lifetime_scope: LifetimeScope::from_json(v),
                 subscription: word(v.get("subscription"), SUBSCRIPTION_MAX),
-                wrong_at: stamp(v.get("wrong_at"), now),
+                wrong_at: stamp(v.get("wrong_at"), by_now),
                 was,
                 proved_by: v
                     .get("proved_by")
@@ -3980,7 +4060,7 @@ impl Logins {
                     Some(CheckStop {
                         account,
                         region,
-                        at: stamp(stop.get("at"), now)?,
+                        at: stamp(stop.get("at"), by_now)?,
                     })
                 }),
             };
@@ -4472,14 +4552,19 @@ const MAX_TOKENS_HERE: usize = 64 * 1024;
 /// last read them from the vault ([`super::accounts_tokens::rows_on_token_read`]) and kept them in
 /// [`TOKENS_HERE_FILE`] under `accounts.lock` ([`Store::note_tokens_here`]). It is a reading, not
 /// an observation: no transaction saves it, no snapshot publishes it, and [`Store::hydrate_lapsed`]
-/// reads it from that file with no vault read. [`on_token_here`] takes it only while it is fresh
-/// ([`TOKENS_HERE_FRESH_S`]) and only for a token whose end has not passed.
+/// reads it from that file with no vault read. [`on_token_here`] takes it only while the window
+/// that keeps it vouches for it ([`TokensHereHolder`]) or it is fresh ([`TOKENS_HERE_FRESH_S`]),
+/// and only for a token whose end has not passed.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TokensHere {
-    /// When the upkeep read the vault (unix seconds).
+    /// When the reading was written (unix seconds): when the vault last read otherwise, or when
+    /// a vouch for it stood down ([`TokensHereHolder`]).
     pub read_at: i64,
     /// Each row on its token here, by label, with when its token ends (unix seconds).
     pub ends: BTreeMap<String, i64>,
+    /// Whether a window's holder vouched for the reading when it was read
+    /// ([`TokensHereHolder`]): its age then says nothing. Not kept in the file.
+    pub vouched: bool,
 }
 
 impl TokensHere {
@@ -4509,18 +4594,25 @@ impl TokensHere {
             .iter()
             .map(|(label, end)| Some((label.clone(), end.as_i64()?)))
             .collect::<Option<BTreeMap<_, _>>>()?;
-        Some(Self { read_at, ends })
+        Some(Self {
+            read_at,
+            ends,
+            vouched: false,
+        })
     }
 }
 
-/// The [`TokensHere`] kept in `dir`, where [`TOKENS_HERE_FILE`] reads as one. The file is a strict
-/// private file ([`aterm_uds::private_file`]), which only Unix has. Off Unix none is kept, and none
-/// is needed: no launch starts on a vault token there ([`super::token_route::LAUNCHES_ON_TOKEN`]).
+/// The [`TokensHere`] kept in `dir`, where [`TOKENS_HERE_FILE`] reads as one, with whether a
+/// window's holder vouches for it now ([`tokens_here::vouched`]). The file is a strict private
+/// file ([`aterm_uds::private_file`]), which only Unix has. Off Unix none is kept, and none is
+/// needed: no launch starts on a vault token there ([`super::token_route::LAUNCHES_ON_TOKEN`]).
 #[cfg(unix)]
 fn kept_tokens_here(dir: &Path) -> Option<TokensHere> {
-    aterm_uds::private_file::read_private(dir, TOKENS_HERE_FILE, MAX_TOKENS_HERE)
+    let mut kept = aterm_uds::private_file::read_private(dir, TOKENS_HERE_FILE, MAX_TOKENS_HERE)
         .ok()
-        .and_then(|bytes| TokensHere::from_json(&bytes))
+        .and_then(|bytes| TokensHere::from_json(&bytes))?;
+    kept.vouched = tokens_here::vouched(dir);
+    Some(kept)
 }
 
 #[cfg(not(unix))]
@@ -4549,55 +4641,81 @@ fn keep_tokens_here(_dir: &Path, _kept: Option<&TokensHere>) -> io::Result<bool>
     Ok(false)
 }
 
-/// When `row`'s vault token ends, where the upkeep's fresh reading ([`State::tokens_here`],
-/// [`TOKENS_HERE_FRESH_S`]) names it as in use on this Mac and that end is after `now`; `None`
-/// where no reading stands, it is older than an hour, it does not name the row, or the token has
-/// ended, and on every host where no launch starts on a token
+/// When `row`'s vault token ends, where the upkeep's reading ([`State::tokens_here`]) stands and
+/// names it as in use on this Mac and that end is after `now`. A reading stands while a window's
+/// holder vouches for it ([`TokensHere::vouched`], [`TokensHereHolder`]), whatever its age, and
+/// otherwise while it is fresh: written no later than `now` and no more than
+/// [`TOKENS_HERE_FRESH_S`] before it. `None` where no reading stands, it does not name the row, or
+/// the token has ended, and on every host where no launch starts on a token
 /// ([`super::token_route::LAUNCHES_ON_TOKEN`]: the judgment's platform step), whatever a file says.
+/// Each age and end is compared through `now` ([`trace::Now`]).
 #[must_use]
-pub fn on_token_here(row: &Row, state: &State, now: i64) -> Option<i64> {
+pub fn on_token_here(row: &Row, state: &State, now: impl Into<trace::Now>) -> Option<i64> {
     on_token_where(super::token_route::LAUNCHES_ON_TOKEN, row, state, now)
 }
 
 /// [`on_token_here`] on a host where a launch starts on a token (`launches`) or none does.
-fn on_token_where(launches: bool, row: &Row, state: &State, now: i64) -> Option<i64> {
+fn on_token_where(
+    launches: bool,
+    row: &Row,
+    state: &State,
+    now: impl Into<trace::Now>,
+) -> Option<i64> {
     if !launches {
         return None;
     }
+    let now: trace::Now = now.into();
     let read = state.tokens_here.as_ref()?;
-    if read.read_at > now || now.saturating_sub(read.read_at) > TOKENS_HERE_FRESH_S {
+    if !read.vouched
+        && (now.before(read.read_at)
+            || now.aged(read.read_at, TOKENS_HERE_FRESH_S.saturating_add(1)))
+    {
         return None;
     }
-    read.ends.get(&row.label).copied().filter(|end| *end > now)
+    read.ends
+        .get(&row.label)
+        .copied()
+        .filter(|end| now.before(*end))
 }
 
 /// The first second after `now` at which [`on_token_here`] of `row` can answer otherwise with
 /// `state` as it stands, by the clock alone: the reading coming to stand (its `read_at`, where
 /// that is ahead), the reading aging out ([`TOKENS_HERE_FRESH_S`] past it), and the row's token
-/// ending. `None` where none of them is ahead, or on a host where no launch starts on a token.
+/// ending. A reading a window's holder vouched for ([`TokensHere::vouched`]) neither comes to
+/// stand nor ages out by the clock, so its token's end is its one turn. `None` where none of
+/// them is ahead, or on a host where no launch starts on a token.
 #[must_use]
 pub fn on_token_turns(row: &Row, state: &State, now: i64) -> Option<i64> {
     if !super::token_route::LAUNCHES_ON_TOKEN {
         return None;
     }
     let read = state.tokens_here.as_ref()?;
-    [
+    let aging = (!read.vouched).then_some([
         Some(read.read_at),
         read.read_at.checked_add(TOKENS_HERE_FRESH_S + 1),
-        read.ends.get(&row.label).copied(),
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|at| *at > now)
-    .min()
+    ]);
+    aging
+        .into_iter()
+        .flatten()
+        .chain([read.ends.get(&row.label).copied()])
+        .flatten()
+        .filter(|at| *at > now)
+        .min()
 }
 
 /// Computes the [`LoginState`] of `row` at `now` from `logins` and `state`: where
 /// [`signed_out_here`] holds, [`LoginState::OnToken`] while the row runs on its vault token here
 /// ([`on_token_here`]) and [`LoginState::Expired`] otherwise, whatever its records forecast; and
-/// otherwise what its records say (`recorded_login_state`).
+/// otherwise what its records say (`recorded_login_state`). Compared through `now`
+/// ([`trace::Now`]).
 #[must_use]
-pub fn login_state(row: &Row, logins: &Logins, state: &State, now: i64) -> LoginState {
+pub fn login_state(
+    row: &Row,
+    logins: &Logins,
+    state: &State,
+    now: impl Into<trace::Now>,
+) -> LoginState {
+    let now: trace::Now = now.into();
     if signed_out_here(row, state) {
         return on_token_here(row, state, now)
             .map_or(LoginState::Expired, |until| LoginState::OnToken { until });
@@ -4607,8 +4725,16 @@ pub fn login_state(row: &Row, logins: &Logins, state: &State, now: i64) -> Login
 
 /// The [`LoginState`] of `row` by its records alone, blind to a lapse its credential file shows
 /// ([`lapsed_here`]): what [`login_state`] answers of a row not signed out here, and the only
-/// reading the renewal door takes ([`renewal_reading`]).
-fn recorded_login_state(row: &Row, logins: &Logins, state: &State, now: i64) -> LoginState {
+/// reading the renewal door takes ([`renewal_reading`]). Its forecast comes due once `now`
+/// reaches [`DUE_S`] before it, compared through `now` ([`trace::Now`]), so a trace that read a
+/// login not yet due stands only until that second.
+fn recorded_login_state(
+    row: &Row,
+    logins: &Logins,
+    state: &State,
+    now: impl Into<trace::Now>,
+) -> LoginState {
+    let now: trace::Now = now.into();
     let account = state.accounts.get(&row.label);
     let auth = account.map_or(Auth::Unseen, |account| account.current_auth(row));
     if auth == Auth::SignedOut {
@@ -4618,7 +4744,7 @@ fn recorded_login_state(row: &Row, logins: &Logins, state: &State, now: i64) -> 
         return LoginState::Idle;
     }
     if let Some(by) = login_forecast(row, logins, state)
-        && by.saturating_sub(now) <= DUE_S
+        && now.passed(by.saturating_sub(DUE_S))
     {
         return LoginState::Due { by };
     }
@@ -4637,20 +4763,22 @@ pub const USED_WITHIN_S: i64 = WEEK_WINDOW_S;
 /// Whether this Mac uses `label`'s login, so its upkeep may renew it (§4.15 rule 4): a session
 /// here ran on it within [`USED_WITHIN_S`] ([`Account::ran_at`], which only a session noted on
 /// this Mac sets), and this Mac holds the account's senior live claim or no Mac claims it
-/// ([`State::leases`], as the claims ring settles it).
+/// ([`State::leases`], as the claims ring settles it). Compared through `now` ([`trace::Now`]).
 #[must_use]
-pub fn used_here(state: &State, label: &str, now: i64) -> bool {
+pub fn used_here(state: &State, label: &str, now: impl Into<trace::Now>) -> bool {
     #[cfg(any(test, debug_assertions))]
     if USE_CONDITION_OFF.with(std::cell::Cell::get) {
         return true;
     }
+    let now: trace::Now = now.into();
     ran_here(state, label, now) && claim_ours_or_none(state, label, now)
 }
 
 /// Whether a session here ran on `label` within [`USED_WITHIN_S`] ([`Account::ran_at`]): the
 /// first half of [`used_here`].
 #[must_use]
-pub fn ran_here(state: &State, label: &str, now: i64) -> bool {
+pub fn ran_here(state: &State, label: &str, now: impl Into<trace::Now>) -> bool {
+    let now: trace::Now = now.into();
     state
         .accounts
         .get(label)
@@ -4670,13 +4798,16 @@ pub fn ran_here_ever(state: &State, label: &str) -> bool {
 }
 
 /// Whether this Mac holds `label`'s senior live claim or no Mac claims it ([`State::leases`], as
-/// the claims ring settles it): the second half of [`used_here`].
+/// the claims ring settles it): the second half of [`used_here`]. A lease stands while its
+/// `until` is to come, compared through `now` ([`trace::Now`]), so a trace that read another
+/// Mac's lease stands only until the second it lapses.
 #[must_use]
-pub fn claim_ours_or_none(state: &State, label: &str, now: i64) -> bool {
+pub fn claim_ours_or_none(state: &State, label: &str, now: impl Into<trace::Now>) -> bool {
+    let now: trace::Now = now.into();
     state
         .leases
         .get(label)
-        .filter(|lease| lease.until > now)
+        .filter(|lease| now.before(lease.until))
         .is_none_or(|lease| state.owns_swarm_label(&lease.holder))
 }
 
@@ -4715,7 +4846,7 @@ pub struct OtherMacs {
     pub unread_why: Option<UnreadWhy>,
     /// Each row that runs on its vault token on this Mac, with the token's end (unix seconds):
     /// renewal is off for it, so no door signs its stored login in with nobody asking, and a
-    /// person's `accounts renew <label>` says so (`docs/DESIGN-claude-setup-token-2026-11-05.md`
+    /// person's `accounts renew <account>` says so (`docs/DESIGN-claude-setup-token-2026-11-05.md`
     /// §5.8; [`super::accounts_tokens::rows_on_token`]).
     pub on_token: BTreeMap<String, u64>,
 }
@@ -4783,14 +4914,18 @@ impl OtherMacs {
 /// on it and loses its login (`DESIGN-alab-one-mesh-2026-11-05.md` §4.15 rule 4). Nor is a login
 /// whose credential file alone shows it lapsed ([`lapsed_here`]): it reads expired
 /// ([`login_state`]) and waits for a person's sign-in or a session here that meets its wall.
+/// Every time it compares (the use's week, a lease's end, the forecast's due second) goes through
+/// `now` ([`trace::Now`]), so a trace that read a door shut stands only until the first second
+/// that could open it.
 #[must_use]
 pub fn renewal_due(
     row: &Row,
     logins: &Logins,
     state: &State,
     others: &OtherMacs,
-    now: i64,
+    now: impl Into<trace::Now>,
 ) -> bool {
+    let now: trace::Now = now.into();
     row.held_by.is_none()
         && row.email.is_some()
         && !others.holds(&row.label)
@@ -4811,7 +4946,7 @@ pub fn renewal_due(
 /// for a lapsed file login (sign-ins are local, never by a process that polls, and never raise a
 /// prompt). So a lapse adds no renewal and takes none away; the test
 /// `the_upkeep_starts_nothing_for_a_lapsed_login` (`accounts_no_sweep_tests.rs`) holds it.
-fn renewal_reading(row: &Row, logins: &Logins, state: &State, now: i64) -> LoginState {
+fn renewal_reading(row: &Row, logins: &Logins, state: &State, now: trace::Now) -> LoginState {
     #[cfg(any(test, debug_assertions))]
     if RENEWAL_ON_LOGIN_STATE.with(std::cell::Cell::get) {
         return login_state(row, logins, state, now);
@@ -4847,8 +4982,9 @@ pub fn renew_due(
     logins: &Logins,
     state: &State,
     others: &OtherMacs,
-    now: i64,
+    now: impl Into<trace::Now>,
 ) -> Vec<String> {
+    let now: trace::Now = now.into();
     roster
         .rows
         .iter()
@@ -4871,8 +5007,9 @@ pub fn due_logins_here(
     logins: &Logins,
     state: &State,
     enrolled: &BTreeSet<String>,
-    now: i64,
+    now: impl Into<trace::Now>,
 ) -> Vec<String> {
+    let now: trace::Now = now.into();
     roster
         .rows
         .iter()
@@ -4886,16 +5023,22 @@ pub fn due_logins_here(
 }
 
 /// Returns whether the roster has renewable accounts enrolled here and none remain working past
-/// `now + within`.
+/// `now + within`: each login's end is within `within` of `now` once `now` reaches the end less
+/// `within`, compared through `now` ([`trace::Now`]), so a trace that read every login working
+/// stands only until the first second one of them could stop being so.
 #[must_use]
 pub fn none_working_within(
     roster: &Roster,
     logins: &Logins,
     state: &State,
     enrolled: &BTreeSet<String>,
-    now: i64,
+    now: impl Into<trace::Now>,
     within: i64,
 ) -> bool {
+    let now: trace::Now = now.into();
+    // `end - now <= within` without overflow, as `now - end >= -within` (exact for every `within`
+    // above `i64::MIN`, whose negation saturates one short).
+    let ends_within = |end: i64| now.aged(end, within.saturating_neg());
     let mut rows = roster
         .rows
         .iter()
@@ -4904,9 +5047,8 @@ pub fn none_working_within(
     rows.peek().is_some()
         && rows.all(|row| match login_state(row, logins, state, now) {
             LoginState::Expired => true,
-            LoginState::OnToken { until } => until.saturating_sub(now) <= within,
-            _ => login_forecast(row, logins, state)
-                .is_some_and(|by| by.saturating_sub(now) <= within),
+            LoginState::OnToken { until } => ends_within(until),
+            _ => login_forecast(row, logins, state).is_some_and(ends_within),
         })
 }
 
@@ -5163,9 +5305,17 @@ pub fn check_stopped_at(row: &Row, logins: &Logins) -> Option<i64> {
 /// Whether `row` still needs a sign-in on this machine: it has no login it can be run on here
 /// (not enrolled, or signed out), or it has an email and its login is due for renewal
 /// ([`login_state`]). A failed automatic sign-in of such a row is still news
-/// ([`failing_sign_ins`]); one of a row whose login works and is not due is not.
+/// ([`failing_sign_ins`]); one of a row whose login works and is not due is not. Compared through
+/// `now` ([`trace::Now`]).
 #[must_use]
-pub fn needs_sign_in(row: &Row, state: &State, logins: &Logins, enrolled: bool, now: i64) -> bool {
+pub fn needs_sign_in(
+    row: &Row,
+    state: &State,
+    logins: &Logins,
+    enrolled: bool,
+    now: impl Into<trace::Now>,
+) -> bool {
+    let now: trace::Now = now.into();
     row.held_by.is_none()
         && (matches!(
             condition(row, state, enrolled, now),
@@ -5177,15 +5327,17 @@ pub fn needs_sign_in(row: &Row, state: &State, logins: &Logins, enrolled: bool, 
 
 /// The bound rows whose current automatic sign-in failed and which still need one
 /// ([`needs_sign_in`]: not enrolled, signed out, or due for renewal), in roster order, with that
-/// attempt. `raw_roster` supplies each workflow's configured policy.
+/// attempt. `raw_roster` supplies each workflow's configured policy. Compared through `now`
+/// ([`needs_sign_in`]).
 #[must_use]
 pub fn failing_sign_ins(
     roster: &Roster,
     raw_roster: &Roster,
     state: &State,
     logins: &Logins,
-    now: i64,
+    now: impl Into<trace::Now>,
 ) -> Vec<(String, SignInAttempt)> {
+    let now: trace::Now = now.into();
     let enrolled = enrolled(roster);
     roster
         .rows
@@ -5203,15 +5355,17 @@ pub fn failing_sign_ins(
 
 /// Whether some Claude Code login works here, so a row's failed sign-in leaves nothing broken: a
 /// row on a login of its own that a session was seen on and that is not signed out, or the
-/// default login (`default_signed_in`) where no row on it is recorded signed out.
+/// default login (`default_signed_in`) where no row on it is recorded signed out. Compared through
+/// `now` ([`condition`]).
 #[must_use]
 pub fn claude_serves(
     roster: &Roster,
     state: &State,
     enrolled: &BTreeSet<String>,
     default_signed_in: bool,
-    now: i64,
+    now: impl Into<trace::Now>,
 ) -> bool {
+    let now: trace::Now = now.into();
     let of = |row: &Row| condition(row, state, is_enrolled(row, enrolled), now);
     roster.rows.iter().any(|row| {
         row.dir.is_some()
@@ -5748,6 +5902,15 @@ pub fn note_wrong_account(logins: &mut Logins, label: &str, at: i64) -> Vec<Even
     }
 }
 
+/// The reason a [`Kind::Displaced`] event gives ([`note_displaced`]): `default login now` and the
+/// account the default login holds now, by the word `now_default` the caller names it: the
+/// writer its row's label (the ledger's key until SF-10), `ledger accounts` its key and slug, so
+/// that line prints the reason with the account named in that place.
+#[must_use]
+pub fn displaced_why(now_default: &str) -> String {
+    format!("default login now {now_default}")
+}
+
 /// Records at `at` that the vendor's own sign-in on the default login replaced `label`'s account
 /// there with `now_default`'s, so `label` has no login on this machine: its auth word is signed
 /// out, a pin on it ends ([`Kind::Unpin`]), its binding's `served_at` (turns served under a login
@@ -5780,7 +5943,7 @@ pub fn note_displaced(
     let mut out = vec![
         Event::new(at, Kind::Displaced, label)
             .with_to(now_default)
-            .because(&format!("default login now {now_default}")),
+            .because(&displaced_why(now_default)),
     ];
     out.extend(repoint_active(state, label, now_default, at));
     if let Some(binding) = logins.labels.get_mut(label) {
@@ -6041,9 +6204,42 @@ pub fn move_accounts(
 
 /// Whether either snapshot still references a label, including pending work.
 pub(super) fn label_is_retained(state: &State, logins: &Logins, label: &str) -> bool {
-    logins.labels.contains_key(label)
+    label_is_retained_from(state, logins, label, None)
+}
+
+/// The records retained under a new row's label that are the row's own, so it takes them rather
+/// than being refused ([`Store::retained_from`]): where the label is its account's reserved
+/// slug (`aterm_db::typed::keys::reserved_slug`), which no other account can come to hold, the
+/// account record kept under it (one naming this key, or no key) and the login binding kept under
+/// it where that binding names the row's own login directory. Work in flight under the label (a
+/// sign-in, a session, a pin, a claim, a rollback) is never the row's to take, and neither is a
+/// binding that would redirect the row to another directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct OwnRecords<'a> {
+    /// The account key (`ac-…`) the label is the reserved slug of.
+    pub(super) pk: &'a str,
+    /// The login directory the new row takes (`None`: the default home).
+    pub(super) dir: Option<&'a str>,
+}
+
+/// [`label_is_retained`], but the records `own` says are the new row's own are not counted
+/// ([`OwnRecords`]).
+pub(super) fn label_is_retained_from(
+    state: &State,
+    logins: &Logins,
+    label: &str,
+    own: Option<OwnRecords<'_>>,
+) -> bool {
+    let binding = logins
+        .labels
+        .get(label)
+        .is_some_and(|binding| own.is_none_or(|own| binding.dir.as_deref() != own.dir));
+    let record = state.accounts.get(label).is_some_and(|account| {
+        own.is_none_or(|own| account.pk.as_deref().is_some_and(|pk| pk != own.pk))
+    });
+    binding
+        || record
         || logins.sign_in_receipts.contains_key(label)
-        || state.accounts.contains_key(label)
         || state.prepared_accounts.contains(label)
         || state.active.as_deref() == Some(label)
         || state.previous.as_deref() == Some(label)
@@ -6216,6 +6412,18 @@ impl Wall {
         self.seen.unwrap_or(self.at)
     }
 
+    /// Marks it lifted, as every lift does: lifted at `mark` (`at`, the instant after which a
+    /// wall observed raises the window again, [`Account::cleared_since`]), by `by` (a peer's lift
+    /// names the peer, [`note_peer_lift`]), its rungs reset, and `proof` the time the proof that
+    /// lifted it was served (`seen`, [`Wall::seen()`]).
+    fn lift(&mut self, by: &str, proof: i64, mark: i64) {
+        self.cleared = true;
+        self.at = mark;
+        by.clone_into(&mut self.by);
+        self.attempts = 0;
+        self.seen = Some(proof);
+    }
+
     /// Returns the Unix timestamp until which this observed wall remains standing.
     #[must_use]
     pub fn stands_until(&self) -> Option<i64> {
@@ -6323,36 +6531,44 @@ fn standing_warning<'a>(
     })
 }
 
+/// A window's figure, `pct`, and its end while `now` is short of it: `reset`, else `window_s`
+/// past `at`. The end is compared through `now` ([`trace::Now`]) wherever there is a figure.
 fn figure(
     pct: Option<u32>,
     reset: Option<i64>,
     at: i64,
     window_s: i64,
-    now: i64,
+    now: trace::Now,
 ) -> Option<(u32, i64)> {
     let end = reset.unwrap_or_else(|| at.saturating_add(window_s));
-    pct.filter(|_| now < end).map(|pct| (pct, end))
+    pct.filter(|_| now.before(end)).map(|pct| (pct, end))
 }
 
 impl Sample {
     /// Returns the 5-hour session utilization percentage and reset timestamp while the window is
-    /// active.
+    /// active, its end compared through `now` ([`trace::Now`]).
     #[must_use]
-    pub fn session(&self, now: i64) -> Option<(u32, i64)> {
+    pub fn session(&self, now: impl Into<trace::Now>) -> Option<(u32, i64)> {
         figure(
             self.session_pct,
             self.session_reset,
             self.at,
             SESSION_WINDOW_S,
-            now,
+            now.into(),
         )
     }
 
     /// Returns the 7-day weekly utilization percentage and reset timestamp while the window is
-    /// active.
+    /// active, its end compared through `now` ([`trace::Now`]).
     #[must_use]
-    pub fn week(&self, now: i64) -> Option<(u32, i64)> {
-        figure(self.week_pct, self.week_reset, self.at, WEEK_WINDOW_S, now)
+    pub fn week(&self, now: impl Into<trace::Now>) -> Option<(u32, i64)> {
+        figure(
+            self.week_pct,
+            self.week_reset,
+            self.at,
+            WEEK_WINDOW_S,
+            now.into(),
+        )
     }
 
     /// Returns the latest timestamp until which any running window in this sample is at or above
@@ -6455,10 +6671,11 @@ pub struct CreditsUse {
 }
 
 impl CreditsUse {
-    /// Returns whether this credits episode is still considered active at `now`.
+    /// Returns whether this credits episode is still considered active at `now`: short of
+    /// [`Self::until_at`], compared through `now` ([`trace::Now`]).
     #[must_use]
-    pub fn stands(&self, now: i64) -> bool {
-        now < self.until_at()
+    pub fn stands(&self, now: impl Into<trace::Now>) -> bool {
+        now.into().before(self.until_at())
     }
 
     /// Timestamp until which this credits episode is considered active.
@@ -6495,10 +6712,10 @@ pub struct WindowSaid {
 
 impl WindowSaid {
     /// Returns the utilization percentage and window end timestamp while the warning window is
-    /// active.
+    /// active, its end compared through `now` ([`trace::Now`]).
     #[must_use]
-    pub fn figure(&self, window_s: i64, now: i64) -> Option<(u32, i64)> {
-        figure(self.pct, self.reset, self.at, window_s, now)
+    pub fn figure(&self, window_s: i64, now: impl Into<trace::Now>) -> Option<(u32, i64)> {
+        figure(self.pct, self.reset, self.at, window_s, now.into())
     }
 }
 
@@ -6533,6 +6750,142 @@ pub const fn week_bucket(model: aterm_phase::WeekModel) -> &'static str {
     match model {
         aterm_phase::WeekModel::Fable => super::profile::Bucket::Fable.id(),
         aterm_phase::WeekModel::Sonnet => super::profile::Bucket::SevenDaySonnet.id(),
+    }
+}
+
+/// The models' own weekly buckets ([`super::profile::Bucket::id`]), each with the words a row
+/// names its wall by: Fable's, Sonnet's and Opus's, the buckets a model's id draws on beside the
+/// week of all models ([`super::profile::model_bucket`]).
+const MODEL_WEEKS: [(super::profile::Bucket, &str); 3] = [
+    (super::profile::Bucket::Fable, "Fable week"),
+    (super::profile::Bucket::SevenDaySonnet, "Sonnet week"),
+    (super::profile::Bucket::SevenDayOpus, "Opus week"),
+];
+
+/// The words a row names `window`'s wall by where `window` is a model's own weekly bucket
+/// (`Fable week`), else `None` ([`model_window`]).
+#[must_use]
+pub fn model_week_name(window: &str) -> Option<&'static str> {
+    MODEL_WEEKS
+        .iter()
+        .find(|(bucket, _)| bucket.id() == window)
+        .map(|(_, name)| *name)
+}
+
+/// Whether `window` is a model's own weekly bucket (Fable's `seven_day_overage_included`, Sonnet's,
+/// Opus's): its wall walls only that model's sessions, so it is in neither
+/// [`Account::limited_until`] nor [`Account::walled_at`] and ends no pin ([`note_wall`]); a
+/// session of that model reads it by [`Account::model_limited_until`] (owner, 2026-11-11: "no,
+/// keep the same account and switch from fable to opus.").
+#[must_use]
+pub fn model_window(window: &str) -> bool {
+    model_week_name(window).is_some()
+}
+
+/// The clause a row's condition carries for each model's own wall standing on `account` at `now`
+/// ([`Account::model_walls`]): ` · Fable week walled until <time>`, one for each; empty where
+/// none stands. The condition's word itself is the account's ([`condition`]).
+#[must_use]
+pub fn model_walls_clause(account: Option<&Account>, now: i64) -> String {
+    account
+        .into_iter()
+        .flat_map(|account| account.model_walls(now))
+        .map(|(bucket, until)| {
+            format!(
+                " \u{b7} {} walled until {}",
+                model_week_name(bucket).unwrap_or(bucket),
+                super::usage::rfc3339_utc(until)
+            )
+        })
+        .collect()
+}
+
+/// Whether a refill of `window` refills `other` with it: the same window, or one the vendor names
+/// by the same limit when it refills it (`aterm_phase::reset_limit_names`: `seven_day` and Fable's
+/// `seven_day_overage_included` are both its weekly limit), so the week's refill refills Fable's
+/// bucket, and the five-hour window's, or Opus's, refills no other. The one table every refill's
+/// lift reads ([`lift_refilled`]).
+#[must_use]
+pub fn refills_with(window: &str, other: &str) -> bool {
+    let names = aterm_phase::reset_limit_names(window);
+    window == other || (!names.is_empty() && names == aterm_phase::reset_limit_names(other))
+}
+
+/// A refill of `window` as its lift reads it ([`lift_refilled`]): proved at `proof`, the refill
+/// barrier its figures get, and the reset `window`'s allowance runs to (`None` where unknown).
+#[derive(Debug, Clone, Copy)]
+struct Refill<'a> {
+    /// The window refilled.
+    window: &'a str,
+    /// When the refill is proved by: a tap's figures that show it ([`WindowFig::epoch_at`]), or a
+    /// used reset's outcome, the barrier it writes ([`note_reset_refill`]).
+    proof: i64,
+    /// The reset the refilled allowance runs to.
+    reset: Option<i64>,
+}
+
+/// THE ONE RULE EVERY REFILL LIFTS BY: each wall of `record` of a window `refill` refills with
+/// its own ([`refills_with`]: the week's refill is Fable's bucket's too) whose newest sighting
+/// ([`Wall::seen()`]) is before the refill's proof, still standing unlifted, but `except` (the
+/// window a reset's claim lifts by its own rule, [`reset_outcome`]): its mark `now`, by `by`, the
+/// refill its proof. A wall met after the refill, or met before it and seen standing again after
+/// it, stands: the refill did not refill it. Returns each window it lifted, with whether that
+/// wall still stood at the proof ([`Wall::stands_until`]), in the windows' order; the caller
+/// writes one [`Kind::Wall`] row for each, which wakes the sessions waiting on it
+/// ([`Event::wakes`]), and tells the refill to the peers ([`tell_refilled`]).
+fn lift_refilled(
+    record: &mut Account,
+    refill: Refill<'_>,
+    except: Option<&str>,
+    by: &str,
+    now: i64,
+) -> Vec<(String, bool)> {
+    let mut lifted = Vec::new();
+    for (other, wall) in &mut record.walls {
+        if wall.cleared
+            || except == Some(other.as_str())
+            || !refills_with(refill.window, other)
+            || wall.seen() >= refill.proof
+        {
+            continue;
+        }
+        let stood = wall.stands_until().is_some_and(|end| refill.proof < end);
+        wall.lift(by, refill.proof, now);
+        lifted.push((other.clone(), stood));
+    }
+    lifted
+}
+
+/// Leaves the lift of `refill`, which lifted a wall here, on each other window it refills with
+/// its own ([`refills_with`]) where no wall stands here (none, or one an earlier lift left), as
+/// a lift `by` made at `now` with the refill its proof and its reset the wall's: so the peers hear
+/// each window of the family lifted ([`Account::newest_lifts`], [`note_peer_lift`], which lifts
+/// its own window alone), and a peer that holds Fable's wall and not the week's is told the
+/// week's refill too. A window whose wall stands (one seen after the proof) keeps it, and a new
+/// window is left only where the record has room ([`MAX_WALLS`]): a lift is never bought by
+/// evicting a wall.
+fn tell_refilled(record: &mut Account, refill: Refill<'_>, by: &str, now: i64) {
+    let windows = [SESSION_LIMIT, WEEK_LIMIT]
+        .into_iter()
+        .chain(MODEL_WEEKS.iter().map(|(bucket, _)| bucket.id()));
+    for other in
+        windows.filter(|other| *other != refill.window && refills_with(refill.window, other))
+    {
+        let mark = Wall {
+            until: refill.reset,
+            at: now,
+            by: by.to_owned(),
+            attempts: 0,
+            cleared: true,
+            seen: Some(refill.proof),
+        };
+        if let Some(wall) = record.walls.get_mut(other) {
+            if wall.cleared && wall.seen() < refill.proof {
+                *wall = mark;
+            }
+        } else if record.walls.len() < MAX_WALLS {
+            record.walls.insert(other.to_owned(), mark);
+        }
     }
 }
 
@@ -6730,7 +7083,9 @@ impl SampleContext {
 /// Per-account observations persisted in `state.json`.
 #[derive(Debug, Clone, Default)]
 pub struct Account {
-    /// Observation: the walls, by the vendor's limit type.
+    /// Observation: the walls, by the vendor's limit type. A model's own weekly bucket's
+    /// ([`model_window`]) walls only that model's sessions ([`Self::model_limited_until`]); every
+    /// other walls the account ([`Self::limited_until`]).
     pub walls: BTreeMap<String, Wall>,
     /// Machine-local: the walls of Codex limits other than the codex bucket (a model's own), by
     /// limit id ([`limit_wall`]), as a usage-limit handoff asked about that limit recorded them.
@@ -6994,13 +7349,14 @@ impl Account {
     /// When its newest wall on record was observed, whether or not it still stands. A lapsed wall
     /// stays in the record until a read lifts it ([`note_room`]), a clearing or another account's
     /// reading removes it, or a newer wall takes its place ([`MAX_WALLS`]), so this outlasts the wall.
-    /// A lifted wall ([`Wall::cleared`]) counts for nothing.
+    /// A lifted wall ([`Wall::cleared`]) counts for nothing, and so does a model's own
+    /// ([`model_window`]): it walls that model's sessions, not the account.
     #[must_use]
     pub fn walled_at(&self) -> Option<i64> {
         self.walls
-            .values()
-            .filter(|wall| !wall.cleared)
-            .map(|wall| wall.at)
+            .iter()
+            .filter(|(window, wall)| !wall.cleared && !model_window(window))
+            .map(|(_, wall)| wall.at)
             .max()
     }
 
@@ -7046,25 +7402,59 @@ impl Account {
             .filter(|until| *until > now)
     }
 
-    /// Returns the latest timestamp until which a standing wall blocks this account at `now`. A
-    /// limit wall ([`Self::limit_walls`]) blocks only that limit's handoffs, never this.
+    /// Returns the latest timestamp until which a standing wall blocks this account at `now`,
+    /// each wall's end compared through `now` ([`trace::Now`]). A limit wall
+    /// ([`Self::limit_walls`]) blocks only that limit's handoffs, never this, and a model's own
+    /// weekly wall ([`model_window`]) only that model's sessions ([`Self::model_limited_until`]):
+    /// the account stays a candidate for every other session, and a session of that model that
+    /// moves (one with no Opus fallback) moves only onto a row that model's wall leaves open
+    /// ([`candidates`]).
     #[must_use]
-    pub fn limited_until(&self, now: i64) -> Option<i64> {
+    pub fn limited_until(&self, now: impl Into<trace::Now>) -> Option<i64> {
+        let now: trace::Now = now.into();
         self.walls
-            .values()
-            .filter_map(Wall::stands_until)
-            .filter(|end| now < *end)
+            .iter()
+            .filter(|(window, _)| !model_window(window))
+            .filter_map(|(_, wall)| wall.stands_until())
+            .filter(|end| now.before(*end))
             .max()
     }
 
-    /// Until when a standing wall of the Codex limit `id` ([`limit_wall`]) holds this account off
-    /// that limit's handoffs at `now`.
+    /// Until when `bucket`'s wall, a model's own weekly bucket ([`model_window`]:
+    /// `seven_day_overage_included` for Fable), holds a session of that model off this account at
+    /// `now`, apart from the account's own walls ([`Self::limited_until`]); `None` for any other
+    /// window, or where none stands. The wall's end is compared through `now` ([`trace::Now`]).
     #[must_use]
-    pub fn limit_wall_until(&self, id: &str, now: i64) -> Option<i64> {
+    pub fn model_limited_until(&self, bucket: &str, now: impl Into<trace::Now>) -> Option<i64> {
+        let now: trace::Now = now.into();
+        self.walls
+            .get(bucket)
+            .filter(|_| model_window(bucket))
+            .and_then(Wall::stands_until)
+            .filter(|end| now.before(*end))
+    }
+
+    /// Each model's own weekly wall standing at `now` ([`Self::model_limited_until`]), by its
+    /// bucket, with when it ends, in the buckets' order.
+    pub fn model_walls(
+        &self,
+        now: impl Into<trace::Now>,
+    ) -> impl Iterator<Item = (&str, i64)> + '_ {
+        let now: trace::Now = now.into();
+        self.walls.keys().filter_map(move |window| {
+            Some((window.as_str(), self.model_limited_until(window, now)?))
+        })
+    }
+
+    /// Until when a standing wall of the Codex limit `id` ([`limit_wall`]) holds this account off
+    /// that limit's handoffs at `now`, its end compared through `now` ([`trace::Now`]).
+    #[must_use]
+    pub fn limit_wall_until(&self, id: &str, now: impl Into<trace::Now>) -> Option<i64> {
+        let now: trace::Now = now.into();
         self.limit_walls
             .get(id)
             .and_then(Wall::stands_until)
-            .filter(|end| now < *end)
+            .filter(|end| now.before(*end))
     }
 
     /// The wall on record under `window`: a limit wall's ([`limit_of`]) in [`Self::limit_walls`],
@@ -7078,9 +7468,10 @@ impl Account {
     }
 
     /// Returns the timestamp until which the 5-hour session window marks this account `low` at
-    /// `now`.
+    /// `now`, each window's end compared through `now` ([`trace::Now`]).
     #[must_use]
-    pub fn session_low_until(&self, now: i64) -> Option<i64> {
+    pub fn session_low_until(&self, now: impl Into<trace::Now>) -> Option<i64> {
+        let now: trace::Now = now.into();
         let refilled = self
             .warned_session
             .as_ref()
@@ -7098,9 +7489,11 @@ impl Account {
         sample.max(warned)
     }
 
-    /// Returns the timestamp until which the 7-day weekly window marks this account `low` at `now`.
+    /// Returns the timestamp until which the 7-day weekly window marks this account `low` at
+    /// `now`, each window's end compared through `now` ([`trace::Now`]).
     #[must_use]
-    pub fn week_low_until(&self, now: i64) -> Option<i64> {
+    pub fn week_low_until(&self, now: impl Into<trace::Now>) -> Option<i64> {
+        let now: trace::Now = now.into();
         let refilled = self
             .warned_week
             .as_ref()
@@ -7154,18 +7547,21 @@ impl Account {
         )
     }
 
-    /// Returns the timestamp until which active usage credits mark this account `low` at `now`.
+    /// Returns the timestamp until which active usage credits mark this account `low` at `now`,
+    /// compared through `now` ([`trace::Now`]).
     #[must_use]
-    pub fn credits_until(&self, now: i64) -> Option<i64> {
+    pub fn credits_until(&self, now: impl Into<trace::Now>) -> Option<i64> {
         match &self.credits {
             Some(Credits::InUse(c)) if c.stands(now) => Some(c.until_at()),
             _ => None,
         }
     }
 
-    /// Returns the latest timestamp until which this account is `low` at `now`.
+    /// Returns the latest timestamp until which this account is `low` at `now`, every window's
+    /// end compared through `now` ([`trace::Now`]).
     #[must_use]
-    pub fn low_until(&self, now: i64) -> Option<i64> {
+    pub fn low_until(&self, now: impl Into<trace::Now>) -> Option<i64> {
+        let now: trace::Now = now.into();
         [
             self.session_low_until(now),
             self.week_low_until(now),
@@ -7176,9 +7572,9 @@ impl Account {
         .max()
     }
 
-    /// Returns whether this account is `low` at `now`.
+    /// Returns whether this account is `low` at `now`, compared through `now` ([`trace::Now`]).
     #[must_use]
-    pub fn low(&self, now: i64) -> bool {
+    pub fn low(&self, now: impl Into<trace::Now>) -> bool {
         self.low_until(now).is_some()
     }
 
@@ -7300,6 +7696,10 @@ pub struct SessionRow {
     pub at: i64,
     /// Why it could not move, where a move was refused.
     pub held: Option<String>,
+    /// The process that noted it: the window whose tab the session was, which answers whether it
+    /// still lives until another window takes the tab over ([`reconcile_sessions`]); `None` for a
+    /// row a build before owners noted, or where this process's start could not be read.
+    pub owner: Option<Owner>,
 }
 
 /// One stretch of a Claude Code conversation under a login of a row's own directory
@@ -7393,8 +7793,8 @@ impl LoginDirSpans {
     /// What of it still matters at `now`: a wall written in a stretch stands a week at most
     /// ([`WEEK_WINDOW_S`]), so a stretch that ended that long ago cuts no standing wall, and a
     /// record no host noted in that long is of no process that runs. `None` where nothing is left.
-    fn kept_at(&self, now: i64) -> Option<Self> {
-        if self.at.saturating_add(WEEK_WINDOW_S) <= now {
+    fn kept_at(&self, now: trace::Now) -> Option<Self> {
+        if now.passed(self.at.saturating_add(WEEK_WINDOW_S)) {
             return None;
         }
         let spans: Vec<DirSpan> = self
@@ -7402,7 +7802,7 @@ impl LoginDirSpans {
             .iter()
             .filter(|span| {
                 span.until
-                    .is_none_or(|until| until.saturating_add(WEEK_WINDOW_S) > now)
+                    .is_none_or(|until| now.before(until.saturating_add(WEEK_WINDOW_S)))
             })
             .copied()
             .collect();
@@ -7428,7 +7828,8 @@ fn spans_opened(spans: &[DirSpan], since: i64) -> Vec<DirSpan> {
 
 /// `state`'s conversation records with what no longer matters at `now` gone
 /// ([`LoginDirSpans::kept_at`]).
-fn login_dir_spans_kept(state: &mut State, now: i64) {
+fn login_dir_spans_kept(state: &mut State, now: impl Into<trace::Now>) {
+    let now: trace::Now = now.into();
     let spans = std::mem::take(&mut state.login_dir_spans);
     state.login_dir_spans = spans
         .into_iter()
@@ -7890,20 +8291,53 @@ impl Unread {
     }
 }
 
-fn recent(t: i64, now: i64, window: i64) -> bool {
-    (0..window).contains(&now.saturating_sub(t))
+/// Whether `t` is `now` or less than `window` before it: `0 <= now - t < window`, compared
+/// through `now` ([`trace::Now::within`]).
+fn recent(t: i64, now: impl Into<trace::Now>, window: i64) -> bool {
+    now.into().within(t, window)
 }
 
 fn int(v: Option<&Value>) -> Option<i64> {
     v.and_then(Value::as_i64)
 }
 
-const fn stamp_cap(now: i64) -> i64 {
-    now.saturating_add(STAMP_SKEW_S)
+/// The latest instant a stamp read from a record may name: `skew` seconds past `now`. A stamp
+/// after it is read as it ([`stamp`]).
+#[derive(Clone, Copy)]
+struct Cap {
+    /// The reading the record is read at.
+    now: trace::Now,
+    /// How far past `now` a stamp may name.
+    skew: i64,
 }
 
-fn stamp(v: Option<&Value>, cap: i64) -> Option<i64> {
-    int(v).map(|at| at.min(cap))
+impl Cap {
+    /// The cap of a state's records: [`STAMP_SKEW_S`] past `now`.
+    const fn skewed(now: trace::Now) -> Self {
+        Self {
+            now,
+            skew: STAMP_SKEW_S,
+        }
+    }
+
+    /// The cap of a login's records: `now` itself.
+    const fn at(now: trace::Now) -> Self {
+        Self { now, skew: 0 }
+    }
+
+    /// `at`, where it is no later than the cap (`at <= now + skew`, compared through `now`);
+    /// otherwise the cap, whose number takes the reading raw.
+    fn of(self, at: i64) -> i64 {
+        if self.now.passed(at.saturating_sub(self.skew)) {
+            at
+        } else {
+            self.now.raw().saturating_add(self.skew)
+        }
+    }
+}
+
+fn stamp(v: Option<&Value>, cap: Cap) -> Option<i64> {
+    int(v).map(|at| cap.of(at))
 }
 
 fn count(v: Option<&Value>) -> Option<u32> {
@@ -7992,7 +8426,7 @@ fn wall_json(w: &Wall) -> Value {
     Value::Object(o)
 }
 
-fn wall_of(v: &Value, cap: i64) -> Option<Wall> {
+fn wall_of(v: &Value, cap: Cap) -> Option<Wall> {
     Some(Wall {
         until: int(v.get("until")),
         at: stamp(v.get("at"), cap)?,
@@ -8020,7 +8454,7 @@ fn sample_json(s: &Sample) -> Value {
     Value::Object(o)
 }
 
-fn sample_of(v: &Value, cap: i64) -> Option<Sample> {
+fn sample_of(v: &Value, cap: Cap) -> Option<Sample> {
     let at = stamp(v.get("at"), cap)?;
     Some(Sample {
         session_pct: pct(v.get("session_pct")),
@@ -8046,7 +8480,7 @@ fn offer_json(o: &Offer) -> Value {
     Value::Object(m)
 }
 
-fn offer_of(v: &Value, cap: i64) -> Option<Offer> {
+fn offer_of(v: &Value, cap: Cap) -> Option<Offer> {
     Some(Offer {
         kind: v
             .get("kind")
@@ -8248,7 +8682,7 @@ fn fig_json(w: &WindowFig) -> Value {
     Value::Object(m)
 }
 
-fn fig_of(v: &Value, cap: i64) -> Option<WindowFig> {
+fn fig_of(v: &Value, cap: Cap) -> Option<WindowFig> {
     Some(WindowFig {
         pct_x10: count(v.get("pct_x10")).filter(|p| *p <= 10 * PCT_MAX)?,
         reset: int(v.get("reset"))?,
@@ -8283,7 +8717,7 @@ fn credits_json(c: &Credits) -> Value {
     Value::Object(m)
 }
 
-fn credits_of(v: &Value, cap: i64) -> Option<Credits> {
+fn credits_of(v: &Value, cap: Cap) -> Option<Credits> {
     match v.get("word").and_then(Value::as_str)? {
         "in-use" => Some(Credits::InUse(CreditsUse {
             since: stamp(v.get("since"), cap)?,
@@ -8309,7 +8743,7 @@ fn window_json(w: &WindowSaid) -> Value {
     Value::Object(m)
 }
 
-fn window_of(v: &Value, cap: i64) -> Option<WindowSaid> {
+fn window_of(v: &Value, cap: Cap) -> Option<WindowSaid> {
     Some(WindowSaid {
         pct: pct(v.get("pct")),
         reset: int(v.get("reset")),
@@ -8330,7 +8764,7 @@ fn week_said_json(w: &WeekSaid) -> Value {
 
 /// A [`WeekSaid`] as [`week_said_json`] wrote it; a figure out of range is no entry, where a
 /// `null` one is a limit reset's.
-fn week_said_of(v: &Value, cap: i64) -> Option<WeekSaid> {
+fn week_said_of(v: &Value, cap: Cap) -> Option<WeekSaid> {
     let pct = match v.get("pct") {
         None | Some(Value::Null) => None,
         figure => Some(pct(figure)?),
@@ -8345,8 +8779,9 @@ fn week_said_of(v: &Value, cap: i64) -> Option<WeekSaid> {
     })
 }
 
-fn account_of(v: &Value, now: i64) -> Account {
-    let cap = stamp_cap(now);
+fn account_of(v: &Value, now: trace::Now) -> Account {
+    let cap = Cap::skewed(now);
+    let by_now = Cap::at(now);
     let mut walls: Vec<(String, Wall)> = v
         .get("walls")
         .and_then(Value::as_object)
@@ -8413,7 +8848,7 @@ fn account_of(v: &Value, now: i64) -> Account {
             .get("key")
             .and_then(Value::as_str)
             .and_then(super::profile::AccountKey::parse),
-        keyed_at: stamp(v.get("keyed_at"), now),
+        keyed_at: stamp(v.get("keyed_at"), by_now),
         pk: v
             .get("pk")
             .and_then(Value::as_str)
@@ -8430,7 +8865,7 @@ fn account_of(v: &Value, now: i64) -> Account {
         before: v.get("before").and_then(|s| sample_of(s, cap)),
         offer: v.get("offer").and_then(|o| offer_of(o, cap)),
         auth,
-        auth_at: stamp(v.get("auth_at"), now),
+        auth_at: stamp(v.get("auth_at"), by_now),
         auth_scope: ManagedScope::from_retired(
             v.get("auth_retired")
                 .is_some_and(|value| value.as_bool() != Some(false)),
@@ -8440,9 +8875,9 @@ fn account_of(v: &Value, now: i64) -> Account {
         served_metadata,
         auth_refusal,
         auth_projection: AuthProjection::Legacy,
-        cleared_at: stamp(v.get("cleared_at"), now),
-        room_at: stamp(v.get("room_at"), now),
-        ran_at: stamp(v.get("ran_at"), now),
+        cleared_at: stamp(v.get("cleared_at"), by_now),
+        room_at: stamp(v.get("room_at"), by_now),
+        ran_at: stamp(v.get("ran_at"), by_now),
         unanswered: v.get("unanswered").and_then(|u| {
             Some(Unanswered {
                 at: stamp(u.get("at"), cap)?,
@@ -8547,6 +8982,9 @@ impl State {
                         row.insert("account".to_owned(), Value::from(s.account.as_str()));
                         row.insert("at".to_owned(), Value::from(s.at));
                         row.insert("held".to_owned(), Value::from(s.held.clone()));
+                        if let Some(owner) = s.owner {
+                            row.insert("owner".to_owned(), Value::from(owner.token()));
+                        }
                         (sid.clone(), Value::Object(row))
                     })
                     .collect(),
@@ -8744,7 +9182,9 @@ impl State {
         aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| String::from("{}"))
     }
 
-    /// Deserializes and sanitizes `state.json` against `now`.
+    /// Deserializes and sanitizes `state.json` against `now`, comparing through it
+    /// ([`trace::Now`]): a stamp is capped [`STAMP_SKEW_S`] past it, a login directory's record
+    /// is kept while it still matters, and the claims clock while its `until` is to come.
     /// # Errors
     ///
     /// [`Unread::Torn`]: not JSON, including a file cut short.
@@ -8752,7 +9192,8 @@ impl State {
     /// [`SCHEMA`], [`PREPARED_STATE_SCHEMA`] or [`NATIVE_CANARY_STATE_SCHEMA`], or
     /// malformed native canary history or a malformed or unknown pending
     /// selection: a file this build must not guess at or write over.
-    pub fn from_json(text: &str, now: i64) -> Result<State, Unread> {
+    pub fn from_json(text: &str, now: impl Into<trace::Now>) -> Result<State, Unread> {
+        let now: trace::Now = now.into();
         let doc: Value = aterm_json::from_str(text)
             .map_err(|e| Unread::Torn(format!("not JSON ({})", shown(&e.to_string()))))?;
         if !doc.is_object() {
@@ -8801,6 +9242,10 @@ impl State {
                         account: label(v.get("account"))?,
                         at: int(v.get("at"))?,
                         held: word(v.get("held"), WORD_MAX),
+                        owner: v
+                            .get("owner")
+                            .and_then(Value::as_str)
+                            .and_then(Owner::parse),
                     },
                 ))
             })
@@ -9021,7 +9466,7 @@ impl State {
                     .collect(),
                 until: int(c.get("until"))?,
             })
-            .filter(|clock| clock.until > now)
+            .filter(|clock| now.before(clock.until))
         });
         let forgotten: BTreeMap<String, Account> = doc
             .get("forgotten")
@@ -9201,10 +9646,12 @@ impl State {
         Ok(())
     }
 
-    /// This Mac's clock record where it still counts at `now` ([`State::clock`]).
+    /// This Mac's clock record where it still counts at `now` ([`State::clock`]): short of its
+    /// `until`, compared through `now` ([`trace::Now`]).
     #[must_use]
-    pub fn clock_at(&self, now: i64) -> Option<&Clock> {
-        self.clock.as_ref().filter(|clock| clock.until > now)
+    pub fn clock_at(&self, now: impl Into<trace::Now>) -> Option<&Clock> {
+        let now: trace::Now = now.into();
+        self.clock.as_ref().filter(|clock| now.before(clock.until))
     }
 
     /// Records or renews a lease on `label` held by `holder` until `until`.
@@ -9267,11 +9714,21 @@ impl State {
     }
 }
 
-/// Generates a fresh 16-hex-char machine identifier from OS entropy.
+/// The id drawn for each store directory this process loaded while the store kept none
+/// ([`Store::unkept_machine`]). An entry is never replaced: the store's own `machine` file, once
+/// kept, is read before it.
+static UNKEPT_MACHINES: std::sync::Mutex<BTreeMap<PathBuf, String>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Generates a fresh 16-hex-char machine identifier from OS entropy. A trace scope armed on this
+/// thread is poisoned ([`trace::poison`]): a run that minted one answers by a draw no replay makes
+/// again, as the first load in a process of a store with no `machine` file and a state that names
+/// none does ([`Store::load`]); later loads of that store answer the same draw.
 /// # Errors
 ///
 /// No OS entropy source answered.
 pub fn mint_machine() -> io::Result<String> {
+    trace::poison("a machine id minted from OS entropy");
     aterm_uds::rand::hex_token::<8>()
 }
 
@@ -9366,7 +9823,12 @@ impl LoginHere {
 /// here ([`on_token_here`]). A row with no login made here is such a row too (FL-135): its fleet
 /// token needs no sign-in here, so it is never read as a login made here.
 #[must_use]
-pub fn login_here(row: &Row, state: &State, enrolled: bool, now: i64) -> LoginHere {
+pub fn login_here(
+    row: &Row,
+    state: &State,
+    enrolled: bool,
+    now: impl Into<trace::Now>,
+) -> LoginHere {
     let none_here = if !enrolled {
         LoginHere::NotMade
     } else if signed_out_here(row, state) {
@@ -9386,9 +9848,16 @@ pub fn login_here(row: &Row, state: &State, enrolled: bool, now: i64) -> LoginHe
 /// [`Condition::SignedOut`] (the rule [`login_state`] reads as [`LoginState::Expired`]), a lapsed
 /// credential file whatever its records say, so no launch picks it. A row on its vault token here
 /// ([`LoginHere::OnToken`]) runs: its walls, its low windows and the claims ring judge it as they
-/// judge a signed-in row.
+/// judge a signed-in row. Every end it compares (a wall's, a window's, a credits episode's, a vault
+/// token's) goes through `now` ([`trace::Now`]).
 #[must_use]
-pub fn condition(row: &Row, state: &State, enrolled: bool, now: i64) -> Condition {
+pub fn condition(
+    row: &Row,
+    state: &State,
+    enrolled: bool,
+    now: impl Into<trace::Now>,
+) -> Condition {
+    let now: trace::Now = now.into();
     match login_here(row, state, enrolled, now) {
         LoginHere::NotMade => return Condition::NotEnrolled,
         LoginHere::SignedOut => return Condition::SignedOut,
@@ -9425,9 +9894,16 @@ pub fn condition(row: &Row, state: &State, enrolled: bool, now: i64) -> Conditio
 /// (`claude -p --output-format text` is no session-starting shape, so
 /// [`super::token_route::shape_refusal`] runs it on the stored login), and the renewal ranking,
 /// which turns renewal off for a row on its token only by the live read
-/// ([`OtherMacs::on_token`]), never by a reading kept across a vault it could not read.
+/// ([`OtherMacs::on_token`]), never by a reading kept across a vault it could not read, and asks
+/// it only whether the row wants a sign-in ([`stored_login_wants_sign_in`]).
 #[must_use]
-pub fn stored_login_condition(row: &Row, state: &State, enrolled: bool, now: i64) -> Condition {
+pub fn stored_login_condition(
+    row: &Row,
+    state: &State,
+    enrolled: bool,
+    now: impl Into<trace::Now>,
+) -> Condition {
+    let now: trace::Now = now.into();
     if login_here(row, state, enrolled, now) == LoginHere::OnToken {
         return if enrolled {
             Condition::SignedOut
@@ -9438,14 +9914,32 @@ pub fn stored_login_condition(row: &Row, state: &State, enrolled: bool, now: i64
     condition(row, state, enrolled, now)
 }
 
-/// Returns the labels of accounts in [`Condition::SignedOut`] in roster order.
+/// Whether [`stored_login_condition`] reads `row` as wanting a sign-in here
+/// ([`Condition::NotEnrolled`] or [`Condition::SignedOut`]), from [`login_here`] alone: no login
+/// is made here, it is signed out, or it is on its vault token, which the stored login reads as
+/// signed out. Every other [`LoginHere`] reads as a condition that wants none, whatever its walls
+/// and windows say, so none of them is read. The renewal ranking's question, compared through
+/// `now` ([`trace::Now`]).
+#[must_use]
+pub fn stored_login_wants_sign_in(
+    row: &Row,
+    state: &State,
+    enrolled: bool,
+    now: impl Into<trace::Now>,
+) -> bool {
+    login_here(row, state, enrolled, now) != LoginHere::In
+}
+
+/// Returns the labels of accounts in [`Condition::SignedOut`] in roster order, compared through
+/// `now` ([`condition`]).
 #[must_use]
 pub fn signed_out(
     roster: &Roster,
     state: &State,
     enrolled: &BTreeSet<String>,
-    now: i64,
+    now: impl Into<trace::Now>,
 ) -> Vec<String> {
+    let now: trace::Now = now.into();
     roster
         .rows
         .iter()
@@ -9727,6 +10221,11 @@ pub struct Rank {
     /// The row is another Mac's that runs here on its fleet token ([`borrowed`]): it is taken
     /// after every row of this Mac's own (FL-135).
     pub borrowed: bool,
+    /// A model's own weekly wall stands on the row ([`Account::model_walls`]): the row serves every
+    /// other model, but a session moved here knows nothing of its model, and a session of the
+    /// walled one (Fable's, by Claude Code's default) would meet that wall at once, so it is taken
+    /// after every row of its kind with none.
+    pub model_walled: bool,
     /// `low`: admitted only at a wall.
     pub low: bool,
     /// The row's class.
@@ -9736,9 +10235,10 @@ pub struct Rank {
 }
 
 impl Rank {
-    fn key<'a>(&self, label: &'a str) -> (bool, bool, Class, bool, i64, &'a str) {
+    fn key<'a>(&self, label: &'a str) -> (bool, bool, bool, Class, bool, i64, &'a str) {
         (
             self.borrowed,
+            self.model_walled,
             self.low,
             self.class,
             self.week_reset.is_none(),
@@ -9917,6 +10417,18 @@ pub fn effective_ranking_point<'a>(
     }
 }
 
+/// Until when the wall `point` stands at, where it is a model's own weekly wall ([`Point::Wall`]
+/// on a [`model_window`]: the session runs that model), holds that model's sessions off `label`
+/// at `now` ([`Account::model_limited_until`]); `None` at any other point, or where none stands.
+/// A model's wall leaves its account a candidate for every other session, never for one at
+/// that model's own wall.
+fn point_model_wall(state: &State, point: &Point, label: &str, now: i64) -> Option<i64> {
+    let Point::Wall { window, .. } = point else {
+        return None;
+    };
+    state.accounts.get(label)?.model_limited_until(window, now)
+}
+
 /// Ranks all roster rows as rotation candidates.
 #[must_use]
 pub fn candidates(
@@ -9948,6 +10460,10 @@ pub fn candidates(
         .map(|(row, cond)| {
             let rank = |low: bool| Rank {
                 borrowed: borrowed(row, state, enrolled),
+                model_walled: state
+                    .accounts
+                    .get(&row.label)
+                    .is_some_and(|a| a.model_walls(now).next().is_some()),
                 low,
                 class: row.class,
                 week_reset: state
@@ -9976,6 +10492,12 @@ pub fn candidates(
                         state.lease_verdict(&row.label, now).map(|()| rank(false))
                     }
                 }
+            };
+            // A session at a model's own weekly wall moves onto no row where that model's wall
+            // stands too: its condition is the account's, and the session would meet it at once.
+            let verdict = match (verdict, point_model_wall(state, point, &row.label, now)) {
+                (Ok(_), Some(until)) => Err(WhyNot::Limited { until }),
+                (verdict, _) => verdict,
             };
             (row.label.clone(), verdict)
         })
@@ -10029,8 +10551,10 @@ pub fn hold_until(why: StayWhy, state: &State, opening: Option<i64>, now: i64) -
 enum Instants<'a> {
     /// Every account's.
     All,
-    /// Every account's, but only one ahead of `now` for this one.
-    WalledOn(&'a str),
+    /// Every account's, but only one ahead of `now` for this one, a session at this point's wall
+    /// stands at: at a model's own weekly wall, each row's once that model's wall on it ends too
+    /// ([`point_model_wall`]).
+    WalledOn(&'a str, &'a Point),
     /// Only the ones ahead of `now` ([`next_opening`]).
     Ahead,
 }
@@ -10048,9 +10572,15 @@ fn wait_instant(
         .filter_map(|r| {
             let cond = condition(r, state, is_enrolled(r, enrolled), now);
             let at = effective_usable_at(r, state, cond, now)?;
+            let at = match which {
+                Instants::WalledOn(_, point) => {
+                    point_model_wall(state, point, &r.label, now).map_or(at, |end| at.max(end))
+                }
+                Instants::All | Instants::Ahead => at,
+            };
             let counted = match which {
                 Instants::All => true,
-                Instants::WalledOn(walled) => walled != r.label || at > now,
+                Instants::WalledOn(walled, _) => walled != r.label || at > now,
                 Instants::Ahead => at > now,
             };
             counted.then_some(at)
@@ -10534,13 +11064,20 @@ fn advise_with(
             sid: "advice-admission",
             account: &mine.label,
         };
-        begin_rotation(
+        // The commit asks with the window its session leaves, as this does
+        // ([`super::accounts_pool`]): an `active` walled on it holds no move past it.
+        let leaves = match point {
+            Point::Wall { window, .. } => Some(window.as_str()),
+            _ => None,
+        };
+        begin_rotation_for(
             &mut current,
             roster,
             enrolled,
             state.active.as_deref(),
             mover,
             to,
+            leaves,
             now,
         )
         .is_ok()
@@ -10553,9 +11090,12 @@ fn advise_with(
         yields,
     };
     let mut low_active = None;
+    // A session at a model's own weekly wall follows no `active` where that model's wall stands
+    // too ([`point_model_wall`]), as it moves onto no such candidate.
     if let Some(active) = state.active.as_deref().and_then(|l| roster.row(l))
         && active.label != mine.label
         && available_here(active)
+        && point_model_wall(state, point, &active.label, now).is_none()
     {
         let theirs = cond(active);
         if theirs.runs() && !state.proven {
@@ -10650,7 +11190,7 @@ fn advise_with(
                 yields: None,
             },
             (None, ..) => {
-                let walled = Instants::WalledOn(&mine.label);
+                let walled = Instants::WalledOn(&mine.label, point);
                 match wait_instant(roster, state, enrolled, walled, now) {
                     Some(until) if until > now => Advice::Wait { until },
                     _ if unavailable => Advice::Wait { until: retry },
@@ -11188,7 +11728,9 @@ pub fn believed_reset(until: Option<i64>, at: i64) -> Option<i64> {
 /// for a [`MONTH_LIMIT`] wall. A wall of the `active` row ends the owner's pin on it. A limit wall
 /// ([`limit_wall`]) is recorded under its limit's id in [`Account::limit_walls`], by the same rule
 /// and bound as every other in [`Account::walls`], and ends no pin: the row still serves every
-/// session of every other limit, and the pin is the owner's ordinary decision.
+/// session of every other limit, and the pin is the owner's ordinary decision. So does a model's
+/// own weekly wall ([`model_window`]), for the same reason: the row still serves every other
+/// model.
 pub fn note_wall(
     state: &mut State,
     account: &str,
@@ -11198,7 +11740,7 @@ pub fn note_wall(
     now: i64,
 ) -> Vec<Event> {
     let limit = limit_of(window).map(str::to_owned);
-    let ordinary = limit.is_none();
+    let ordinary = limit.is_none() && !model_window(window);
     let window = match &limit {
         Some(id) => limit_wall(id),
         None => one_line(window, WORD_MAX),
@@ -11285,11 +11827,16 @@ pub fn note_wall(
 }
 
 /// Lifts the walls a read of `account` shows gone: `sample`, read after each of them and naming no
-/// wall of its own, has a figure for the wall's window below full. A wall written after the read
-/// stands, and so does one of a window it has no figure for (a month, a window its plan does not
-/// show). The caller holds a read that named a wall back, since a server can refuse use with no
-/// window full. As a reset's clearing does ([`reset_outcome`]), the mark keeps an older observer
-/// from raising it again; the lifted wall keeps the read's time as its proof ([`Wall::seen()`]).
+/// wall of its own, has a figure for the wall's window below full, its session's or its week's. A
+/// wall written after the read stands, and so does one of a window it has no figure for (a month,
+/// a window its plan does not show, a model's own weekly bucket, [`model_window`]): room in the
+/// week of all models says nothing of Fable's bucket, and a week walled by a refusal can show
+/// room, so a read's room lifts each window by its own figure and never the windows a refill
+/// refills with it ([`refills_with`]). A model's bucket is lifted by its own figure below full,
+/// which only a session's own read carries ([`note_model_room`]). The caller holds a read that
+/// named a wall back, since a server can refuse use with no window full. As a reset's clearing
+/// does ([`reset_outcome`]), the mark keeps an older observer from raising it again; the lifted
+/// wall keeps the read's time as its proof ([`Wall::seen()`]).
 pub fn note_room(state: &mut State, account: &str, sample: &Sample, now: i64) -> Vec<Event> {
     let by = state.machine.clone();
     let Some(record) = account_mut(state, account) else {
@@ -11303,11 +11850,7 @@ pub fn note_room(state: &mut State, account: &str, sample: &Sample, now: i64) ->
             _ => None,
         };
         if !wall.cleared && wall.at < sample.at && pct.is_some_and(|pct| pct < 100) {
-            wall.cleared = true;
-            wall.at = now;
-            wall.by = by.clone();
-            wall.attempts = 0;
-            wall.seen = Some(sample.at);
+            wall.lift(&by, sample.at, now);
             out.push(
                 Event::new(now, Kind::Wall, account)
                     .because(&format!("{window}{WALL_LIFTED}a read shows room")),
@@ -11366,11 +11909,7 @@ pub fn note_served(state: &mut State, account: &str, s: &ServedTurn<'_>, now: i6
     let mut out = Vec::new();
     for (window, wall) in &mut record.walls {
         if !wall.cleared && wall.seen() < at && draws_on(s.model, window) {
-            wall.cleared = true;
-            wall.at = at;
-            wall.by = by.clone();
-            wall.attempts = 0;
-            wall.seen = Some(at);
+            wall.lift(&by, at, at);
             out.push(
                 Event::new(now, Kind::Wall, account)
                     .because(&format!("{window}{WALL_LIFTED}a turn {short} served")),
@@ -11406,11 +11945,7 @@ pub fn note_model_room(
     let Some(wall) = record.walls.get_mut(window) else {
         return Vec::new();
     };
-    wall.cleared = true;
-    wall.at = at;
-    wall.by = by;
-    wall.attempts = 0;
-    wall.seen = Some(at);
+    wall.lift(&by, at, at);
     vec![
         Event::new(now, Kind::Wall, account)
             .because(&format!("{window}{WALL_LIFTED}a read shows room")),
@@ -11422,7 +11957,9 @@ pub fn note_model_room(
 /// served no earlier than the earlier of its claim and the loop's own read time, since the probe
 /// opens the panel after its claim), and a lift of each wall it shows with room ([`note_room`])
 /// where that wall was written before the read, by that same earlier time: a wall another session
-/// met after the panel was read stands, though the read is recorded after it.
+/// met after the panel was read stands, though the read is recorded after it. The probe hands its
+/// host the panel's session and week alone ([`Sample`]), so the read lifts no model's own wall: a
+/// session's own read of Fable's row lifts that ([`note_model_room`]).
 pub fn note_panel_read(
     state: &mut State,
     account: &str,
@@ -11481,11 +12018,7 @@ pub fn note_limits(
     for (id, wall) in &mut record.limit_walls {
         let roomy = limits.get(id).is_some_and(|limit| limit.room(at));
         if roomy && !wall.cleared && wall.at < at {
-            wall.cleared = true;
-            wall.at = now;
-            wall.by = by.clone();
-            wall.attempts = 0;
-            wall.seen = Some(at);
+            wall.lift(&by, at, now);
             out.push(
                 Event::new(now, Kind::Wall, account)
                     .because(&format!("{}{WALL_LIFTED}a read shows room", limit_wall(id))),
@@ -11557,7 +12090,12 @@ pub struct PeerLift<'a> {
 /// peers is older than the mark and resumes ([`Account::cleared_since`]). The mark names the
 /// peer, so this Mac does not tell the lift again as its own ([`Account::newest_lifts`]). A lift
 /// raises no wall, lifts one seen after its proof or of another reset nothing, lifts a lifted
-/// wall nothing (so one lift lifts one wall once), and leaves `active` and a pin as they were.
+/// wall nothing (so one lift lifts one wall once), and leaves `active` and a pin as they were. It
+/// lifts its own window alone, whatever the window: a peer's refill tells each window of the
+/// family it refilled as a lift of its own, Fable's bucket with the week's whether or not the
+/// peer held a wall of it ([`tell_refilled`], [`Account::newest_lifts`]), while its read's or
+/// served turn's lift proves nothing of the windows a refill refills with it, and the row does
+/// not say which proof it was.
 pub fn note_peer_lift(state: &mut State, lift: &PeerLift<'_>, now: i64) -> Vec<Event> {
     let Some((label, record)) = state
         .accounts
@@ -11573,11 +12111,7 @@ pub fn note_peer_lift(state: &mut State, lift: &PeerLift<'_>, now: i64) -> Vec<E
     }) else {
         return Vec::new();
     };
-    wall.cleared = true;
-    wall.at = now;
-    wall.by = one_line(lift.peer, WORD_MAX);
-    wall.attempts = 0;
-    wall.seen = Some(lift.at);
+    wall.lift(&one_line(lift.peer, WORD_MAX), lift.at, now);
     vec![Event::new(now, Kind::Wall, label).because(&format!(
         "{}{WALL_LIFTED}{} saw it come back",
         lift.window, lift.peer
@@ -12138,27 +12672,36 @@ pub fn note_reading_held(
                     )),
             );
         }
-        // The wall this window raised was observed of the allowance a refill replaced, so it ends
-        // at the refill and not at the reset it named. One observed at or after the refill
-        // stands. Read from the held figure, not from this reading's own refill, so a wall whose
-        // refill an earlier reading filed is lifted by the next one. The mark keeps an older
-        // observer from raising it again, as a read's clearing does ([`note_room`]), and the
-        // refill is the lift's proof ([`Wall::seen()`]).
-        if let Some(refilled) = merged.as_ref().and_then(|m| m.epoch_at)
-            && let Some(wall) = record
-                .walls
-                .get_mut(bucket)
-                .filter(|wall| !wall.cleared && wall.at < refilled)
+        // A wall this window's refill refilled ([`refills_with`]: the week's is Fable's bucket's
+        // too) was observed of the allowance the refill replaced, so it ends at the refill and
+        // not at the reset it named. One observed at or after the refill, or seen standing again
+        // since, stands ([`lift_refilled`]). Read from the held figure, not from this reading's
+        // own refill, so a wall whose refill an earlier reading filed is lifted by the next one.
+        // The mark keeps an older observer from raising it again, as a read's clearing does
+        // ([`note_room`]), and the refill is the lift's proof ([`Wall::seen()`]).
+        if let Some(barred) = merged.as_ref()
+            && let Some(refilled) = barred.epoch_at
         {
-            wall.cleared = true;
-            wall.at = now;
-            wall.by = by.clone();
-            wall.attempts = 0;
-            wall.seen = Some(refilled);
-            changed = true;
-            events.push(Event::new(now, Kind::Wall, account).because(&format!(
-                "{bucket}{WALL_LIFTED}it was refilled or raised inside its window"
-            )));
+            let refill = Refill {
+                window: bucket,
+                proof: refilled,
+                reset: Some(barred.reset),
+            };
+            let lifted = lift_refilled(record, refill, None, &by, now);
+            if !lifted.is_empty() {
+                tell_refilled(record, refill, &by, now);
+            }
+            for (window, _) in lifted {
+                changed = true;
+                let proof = if window == bucket {
+                    "it was".to_owned()
+                } else {
+                    format!("{bucket}, refilled with it, was")
+                };
+                events.push(Event::new(now, Kind::Wall, account).because(&format!(
+                    "{window}{WALL_LIFTED}{proof} refilled or raised inside its window"
+                )));
+            }
         }
         if merged.is_some() {
             changed |= fig_news(merged.as_ref()) != fig_news(stored.as_ref());
@@ -12410,7 +12953,8 @@ pub(crate) fn stage_auth_check(
     stage_auth_kind(state, raw, logins, context, PendingAuthKind::Check, at);
 }
 
-/// Records the account `sid` is running on and any hold reason.
+/// Records the account `sid` is running on and any hold reason, as this process's row
+/// ([`Owner::here`]): only a window's harness host notes rows, each of a tab of its own.
 pub fn note_session(
     state: &mut State,
     sid: &str,
@@ -12444,6 +12988,7 @@ pub fn note_session(
             held: held
                 .map(|h| one_line(h, WORD_MAX))
                 .filter(|h| !h.is_empty()),
+            owner: Owner::here(),
         },
     );
     out
@@ -12568,15 +13113,6 @@ pub fn forget_session(state: &mut State, sid: &str) -> bool {
         !ladder.waiters.is_empty()
     });
     state.sessions.remove(sid).is_some() || canary || passed.is_some() || waited
-}
-
-/// Removes session rows not updated within [`SESSION_KEEP_S`] of `now`.
-pub fn drop_stale_sessions(state: &mut State, now: i64) -> usize {
-    let before = state.sessions.len();
-    state
-        .sessions
-        .retain(|_, row| now.saturating_sub(row.at) <= SESSION_KEEP_S);
-    before - state.sessions.len()
 }
 
 /// Returns whether an existing probe claim prevents claiming a new `/usage` probe for `account` at
@@ -13216,78 +13752,146 @@ pub fn reset_outcome(
         ResetDone::Kept(why) => (Kind::ResetKept, reset_reason(why)),
         ResetDone::Failed(why) => (Kind::ResetFailed, reset_reason(why)),
     };
-    if matches!(done, ResetDone::Used { .. } | ResetDone::Lifted)
-        && let Some(window) = window
+    let used = matches!(done, ResetDone::Used { .. });
+    let mut lifted: Vec<(String, bool)> = Vec::new();
+    let mut out = Vec::new();
+    if (used || matches!(done, ResetDone::Lifted))
         && let Some(record) = account_mut(state, account)
-        && let Some(wall) = record.walls.get_mut(&window)
-        && wall.until == Some(until)
-        && wall.at <= claimed
-        && !wall.cleared
     {
-        let used = matches!(done, ResetDone::Used { .. });
-        let stood = wall.stands_until().is_some_and(|end| claimed < end);
-        let record_by = machine.clone();
-        wall.cleared = true;
-        wall.at = now;
-        wall.by = machine;
-        wall.attempts = 0;
-        // The reset was used no earlier than its claim: a wall seen before then is one it lifts.
-        wall.seen = Some(claimed);
-        let sample = record.sample.as_ref();
-        let bucket = match window.as_str() {
-            WEEK_LIMIT => Some((
-                &mut record.warned_week,
-                sample.filter(|s| s.week_pct.is_some()).map(|s| s.at),
-            )),
-            SESSION_LIMIT => Some((
-                &mut record.warned_session,
-                sample.filter(|s| s.session_pct.is_some()).map(|s| s.at),
-            )),
-            _ => None,
-        };
-        if stood
-            && let Some((warned, sampled)) = bucket
-            && sampled.is_none_or(|at| at <= claimed)
-            && warned.as_ref().is_none_or(|w| w.at <= claimed)
+        if let Some(window) = window.as_deref()
+            && let Some(wall) = record.walls.get_mut(window)
+            && wall.until == Some(until)
+            && wall.at <= claimed
+            && !wall.cleared
         {
-            *warned = Some(WindowSaid {
-                pct: None,
-                reset: (!used).then_some(until),
-                at: now,
-            });
+            lifted.push((
+                window.to_owned(),
+                wall.stands_until().is_some_and(|end| claimed < end),
+            ));
+            // The reset was used no earlier than its claim: a wall seen before then is one it
+            // lifts.
+            wall.lift(&machine, claimed, now);
         }
-        if used
-            && stood
-            && let Some(fig) = record.windows.get_mut(window.as_str())
+        // A reset that refills the week (a weekly or a full one) refills with each window it
+        // refilled the windows the vendor names by the same limit ([`refills_with`]: Fable's
+        // bucket with the week), so each of their walls last seen before the outcome is lifted
+        // too, each told by its own row, by the one rule a tap's refill lifts by
+        // ([`lift_refilled`]): its proof is the barrier the reset writes on the windows it
+        // refilled ([`note_reset_refill`]), which a reading of the same reset takes for the
+        // refill, so the next reading lifts nothing this kept. A Fable reset gives back only what
+        // Fable used of the week, and a session reset refills no week: each lifts its claim's
+        // window alone. The claim's own window was lifted above, for its wall alone, and a claim
+        // that names no window (an older build's) lifts no wall at all.
+        if let ResetDone::Used { kind, .. } = done
+            && matches!(kind, ResetKind::Weekly | ResetKind::Full)
+            && let Some(claim) = window.as_deref()
         {
-            fig.epoch_at = fig.epoch_at.max(Some(now));
+            let refills: Vec<Refill<'_>> = refilled
+                .iter()
+                .map(|refill| Refill {
+                    window: refill,
+                    proof: now,
+                    reset: if refill == claim {
+                        Some(until)
+                    } else {
+                        record.windows.get(refill.as_str()).map(|fig| fig.reset)
+                    },
+                })
+                .collect();
+            for refill in &refills {
+                for (other, stood) in lift_refilled(record, *refill, Some(claim), &machine, now) {
+                    out.push(Event::new(now, Kind::Wall, account).with_sid(&sid).because(
+                        &format!("{other}{WALL_LIFTED}a {} reset refilled it", kind.word()),
+                    ));
+                    lifted.push((other, stood));
+                }
+            }
+            if !lifted.is_empty() {
+                for refill in &refills {
+                    tell_refilled(record, *refill, &machine, now);
+                }
+            }
         }
-        if stood
-            && week_model(&window).is_some()
-            && record
-                .weeks_said
-                .get(window.as_str())
-                .is_none_or(|said| said.at <= claimed)
-        {
-            record.weeks_said.insert(
-                window.clone(),
-                WeekSaid {
-                    pct: None,
-                    reset: (!used).then_some(until),
-                    at: now,
-                    by: record_by,
-                    wall: false,
-                    ends_by: None,
-                },
-            );
+        for (window, stood) in &lifted {
+            if *stood {
+                note_reset_refill(
+                    record,
+                    window,
+                    (claimed, (!used).then_some(until)),
+                    &machine,
+                    now,
+                );
+            }
         }
     }
-    vec![
+    out.insert(
+        0,
         Event::new(now, kind, account)
             .with_sid(&sid)
             .refilling(refilled.iter().map(String::as_str))
             .because(&why),
-    ]
+    );
+    out
+}
+
+/// What a reset spent on `window`, claimed at `claimed`, says of it where its wall stood then
+/// ([`reset_outcome`]): its warning, the week's or the session's, refilled where nothing read it
+/// after the claim; its figure's refill barrier moved to `now` where the reset was used
+/// (`lifted_until` `None`); and a model's week as a session's screen said it
+/// ([`Account::weeks_said`]) refilled, where nothing said it after the claim. A limit that lifted
+/// by itself (`lifted_until`, the reset it named) keeps that reset on both words.
+fn note_reset_refill(
+    record: &mut Account,
+    window: &str,
+    (claimed, lifted_until): (i64, Option<i64>),
+    by: &str,
+    now: i64,
+) {
+    let sample = record.sample.as_ref();
+    let bucket = match window {
+        WEEK_LIMIT => Some((
+            &mut record.warned_week,
+            sample.filter(|s| s.week_pct.is_some()).map(|s| s.at),
+        )),
+        SESSION_LIMIT => Some((
+            &mut record.warned_session,
+            sample.filter(|s| s.session_pct.is_some()).map(|s| s.at),
+        )),
+        _ => None,
+    };
+    if let Some((warned, sampled)) = bucket
+        && sampled.is_none_or(|at| at <= claimed)
+        && warned.as_ref().is_none_or(|w| w.at <= claimed)
+    {
+        *warned = Some(WindowSaid {
+            pct: None,
+            reset: lifted_until,
+            at: now,
+        });
+    }
+    if lifted_until.is_none()
+        && let Some(fig) = record.windows.get_mut(window)
+    {
+        fig.epoch_at = fig.epoch_at.max(Some(now));
+    }
+    if week_model(window).is_some()
+        && record
+            .weeks_said
+            .get(window)
+            .is_none_or(|said| said.at <= claimed)
+    {
+        record.weeks_said.insert(
+            window.to_owned(),
+            WeekSaid {
+                pct: None,
+                reset: lifted_until,
+                at: now,
+                by: by.to_owned(),
+                wall: false,
+                ends_by: None,
+            },
+        );
+    }
 }
 
 /// Returns whether the machine's hourly account-rotation circuit breaker is spent at `now`.
@@ -13371,20 +13975,22 @@ pub fn begin_rotation(
     begin_rotation_for(state, roster, enrolled, expect_active, mover, to, None, now)
 }
 
-/// [`begin_rotation`] for a session that leaves a wall of the Codex limit `limit` ([`limit_of`]),
-/// where one is: a fresh `active` the records hold off that limit
-/// ([`Account::limit_wall_until`]) is no row the session could follow there, so a mover on
-/// another row rotates past it as past a low one. Its pin and its unanswered canary still hold.
-/// Advice needs no limit: it judges the pool's handoff candidates, which leave out every row the
-/// records hold off that limit, so such an `active` is not fresh there. The commit judges the
-/// stored records, and asks this.
+/// [`begin_rotation`] for a session that leaves a wall of `window`, where one is: a fresh `active`
+/// the records hold off that window is no row the session could follow there, so a mover on
+/// another row rotates past it as past a low one. A wall of a Codex limit holds a row off that
+/// limit's handoffs ([`limit_of`], [`Account::limit_wall_until`]), and a model's own weekly wall
+/// off that model's sessions ([`model_window`], [`Account::model_limited_until`]); a row so held
+/// still serves every other session, so the wall ends no pin, and the pin and the `active`'s
+/// unanswered canary still hold (the owner's pin is the owner's: a session of that model on the
+/// pinned row with no fallback waits, as a Codex limit's does). Advice asks it with its point's
+/// window ([`advise`]) and the commit with the same window, so both judge the one rule.
 ///
 /// # Errors
 ///
 /// A [`Lost`], with nothing changed.
 #[expect(
     clippy::too_many_arguments,
-    reason = "begin_rotation's seven, and the limit its mover leaves"
+    reason = "begin_rotation's seven, and the window its mover leaves"
 )]
 pub fn begin_rotation_for(
     state: &mut State,
@@ -13393,7 +13999,7 @@ pub fn begin_rotation_for(
     expect_active: Option<&str>,
     mover: Mover<'_>,
     to: &str,
-    limit: Option<&str>,
+    window: Option<&str>,
     now: i64,
 ) -> Result<Event, Lost> {
     let sid = one_line(mover.sid, WORD_MAX);
@@ -13416,11 +14022,11 @@ pub fn begin_rotation_for(
     let fresh = |label: &str| cond(label).is_some_and(Condition::fresh);
     let followed = |label: &str| {
         fresh(label)
-            && limit.is_none_or(|id| {
-                state
-                    .accounts
-                    .get(label)
-                    .is_none_or(|account| account.limit_wall_until(id, now).is_none())
+            && window.is_none_or(|window| {
+                state.accounts.get(label).is_none_or(|account| {
+                    limit_of(window).is_none_or(|id| account.limit_wall_until(id, now).is_none())
+                        && account.model_limited_until(window, now).is_none()
+                })
             })
     };
     // An `active` this Mac may not use (another Mac's senior claim, one it cannot record) holds
@@ -13746,19 +14352,28 @@ pub(crate) enum PinRefusal {
 }
 
 impl PinRefusal {
-    fn message(self, label: &str) -> String {
+    /// The refusal, naming the account as `account`: `accounts use` names it by its name and
+    /// slug (`account_names::Named::shown`); the selection that a roster label keys
+    /// ([`Store::select_account_for`]) and [`pin`] by the label in backticks
+    /// ([`PinRefusal::of_label`]).
+    pub(crate) fn message(self, account: &str) -> String {
         match self {
-            Self::NotListed => format!("`{}` is not in the roster", shown(label)),
+            Self::NotListed => format!("{account} is not in the roster"),
             Self::PreparationOnly => {
-                format!("`{label}` is prepared but has no execution authority")
+                format!("{account} is prepared but has no execution authority")
             }
-            Self::PreparationFailed => format!("`{label}` preparation failed in this selection"),
+            Self::PreparationFailed => format!("{account} preparation failed in this selection"),
             Self::NotEnrolled => format!(
-                "`{label}` is not-enrolled: no login was made for it on this machine (its login \
+                "{account} is not-enrolled: no login was made for it on this machine (its login \
                  directory is missing or empty)"
             ),
-            Self::SignedOut => format!("`{label}` is signed-out"),
+            Self::SignedOut => format!("{account} is signed-out"),
         }
+    }
+
+    /// [`PinRefusal::message`] naming the row by its roster label, in backticks.
+    fn of_label(self, label: &str) -> String {
+        self.message(&format!("`{}`", shown(label)))
     }
 }
 
@@ -13798,7 +14413,8 @@ pub enum PinSelection {
     Renew(PinRequest),
 }
 
-/// Pins `label` as the active account (`accounts use <label>`) and clears its standing walls.
+/// Pins the row labelled `label` as the active account (`accounts use <account>`, which names
+/// the row's account) and clears its standing walls.
 /// # Errors
 ///
 /// By name: a label the roster does not list, one not enrolled on this
@@ -13812,7 +14428,7 @@ pub fn pin(
     now: i64,
 ) -> Result<Event, String> {
     if let Some(why) = pin_refusal(state, roster, enrolled, label) {
-        return Err(why.message(label));
+        return Err(why.of_label(label));
     }
     state.pending_pin = None;
     if let Some(record) = account_mut(state, label) {
@@ -13886,55 +14502,69 @@ fn absent_at_open(look: io::Result<std::fs::Metadata>) -> bool {
     }
 }
 
-/// Reads at most `max` bytes from a regular file at `path`, returning `Ok(None)` if absent.
+/// Reads at most `max` bytes from a regular file at `path`, returning `Ok(None)` if absent. With
+/// a trace scope armed it records the file's stamp before its open ([`trace::fs::opening`]), and a
+/// retry where the open, the look at the opened file or the read failed for a reason no stamp
+/// decides.
 pub(crate) fn read_bounded(path: &Path, max: u64) -> io::Result<Option<String>> {
     use std::io::Read as _;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
-    }
-    let file = match options.open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return if absent_at_open(std::fs::symlink_metadata(path)) {
-                Ok(None)
-            } else {
-                Err(e)
-            };
+    trace::fs::opening(path);
+    let read = || -> io::Result<Option<String>> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
         }
-        Err(e) => return Err(e),
+        let file = match options.open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return if absent_at_open(std::fs::symlink_metadata(path)) {
+                    Ok(None)
+                } else {
+                    Err(e)
+                };
+            }
+            Err(e) => return Err(e),
+        };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        if metadata.len() > max {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                format!("larger than {max} bytes"),
+            ));
+        }
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(metadata.len())
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
+        file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > max {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                format!("larger than {max} bytes"),
+            ));
+        }
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not UTF-8"))
     };
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
-    if metadata.len() > max {
-        return Err(io::Error::new(
-            io::ErrorKind::FileTooLarge,
-            format!("larger than {max} bytes"),
-        ));
-    }
-    let mut bytes = Vec::with_capacity(
-        usize::try_from(metadata.len())
-            .unwrap_or(0)
-            .saturating_add(1),
-    );
-    file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > max {
-        return Err(io::Error::new(
-            io::ErrorKind::FileTooLarge,
-            format!("larger than {max} bytes"),
-        ));
-    }
-    String::from_utf8(bytes)
-        .map(Some)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not UTF-8"))
+    read().inspect_err(|error| {
+        if !matches!(
+            error.kind(),
+            io::ErrorKind::InvalidInput | io::ErrorKind::FileTooLarge
+        ) {
+            trace::fs::failed(path, error);
+        }
+    })
 }
 
 /// On-disk store.
@@ -14109,10 +14739,11 @@ impl RenewalPolicy<'_> {
     /// Refuses when the captured roster, effective row or login parent changed.
     pub(super) fn require_current(self, raw: &Roster, logins: &Logins) -> Result<(), String> {
         if raw != self.roster || bound(raw, logins).row(&self.row.label) != Some(self.row) {
-            return Err(format!(
-                "account `{}` configuration or login changed during sign-in; nothing recorded",
-                self.row.label
-            ));
+            // As [`RenewalParent::require_current`]'s: the caller's prefix names the row.
+            return Err(
+                "the account's configuration or login changed during sign-in; nothing recorded"
+                    .to_owned(),
+            );
         }
         RenewalParent::capture(self.logins, &self.row.label)
             .require_current(logins, &self.row.label)
@@ -14133,15 +14764,33 @@ pub struct Lock(std::fs::File);
 // Inspect the opened handle before using it as a lock or publication witness. Unix opens
 // must neither follow a link nor wait on a special file before the caller can reject it.
 fn open_retained_file(path: &Path, kind: &str) -> io::Result<std::fs::File> {
-    open_retained_file_by(path, kind, false)
+    open_retained_file_by(path, kind, Making::IfAbsent)
 }
 
 #[cfg(unix)]
 fn create_retained_file(path: &Path, kind: &str) -> io::Result<std::fs::File> {
-    open_retained_file_by(path, kind, true)
+    open_retained_file_by(path, kind, Making::New)
 }
 
-fn open_retained_file_by(path: &Path, kind: &str, exclusive: bool) -> io::Result<std::fs::File> {
+/// [`open_retained_file`] of a file that is there, never making one: `NotFound` where none is.
+#[cfg(unix)]
+fn open_present_file(path: &Path, kind: &str) -> io::Result<std::fs::File> {
+    open_retained_file_by(path, kind, Making::Never)
+}
+
+/// Whether [`open_retained_file_by`] makes the file it opens.
+#[derive(Clone, Copy)]
+enum Making {
+    /// Where none is there.
+    IfAbsent,
+    /// Always: one already there fails the open.
+    New,
+    /// Never: none there fails the open.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Never,
+}
+
+fn open_retained_file_by(path: &Path, kind: &str, making: Making) -> io::Result<std::fs::File> {
     let not_regular = || {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -14149,14 +14798,14 @@ fn open_retained_file_by(path: &Path, kind: &str, exclusive: bool) -> io::Result
         )
     };
     #[cfg(not(any(unix, windows)))]
-    match std::fs::symlink_metadata(path) {
+    match trace::fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.is_file() => return Err(not_regular()),
         Err(why) if why.kind() != io::ErrorKind::NotFound => return Err(why),
         _ => {}
     }
     let mut open = std::fs::OpenOptions::new();
-    open.create(!exclusive)
-        .create_new(exclusive)
+    open.create(matches!(making, Making::IfAbsent))
+        .create_new(matches!(making, Making::New))
         .truncate(false)
         .write(true);
     #[cfg(unix)]
@@ -14479,9 +15128,10 @@ impl Store {
     }
 
     /// The upkeep's last reading of the rows on their vault token here ([`TokensHere`]), from
-    /// [`TOKENS_HERE_FILE`] in Claude Code's store: `None` for every other CLI's store, where none
-    /// was kept, or where the file does not read as one. Freshness and each token's end are
-    /// judged where it is read ([`on_token_here`]).
+    /// [`TOKENS_HERE_FILE`] in Claude Code's store, with whether a window's holder vouches for it
+    /// now ([`TokensHere::vouched`]): `None` for every other CLI's store, where none was kept, or
+    /// where the file does not read as one. Freshness and each token's end are judged where it is
+    /// read ([`on_token_here`]).
     #[must_use]
     pub fn read_tokens_here(&self) -> Option<TokensHere> {
         if self.cli != Cli::Claude {
@@ -14492,10 +15142,16 @@ impl Store {
 
     /// KEEPS THE UPKEEP'S READING of the rows on their vault token here (`read`, as
     /// [`super::accounts_tokens::rows_on_token_read`] returns it: each row's token end) under
-    /// `accounts.lock`, read at `now`: a reading naming rows replaces [`TOKENS_HERE_FILE`]; one
-    /// naming none removes it; a vault that could not be read (`None`) keeps the reading before
-    /// it, which ages out by itself ([`TOKENS_HERE_FRESH_S`]). Returns whether the file changed.
-    /// Claude Code's store only.
+    /// `accounts.lock`, read at `now`, and notes it for this store's holder, if this process has
+    /// one ([`TokensHereHolder::turn`]). A reading naming rows replaces [`TOKENS_HERE_FILE`]; one
+    /// naming none removes it. Nothing is written where nothing would change: a reading naming
+    /// none with none kept, and a reading naming the same rows with the same ends as the kept one
+    /// while a holder vouches for that ([`TokensHere::vouched`]), whose age then says nothing;
+    /// with no vouch the same reading is written again at `now`, so its age is the last read's.
+    /// A vault that could not be read (`None`) keeps the reading before it, records a retry in
+    /// the armed trace scope ([`trace::retry`]) and notes the holder's turn unconfirmed, which
+    /// stands its vouch down, so the reading ages out by itself ([`TOKENS_HERE_FRESH_S`]).
+    /// Returns whether the file changed. Claude Code's store only.
     ///
     /// # Errors
     /// The store cannot be made, `accounts.lock` stayed held past its ladder, or the file cannot
@@ -14503,25 +15159,81 @@ impl Store {
     pub fn note_tokens_here(
         &self,
         read: Option<&BTreeMap<String, u64>>,
-        now: i64,
+        now: impl Into<trace::Now>,
     ) -> io::Result<bool> {
+        let now: trace::Now = now.into();
+        if self.cli != Cli::Claude {
+            return Ok(false);
+        }
         let Some(read) = read else {
+            trace::retry("the vault could not be read for the rows on their token here");
+            tokens_here::noted(&self.dir, tokens_here::Noted::Unknown);
             return Ok(false);
         };
-        if self.cli != Cli::Claude || (read.is_empty() && self.read_tokens_here().is_none()) {
+        let ends: BTreeMap<String, i64> = read
+            .iter()
+            .map(|(label, end)| (label.clone(), i64::try_from(*end).unwrap_or(i64::MAX)))
+            .collect();
+        let unchanged = match self.read_tokens_here() {
+            None => ends.is_empty(),
+            Some(kept) => kept.vouched && kept.ends == ends,
+        };
+        if unchanged {
+            tokens_here::noted(&self.dir, tokens_here::Noted::Confirmed);
             return Ok(false);
         }
         let _held = self
             .acquire_within(&LOCK_LADDER)?
             .ok_or_else(|| io::Error::other(LOCK_HELD))?;
-        let kept = (!read.is_empty()).then(|| TokensHere {
-            read_at: now,
-            ends: read
-                .iter()
-                .map(|(label, end)| (label.clone(), i64::try_from(*end).unwrap_or(i64::MAX)))
-                .collect(),
+        // The reading is written, stamped with it.
+        let kept = (!ends.is_empty()).then(|| TokensHere {
+            read_at: now.raw(),
+            ends,
+            vouched: false,
         });
-        keep_tokens_here(&self.dir, kept.as_ref())
+        let changed = keep_tokens_here(&self.dir, kept.as_ref())?;
+        tokens_here::noted(&self.dir, tokens_here::Noted::Confirmed);
+        Ok(changed)
+    }
+
+    /// Notes the reading kept in this store as the vault's, confirmed, for its holder's next turn
+    /// ([`TokensHereHolder::turn`]), with no vault read: what [`Self::note_tokens_here`] noted in
+    /// a run of the upkeep whose kept trace stands, so that the pass skips it
+    /// (`accounts_upkeep_memo`). Claude Code's store only.
+    pub(crate) fn confirm_tokens_here(&self) {
+        if self.cli == Cli::Claude {
+            tokens_here::noted(&self.dir, tokens_here::Noted::Confirmed);
+        }
+    }
+
+    /// Writes the kept reading of the rows on their vault token here again with `read_at = now`,
+    /// under `accounts.lock`, where one is kept and it was not written at `now`: as a vouch for it
+    /// stands down ([`TokensHereHolder`]), so its age from then on is the one a reader judges.
+    /// Returns whether the file changed.
+    ///
+    /// # Errors
+    /// `accounts.lock` stayed held past its ladder, or the file cannot be written.
+    fn stamp_tokens_here(&self, now: i64) -> io::Result<bool> {
+        if self
+            .read_tokens_here()
+            .is_none_or(|kept| kept.read_at == now)
+        {
+            return Ok(false);
+        }
+        let _held = self
+            .acquire_within(&LOCK_LADDER)?
+            .ok_or_else(|| io::Error::other(LOCK_HELD))?;
+        let Some(kept) = self.read_tokens_here() else {
+            return Ok(false);
+        };
+        keep_tokens_here(
+            &self.dir,
+            Some(&TokensHere {
+                read_at: now,
+                vouched: false,
+                ..kept
+            }),
+        )
     }
 
     fn hydrate_codex_contexts(&self, state: &mut State, roster: &Roster) {
@@ -14812,6 +15524,7 @@ impl Store {
     }
 
     fn finish_account_lock(&self, held: Lock) -> io::Result<Lock> {
+        super::accounts_upkeep_counts::count(super::accounts_upkeep_counts::Event::StoreLock);
         self.sync_writer_barrier()?;
         Ok(held)
     }
@@ -14899,7 +15612,7 @@ impl Store {
 
     fn absent_state(&self) -> Result<State, String> {
         for path in [self.state_witness_file(), self.ledger_path()] {
-            match std::fs::symlink_metadata(&path) {
+            match trace::fs::symlink_metadata(&path) {
                 Ok(_) => {
                     return Err(format!(
                         "{STATE_FILE} is missing but {} remains; account state is unknown",
@@ -14952,7 +15665,7 @@ impl Store {
 
     fn absent_logins(&self) -> Result<(Logins, Option<String>), String> {
         let path = self.logins_witness_file();
-        match std::fs::symlink_metadata(&path) {
+        match trace::fs::symlink_metadata(&path) {
             Ok(_) => Err(format!(
                 "{LOGINS_FILE} is missing but {} remains; account login bindings are unknown",
                 path.display()
@@ -15009,7 +15722,10 @@ impl Store {
             project = "aterm_agent::harness::cli::tests::binding_retention::binding_transition"
         )
     )]
-    pub fn load_logins(&self, now: i64) -> Result<(Logins, Option<String>), String> {
+    pub fn load_logins(
+        &self,
+        now: impl Into<trace::Now>,
+    ) -> Result<(Logins, Option<String>), String> {
         let receipt = self.sync_read_receipt()?;
         let result = self.logins_as_stored(now);
         self.check_sync_read_receipt(&receipt)
@@ -15020,7 +15736,10 @@ impl Store {
     /// [`Self::load_logins`] without its receipt check, for a caller whose own check spans this
     /// read ([`Self::recover_account_records_with`]) or who holds the writer lock past a recovery,
     /// so that no publication can begin or be pending ([`Self::transact_images_held`]).
-    fn logins_as_stored(&self, now: i64) -> Result<(Logins, Option<String>), String> {
+    fn logins_as_stored(
+        &self,
+        now: impl Into<trace::Now>,
+    ) -> Result<(Logins, Option<String>), String> {
         match read_bounded(&self.logins_file(), MAX_LOGINS_BYTES) {
             Ok(None) => self.absent_logins(),
             Ok(Some(text)) => match Logins::from_json(&text, now) {
@@ -15085,7 +15804,7 @@ impl Store {
     pub fn read_roster(
         &self,
         roster_path: Option<&Path>,
-        now: i64,
+        now: impl Into<trace::Now>,
     ) -> Result<Roster, RosterReadError> {
         match roster_path {
             Some(path) => self.read_bound_roster(path, now),
@@ -15124,7 +15843,7 @@ impl Store {
     pub fn read_account_records(
         &self,
         roster_path: Option<&Path>,
-        now: i64,
+        now: impl Into<trace::Now>,
     ) -> Result<AccountRecords, RosterReadError> {
         self.read_account_records_with(roster_path, now, || {})
     }
@@ -15175,7 +15894,7 @@ impl Store {
         }
         let snapshot = NativeRowSnapshot {
             store: self,
-            roster: std::fs::canonicalize(roster).map_err(|_| "native row source unavailable")?,
+            roster: trace::fs::canonicalize(roster).map_err(|_| "native row source unavailable")?,
             held,
             records,
         };
@@ -15186,7 +15905,7 @@ impl Store {
     pub fn peek_account_records(
         &self,
         roster_path: &Path,
-        now: i64,
+        now: impl Into<trace::Now>,
     ) -> Result<AccountRecords, RosterReadError> {
         self.peek_account_records_with(roster_path, now, || {})
     }
@@ -15194,9 +15913,10 @@ impl Store {
     fn peek_account_records_with(
         &self,
         roster_path: &Path,
-        now: i64,
+        now: impl Into<trace::Now>,
         after_roster: impl FnOnce(),
     ) -> Result<AccountRecords, RosterReadError> {
+        let now: trace::Now = now.into();
         let receipt = self.sync_read_receipt().map_err(RosterReadError::Records)?;
         let before = roster_text(roster_path).map_err(RosterReadError::Roster)?;
         let raw = before
@@ -15260,7 +15980,7 @@ impl Store {
     fn read_account_records_with(
         &self,
         roster_path: Option<&Path>,
-        now: i64,
+        now: impl Into<trace::Now>,
         after_raw: impl FnOnce(),
     ) -> Result<AccountRecords, RosterReadError> {
         self.recover_account_records_with(roster_path, now, after_raw)
@@ -15275,7 +15995,7 @@ impl Store {
     pub(super) fn recover_account_records(
         &self,
         roster_path: Option<&Path>,
-        now: i64,
+        now: impl Into<trace::Now>,
     ) -> Result<(bool, AccountRecords), RosterReadError> {
         self.recover_account_records_with(roster_path, now, || {})
     }
@@ -15283,9 +16003,10 @@ impl Store {
     fn recover_account_records_with(
         &self,
         roster_path: Option<&Path>,
-        now: i64,
+        now: impl Into<trace::Now>,
         after_raw: impl FnOnce(),
     ) -> Result<(bool, AccountRecords), RosterReadError> {
+        let now: trace::Now = now.into();
         let recovered = match roster_path {
             Some(path) => self.recover_records(path),
             None => self.recover_state_records(),
@@ -15338,7 +16059,7 @@ impl Store {
     pub fn read_bound_roster(
         &self,
         roster_path: &Path,
-        now: i64,
+        now: impl Into<trace::Now>,
     ) -> Result<Roster, RosterReadError> {
         self.read_bound_roster_with(roster_path, now, || {})
     }
@@ -15347,7 +16068,7 @@ impl Store {
     fn read_bound_roster_with(
         &self,
         roster_path: &Path,
-        now: i64,
+        now: impl Into<trace::Now>,
         after_raw: impl FnOnce(),
     ) -> Result<Roster, RosterReadError> {
         self.recover_records(roster_path)
@@ -15391,8 +16112,23 @@ impl Store {
     pub(super) fn retained<'a>(
         &self,
         labels: &[&'a str],
-        now: i64,
+        now: impl Into<trace::Now>,
     ) -> Result<Option<&'a str>, String> {
+        let labels: Vec<(&str, Option<OwnRecords<'_>>)> =
+            labels.iter().map(|label| (*label, None)).collect();
+        self.retained_from(&labels, now)
+    }
+
+    /// The first of `labels` either snapshot still references, apart from the records each
+    /// label's [`OwnRecords`] says are its new row's own ([`label_is_retained_from`]).
+    /// # Errors
+    /// As [`Self::load`] or [`Self::load_logins`].
+    pub(super) fn retained_from<'a>(
+        &self,
+        labels: &[(&'a str, Option<OwnRecords<'_>>)],
+        now: impl Into<trace::Now>,
+    ) -> Result<Option<&'a str>, String> {
+        let now: trace::Now = now.into();
         let (state, _) = self
             .load(now)
             .map_err(|why| format!("{why} ({})", self.state_file().display()))?;
@@ -15401,8 +16137,8 @@ impl Store {
             .map_err(|why| format!("{why} ({})", self.logins_file().display()))?;
         Ok(labels
             .iter()
-            .copied()
-            .find(|label| label_is_retained(&state, &logins, label)))
+            .find(|(label, own)| label_is_retained_from(&state, &logins, label, *own))
+            .map(|(label, _)| *label))
     }
 
     /// Loads `logins.json` and returns `roster` with machine-local renewal bindings applied.
@@ -15534,7 +16270,7 @@ impl Store {
             project = "aterm_agent::harness::cli::tests::state_read::state_read_transition"
         )
     )]
-    pub fn load(&self, now: i64) -> Result<(State, Option<String>), String> {
+    pub fn load(&self, now: impl Into<trace::Now>) -> Result<(State, Option<String>), String> {
         let receipt = self.sync_read_receipt()?;
         let (state, note, _) = self.state_as_stored(now)?;
         self.check_sync_read_receipt(&receipt)
@@ -15580,7 +16316,10 @@ impl Store {
     /// [`Self::load`] without its receipt check, as [`Self::logins_as_stored`] is
     /// [`Self::load_logins`], and whether [`Self::machine_file`] named the state's machine: that
     /// file, once linked, is never rewritten, so [`Self::machine_id`] would read the same id again.
-    fn state_as_stored(&self, now: i64) -> Result<(State, Option<String>, bool), String> {
+    fn state_as_stored(
+        &self,
+        now: impl Into<trace::Now>,
+    ) -> Result<(State, Option<String>, bool), String> {
         let mut state = match read_bounded(&self.state_file(), MAX_STATE_BYTES) {
             Ok(None) => self.absent_state()?,
             Ok(Some(text)) => State::from_json(&text, now)
@@ -15595,7 +16334,7 @@ impl Store {
                 kept = true;
             }
             Ok(None) if !state.machine.is_empty() => {}
-            Ok(None) => match mint_machine() {
+            Ok(None) => match self.unkept_machine() {
                 Ok(id) => state.machine = id,
                 Err(e) => {
                     note.get_or_insert_with(|| {
@@ -15621,6 +16360,24 @@ impl Store {
             }
         }
         Ok((state, note, kept))
+    }
+
+    /// The id this store's loads answer while it keeps none ([`Self::state_as_stored`]): drawn
+    /// once in this process ([`mint_machine`], whose draw poisons the trace scope armed around
+    /// it) and answered again by every later load of the same store, so a run that reads the
+    /// store again reads the same id, and a run that keeps it ([`Self::machine_id`], given the
+    /// state's id) keeps that one. Before, each load drew another, so a duty that loaded a store
+    /// with no `machine` file was poisoned at every pass.
+    fn unkept_machine(&self) -> io::Result<String> {
+        let mut drawn = UNKEPT_MACHINES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(id) = drawn.get(&self.dir) {
+            return Ok(id.clone());
+        }
+        let id = mint_machine()?;
+        drawn.insert(self.dir.clone(), id.clone());
+        Ok(id)
     }
 
     /// Path to the `<dir>/machine` identifier file.
@@ -15673,8 +16430,11 @@ impl Store {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "kept, then gone"))
     }
 
+    /// Writes `id` at `tmp` and links it to [`Self::machine_file`], a write in the armed trace
+    /// scope ([`trace::Effect::Write`]) whether or not the link takes.
     fn keep_machine_at(&self, id: &str, tmp: &Path) -> io::Result<()> {
         use std::io::Write as _;
+        trace::effect(trace::Effect::Write);
         let mut open = std::fs::OpenOptions::new();
         open.write(true).create_new(true);
         #[cfg(unix)]
@@ -16026,7 +16786,7 @@ impl Store {
                 match pin_refusal(state, &roster, &enrolled, label) {
                     None => pin(state, &roster, &enrolled, label, now).map(|event| vec![event]),
                     Some(why @ (PinRefusal::NotListed | PinRefusal::PreparationOnly | PinRefusal::PreparationFailed)) => {
-                        Err(why.message(label))
+                        Err(why.of_label(label))
                     }
                     Some(why @ (PinRefusal::NotEnrolled | PinRefusal::SignedOut)) => {
                         if manual_signin_capability() == ManualSigninCapability::Unavailable {
@@ -16038,7 +16798,7 @@ impl Store {
                             return Err("this account requires a fresh root-authorized shared renewal; use `aterm harness accounts shared-renew`".into());
                         }
                         if cli != Cli::Claude && cli.accounts().signin.is_none() {
-                            return Err(why.message(label));
+                            return Err(why.of_label(label));
                         }
                         if roster
                             .row(label)
@@ -17110,9 +17870,11 @@ fn note_week(
     moved.then(|| Event::new(now, Kind::Warned, account).because(&why))
 }
 
-/// Returns the labels in roster order whose active usage-credits episode warrants a digest entry.
+/// Returns the labels in roster order whose active usage-credits episode warrants a digest entry,
+/// each episode's end compared through `now` ([`CreditsUse::stands`]).
 #[must_use]
-pub fn credits_noted(roster: &Roster, state: &State, now: i64) -> Vec<String> {
+pub fn credits_noted(roster: &Roster, state: &State, now: impl Into<trace::Now>) -> Vec<String> {
+    let now: trace::Now = now.into();
     roster
         .rows
         .iter()
@@ -17155,9 +17917,11 @@ const fn gives_week_back(kind: Option<ResetKind>) -> bool {
 /// on the week at [`WINDOW_FULL_PCT`] or more with its reset over [`WINDOW_FULL_AHEAD_S`] off, and
 /// the credits word off. Each carries the account's standing reset offer of a kind that gives the
 /// week back ([`WindowFull::grants`]), which decides nothing here: an offer neither adds an account
-/// nor drops one.
+/// nor drops one. Every end it compares (the credits word's, the week's, how far off the week's
+/// reset is, an offer's use-by instant) goes through `now` ([`trace::Now`]).
 #[must_use]
-pub fn windows_full(roster: &Roster, state: &State, now: i64) -> Vec<WindowFull> {
+pub fn windows_full(roster: &Roster, state: &State, now: impl Into<trace::Now>) -> Vec<WindowFull> {
+    let now: trace::Now = now.into();
     roster
         .rows
         .iter()
@@ -17166,18 +17930,20 @@ pub fn windows_full(roster: &Roster, state: &State, now: i64) -> Vec<WindowFull>
             let Some(Credits::Off(off)) = &account.credits else {
                 return None;
             };
-            if off.until.is_some_and(|until| now >= until) {
+            if off.until.is_some_and(|until| now.passed(until)) {
                 return None;
             }
             let (pct, end) = account.week_warning()?.figure(WEEK_WINDOW_S, now)?;
-            (pct >= WINDOW_FULL_PCT && end.saturating_sub(now) > WINDOW_FULL_AHEAD_S).then(|| {
-                WindowFull {
-                    label: row.label.clone(),
-                    reason: off.reason.clone(),
-                    grants: account.offer.clone().filter(|o| {
-                        o.left > 0 && o.use_by.is_none_or(|by| by > now) && gives_week_back(o.kind)
-                    }),
-                }
+            // The reset more than `WINDOW_FULL_AHEAD_S` off: `end - now > WINDOW_FULL_AHEAD_S`,
+            // as `now - end < -WINDOW_FULL_AHEAD_S`.
+            (pct >= WINDOW_FULL_PCT && !now.aged(end, -WINDOW_FULL_AHEAD_S)).then(|| WindowFull {
+                label: row.label.clone(),
+                reason: off.reason.clone(),
+                grants: account.offer.clone().filter(|o| {
+                    o.left > 0
+                        && o.use_by.is_none_or(|by| now.before(by))
+                        && gives_week_back(o.kind)
+                }),
             })
         })
         .collect()
@@ -17191,7 +17957,7 @@ pub fn windows_full(roster: &Roster, state: &State, now: i64) -> Vec<WindowFull>
 /// be locked or written, or the lock stayed held (exactly [`LOCK_HELD`]); or `wake` could not
 /// be touched.
 pub fn record_gone(store: &Store, sid: &str, now: i64) -> Result<bool, String> {
-    if !store.state_file().exists() {
+    if !trace::fs::exists(store.state_file()) {
         return Ok(false);
     }
     let sid = one_line(sid, WORD_MAX);
@@ -17571,6 +18337,10 @@ pub fn account_usage_source_environment() {}
 #[cfg(test)]
 #[path = "accounts_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "accounts_trace_tests.rs"]
+mod trace_tests;
 
 #[cfg(test)]
 #[path = "accounts_usage_source_tests.rs"]

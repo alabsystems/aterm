@@ -208,6 +208,7 @@ fn print_changes(at: &str, view: &JobsView, said: &mut BTreeMap<String, Verdict>
 
 struct Host {
     jobs: Jobs,
+    vitals: aterm_vitals::model::Vitals,
     reader: JobsReader,
     tab: JobTab,
     process_limit: Option<u64>,
@@ -217,6 +218,7 @@ impl Host {
     fn new() -> Self {
         Self {
             jobs: Jobs::new(),
+            vitals: aterm_vitals::model::Vitals::new(),
             reader: JobsReader::new(),
             tab: JobTab {
                 key: 1,
@@ -232,7 +234,43 @@ impl Host {
         let sweep = processes().ok_or_else(|| std::io::Error::other("no process sweep"))?;
         let me = std::process::id();
         let self_uid = sweep.procs.iter().find(|p| p.pid == me).and_then(|p| p.uid);
+        let procs_truncated = sweep.truncated;
         let sweep: Vec<SweepProc> = sweep.procs.iter().map(sweep_proc).collect();
+        let source = self.vitals.absorb(&aterm_vitals::model::Sample {
+            at_ns: at_ms.saturating_mul(1_000_000),
+            mono_ms: at_ms,
+            self_pid: me,
+            self_uid,
+            procs_truncated,
+            zombie_read: if cfg!(windows) {
+                aterm_vitals::blockage::ZombieRead::Unsupported
+            } else {
+                aterm_vitals::blockage::ZombieRead::Sweep
+            },
+            procs: Some(
+                sweep
+                    .iter()
+                    .map(|p| aterm_vitals::model::ProcSample {
+                        pid: p.pid,
+                        ppid: p.ppid,
+                        pgid: p.pgid,
+                        uid: p.uid,
+                        name: p.name.clone(),
+                        state: match p.state {
+                            ProcState::Zombie => aterm_vitals::model::ProcState::Zombie,
+                            ProcState::Stopped => aterm_vitals::model::ProcState::Stopped,
+                            ProcState::Uninterruptible => {
+                                aterm_vitals::model::ProcState::Uninterruptible
+                            }
+                            ProcState::Unknown => aterm_vitals::model::ProcState::Unknown,
+                            _ => aterm_vitals::model::ProcState::Run,
+                        },
+                        ..aterm_vitals::model::ProcSample::default()
+                    })
+                    .collect(),
+            ),
+            ..aterm_vitals::model::Sample::default()
+        });
         let tabs = vec![self.tab.clone()];
         let wants = self.jobs.plan(&sweep, &tabs);
         let reqs: Vec<ReadReq> = wants
@@ -263,6 +301,8 @@ impl Host {
         let lanes = self.reader.lanes();
         Ok(JobTick {
             at_ms,
+            source_seq: Some(source.seq),
+            zombie_facts: self.vitals.current_zombie_facts(),
             read_ms: at_ms,
             probe_ms: at_ms,
             self_uid,

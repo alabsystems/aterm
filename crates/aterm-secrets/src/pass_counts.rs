@@ -11,7 +11,8 @@
 //! ends and then as each 256th does ([`aterm_uds::tally::due`]): every total since the loop
 //! began, and the same totals over the last [`WINDOW`] passes, so one read gives an average over
 //! that many passes as well as over the loop's life. The lines hold names and numbers only, and
-//! leave out a total that is 0.
+//! leave out a total that is 0; each ends with the time it was said (`unix_s`, seconds since the
+//! epoch).
 //!
 //! Every count only rises and is one relaxed add where it is counted, found through a
 //! thread-local the pass sets on the threads that work for it ([`metered`], [`starting`]): a
@@ -34,6 +35,12 @@
 //! - records from the source first: `records_peers` per pass, and what the records fan-out
 //!   costs, which is `records_threads_cpu_ns` (its `vault-read` threads and the one that asks
 //!   the source) plus `records_cpu_ns` (the loop thread's share), not the loop thread's alone;
+//! - the source first ([`Count::GatedPasses`]): `requests` per pass (every vault request the
+//!   pass's threads made, each its own connection) and `local_dials` (those to a `.local` name,
+//!   each a lookup of the name through the LAN broker and, on macOS, a connect through it), with
+//!   `catch_ups`, `gated_passes` and `sweeps` saying which passes asked beyond the source, and
+//!   `sweep_unanswered` how many peers a sweep asked that did not answer every request (two lines'
+//!   `unix_s` give the rate over the time between them);
 //! - what a pass spends where: `<phase>_cpu_ns` and `<phase>_wall_ns` of the loop's thread, and
 //!   `<phase>_threads` and `<phase>_threads_cpu_ns` of the threads it started in that phase
 //!   (`probe_threads_cpu_ns` is the envelope probe's `vault-read` threads, `peers_threads_cpu_ns`
@@ -119,10 +126,22 @@ pub(crate) enum Count {
     MemoSelectHeld,
     MemoSelectPeer,
     MemoAdmin,
+    /// Vault requests the pass's threads made, each its own connection (`transport`'s
+    /// connector), and those of them to a `.local` name, each looked up through the LAN broker
+    /// and, on macOS, connected through it.
+    Requests,
+    LocalDials,
+    /// Which passes asked beyond the source (`client`'s `Gate`): a catch-up asks every peer its
+    /// plan cuts, a sweep a few, and a gated pass its source alone unless the source fell short.
+    CatchUps,
+    GatedPasses,
+    Sweeps,
+    /// Peers a sweep asked that did not answer every request it made of them.
+    SweepUnanswered,
 }
 
 impl Count {
-    pub(crate) const ALL: [Self; 31] = [
+    pub(crate) const ALL: [Self; 37] = [
         Self::Passes,
         Self::PrimaryBody,
         Self::PrimaryMissing,
@@ -154,6 +173,12 @@ impl Count {
         Self::MemoSelectHeld,
         Self::MemoSelectPeer,
         Self::MemoAdmin,
+        Self::Requests,
+        Self::LocalDials,
+        Self::CatchUps,
+        Self::GatedPasses,
+        Self::Sweeps,
+        Self::SweepUnanswered,
     ];
 
     #[cfg(any(unix, test))]
@@ -190,6 +215,12 @@ impl Count {
             Self::MemoSelectHeld => "memo_select_held",
             Self::MemoSelectPeer => "memo_select_peer",
             Self::MemoAdmin => "memo_admin",
+            Self::Requests => "requests",
+            Self::LocalDials => "local_dials",
+            Self::CatchUps => "catch_ups",
+            Self::GatedPasses => "gated_passes",
+            Self::Sweeps => "sweeps",
+            Self::SweepUnanswered => "sweep_unanswered",
         }
     }
 }
@@ -363,12 +394,17 @@ impl PassCounts {
         let before = ended.front().cloned().unwrap_or_default();
         let over = ended.len() - 1;
         drop(ended);
+        // When the lines are said, so two lines give the rate over the time between them.
+        let said = aterm_time::unix_millis().map(|ms| ms / 1_000);
         let line = |head: String, values: &mut dyn Iterator<Item = u64>| {
             let mut line = head;
             for (name, value) in Self::names().iter().zip(values) {
                 if value != 0 {
                     let _ = write!(line, " {name}={value}");
                 }
+            }
+            if let Some(said) = said {
+                let _ = write!(line, " unix_s={said}");
             }
             line
         };

@@ -23,6 +23,10 @@ pub(crate) fn remove_unused_dir(dir: &Path) -> Result<bool, String> {
 /// The record's schema, and what the key and the bundle digest are taken under.
 pub const SCHEMA: &str = "aterm-release-artifact-v2";
 
+/// Private cache keys issued only after the producer's retained input seal was checked.
+/// Keep the bundle digest and published record formats under their existing domains.
+const PRODUCER_INPUTS_POLICY: &str = "aterm-release-producer-inputs-v1";
+
 /// The store entry's record, written last.
 pub const COMPLETE_FILE: &str = "COMPLETE";
 
@@ -91,8 +95,8 @@ pub struct Complete {
     pub macho_sha256: String,
     /// [`bundle_digest`] of the whole bundle.
     pub bundle_digest: String,
-    /// U: all bundle content, with identity and signature storage normalized. Older completed
-    /// builds remain readable and can ship, but cannot supply a cross-tree measure receipt.
+    /// U: all bundle content, with identity and signature storage normalized. Producer-bound
+    /// builds without U remain readable but cannot supply a cross-tree measure receipt.
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]
@@ -137,7 +141,9 @@ pub fn store(repo: &Path) -> Result<PathBuf, String> {
     Ok(CacheRoot::for_repo(repo)?.artifacts())
 }
 
-/// The pre-build lookup key for `identity` and `compilers`: SHA-256 over [`SCHEMA`] and each input, NUL-separated, lowercase hex. New entries are addressed by [`stamped_key`]; earlier completed entries remain at this key.
+/// The pre-build lookup key for `identity` and `compilers`: SHA-256 over [`SCHEMA`], the
+/// producer-input binding policy and each input, NUL-separated, lowercase hex. Direct records
+/// use this key; indexed product entries use [`stamped_key`]. Unbound earlier keys are refused.
 #[must_use]
 pub fn key(identity: &Identity, compilers: &Compilers) -> String {
     key_parts(
@@ -177,6 +183,7 @@ fn key_parts(
     let mut h = aterm_digest::Sha256::new();
     for part in [
         SCHEMA,
+        PRODUCER_INPUTS_POLICY,
         version,
         &build.to_string(),
         commit,
@@ -454,7 +461,9 @@ pub(crate) fn host_memory_bytes() -> Option<u64> {
 pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
     let store = store(repo)?;
     crate::snapshot::private_dir(&store, "release artifact store")?;
-    let compilers = compilers()?;
+    let compiler =
+        crate::trust_lock::inputs_at(&crate::ledger::GitCli::new(repo), &identity.commit)?;
+    let compilers = compilers_for(&compiler)?;
     let key = key(identity, &compilers);
     match read(&store, &key) {
         Ok(Some(complete)) => {
@@ -474,9 +483,14 @@ pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
     let expected_pin =
         crate::publish::expected_embedded_update_pin(aterm_update_core::pins::PAPER_MASTER_PUBKEYS)
             .map_err(|e| e.to_string())?;
-    crate::gates::universal_gate(crate::gates::x86_target_probe, || {
-        crate::gates::rosetta_runs(&mut |command| command.output())
-    })
+    let stock = compiler.stock()?;
+    crate::gates::universal_gate(
+        || {
+            crate::buildplan::require_rustup_target_in(stock, "x86_64-apple-darwin")
+                .map_err(crate::ledger::Error::new)
+        },
+        || crate::gates::rosetta_runs(&mut |command| command.output()),
+    )
     .map_err(|e| e.to_string())?;
     crate::gates::disk_gate(&store).map_err(|e| e.to_string())?;
     let dir = store.join(&key);
@@ -507,79 +521,119 @@ pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
             dir.display()
         ));
     }
-    if self::compilers()? != compilers {
-        return Err(
-            "compiler or SDK inputs changed during the build; no COMPLETE record was written"
-                .into(),
-        );
+    publish_build_result(
+        built,
+        compilers,
+        compilers_for(&compiler)?,
+        |built, compilers| {
+            let content = content_digest(&built.app)?;
+            let product_key = stamped_key(&content, &key, index_hint.as_deref());
+            let complete = Complete {
+                schema: SCHEMA.to_string(),
+                key: product_key.clone(),
+                version: identity.version.clone(),
+                build: identity.build,
+                commit: identity.commit.clone(),
+                trustc: compilers.trustc,
+                rustc: compilers.rustc,
+                inputs: compilers.inputs,
+                snapshot: built.snapshot_digest,
+                archs: built.archs,
+                compiler_line: built.compiler_line,
+                macho_sha256: macho_sha256(&built.app)?,
+                bundle_digest: bundle_digest(&built.app)?,
+                content: Some(content),
+                slices: built
+                    .slices
+                    .iter()
+                    .map(|s| SliceRecord {
+                        triple: s.triple.to_string(),
+                        secs: s.secs,
+                        peak_bytes: s.peak_bytes,
+                        cpu_ns: s.cpu_ns,
+                        units_fresh: s.units.map(|u| u.fresh),
+                        units_compiled: s.units.map(|u| u.compiled),
+                        output_bytes: s.units.map(|u| u.output_bytes),
+                    })
+                    .collect(),
+                index_hint,
+            };
+            let product_dir = store.join(&product_key);
+            in_use::remove_unused(&product_dir)
+                .map_err(|e| format!("replace incomplete product entry: {e}"))?;
+            std::fs::rename(&dir, &product_dir)
+                .map_err(|e| format!("address stamped product by U: {e}"))?;
+            write_complete(&product_dir, &complete)?;
+            let index = store.join("identity");
+            crate::snapshot::private_dir(&index, "artifact identity index")?;
+            crate::durable::write_atomic_durable(&index.join(&key), product_key.as_bytes(), 0o600)
+                .map_err(|e| format!("write artifact identity index: {e}"))?;
+            let needed = needed_keys(repo);
+            let mut keep: Vec<&str> = needed.iter().map(String::as_str).collect();
+            keep.push(&product_key);
+            prune(&store, &keep);
+            println!(
+                "==> built ONCE: {} — executable sha256 {}, bundle {}",
+                complete.app(&store).display(),
+                complete.macho_sha256,
+                complete.bundle_digest
+            );
+            Ok(complete)
+        },
+    )
+}
+
+/// Match the actual producer's retained seal, not just two observations around the build.
+/// Non-macOS native handoffs have no universal SDK seal and retain their existing protocol.
+pub(crate) fn validate_build_result(
+    built: &crate::buildplan::BuildOutput,
+    before: &Compilers,
+    after: &Compilers,
+) -> Result<(), String> {
+    if built
+        .inputs
+        .as_ref()
+        .is_some_and(|actual| *actual != before.inputs)
+        || (cfg!(target_os = "macos") && built.inputs.is_none())
+        || after != before
+    {
+        return Err("compiler or SDK inputs differ from the actual build take; no COMPLETE record was written".into());
     }
-    let content = content_digest(&built.app)?;
-    let product_key = stamped_key(&content, &key, index_hint.as_deref());
-    let complete = Complete {
-        schema: SCHEMA.to_string(),
-        key: product_key.clone(),
-        version: identity.version.clone(),
-        build: identity.build,
-        commit: identity.commit.clone(),
-        trustc: compilers.trustc,
-        rustc: compilers.rustc,
-        inputs: compilers.inputs,
-        snapshot: built.snapshot_digest,
-        archs: built.archs,
-        compiler_line: built.compiler_line,
-        macho_sha256: macho_sha256(&built.app)?,
-        bundle_digest: bundle_digest(&built.app)?,
-        content: Some(content),
-        slices: built
-            .slices
-            .iter()
-            .map(|s| SliceRecord {
-                triple: s.triple.to_string(),
-                secs: s.secs,
-                peak_bytes: s.peak_bytes,
-                cpu_ns: s.cpu_ns,
-                units_fresh: s.units.map(|u| u.fresh),
-                units_compiled: s.units.map(|u| u.compiled),
-                output_bytes: s.units.map(|u| u.output_bytes),
-            })
-            .collect(),
-        index_hint,
-    };
-    let product_dir = store.join(&product_key);
-    in_use::remove_unused(&product_dir)
-        .map_err(|e| format!("replace incomplete product entry: {e}"))?;
-    std::fs::rename(&dir, &product_dir)
-        .map_err(|e| format!("address stamped product by U: {e}"))?;
-    write_complete(&product_dir, &complete)?;
-    let index = store.join("identity");
-    crate::snapshot::private_dir(&index, "artifact identity index")?;
-    crate::durable::write_atomic_durable(&index.join(&key), product_key.as_bytes(), 0o600)
-        .map_err(|e| format!("write artifact identity index: {e}"))?;
-    let needed = needed_keys(repo);
-    let mut keep: Vec<&str> = needed.iter().map(String::as_str).collect();
-    keep.push(&product_key);
-    prune(&store, &keep);
-    println!(
-        "==> built ONCE: {} — executable sha256 {}, bundle {}",
-        complete.app(&store).display(),
-        complete.macho_sha256,
-        complete.bundle_digest
-    );
-    Ok(complete)
+    Ok(())
+}
+
+fn publish_build_result<T>(
+    built: crate::buildplan::BuildOutput,
+    before: Compilers,
+    after: Compilers,
+    publish: impl FnOnce(crate::buildplan::BuildOutput, Compilers) -> Result<T, String>,
+) -> Result<T, String> {
+    validate_build_result(&built, &before, &after)?;
+    publish(built, before)
 }
 
 /// The compilers this machine's build runs now.
 /// # Errors
 /// Either compiler cannot be asked for its commit.
-pub fn compilers() -> Result<Compilers, String> {
-    let trustc = crate::buildplan::commit_hash_of(&crate::buildplan::trust_rustc_version()?)
-        .ok_or(
-            "the Trust trustc's -vV names no commit-hash — a build no other build can be told from",
-        )?;
+pub fn compilers(repo: &Path, commit: &str) -> Result<Compilers, String> {
+    let compiler = crate::trust_lock::inputs_at(&crate::ledger::GitCli::new(repo), commit)?;
+    compilers_for(&compiler)
+}
+
+pub(crate) fn compilers_for(
+    compiler: &crate::trust_lock::CompilerInputs,
+) -> Result<Compilers, String> {
+    let trustc = atpkg::trust_lock::compiler_commit(&compiler.bin)
+        .map_err(|error| format!("identify the held source compiler: {error}"))?;
+    if trustc != compiler.pin.compiler_commit {
+        return Err(
+            "the held compiler no longer reports the selected source's compiler commit".into(),
+        );
+    }
     Ok(Compilers {
         trustc,
-        rustc: crate::buildplan::stable_rustc_commit()?,
-        inputs: crate::build_inputs::current()?,
+        rustc: crate::buildplan::stock_rustc_commit_in(compiler.stock()?)?,
+        inputs: crate::build_inputs::current_for(compiler)?,
     })
 }
 
@@ -848,3 +902,7 @@ pub fn provisional_identity(
         commit,
     })
 }
+
+#[cfg(test)]
+#[path = "artifact_inputs_tests.rs"]
+mod inputs_tests;

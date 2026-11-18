@@ -379,7 +379,7 @@ mod background;
 mod branch_shares;
 mod jobserver;
 pub use branch_shares::{BranchShares, FixtureShare, InitialReservation};
-pub use jobserver::{IMPLICIT_POOL_ENV, Jobserver, POOL_ENV, Token, TokenCount};
+pub use jobserver::{HeldJobserverFifo, IMPLICIT_POOL_ENV, Jobserver, POOL_ENV, Token, TokenCount};
 
 /// What a claim needs. Sizes are bytes.
 #[derive(Clone, Debug, Default, PartialEq)]

@@ -434,8 +434,9 @@ pub(super) fn hello_at(path: &Path, protocol: u32) -> Result<BrokerHello, LanErr
 }
 
 /// What a Bonjour request hears, as it hears it: a blocking iterator, whose descriptor a poll
-/// loop can wait on ([`AsFd`]), and [`Events::next_within`] for a bounded wait. Dropping it ends
-/// the request.
+/// loop can wait on ([`AsFd`]), [`Events::next_within`] for a bounded wait, and
+/// [`Events::next_beside`] for a wait with no timer that another descriptor ends. Dropping it
+/// ends the request.
 #[derive(Debug)]
 pub struct Events {
     stream: CtlStream,
@@ -454,12 +455,37 @@ impl Events {
         self.next_by(deadline.or(Some(Instant::now() + super::here::MAX_WITHIN)))
     }
 
+    /// The next event, waiting with no timer for as long as it takes, or until `cancel` is
+    /// readable (at its end included: the read end of a pipe whose writer was dropped):
+    /// `Ok(None)` then, the request still open and `cancel` unread. An event already read off the
+    /// connection ([`Self::buffered`]) comes before `cancel` is looked at, so a caller hears
+    /// every one it took in; with none here, a readable `cancel` wins over whatever the
+    /// connection holds, which stays there for the next call.
+    ///
+    /// # Errors
+    /// As [`Self::next_within`]; only those end the request.
+    pub fn next_beside(&mut self, cancel: BorrowedFd<'_>) -> Result<Option<Event>, LanError> {
+        self.next_cancelled(None, Some(cancel))
+    }
+
     fn next_by(&mut self, deadline: Option<Instant>) -> Result<Option<Event>, LanError> {
+        self.next_cancelled(deadline, None)
+    }
+
+    fn next_cancelled(
+        &mut self,
+        deadline: Option<Instant>,
+        cancel: Option<BorrowedFd<'_>>,
+    ) -> Result<Option<Event>, LanError> {
         if self.ended {
             return Err(ended().into());
         }
-        let frame = match self.reader.frame(&self.stream, deadline) {
+        let frame = match self.reader.frame_cancelled(&self.stream, deadline, cancel) {
             Err(error) if error.kind() == io::ErrorKind::TimedOut && deadline.is_some() => {
+                return Ok(None);
+            }
+            // The reader's only `Interrupted` is its cancel's.
+            Err(error) if error.kind() == io::ErrorKind::Interrupted && cancel.is_some() => {
                 return Ok(None);
             }
             other => other,

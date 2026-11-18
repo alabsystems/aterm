@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 const NOW: i64 = 1_793_000_000;
 
@@ -139,7 +139,7 @@ impl Bed {
             &self.path,
             request.clone(),
             NOW,
-            &Arc::default(),
+            &AutoRenewGuard::default().shared(),
             &move |_| {
                 counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
@@ -296,9 +296,9 @@ fn progress(bed: &Bed) -> (bool, usize) {
     .unwrap();
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = Arc::clone(&calls);
-    let cooldown = Mutex::new(None);
-    let rediscovery = Mutex::new(Rediscovery::default());
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let cooldown = Watched::new("accounts_sync/sync_cooldown", None);
+    let rediscovery = Watched::new("accounts_sync/rediscovery", Rediscovery::default());
+    let guard = AutoRenewGuard::default().shared();
     let lifetime = crate::harness::account_work::Lifetime::default();
     let fx = UpkeepEffects {
         scope: lifetime.enter(),
@@ -383,7 +383,7 @@ fn a_selection_whose_worker_could_not_start_waits_for_a_later_upkeep() {
     let bed = Bed::new();
     bed.shared(accounts::shared::Outcome::Unknown);
     let before = bed.store.load_logins(NOW).unwrap().0.shared;
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let lifetime = crate::harness::account_work::Lifetime::default();
     let refused = |_work: Box<dyn FnOnce() + Send>| Err(io::Error::other("injected spawn refusal"));
     let mut fx = live_effects();

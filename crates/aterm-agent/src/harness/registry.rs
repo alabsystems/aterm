@@ -268,7 +268,8 @@ impl Registry {
             .find_map(|e| e.mark.as_ref())
     }
 
-    /// Whether the executable `exe` may run as `row`'s harness in `layout`, judged now: inside
+    /// What the executable `exe` is admitted as when it may run as `row`'s harness in `layout`
+    /// (the store build and its version, or a link's checkout; `None` when it may not), judged now: inside
     /// a store build of the row's package whose kept record verifies again at this proof (a
     /// signed row's, or a seed row's build that carries a record), any ready build of a seed
     /// row's package that carries none, or a development link's checkout under its rule. The
@@ -282,7 +283,7 @@ impl Registry {
         layout: &atpkg::store::Layout,
         row: &Row,
         exe: &std::path::Path,
-    ) -> bool {
+    ) -> Option<atpkg::harness_record::Admitted> {
         self.admits_image_under(layout, row, exe, &self.trust.refreshed(layout))
     }
 
@@ -294,9 +295,9 @@ impl Registry {
         row: &Row,
         exe: &std::path::Path,
         trust: &Trust,
-    ) -> bool {
+    ) -> Option<atpkg::harness_record::Admitted> {
         let Some(entry) = self.entry(row.id) else {
-            return false;
+            return None;
         };
         let composed = atpkg::harness_record::Row {
             declaration: atpkg::harness_record::Declaration {

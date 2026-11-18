@@ -55,6 +55,17 @@ pub(crate) struct Scoped {
 }
 
 impl Scoped {
+    /// The same granted authority under the same kernel proof and kept vendor child. A changed
+    /// request alone is retained for later re-granting and supersedes no current authority.
+    pub(crate) fn same_authority(&self, other: &Self) -> bool {
+        let Self {
+            proven,
+            claim,
+            child,
+        } = self;
+        proven == &other.proven && claim.same_authority(&other.claim) && child == &other.child
+    }
+
     /// WHETHER THIS CLAIM HEARS `restart` FOR ITS CHILD'S MODEL: it holds `relaunch` (contract 3
     /// or 4), or, under contract 4, `accounts` (the duty of moving its child between logins, which
     /// a restart on another login carries). It hears an account move only where
@@ -88,6 +99,16 @@ impl Scoped {
                     .is_some_and(|birth| birth == kept.birth)
             })
             .map_or(self.proven.pid, |kept| kept.pid)
+    }
+}
+
+/// Whether two optional scoped claims name the same current authority, including the absence
+/// of a scoped claim. Representation equality remains available for the stored request itself.
+pub(crate) fn same_authority(left: Option<&Scoped>, right: Option<&Scoped>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.same_authority(right),
+        _ => false,
     }
 }
 
@@ -231,17 +252,63 @@ pub(crate) fn agent_pid_with(
     .unwrap_or(group)
 }
 
-/// The `supervisor_version=` and `supervisor_vendor=` words of `status` and `sessions`: the
-/// versions a proven contract v3 claim announced
-/// ([`crate::session_timeline::SessionMeta::live_scoped`],
-/// `docs/DESIGN-harness-repos-2026-10-24.md` §5, §11 D48), percent-encoded; `-` for a word the
-/// claim did not name, and for both under any other claim or none.
+/// A CLAIMANT'S IMAGE THAT PASSED ITS RULE, with the version aterm read where it was admitted:
+/// the store build's own (its verified manifest's under a record), `link` for a development
+/// link's checkout ([`atpkg::harness_record::Admitted`]); `None` for a build that records no
+/// version, and for a fixture's captured image.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Passed {
+    /// The version to show for the claimant (`supervisor_version=`).
+    pub(crate) version: Option<String>,
+}
+
+impl From<atpkg::harness_record::Admitted> for Passed {
+    fn from(admitted: atpkg::harness_record::Admitted) -> Self {
+        Self {
+            version: admitted.version().map(str::to_string),
+        }
+    }
+}
+
+/// THE PROOF OF A CLAIM BEING MADE: the claimant's identity as the kernel named it, and the
+/// version of the build its image proof admitted ([`Passed`]). A claim's own `version=` word is
+/// never that version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClaimProof {
+    /// The claimant (pid and kernel start).
+    pub(crate) proven: Proven,
+    /// The admitted build's version; `None` where the proof read none (a codex-alab self-claim,
+    /// a build that records no version).
+    pub(crate) version: Option<String>,
+}
+
+impl From<Proven> for ClaimProof {
+    /// A proof that read no version.
+    fn from(proven: Proven) -> Self {
+        Self {
+            proven,
+            version: None,
+        }
+    }
+}
+
+/// The `supervisor_version=` and `supervisor_vendor=` words of `status` and `sessions` for the
+/// live proven scoped claim of `meta` at `now_us`
+/// ([`crate::session_timeline::SessionMeta::live_scoped`]), percent-encoded. The version is the
+/// one aterm read from the build its proof admitted
+/// ([`crate::session_timeline::SessionMeta::verified_version`]: that build's manifest, or `link`
+/// for a development link), never the claim's or a `claim` record's `version=`; the vendor has no
+/// verified source and is the word the claim states. `-` for a word that is not known, and for
+/// both under any other claim or none.
 #[must_use]
-pub(crate) fn wire_versions(scoped: Option<&Scoped>) -> (String, String) {
+pub(crate) fn wire_versions(
+    meta: &crate::session_timeline::SessionMeta,
+    now_us: u64,
+) -> (String, String) {
     let word = |v: Option<&str>| v.map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode);
-    match scoped {
+    match meta.live_scoped(now_us) {
         Some(s) => (
-            word(s.claim.version.as_ref().map(|v| v.text.as_str())),
+            word(meta.verified_version(now_us)),
             word(s.claim.vendor.as_deref()),
         ),
         None => ("-".to_string(), "-".to_string()),
@@ -292,15 +359,19 @@ pub(crate) fn prove_in(
     Some(crate::self_claim::Proven { pid, start })
 }
 
-/// Whether `exe` is a build of `row`'s harness in `layout`, by the image rule of `layout`'s
+/// What `exe` is admitted as when it is a build of `row`'s harness in `layout` (`None` when it
+/// is not), by the image rule of `layout`'s
 /// registry ([`aterm_agent::harness::registry::for_layout`]): inside a signed row's verified
 /// build, a seed row's ready store build, or a development link's checkout under its rule.
 #[must_use]
-pub(crate) fn image_in(layout: &atpkg::store::Layout, row: &Row, exe: &Path) -> bool {
-    aterm_agent::harness::registry::for_layout(layout).admits_image(layout, row, exe)
+pub(crate) fn image_in(layout: &atpkg::store::Layout, row: &Row, exe: &Path) -> Option<Passed> {
+    aterm_agent::harness::registry::for_layout(layout)
+        .admits_image(layout, row, exe)
+        .map(Passed::from)
 }
 
-/// Whether `exe` may run as `row`'s claimant under `contract` in `layout`: a contract 3 claim,
+/// What `exe` is admitted as when it may run as `row`'s claimant under `contract` in `layout`
+/// (`None` when it may not): a contract 3 claim,
 /// which only a seed id makes, by the rule contract 3 always had (a ready, complete store build
 /// of the row's package, or its dev link's checkout:
 /// [`atpkg::harness_record::admits_seed_image`]), whatever row the registry composed for the id;
@@ -311,9 +382,9 @@ pub(crate) fn image_for(
     row: &Row,
     contract: u32,
     exe: &Path,
-) -> bool {
+) -> Option<Passed> {
     if contract == aterm_agent::harness::contract::SCOPED {
-        atpkg::harness_record::admits_seed_image(layout, row.package, exe)
+        atpkg::harness_record::admits_seed_image(layout, row.package, exe).map(Passed::from)
     } else {
         image_in(layout, row, exe)
     }
@@ -331,12 +402,13 @@ pub(crate) fn image_by(
     row: &Row,
     contract: u32,
     exe: &Path,
-) -> bool {
+) -> Option<Passed> {
     if contract == aterm_agent::harness::contract::SCOPED {
         atpkg::harness_record::admits_seed_image(layout, row.package, exe)
     } else {
         registry.admits_image(layout, row, exe)
     }
+    .map(Passed::from)
 }
 
 /// WHY A LIVE CONTRACT 4 CLAIM NO LONGER STANDS under the registry's `rows` as they read now
@@ -439,7 +511,8 @@ pub(crate) fn runs_harness_build(row: &Row, contract: u32, pid: u32) -> bool {
     let Some(exe) = i32::try_from(pid).ok().and_then(aterm_uds::sudo::exe_path) else {
         return false;
     };
-    atpkg::store::resolve_configured().is_some_and(|layout| image_for(&layout, row, contract, &exe))
+    atpkg::store::resolve_configured()
+        .is_some_and(|layout| image_for(&layout, row, contract, &exe).is_some())
 }
 
 /// [`runs_harness_build`] under `registry` ([`image_by`]): what a pass that read the registry
@@ -455,7 +528,7 @@ pub(crate) fn runs_harness_build_in(
         return false;
     };
     atpkg::store::resolve_configured()
-        .is_some_and(|layout| image_by(registry, &layout, row, contract, &exe))
+        .is_some_and(|layout| image_by(registry, &layout, row, contract, &exe).is_some())
 }
 
 /// A claimant whose image a proof judges: the holder it claims as, its row, the contract whose
@@ -539,26 +612,31 @@ impl ImageKey {
 /// ([`ImageKey`]). The claim's own proof judges in full, and so does the host's re-proof of live
 /// contract 4 claims at each new registry generation ([`reprove`]).
 #[derive(Debug, Default)]
-pub(crate) struct KeptImage(std::sync::Mutex<Option<ImageKey>>);
+pub(crate) struct KeptImage(std::sync::Mutex<Option<(ImageKey, Passed)>>);
 
 impl KeptImage {
-    /// Whether the claimant `key` names passes its image rule, by `judge`: with `reuse` (a standing
-    /// claim's re-proof) and `key` the last pass's, the kept pass stands and `judge` is not asked;
-    /// otherwise `judge` is asked, a pass is kept for the next re-proof and a refusal keeps
-    /// nothing. A claimant with no key (its executable's identity unread) is judged every time.
-    /// `judge` reads files, so it runs with no lock held.
+    /// What the claimant `key` names passed its image rule as, by `judge` (`None`: it did not):
+    /// with `reuse` (a standing claim's re-proof) and `key` the last pass's, the kept pass stands,
+    /// with what it was admitted as, and `judge` is not asked; otherwise `judge` is asked, a pass
+    /// is kept for the next re-proof and a refusal keeps nothing. A claimant with no key (its
+    /// executable's identity unread) is judged every time. `judge` reads files, so it runs with
+    /// no lock held.
     pub(crate) fn passes(
         &self,
         key: Option<ImageKey>,
         reuse: bool,
-        judge: impl FnOnce() -> bool,
-    ) -> bool {
+        judge: impl FnOnce() -> Option<Passed>,
+    ) -> Option<Passed> {
         let kept = || self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if reuse && key.is_some() && *kept() == key {
-            return true;
+        if reuse
+            && let Some(key) = key.as_ref()
+            && let Some((last, passed)) = kept().as_ref()
+            && last == key
+        {
+            return Some(passed.clone());
         }
         let passed = judge();
-        *kept() = key.filter(|_| passed);
+        *kept() = key.zip(passed.clone());
         passed
     }
 }

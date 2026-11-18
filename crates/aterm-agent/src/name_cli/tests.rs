@@ -531,22 +531,25 @@ fn the_caller_is_an_agent_whose_session_status_names_an_agent_program() {
 fn nick_sets_a_chosen_nickname_raising_rev_and_keeping_the_claim() {
     use super::unix::{NickAsk, Note, renick};
     use crate::machine_name::NickTo;
-    use aterm_net::fleet_member::name_record::{ByKind, NickClass, node_word};
+    use crate::machine_name::registry::{Written, with_door};
+    use aterm_net::fleet_member::name_record::{ByKind, NickClass};
     let root = state(0o700);
     let heron = NickTo::Word(nickname("Blue Heron"));
-    let (line, notes) = renick(
-        root.path(),
-        Some(&vault(root.path())),
-        &NickAsk {
-            to: &heron,
-            kind: ByKind::Person,
-            dry_run: false,
-        },
-        false,
-        no_roster,
-        NOW,
-    )
-    .expect("sets it");
+    let ((line, notes), asked) = with_door(Written::Unbound, || {
+        renick(
+            root.path(),
+            Some(&vault(root.path())),
+            &NickAsk {
+                to: &heron,
+                kind: ByKind::Person,
+                dry_run: false,
+            },
+            false,
+            no_roster,
+            NOW,
+        )
+        .expect("sets it")
+    });
     assert!(
         line.starts_with("unnumbered Blue Heron  class=auto fleet=out node="),
         "{line}"
@@ -558,13 +561,10 @@ fn nick_sets_a_chosen_nickname_raising_rev_and_keeping_the_claim() {
         ("Blue Heron", NickClass::Chosen, 1),
         "the first nickname edit advances the local revision"
     );
-    let by = set.by.expect("who set it");
-    let me = aterm_net::fleet_member::read_node_identity(root.path())
-        .expect("reads")
-        .expect("a node minted for `by`");
     assert_eq!(
-        (node_word(by.node), by.kind),
-        (me.node().to_owned(), ByKind::Person)
+        asked,
+        [["nickname=Blue Heron", "by=person"]],
+        "the row's write says a person asked"
     );
 
     let (_, notes) = renick(
@@ -587,26 +587,33 @@ fn nick_sets_a_chosen_nickname_raising_rev_and_keeping_the_claim() {
         "no change, no rev"
     );
 
-    let (json, notes) = renick(
-        root.path(),
-        Some(&vault(root.path())),
-        &NickAsk {
-            to: &NickTo::Random,
-            kind: ByKind::Agent,
-            dry_run: false,
-        },
-        true,
-        unread,
-        NOW,
-    )
-    .expect("draws");
+    let ((json, notes), asked) = with_door(Written::Unbound, || {
+        renick(
+            root.path(),
+            Some(&vault(root.path())),
+            &NickAsk {
+                to: &NickTo::Random,
+                kind: ByKind::Agent,
+                dry_run: false,
+            },
+            true,
+            unread,
+            NOW,
+        )
+        .expect("draws")
+    });
     assert!(notes.is_empty(), "{notes:?}");
     assert!(json.contains("\"chosen\""), "{json}");
     let drawn = file::read(root.path()).expect("reads").expect("a name");
     assert!(nouns::NOUNS.contains(&drawn.nick.as_str()), "{drawn:?}");
+    assert_eq!((drawn.nick_class, drawn.rev), (NickClass::Chosen, 2));
     assert_eq!(
-        (drawn.nick_class, drawn.rev, drawn.by.map(|by| by.kind)),
-        (NickClass::Chosen, 2, Some(ByKind::Agent))
+        asked,
+        [[
+            format!("nickname={}", drawn.nick.as_str()),
+            "by=program".to_owned()
+        ]],
+        "the row's write says a program asked"
     );
     assert_eq!(
         (drawn.num, drawn.class, drawn.since, drawn.act),
@@ -764,28 +771,59 @@ fn tree(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf
     found
 }
 
+/// One owner write to this Mac's row: the nickname `to` over `from`, as History lists it.
+fn nick_write(op: u8, from: &str, to: &str) -> crate::machine_name::history::NameWrite {
+    use crate::machine_name::history::{NameCell, NameWrite};
+    NameWrite {
+        op: [op; 32],
+        at_ms: u64::from(op) * 1_000,
+        mac: "m8".to_owned(),
+        kind: aterm_db::att::EntryKind::Explicit,
+        reverts: None,
+        carried: false,
+        cells: vec![NameCell {
+            cell: aterm_db::file::Renamed::Nickname,
+            value: Some(to.to_owned()),
+            stands: true,
+            replaced: vec![Some(from.to_owned())],
+            unseen: Vec::new(),
+        }],
+    }
+}
+
+/// This Mac's row, holding `writes`, newest first: only the newest write's values stand.
+fn row_history(
+    mut writes: Vec<crate::machine_name::history::NameWrite>,
+) -> crate::machine_name::history::History {
+    for older in writes.iter_mut().skip(1) {
+        for cell in &mut older.cells {
+            cell.stands = false;
+        }
+    }
+    crate::machine_name::history::History {
+        row: Some("mc-0123456789abcdef".to_owned()),
+        pending: Vec::new(),
+        writes,
+    }
+}
+
 /// `aterm name undo --dry-run` reports the name the undo would give and changes nothing under
 /// the state directory, no file added or rewritten; the control, the same undo for real, writes
-/// that name. An undo asked over a change the command read before a later one is refused as
-/// unseen, writing nothing, so the command takes back only the change it read. A second undo is
-/// refused as an undo's, by kind. `aterm name history` prints each change's line
-/// ([`file::Change::line`]), byte for byte, and a change's line says whether it was undone. The
-/// changes come from `aterm name nick` on an unnumbered Mac, which publishes nothing.
+/// that name and queues the nickname it gives back to the row, as a person's. An undo whose
+/// History, read again under the naming locks, gives another undo (a later rename) is refused as
+/// unseen, writing nothing, so the command takes back only the rename it read, and on scratch
+/// state, where no registry row is this Mac's, every real undo is. Undoing the undo redoes the
+/// rename. The renames come from `aterm name nick` on an unnumbered Mac, which publishes nothing.
+/// NEGATIVE CONTROL: with `edit_name`'s `history::fence` removed, the undo over History holding
+/// the later `Third` writes `Test`, and the tree differs.
 #[test]
 fn name_undo_dry_run_changes_nothing() {
-    use super::unix::{NickAsk, Note, UndoAsk, history, renick, undo};
+    use super::unix::{NickAsk, Note, UndoAsk, renick, undo};
     use crate::machine_name::NickTo;
+    use crate::machine_name::history::{undo_of, with_history};
+    use crate::machine_name::registry::{Written, with_door};
     use aterm_net::fleet_member::name_record::ByKind;
     let root = state(0o700);
-    let newest = || {
-        file::read(root.path())
-            .expect("reads")
-            .expect("a name")
-            .history
-            .first()
-            .cloned()
-    };
-    let mut stale = None;
     for word in ["Test", "Other"] {
         renick(
             root.path(),
@@ -800,53 +838,79 @@ fn name_undo_dry_run_changes_nothing() {
             NOW,
         )
         .expect("a nickname");
-        stale = stale.or_else(newest);
     }
+    let read = row_history(vec![nick_write(2, "Test", "Other")]);
+    let rename = undo_of(&read).expect("an undo");
     let before = tree(root.path());
-    let ask = |dry_run, seen| UndoAsk {
+    let ask = |dry_run| UndoAsk {
         kind: ByKind::Person,
         dry_run,
-        seen,
+        seen: &rename,
     };
-    let refused = undo(
-        root.path(),
-        Some(&vault(root.path())),
-        &ask(false, stale.as_ref()),
-        false,
-        unread,
-        NOW + 1,
-    )
-    .expect_err("the change read is no longer the newest");
-    assert_eq!(
-        crate::machine_name::Refused::of(&refused).map(|refused| &refused.cause),
-        Some(&crate::machine_name::Cause::Unseen),
-        "{refused}"
-    );
-    assert_eq!(tree(root.path()), before, "an unseen undo writes nothing");
-    let seen = newest();
-    let (line, notes) = undo(
-        root.path(),
-        Some(&vault(root.path())),
-        &ask(true, seen.as_ref()),
-        false,
-        unread,
-        NOW + 1,
-    )
+    let third = row_history(vec![
+        nick_write(3, "Other", "Third"),
+        nick_write(2, "Test", "Other"),
+    ]);
+    for (row, case) in [
+        (Some(third), "a later rename"),
+        (None, "no registry row is a scratch state's"),
+    ] {
+        let unshown = || {
+            undo(
+                root.path(),
+                Some(&vault(root.path())),
+                &ask(false),
+                false,
+                unread,
+                NOW + 1,
+            )
+        };
+        let refused = match row {
+            Some(row) => with_history(Ok(row), unshown),
+            None => unshown(),
+        }
+        .expect_err(case);
+        assert_eq!(
+            crate::machine_name::Refused::of(&refused).map(|refused| &refused.cause),
+            Some(&crate::machine_name::Cause::Unseen),
+            "{case}: {refused}"
+        );
+        assert_eq!(
+            tree(root.path()),
+            before,
+            "{case}: an unseen undo writes nothing"
+        );
+    }
+    let (line, notes) = with_history(Ok(read.clone()), || {
+        undo(
+            root.path(),
+            Some(&vault(root.path())),
+            &ask(true),
+            false,
+            unread,
+            NOW + 1,
+        )
+    })
     .expect("a dry run");
     assert!(line.starts_with("unnumbered Test  class=auto"), "{line}");
     assert_eq!(notes, [Note::NameDryRun]);
     assert_eq!(tree(root.path()), before, "nothing written");
-    let (json, notes) = undo(
-        root.path(),
-        Some(&vault(root.path())),
-        &ask(false, seen.as_ref()),
-        true,
-        unread,
-        NOW + 1,
-    )
-    .expect("the control: the undo itself");
+    let (undone, asked) = with_door(Written::Unbound, || {
+        with_history(Ok(read.clone()), || {
+            undo(
+                root.path(),
+                Some(&vault(root.path())),
+                &ask(false),
+                true,
+                unread,
+                NOW + 1,
+            )
+        })
+    });
+    let (json, notes) = undone.expect("the control: the undo itself");
     assert!(notes.is_empty(), "{notes:?}");
     assert_ne!(tree(root.path()), before, "the control: the undo writes");
+    assert_eq!(asked, [["nickname=Test", "by=person"]]);
     let json: aterm_json::Value = aterm_json::from_str(&json).expect("JSON");
     assert_eq!(json["title"].as_str(), Some("unnumbered Test"));
     assert_eq!(
@@ -857,73 +921,90 @@ fn name_undo_dry_run_changes_nothing() {
             .as_str(),
         "Test"
     );
-    let seen = newest();
-    let refused = undo(
-        root.path(),
-        Some(&vault(root.path())),
-        &ask(true, seen.as_ref()),
-        false,
-        unread,
-        NOW + 2,
-    )
-    .expect_err("an undo is not undone");
-    assert_eq!(
-        crate::machine_name::Refused::of(&refused).map(|refused| &refused.cause),
-        Some(&crate::machine_name::Cause::Undone),
-        "{refused}"
-    );
 
-    let (json, narrowed) = history(root.path(), true, unread, NOW + 2).expect("History");
-    assert_eq!(narrowed, None);
-    let json: aterm_json::Value = aterm_json::from_str(&json).expect("JSON");
-    let changes = json.as_array().expect("an array");
-    let column = |key: &str| {
-        changes
-            .iter()
-            .map(|change| change[key].as_str().map(str::to_owned))
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(
-        column("why"),
-        ["undone", "nickname", "nickname", "first"].map(|why| Some(why.to_owned()))
-    );
-    assert_eq!(
-        column("nick_to")[..3],
-        ["Test", "Other", "Test"].map(|nick| Some(nick.to_owned()))
-    );
-    assert_eq!(
-        changes
-            .iter()
-            .map(|change| change["undone"].as_bool())
-            .collect::<Vec<_>>(),
-        [Some(false), Some(true), Some(false), Some(false)]
-    );
-    assert!(changes[3]["by"].is_null(), "the first name, by no one");
-    assert_eq!(changes[0]["by"]["kind"].as_str(), Some("person"));
-    let (text, _) = history(root.path(), false, unread, NOW + 2).expect("History");
-    assert_eq!(text.lines().count(), 4, "{text}");
-    assert!(
-        text.lines()
-            .nth(1)
-            .is_some_and(|line| line.ends_with("  (undone)")),
-        "{text}"
-    );
-    let kept = file::read(root.path())
-        .expect("reads")
-        .expect("a name")
-        .history;
+    let undone = row_history(vec![
+        nick_write(3, "Other", "Test"),
+        nick_write(2, "Test", "Other"),
+    ]);
+    let redo = undo_of(&undone).expect("the undo is a rename");
+    let (line, _) = with_history(Ok(undone), || {
+        undo(
+            root.path(),
+            Some(&vault(root.path())),
+            &UndoAsk {
+                kind: ByKind::Person,
+                dry_run: true,
+                seen: &redo,
+            },
+            false,
+            unread,
+            NOW + 2,
+        )
+    })
+    .expect("an undo of the undo");
+    assert!(line.starts_with("unnumbered Other  "), "{line}");
+}
+
+/// `aterm name history` prints History's lines byte for byte ([`History::lines`], every write)
+/// and `--json` its object ([`History::json`]), and makes no name: a state with no
+/// `machine-name.toml` holds none after it. On scratch state, with no row this Mac's, it says
+/// [`NO_ROW`] in one line and an object with no row.
+/// NEGATIVE CONTROL: with `unix::history` reading the name first (`ensure_in_view`, as `aterm
+/// name` does), the scratch state holds a `machine-name.toml` after it.
+///
+/// [`History::lines`]: crate::machine_name::history::History::lines
+/// [`History::json`]: crate::machine_name::history::History::json
+/// [`NO_ROW`]: crate::machine_name::history::NO_ROW
+#[test]
+fn history_prints_the_rows_writes_and_makes_no_name() {
+    use super::unix::history;
+    use crate::machine_name::history::{NO_ROW, with_history};
+    let root = state(0o700);
+    let read_by = || std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let before = tree(root.path());
+    let read = row_history(vec![
+        nick_write(3, "Other", "Test"),
+        nick_write(2, "Test", "Other"),
+    ]);
+    let text =
+        with_history(Ok(read.clone()), || history(root.path(), false, read_by())).expect("History");
     assert_eq!(
         text,
-        kept.iter()
-            .map(|change| change.line() + "\n")
+        read.lines(None)
+            .into_iter()
+            .map(|line| line + "\n")
             .collect::<String>(),
         "History's lines, byte for byte"
     );
-    for change in &kept {
-        let mut flipped = change.clone();
-        flipped.undone = !change.undone;
-        assert_ne!(flipped.line(), change.line(), "{change:?}");
-    }
+    assert_eq!(text.lines().count(), 2, "{text}");
+    assert!(
+        text.contains("  m8  explicit  nickname Other -> Test"),
+        "{text}"
+    );
+    let json =
+        with_history(Ok(read.clone()), || history(root.path(), true, read_by())).expect("History");
+    assert_eq!(
+        aterm_json::from_str::<aterm_json::Value>(&json).expect("JSON"),
+        read.json()
+    );
+    assert_eq!(
+        with_history(Err("busy".to_owned()), || history(
+            root.path(),
+            false,
+            read_by()
+        )),
+        Err("busy".to_owned())
+    );
+    assert_eq!(
+        history(root.path(), false, read_by()),
+        Ok(format!("{NO_ROW}\n"))
+    );
+    let json: aterm_json::Value =
+        aterm_json::from_str(&history(root.path(), true, read_by()).expect("History"))
+            .expect("JSON");
+    assert!(json["row"].is_null(), "{json}");
+    assert_eq!(json["writes"], aterm_json::json!([]));
+    assert_eq!(tree(root.path()), before, "History makes no name");
 }
 
 /// `aterm name set`'s refusal of a number older builds hold names the next free numbers above

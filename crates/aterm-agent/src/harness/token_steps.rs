@@ -11,7 +11,7 @@
 //! the step is held with no clock. Nothing tries it again until something changes
 //! ([`Stopped::holds`]): for a check (a block page, Cloudflare's bot check, a human check)
 //! nothing but a person's act, as only a person lifts one: a person at a terminal of their own on
-//! this Mac (their `aterm harness accounts token <label>`, or the token step after their own
+//! this Mac (their `aterm harness accounts token <account>`, or the token step after their own
 //! sign-in in aterm's window, where they may complete a check and aterm presses nothing on one)
 //! runs the step whatever the record says, and the token made then clears it; no token another
 //! Mac made, no new build, file or time lets aterm back onto the page by itself, and no sign-in

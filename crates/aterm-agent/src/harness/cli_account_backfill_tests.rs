@@ -21,12 +21,15 @@ const SPAN: i64 = 30 * D;
 /// A word no booked row, printed line or JSON value may hold: the wall rows carry it in every
 /// field a transcript row has text in.
 const SENTINEL: &str = "sentinel_6e2b";
-/// The account the default home's profile is signed in as, and its address.
+/// The account the default home's profile is signed in as, and its address, which the home's
+/// roster row `work` holds too and `accounts history` names it by. The address holds no
+/// sentinel: the history heads the account's block with its name, its provider word and
+/// address.
 const UUID: &str = "3c9a1e57-8b2d-4f60-a1c4-7e5d2b0f9a13";
-const ADDRESS: &str = "work.sentinel_6e2b@example.test";
-/// Another account, and its address.
+const ADDRESS: &str = "work@x.example";
+/// Another account, and its address, which no history prints.
 const OTHER_UUID: &str = "b4e2d8c1-6a3f-4e95-8d07-1c2b3a4f5e6d";
-const OTHER: &str = "other.sentinel_6e2b@example.test";
+const OTHER: &str = "other.sentinel_6e2b@x.example";
 
 /// UTC: the zone the tests read local days in.
 fn utc(_: i64) -> i64 {
@@ -64,18 +67,33 @@ fn home_env(tmp: &Tmp) -> Env {
     env
 }
 
-/// A roster on `env` of `work`, the default home's login, and the rows `others` (each with its
-/// own login), every one with a record (`work`'s keyed to another account at `keyed_at`, where
-/// that is given); the state's machine id.
+/// A roster on `env` of `work` ([`ADDRESS`]), the default home's login, and the rows `others`
+/// (each with its own login and the address `<label>@x.example`), every one with a record
+/// (`work`'s keyed to another account at `keyed_at`, where that is given); the state's machine
+/// id.
 fn roster(tmp: &Tmp, env: &Env, others: &[&str], keyed_at: Option<i64>) -> String {
-    let mut text = accounts::append_row("", "work", Class::Preferred, None).expect("work admits");
+    let mut rows = vec![accounts::Row {
+        label: "work".to_owned(),
+        class: Class::Preferred,
+        email: Some(ADDRESS.to_owned()),
+        ..Default::default()
+    }];
     for label in others {
         let dir = tmp.path().join("logins").join(label);
         login_made_in(&dir);
-        text = accounts::append_row(&text, label, Class::Preferred, dir.to_str())
-            .expect("the row admits");
+        rows.push(accounts::Row {
+            label: (*label).to_owned(),
+            class: Class::Preferred,
+            dir: dir.to_str().map(str::to_owned),
+            email: Some(format!("{label}@x.example")),
+            ..Default::default()
+        });
     }
-    std::fs::write(env.accounts_roster().expect("a config dir"), text).expect("write");
+    std::fs::write(
+        env.accounts_roster().expect("a config dir"),
+        accounts::append_rows_for(Cli::Claude, "", &rows).expect("the rows admit"),
+    )
+    .expect("write");
     let mut note = None;
     env.accounts_store()
         .transact(env.now, &mut note, |state| {
@@ -324,7 +342,7 @@ fn the_backfill_books_a_one_login_homes_walls_the_series_holds_no_word_of() {
         ],
         friday - 2 * H,
     );
-    let doc = history_json(&env, "work");
+    let doc = history_json(&env, ADDRESS);
     assert_eq!(
         closes(&doc),
         [
@@ -338,7 +356,7 @@ fn the_backfill_books_a_one_login_homes_walls_the_series_holds_no_word_of() {
     assert_eq!(doc["backfill"]["complete"], Value::from(true));
     assert_eq!(doc["backfill"]["cut"], Value::Null);
     assert_eq!(doc["backfill"]["why"], Value::Null);
-    let text = history(&env, Some("work"), (false, false));
+    let text = history(&env, Some(ADDRESS), (false, false));
     assert_eq!(
         day_lines(&text),
         [
@@ -390,7 +408,7 @@ fn a_days_row_beside_its_readings_keeps_the_walls_before_them() {
         &[five_wall(start + 2 * H)],
         start + 2 * H,
     );
-    let doc = history_json(&env, "work");
+    let doc = history_json(&env, ADDRESS);
     assert_eq!(
         closes(&doc),
         [(accounts::SESSION_LIMIT.to_owned(), start + 3 * H, 1)],
@@ -446,13 +464,13 @@ fn a_day_the_series_holds_by_its_row_alone_takes_no_window_of_it() {
         ],
         start - H,
     );
-    let doc = history_json(&env, "work");
+    let doc = history_json(&env, ADDRESS);
     assert_eq!(
         closes(&doc),
         [(accounts::SESSION_LIMIT.to_owned(), tuesday + H, 1)],
         "{doc}"
     );
-    let text = history(&env, Some("work"), (false, false));
+    let text = history(&env, Some(ADDRESS), (false, false));
     assert_eq!(
         day_lines(&text),
         [
@@ -543,12 +561,12 @@ fn the_backfill_books_nothing_under_several_logins() {
         &[wall_row(tuesday - H, accounts::SESSION_LIMIT, tuesday)],
         tuesday - H,
     );
-    let doc = history_json(&env, "work");
+    let doc = history_json(&env, ADDRESS);
     assert_eq!(doc["backfill"]["booked"], Value::from(0u64), "{doc}");
     assert_eq!(doc["backfill"]["why"], Value::from("several-logins"));
     assert_eq!(doc["backfill"]["complete"], Value::Null, "{doc}");
     assert!(closes(&doc).is_empty());
-    let play = history_json(&env, "play");
+    let play = history_json(&env, "play@x.example");
     assert_eq!(play["backfill"]["why"], Value::from("not-the-home"));
     assert_eq!(play["backfill"]["complete"], Value::Null, "{play}");
     let text = history(&env, None, (false, false));
@@ -586,7 +604,7 @@ fn the_backfill_stops_where_another_account_was_seen() {
         ],
         wednesday - H,
     );
-    assert_eq!(resets(&history_json(&env, "work")), [monday, wednesday]);
+    assert_eq!(resets(&history_json(&env, ADDRESS)), [monday, wednesday]);
     let login = start - 2 * D + 12 * H;
     transcript(
         &env,
@@ -594,9 +612,9 @@ fn the_backfill_stops_where_another_account_was_seen() {
         &[answer_row(login - H), login_row(login)],
         login,
     );
-    assert_eq!(resets(&history_json(&env, "work")), [wednesday]);
+    assert_eq!(resets(&history_json(&env, ADDRESS)), [wednesday]);
     sign_in(&env, UUID, Some(ADDRESS), Some(start - D + 12 * H));
-    assert_eq!(resets(&history_json(&env, "work")), Vec::<i64>::new());
+    assert_eq!(resets(&history_json(&env, ADDRESS)), Vec::<i64>::new());
 }
 
 /// NOTHING IS BOOKED FROM BEFORE THE SERIES SAW THE HOME CHANGE HANDS. `work` held account A,
@@ -637,7 +655,7 @@ fn the_backfill_stops_where_the_series_saw_the_home_change_hands() {
         &[five_wall(saturday), five_wall(tuesday), five_wall(friday)],
         friday,
     );
-    assert_eq!(resets(&history_json(&env, "work")), [friday + H]);
+    assert_eq!(resets(&history_json(&env, ADDRESS)), [friday + H]);
 }
 
 /// NOTHING IS BOOKED FROM BEFORE ANOTHER LOGIN'S CONVERSATION ENDED. The profile names
@@ -646,8 +664,10 @@ fn the_backfill_stops_where_the_series_saw_the_home_change_hands() {
 /// at first run writes none): of its walls at 09:00 and 13:00 only the second is booked. A
 /// conversation on Tuesday that named the other address from 10:00 to its end at 11:00 then
 /// stops every wall before 11:00, and one at 15:00 of a conversation of the home's address is
-/// booked alone. Neither address is printed. Negative control: a fold that reads no
-/// `session_context` books Monday's 09:00 wall, and the first assertion fails.
+/// booked alone. The other address is never printed, and the home's only as its account's name,
+/// heading its block (`name` in the JSON), never in a day, backfill, ledger or stored row line.
+/// Negative control: a fold that reads no `session_context` books Monday's 09:00 wall, and the
+/// first assertion fails.
 #[test]
 fn the_backfill_stops_where_another_login_held_a_conversation() {
     let tmp = tmp_dir("backfill-context");
@@ -668,7 +688,7 @@ fn the_backfill_stops_where_another_login_held_a_conversation() {
         ],
         monday + 13 * H,
     );
-    assert_eq!(resets(&history_json(&env, "work")), [monday + 14 * H]);
+    assert_eq!(resets(&history_json(&env, ADDRESS)), [monday + 14 * H]);
     transcript(
         &env,
         "-proj/tuesday-other.jsonl",
@@ -687,15 +707,26 @@ fn the_backfill_stops_where_another_login_held_a_conversation() {
         ],
         tuesday + 15 * H,
     );
-    assert_eq!(resets(&history_json(&env, "work")), [tuesday + 16 * H]);
-    for printed in [
-        history(&env, Some("work"), (false, true)),
-        history(&env, None, (true, true)),
-    ] {
+    assert_eq!(resets(&history_json(&env, ADDRESS)), [tuesday + 16 * H]);
+    let text = history(&env, Some(ADDRESS), (false, true));
+    let json = history(&env, None, (true, true));
+    for printed in [&text, &json] {
+        assert!(!printed.contains(OTHER), "{printed}");
+    }
+    let header = format!("claude {ADDRESS} \u{b7} claude \u{b7} this Mac \u{b7} ");
+    assert!(text.lines().any(|l| l.starts_with(&header)), "{text}");
+    for line in text.lines().filter(|l| l.contains(ADDRESS)) {
         assert!(
-            !printed.contains(OTHER) && !printed.contains(ADDRESS),
-            "{printed}"
+            line.starts_with(&header),
+            "an address outside its header: {line}"
         );
+    }
+    let doc: Value = aterm_json::from_str(json.trim()).expect("JSON");
+    for account in doc["accounts"].as_array().expect("accounts") {
+        let mut rest = account.as_object().expect("an account").clone();
+        rest.remove("name");
+        let rest = Value::Object(rest).to_string();
+        assert!(!rest.contains(ADDRESS), "an address outside `name`: {rest}");
     }
 }
 
@@ -715,9 +746,9 @@ fn the_backfill_reads_nothing_it_cannot_attribute() {
     seeded_series(&env, &machine);
     let (start, _, _) = series_start(&env);
     transcript(&env, "-proj/s.jsonl", &[five_wall(start - D)], start - D);
-    assert_eq!(resets(&history_json(&env, "work")), [start - D + H]);
+    assert_eq!(resets(&history_json(&env, ADDRESS)), [start - D + H]);
     let refused = |env: &Env, why: &str| {
-        let doc = history_json(env, "work");
+        let doc = history_json(env, ADDRESS);
         assert_eq!(doc["backfill"]["why"], Value::from(why), "{doc}");
         assert_eq!(doc["backfill"]["booked"], Value::from(0u64), "{doc}");
         assert_eq!(doc["backfill"]["complete"], Value::Null, "{doc}");
@@ -821,11 +852,11 @@ fn a_walk_cut_at_its_bounds_books_nothing_and_says_so() {
     let deep = (0..crate::harness::spend::MAX_DEPTH)
         .fold(projects(&env), |dir, depth| dir.join(format!("d{depth}")));
     std::fs::create_dir_all(&deep).expect("mkdir");
-    let doc = history_json(&env, "work");
+    let doc = history_json(&env, ADDRESS);
     assert!(closes(&doc).is_empty(), "{doc}");
     assert_eq!(doc["backfill"]["cut"], Value::from("walk"), "{doc}");
     assert_eq!(doc["backfill"]["complete"], Value::from(false), "{doc}");
-    let text = history(&env, Some("work"), (false, false));
+    let text = history(&env, Some(ADDRESS), (false, false));
     assert!(
         text.lines()
             .nth(1)
@@ -863,13 +894,13 @@ fn the_backfill_keeps_no_transcript_text() {
     let read = account_backfill::read(&projects(&env), ADDRESS, 0, &Limits::none(), env.now);
     assert_eq!(read.walls.len(), 1, "{read:?}");
     assert!(!format!("{read:?}").contains(SENTINEL), "{read:?}");
-    let doc = history_json(&env, "work");
+    let doc = history_json(&env, ADDRESS);
     assert_eq!(doc["backfill"]["booked"], Value::from(1u64), "{doc}");
     for printed in [
-        history(&env, Some("work"), (false, false)),
-        history(&env, Some("work"), (true, false)),
-        history(&env, Some("work"), (false, true)),
-        history(&env, Some("work"), (true, true)),
+        history(&env, Some(ADDRESS), (false, false)),
+        history(&env, Some(ADDRESS), (true, false)),
+        history(&env, Some(ADDRESS), (false, true)),
+        history(&env, Some(ADDRESS), (true, true)),
         history(&env, None, (true, true)),
     ] {
         assert!(
@@ -935,12 +966,12 @@ fn the_backfill_writes_nothing() {
     };
     let before = kept();
     assert_eq!(
-        closes(&history_json(&env, "work")),
+        closes(&history_json(&env, ADDRESS)),
         [(accounts::SESSION_LIMIT.to_owned(), tuesday, 2)],
         "a subagent's wall counts in its window"
     );
     let was = listing(tmp.path());
-    for name in [Some("work"), None] {
+    for name in [Some(ADDRESS), None] {
         for flags in [(false, false), (true, false), (false, true), (true, true)] {
             let _ = history(&env, name, flags);
         }

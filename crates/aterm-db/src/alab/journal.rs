@@ -20,15 +20,19 @@
 //!   [`place::Holding`]s), written as `place` rows; and the reader of every Mac's live rows.
 //! - [`upd`]: this Mac's one update record (`aterm_update_core::update_record`), written as its
 //!   `upd` row; and the reader of every Mac's live rows.
+//! - [`mine`]: this Mac's own `login` rows (the harness's [`mine::Login`]s) and `usage` rows (the
+//!   book's readings), the value-free guard every one passes, and what in them is urgent.
 //!
 //! The ring's collections are compiled ATT/1 schemas ([`EV`], [`USE`], [`SUM`], [`RELAY`],
 //! [`PLACE`], [`UPD`], [`LOGIN`], [`USAGE`]); every row lives at its writer's own Commons machine
 //! uuid and is inert at any other key (`typed::owned`). `LOGIN` and `USAGE` are the rows of the
 //! shared files `ai/logins` and `ai/usage`, and `EV` the entries of `ai/events`
 //! (`crate::file::types`); an older build reads none of the two new collections and still reads
-//! every other row of a record that carries them.
+//! every other row of a record that carries them. The flusher writes the `login` and `usage`
+//! rows beside the `use` and `place` rows, which it keeps writing.
 
 pub mod event;
+pub mod mine;
 pub mod place;
 pub mod seen;
 pub mod spool;
@@ -214,16 +218,8 @@ crate::att_collection!(
     }
 );
 
-/// The CLI words a `login` row names (`Event::cli`'s words).
-pub const CLIS: &[&str] = &[
-    "claude",
-    "codex",
-    "grok",
-    "kimi",
-    "agy",
-    "muse",
-    "codex-alab",
-];
+/// The CLI words a `login` row names (`Event::cli`'s words, [`mine::Cli`]).
+pub const CLIS: &[&str] = &mine::Cli::WORDS;
 
 /// The reading-source words a `usage` row names: [`Source`]'s words a reading carries.
 pub const READING_SOURCES: &[&str] = &[
@@ -253,50 +249,23 @@ crate::att_collection!(
             Column::new("n", Ty::Uint).writer(Writer::Mine),
             Column::new("account", Ty::Ref("account")).writer(Writer::Mine),
             Column::new("cli", Ty::Enum(CLIS)).writer(Writer::Mine),
-            Column::new("place", Ty::Enum(&["default", "managed"])).writer(Writer::Mine),
-            Column::new(
-                "state",
-                Ty::Enum(&[
-                    "signed-in",
-                    "signed-out",
-                    "ended",
-                    "wrong-account",
-                    "key-only",
-                    "routed",
-                ]),
-            )
-            .writer(Writer::Mine),
-            Column::new("proof", Ty::Enum(&["status", "page", "file", "unchecked"]))
-                .writer(Writer::Mine),
-            Column::new(
-                "src",
-                Ty::Enum(&["profile", "auth-file", "cli-log", "vault-token"]),
-            )
-            .writer(Writer::Mine),
-            Column::new("use", Ty::Enum(&["running", "idle"])).writer(Writer::Mine),
+            Column::new("place", Ty::Enum(&mine::Place::WORDS)).writer(Writer::Mine),
+            Column::new("state", Ty::Enum(&mine::State::WORDS)).writer(Writer::Mine),
+            Column::new("proof", Ty::Enum(&mine::Proof::WORDS)).writer(Writer::Mine),
+            Column::new("src", Ty::Enum(&mine::Src::WORDS)).writer(Writer::Mine),
+            Column::new("use", Ty::Enum(&mine::Use::WORDS)).writer(Writer::Mine),
             Column::new("tabs", Ty::Uint).writer(Writer::Mine),
-            Column::new(
-                "held",
-                Ty::Enum(&["linked", "fill", "borrow", "stranded", "probation"]),
-            )
-            .writer(Writer::Mine),
+            Column::new("held", Ty::Enum(&mine::Held::WORDS)).writer(Writer::Mine),
             Column::new("since", Ty::Time).writer(Writer::Mine),
             Column::new("at", Ty::Time).writer(Writer::Mine),
             Column::new("served_at", Ty::Time).null().writer(Writer::Mine),
             Column::new("ends_by", Ty::Time).null().writer(Writer::Mine),
             Column::new("ended_at", Ty::Time).null().writer(Writer::Mine),
-            Column::new(
-                "attempt",
-                Ty::Enum(&["none", "signed-in", "failed", "blocked", "no-route"]),
-            )
-            .writer(Writer::Mine),
+            Column::new("attempt", Ty::Enum(&mine::Attempt::WORDS)).writer(Writer::Mine),
             Column::new("attempt_at", Ty::Time).null().writer(Writer::Mine),
-            Column::new(
-                "attempt_route",
-                Ty::Enum(&["vault", "device", "browser", "window", "mail-code"]),
-            )
-            .null()
-            .writer(Writer::Mine),
+            Column::new("attempt_route", Ty::Enum(&mine::Route::WORDS))
+                .null()
+                .writer(Writer::Mine),
             Column::new("plan", Ty::Text(16)).null().writer(Writer::Mine),
         ],
         unique: &[],
@@ -329,11 +298,7 @@ crate::att_collection!(
             Column::new("w5h_reset", Ty::Time).null().writer(Writer::Mine),
             Column::new("w7d_reset", Ty::Time).null().writer(Writer::Mine),
             Column::new("w7dm_reset", Ty::Time).null().writer(Writer::Mine),
-            Column::new(
-                "wall",
-                Ty::Enum(&["none", "5h", "7d", "7d-model", "credits", "auth"]),
-            )
-            .writer(Writer::Mine),
+            Column::new("wall", Ty::Enum(&mine::Wall::WORDS)).writer(Writer::Mine),
             Column::new("wall_until", Ty::Time).null().writer(Writer::Mine),
             Column::new(
                 "credits",

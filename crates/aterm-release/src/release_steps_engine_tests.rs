@@ -164,6 +164,7 @@ impl World {
         std::fs::create_dir(&bin).unwrap();
         std::os::unix::fs::symlink("/usr/bin/false", bin.join("targo")).unwrap();
         let prover = Prover {
+            compiler: None,
             bin,
             commit: "test".into(),
             source: "test".into(),

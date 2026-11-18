@@ -202,6 +202,9 @@ fn found(service: Service, replaced: Option<&str>) -> Found {
         },
         p,
         node: Some("n-0123456789abcdef".to_string()),
+        job_program: Lasting::Stays,
+        command: Vec::new(),
+        command_program: Lasting::Stays,
         job: (service != Service::None).then_some(4242),
         loaded: Ok(service != Service::None),
         disabled: false,
@@ -543,7 +546,7 @@ fn a_broker_is_renewed_only_where_the_fabric_is_on_and_it_runs_a_replaced_build(
                 looks.set(looks.get() + 1);
                 Ok(rooted(at, &dir.path().join("root")))
             },
-            |_: &Found| {
+            |_: &Found, _: Steps| {
                 steps.set(steps.get() + 1);
                 Ok("broker done (re)started launchd".to_string())
             },
@@ -573,7 +576,7 @@ fn a_broker_is_renewed_only_where_the_fabric_is_on_and_it_runs_a_replaced_build(
         Renew::Look,
         found(Service::Launchd, Some("/old/aterm")),
     );
-    assert!(matches!(due, Ok(BrokerRenewal::Due(_))), "{due:?}");
+    assert!(matches!(due, Ok(BrokerRenewal::Due { .. })), "{due:?}");
     assert_eq!(steps.get(), 0, "a look runs no step");
 
     let renewed = renew(
@@ -638,7 +641,7 @@ fn a_broker_that_does_not_answer_is_due_where_the_job_on_installed_serves_none()
             Some(words("aterm link serve --broker /nonexistent/bus.sock")),
             renew,
             |_: &[String]| Ok(rooted(at, &root)),
-            |_: &Found| {
+            |_: &Found, _: Steps| {
                 steps.set(steps.get() + 1);
                 Ok("broker done loaded launchd".to_string())
             },
@@ -675,7 +678,7 @@ fn a_broker_that_does_not_answer_is_due_where_the_job_on_installed_serves_none()
         let case = format!("{service:?} loaded={loaded} job={job:?} pid={pid:?}");
         let look = renew(Renew::Look, silent(service, loaded, job, pid));
         assert!(
-            matches!(&look, Ok(BrokerRenewal::Due(why))
+            matches!(&look, Ok(BrokerRenewal::Due { from: why, .. })
                 if why.starts_with(&format!("no broker answers on {sock} (connect: "))
                     && why.contains(says)),
             "{case}: {look:?}"
@@ -797,7 +800,7 @@ fn a_broker_renewal_steps_only_under_the_switch_off_and_on_hold() {
         command(),
         Renew::Apply,
         |_: &[String]| Ok(replaced(&root)),
-        |_: &Found| panic!("no step while an off holds the switch"),
+        |_: &Found, _: Steps| panic!("no step while an off holds the switch"),
     );
     assert!(
         matches!(&kept, Ok(BrokerRenewal::Kept(why)) if why.contains("runs now")),
@@ -807,16 +810,16 @@ fn a_broker_renewal_steps_only_under_the_switch_off_and_on_hold() {
         command(),
         Renew::Look,
         |_: &[String]| Ok(replaced(&root)),
-        |_: &Found| panic!("a look runs no step"),
+        |_: &Found, _: Steps| panic!("a look runs no step"),
     );
-    assert!(matches!(due, Ok(BrokerRenewal::Due(_))), "{due:?}");
+    assert!(matches!(due, Ok(BrokerRenewal::Due { .. })), "{due:?}");
     drop(off);
 
     let renewed = renew_with(
         command(),
         Renew::Apply,
         |_: &[String]| Ok(replaced(&root)),
-        |at: &Found| {
+        |at: &Found, _: Steps| {
             let off = switch_lock(&at.p.root, Duration::ZERO);
             assert!(
                 matches!(&off, Err(e) if e.kind() == io::ErrorKind::WouldBlock),
@@ -843,7 +846,7 @@ fn a_broker_renewal_steps_only_under_the_switch_off_and_on_hold() {
         command(),
         Renew::Apply,
         |_: &[String]| Ok(replaced(&file)),
-        |_: &Found| Ok("broker done (re)started launchd".to_string()),
+        |_: &Found, _: Steps| Ok("broker done (re)started launchd".to_string()),
     );
     assert!(
         matches!(&unlocked, Ok(BrokerRenewal::Renewed(said))
@@ -855,7 +858,7 @@ fn a_broker_renewal_steps_only_under_the_switch_off_and_on_hold() {
         command(),
         Renew::Apply,
         |_: &[String]| Ok(replaced(&gone)),
-        |_: &Found| Ok("broker done (re)started launchd".to_string()),
+        |_: &Found, _: Steps| Ok("broker done (re)started launchd".to_string()),
     );
     assert!(
         matches!(&unlocked, Ok(BrokerRenewal::Renewed(said)) if said.contains("(without ")),
@@ -950,7 +953,7 @@ fn a_broker_the_person_keeps_with_service_none_is_never_renewed() {
             Some(words("aterm link serve")),
             renew,
             |_: &[String]| Ok(rooted(absent(Service::Launchd), &p.root)),
-            |_: &Found| panic!("no step for a broker the person keeps"),
+            |_: &Found, _: Steps| panic!("no step for a broker the person keeps"),
         )
     };
     for how in [Renew::Look, Renew::Apply] {
@@ -972,9 +975,1385 @@ fn a_broker_the_person_keeps_with_service_none_is_never_renewed() {
         Some(words("aterm link serve")),
         Renew::Look,
         |_: &[String]| Ok(rooted(absent(Service::Launchd), &p.root)),
-        |_: &Found| panic!("a look runs no step"),
+        |_: &Found, _: Steps| panic!("a look runs no step"),
     );
-    assert!(matches!(due, Ok(BrokerRenewal::Due(_))), "{due:?}");
+    assert!(matches!(due, Ok(BrokerRenewal::Due { .. })), "{due:?}");
+}
+
+/// A program aterm wrote moves to the installed app only where it names no regular file: gone,
+/// a dangling link, a path under a file, a directory. One that names a regular file stays,
+/// whatever file it is: the installed app, a link to it, another build, a link to that. With no
+/// installed app known (or one that names no regular file) a program that names none is
+/// nowhere. A relative path, and one that cannot be read (a link loop), stay.
+/// NEGATIVE CONTROLS: a judge that moves a present file other than the app (the rule before
+/// this) moves `other` onto it, which downgrades a newer broker, flips the job between two
+/// copies on alternating passes and undoes a fabric pointed at a dev build; the read before
+/// that kept whatever program the job named, a gone one included, and so leaves the job on a
+/// file that no longer starts.
+#[test]
+fn a_program_aterm_wrote_moves_only_where_it_names_no_file() {
+    let scratch = crate::test_scratch_dir("en");
+    let dir = scratch.path();
+    let app = dir.join("installed-aterm");
+    std::fs::write(&app, b"the installed app").expect("an app");
+    let other = dir.join("other-aterm");
+    std::fs::write(&other, b"another build").expect("another build");
+    let via = dir.join("linked-aterm");
+    std::os::unix::fs::symlink(&app, &via).expect("a link to the app");
+    let via_other = dir.join("linked-other-aterm");
+    std::os::unix::fs::symlink(&other, &via_other).expect("a link to another build");
+    let dangling = dir.join("dangling-aterm");
+    std::os::unix::fs::symlink(dir.join("removed"), &dangling).expect("a dangling link");
+    let looped = dir.join("loop-a");
+    std::os::unix::fs::symlink(dir.join("loop-b"), &looped).expect("a loop");
+    std::os::unix::fs::symlink(&looped, dir.join("loop-b")).expect("a loop");
+    let gone = dir.join("removed/aterm");
+    let under_a_file = other.join("aterm");
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+    let installed = Some(app.as_path());
+    let moved = |from: &Path| {
+        Lasting::Moves(Moved {
+            from: s(from),
+            to: s(&app),
+        })
+    };
+    for present in [&app, &via, &other, &via_other] {
+        assert_eq!(
+            lasting(&s(present), installed),
+            Lasting::Stays,
+            "{} names a file",
+            present.display()
+        );
+    }
+    for named in [&gone, &dangling, &under_a_file, &dir.to_path_buf()] {
+        assert_eq!(
+            lasting(&s(named), installed),
+            moved(named),
+            "{}",
+            named.display()
+        );
+    }
+    assert_eq!(lasting(&s(&looped), installed), Lasting::Stays, "unread");
+    assert_eq!(lasting("aterm", installed), Lasting::Stays, "relative");
+    assert_eq!(lasting(&s(&other), None), Lasting::Stays, "no app known");
+    assert_eq!(lasting(&s(&gone), None), Lasting::Nowhere(s(&gone)));
+    for no_app in [dir.join("no-app"), dir.to_path_buf()] {
+        assert_eq!(
+            lasting(&s(&gone), Some(&no_app)),
+            Lasting::Nowhere(s(&gone)),
+            "an installed app that names no regular file: {}",
+            no_app.display()
+        );
+    }
+}
+
+/// The job's program judged as `look_at` judges it: one that is gone, with the installed app
+/// known, puts that app in `p`, so the broker step's plist and arguments name it and the step
+/// reloads the job from them (its arguments changed: never a kickstart in place, which would
+/// start the gone program again); an app path that is not a plain word runs through `on`'s
+/// program link in the root, which the program step points at the app. With no installed app
+/// known the gone program stays in `p` (the renewal then leaves the job serving), and a program
+/// that names another build than the app stays there too.
+/// NEGATIVE CONTROL: the read before this kept the job's own program in `p`, so the plist the
+/// step writes names the gone file and reads current against the one on disk: no rewrite.
+#[test]
+fn a_job_whose_program_moves_is_rewritten_onto_the_installed_app() {
+    let scratch = crate::test_scratch_dir("en");
+    let dir = scratch.path();
+    let spaced = dir.join("a b");
+    std::fs::create_dir_all(&spaced).expect("scratch");
+    let gone = dir.join("removed/aterm").to_string_lossy().into_owned();
+    for app in [dir.join("aterm"), spaced.join("aterm")] {
+        std::fs::write(&app, b"#!/bin/sh\n").expect("an app");
+        let shown = app.to_string_lossy().into_owned();
+        let was = Paths {
+            aterm: gone.clone(),
+            ..scratch_paths(dir)
+        };
+        let old = was.plist_text();
+        let mut p = scratch_paths(dir);
+        assert_eq!(
+            job_lasting(&mut p, gone.clone(), Some(&app)),
+            Lasting::Moves(Moved {
+                from: gone.clone(),
+                to: shown.clone(),
+            })
+        );
+        assert_eq!(p.aterm, shown);
+        assert!(
+            launchd_rewrite(&was, Some(old.clone()), true, "").is_none(),
+            "the gone program's own plist reads current"
+        );
+        let text = launchd_rewrite(&p, Some(old), true, "")
+            .expect("rewritten, then reloaded")
+            .text;
+        let program = plist_arguments(&text).first().cloned();
+        if argv_safe(&shown).is_ok() {
+            assert_eq!(program.as_deref(), Some(shown.as_str()));
+        } else {
+            let link = p.program_link();
+            assert_eq!(program, Some(link.to_string_lossy().into_owned()));
+            aterm_uds::private_file::ensure_private_dir(&p.root).expect("the root");
+            let mut out = Out::kept();
+            assert!(program_step(&p, &mut out), "{}", out.said());
+            assert_eq!(std::fs::read_link(&link).expect("the program link"), app);
+        }
+    }
+    let mut p = scratch_paths(dir);
+    assert_eq!(
+        job_lasting(&mut p, gone.clone(), None),
+        Lasting::Nowhere(gone.clone())
+    );
+    assert_eq!(p.aterm, gone, "nothing to point it at");
+    let other = dir.join("other-aterm");
+    std::fs::write(&other, b"#!/bin/sh\n").expect("another build");
+    let other = other.to_string_lossy().into_owned();
+    let mut p = scratch_paths(dir);
+    assert_eq!(
+        job_lasting(&mut p, other.clone(), Some(&dir.join("aterm"))),
+        Lasting::Stays
+    );
+    assert_eq!(
+        p.aterm, other,
+        "a job on another build that starts keeps it"
+    );
+}
+
+/// `[fabric] command`'s program is judged only where aterm wrote the command: read from
+/// aterm.toml, and word for word what `on` writes for the root, fleet and node with that
+/// program (the `aterm-link` shim's form included); there a gone one moves to the installed
+/// app, and the command `on` writes with the app reads as staying, so the next pass leaves it.
+/// A person's command (one more word, another fleet, another node, another root's socket),
+/// one from `$ATERM_FABRIC_COMMAND`, and any of a root that holds no node id stay, gone program
+/// and all.
+/// NEGATIVE CONTROL: a judge that reads the program alone, with no `written_by_on`, rewrites a
+/// person's command, and drops the words they chose for `on`'s.
+#[test]
+fn a_persons_fabric_command_is_never_rewritten() {
+    let scratch = crate::test_scratch_dir("en");
+    let dir = scratch.path();
+    let app = dir.join("aterm");
+    std::fs::write(&app, b"#!/bin/sh\n").expect("an app");
+    let shown = app.to_string_lossy().into_owned();
+    let p = scratch_paths(dir);
+    let node = "n-0123456789abcdef";
+    let gone = dir.join("removed/aterm").to_string_lossy().into_owned();
+    let written = |aterm: &str| {
+        Paths {
+            aterm: aterm.to_string(),
+            ..p.clone()
+        }
+        .bridge_command(node)
+    };
+    let ours = written(&gone);
+    let judged = |command: &[String], in_file: bool, node: Option<&str>| {
+        command_lasting(&p, node, command, in_file, Some(&app))
+    };
+    assert_eq!(
+        judged(&ours, true, Some(node)),
+        Lasting::Moves(Moved {
+            from: gone.clone(),
+            to: shown.clone(),
+        })
+    );
+    let shim = written(&dir.join("removed/aterm-link").to_string_lossy());
+    assert!(!shim.contains(&"link".to_string()), "{shim:?}");
+    assert!(matches!(judged(&shim, true, Some(node)), Lasting::Moves(_)));
+    assert_eq!(
+        judged(&written(&shown), true, Some(node)),
+        Lasting::Stays,
+        "the rewritten command"
+    );
+
+    let mut more = ours.clone();
+    more.push("--verbose".to_string());
+    let mut fleet = ours.clone();
+    let at = fleet.iter().position(|w| w == "--fleet").expect("--fleet") + 1;
+    fleet[at] = "lab".to_string();
+    let mut other_node = ours.clone();
+    *other_node.last_mut().expect("--accept-from's node") = "n-fedcba9876543210".to_string();
+    let elsewhere = Paths {
+        root: dir.join("elsewhere"),
+        aterm: gone.clone(),
+        ..p.clone()
+    }
+    .bridge_command(node);
+    for persons in [more, fleet, other_node, elsewhere] {
+        assert_ne!(persons, ours);
+        assert_eq!(
+            judged(&persons, true, Some(node)),
+            Lasting::Stays,
+            "{persons:?}"
+        );
+    }
+    assert_eq!(judged(&ours, false, Some(node)), Lasting::Stays, "the env");
+    assert_eq!(judged(&ours, true, None), Lasting::Stays, "no node id");
+}
+
+/// A program aterm wrote that names no file is due though the broker answers on its build: a
+/// job's program that is gone (the broker still maps the file it started from, so it also reads
+/// replaced), and a `[fabric] command` aterm wrote; a look names each, the old path then the
+/// installed app's, and what the apply leaves, and an apply steps once. A job's program that is
+/// gone with no installed app known is left as it is, a look and an apply alike, with no step,
+/// its reason saying what was read: a broker that still serves is left serving, and one that
+/// does not answer is said not to; a command that is gone with none known reads left too, never
+/// current. A broker the person started by hand is still kept.
+/// NEGATIVE CONTROLS: the renewal before this read a broker that answers as current whatever
+/// its job named, so `sync.fabric` recorded ok while no new window's bridge could start;
+/// reading a gone program as replaced with no guard for nowhere to go restarts the job onto a
+/// program that no longer exists and stops the broker that serves (the step runs and panics);
+/// a reason that says the broker still serves where none answers misreports the socket.
+#[test]
+fn a_program_that_moves_is_due_and_one_with_nowhere_to_go_is_left_as_it_is() {
+    use std::cell::Cell;
+    let steps = Cell::new(0);
+    let dir = crate::test_scratch_dir("en");
+    let root = dir.path().join("root");
+    aterm_uds::private_file::ensure_private_dir(&root).expect("the root");
+    let app = "/Applications/aterm.app/Contents/MacOS/aterm";
+    let gone = "/nonexistent/removed/aterm";
+    let renew = |renew: Renew, at: Found| {
+        renew_with(
+            Some(words("aterm link serve")),
+            renew,
+            |_: &[String]| Ok(rooted(at, &root)),
+            |_: &Found, _: Steps| {
+                steps.set(steps.get() + 1);
+                Ok("broker done reloaded launchd".to_string())
+            },
+        )
+    };
+    let moves = |from: &str| {
+        Lasting::Moves(Moved {
+            from: from.to_string(),
+            to: app.to_string(),
+        })
+    };
+    let job_moved = |from: &str, replaced: Option<&str>| {
+        let mut at = found(Service::Launchd, replaced);
+        at.job_program = moves(from);
+        at.p.aterm = app.to_string();
+        at
+    };
+
+    let look = renew(Renew::Look, job_moved(gone, Some(gone)));
+    let Ok(BrokerRenewal::Due { from, to }) = &look else {
+        panic!("a gone job program is due: {look:?}");
+    };
+    assert_eq!(
+        from,
+        &format!(
+            "the broker (pid 4242) runs a replaced build ({gone} names no file now); the broker \
+             job runs {gone}, which names no file now (the installed app is {app})"
+        )
+    );
+    assert_eq!(to, &format!("the broker job runs {app}, the installed app"));
+    let applied = renew(Renew::Apply, job_moved(gone, Some(gone)));
+    assert!(
+        matches!(&applied, Ok(BrokerRenewal::Renewed(_))),
+        "{applied:?}"
+    );
+    assert_eq!(steps.get(), 1, "one step");
+
+    let mut both = job_moved(gone, Some(gone));
+    both.command_program = moves(gone);
+    let both = renew(Renew::Look, both);
+    assert!(
+        matches!(&both, Ok(BrokerRenewal::Due { to, .. })
+        if to == &format!(
+            "the broker job runs {app}, the installed app; `[fabric] command` runs {app}, \
+             the installed app"
+        )),
+        "{both:?}"
+    );
+    let mut command = found(Service::Launchd, None);
+    command.command_program = moves(gone);
+    let look = renew(Renew::Look, command);
+    assert!(
+        matches!(&look, Ok(BrokerRenewal::Due { from, to })
+            if from == &format!(
+                "`[fabric] command` runs {gone}, which names no file now (the installed app is \
+                 {app})"
+            ) && to == &format!("`[fabric] command` runs {app}, the installed app")),
+        "{look:?}"
+    );
+
+    let mut by_hand = job_moved(gone, Some(gone));
+    by_hand.job = Some(4343);
+    let by_hand = renew(Renew::Apply, by_hand);
+    assert!(
+        matches!(&by_hand, Ok(BrokerRenewal::Kept(why)) if why.contains("not the job")),
+        "{by_hand:?}"
+    );
+    assert_eq!(steps.get(), 1, "nothing stepped since");
+
+    let nowhere_to_go = |answers: Result<(), String>| {
+        let mut at = rooted(found(Service::Launchd, Some(gone)), &root);
+        at.job_program = Lasting::Nowhere(gone.to_string());
+        at.p.aterm = gone.to_string();
+        at.answers = answers;
+        at
+    };
+    for (answers, says) in [
+        (Ok(()), "start none, so it is left serving"),
+        (
+            Err("connect: Connection refused (os error 61)".to_string()),
+            "would start none, as its program names no file, so it is left as it is",
+        ),
+    ] {
+        for how in [Renew::Look, Renew::Apply] {
+            let kept = renew_with(
+                Some(words("aterm link serve")),
+                how,
+                |_: &[String]| Ok(nowhere_to_go(answers.clone())),
+                |_: &Found, _: Steps| panic!("no restart onto a program that is gone"),
+            );
+            assert!(
+                matches!(&kept, Ok(BrokerRenewal::Kept(why))
+                    if why.contains(&format!(
+                        "the broker job runs {gone}, which names no file now, and no installed"
+                    )) && why.contains(says)
+                        && (answers.is_ok() || !why.contains("serv"))),
+                "{how:?} {answers:?}: {kept:?}"
+            );
+        }
+    }
+
+    let mut nowhere = found(Service::Launchd, None);
+    nowhere.command_program = Lasting::Nowhere(gone.to_string());
+    let left = renew(Renew::Apply, nowhere);
+    assert!(
+        matches!(&left, Ok(BrokerRenewal::Kept(why))
+            if why.starts_with(&format!("`[fabric] command` runs {gone}, which names no file now"))),
+        "a command with nowhere to go is not current: {left:?}"
+    );
+    assert_eq!(steps.get(), 1, "nothing stepped since");
+}
+
+/// A `[fabric] command` aterm wrote whose program names no file is judged apart from the broker:
+/// whatever keeps the broker as it is (the hand record `on --service none` wrote, no job of
+/// `on`'s, a job launchd has disabled or cannot be asked about, a socket whose holder is
+/// unknown, a broker that is not the job's process), a look reads the command due, naming what
+/// keeps the broker beside what the apply leaves, and an apply steps the command alone.
+/// NEGATIVE CONTROL: a renewal that returns the broker's kept reason before it judges the
+/// command (as the one before this did) reads each of these Kept, so a command whose program is
+/// gone is never rewritten and no new window's bridge starts: the KI's symptom.
+#[test]
+fn a_command_aterm_wrote_is_rewritten_whatever_keeps_the_broker() {
+    let dir = crate::test_scratch_dir("en");
+    let root = dir.path().join("root");
+    aterm_uds::private_file::ensure_private_dir(&root).expect("the root");
+    let by_hand = dir.path().join("by-hand");
+    aterm_uds::private_file::ensure_private_dir(&by_hand).expect("a root the person runs");
+    aterm_uds::private_file::write_private(&by_hand, HAND_RECORD, b"").expect("by hand");
+    let app = "/Applications/aterm.app/Contents/MacOS/aterm";
+    let gone = "/nonexistent/removed/aterm";
+    let moving = |mut at: Found, root: &Path| {
+        at.command_program = Lasting::Moves(Moved {
+            from: gone.to_string(),
+            to: app.to_string(),
+        });
+        rooted(at, root)
+    };
+    // Each broker exit, as the look reads it: the hand record (in its own root), no job of
+    // `on`'s, a disabled job, a supervisor that cannot be asked, an unknown holder, a broker
+    // that is not the job's process.
+    let exit = |case: &str| {
+        let mut at = found(Service::Launchd, Some("/old/aterm"));
+        match case {
+            "by hand" => at = found(Service::Launchd, None),
+            "no job" => at = found(Service::None, Some("/old/aterm")),
+            "disabled" => at.disabled = true,
+            "unasked" => {
+                at.loaded = Err("launchd has no gui/501 domain in this login".to_string());
+            }
+            "unknown holder" => {
+                at.view.pid_unknown = Some("the listener scan cannot tell".to_string());
+            }
+            "not the job" => at.job = Some(4343),
+            other => panic!("no such exit: {other}"),
+        }
+        at
+    };
+    for (case, at_root, why) in [
+        ("by hand", &by_hand, "--service none"),
+        ("no job", &root, "no job of `aterm fabric on`'s keeps it"),
+        ("disabled", &root, "launchd has"),
+        ("unasked", &root, "no gui/501 domain"),
+        ("unknown holder", &root, "is unknown"),
+        ("not the job", &root, "not the job"),
+    ] {
+        let look = renew_with(
+            Some(words("aterm link serve")),
+            Renew::Look,
+            |_: &[String]| Ok(moving(exit(case), at_root)),
+            |_: &Found, _: Steps| panic!("a look steps nothing"),
+        );
+        assert!(
+            matches!(&look, Ok(BrokerRenewal::Due { from, to })
+                if from == &format!(
+                    "`[fabric] command` runs {gone}, which names no file now (the installed \
+                     app is {app})"
+                ) && to.starts_with(&format!(
+                    "`[fabric] command` runs {app}, the installed app; left as it is: "
+                )) && to.contains(why)),
+            "{case}: {look:?}"
+        );
+        let applied = renew_with(
+            Some(words("aterm link serve")),
+            Renew::Apply,
+            |_: &[String]| Ok(moving(exit(case), at_root)),
+            |_: &Found, steps: Steps| {
+                assert_eq!(
+                    steps,
+                    Steps {
+                        broker: false,
+                        command: true,
+                    },
+                    "{case}: the command alone"
+                );
+                Ok("config ok updated [fabric] command".to_string())
+            },
+        );
+        assert!(
+            matches!(&applied, Ok(BrokerRenewal::Renewed(said))
+                if said.starts_with("config ok updated [fabric] command; left as it is: ")
+                    && said.contains(why)),
+            "{case}: {applied:?}"
+        );
+    }
+}
+
+/// A scratch fabric for a renewal's look and apply: a root (0700) holding a node id, aterm.toml
+/// and the rendezvous file beside it, and the installed app at `<dir>/app/aterm`.
+struct World {
+    p: Paths,
+    node: &'static str,
+    app: String,
+}
+
+impl World {
+    fn new(dir: &Path) -> Self {
+        let config_dir = dir.join("cfg/aterm");
+        std::fs::create_dir_all(&config_dir).expect("aterm.toml's folder");
+        let p = Paths {
+            config: Some(config_dir.join("aterm.toml")),
+            rendezvous: Some(dir.join("run/fabric.toml")),
+            ..scratch_paths(dir)
+        };
+        aterm_uds::private_file::ensure_private_dir(&p.root).expect("the root");
+        let node = "n-0123456789abcdef";
+        std::fs::create_dir_all(p.state()).expect("the state dir");
+        std::fs::write(p.state().join("node"), node).expect("the node id");
+        let app = dir.join("app/aterm");
+        std::fs::create_dir_all(app.parent().expect("app/")).expect("app/");
+        std::fs::write(&app, b"#!/bin/sh\n").expect("the installed app");
+        Self {
+            p,
+            node,
+            app: app.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// The bridge command `on` writes for this root with `program` as its aterm.
+    fn written(&self, program: &str) -> Vec<String> {
+        Paths {
+            aterm: program.to_string(),
+            ..self.p.clone()
+        }
+        .bridge_command(self.node)
+    }
+
+    fn configure(&self, command: &[String]) {
+        let (toml, _) = set_fabric_command("", command).expect("a command");
+        std::fs::write(self.p.config.as_ref().expect("aterm.toml"), toml).expect("aterm.toml");
+    }
+
+    fn configured(&self) -> Option<Vec<String>> {
+        let text = std::fs::read_to_string(self.p.config.as_ref().expect("aterm.toml"))
+            .expect("aterm.toml");
+        fabric::command_in_toml(&text).expect("a [fabric] table")
+    }
+
+    /// The launchd job `on` installs for this root, running `program`.
+    fn install_job(&self, program: &str) {
+        let job = Paths {
+            aterm: program.to_string(),
+            ..self.p.clone()
+        };
+        std::fs::write(self.p.plist(), job.plist_text()).expect("the job's plist");
+    }
+
+    fn look(&self, command: &[String], service: Service, asks: &Asks<'_>) -> Result<Found, String> {
+        look_from(
+            self.p.clone(),
+            command,
+            service,
+            true,
+            Some(Path::new(&self.app)),
+            asks,
+        )
+    }
+}
+
+/// A file at `<dir>/<name>`, made, as a path.
+fn a_file(dir: &Path, name: &str) -> String {
+    let path = dir.join(name);
+    std::fs::create_dir_all(path.parent().expect("a folder")).expect("its folder");
+    std::fs::write(&path, b"#!/bin/sh\n").expect("a file");
+    path.to_string_lossy().into_owned()
+}
+
+/// THE APPLY, END TO END BUT FOR THE SUPERVISOR AND THE WINDOWS: a look of a scratch root whose
+/// `[fabric] command` aterm wrote runs a program that is gone reads it due, and the apply
+/// rewrites aterm.toml and the rendezvous file to the installed app and arms the windows with
+/// that command, the broker the look found answering, with no broker step while the job's
+/// program still names a file; the next pass reads it current. Where the job's program is gone
+/// too, the broker step runs first, on the installed app, `on`'s order, then the command is
+/// rewritten and the windows armed and waited for on the broker it started.
+/// NEGATIVE CONTROLS: a step that runs the broker step for a command alone panics the stand-in;
+/// one that rewrites the command before the broker step finds aterm.toml rewritten in the
+/// stand-in; a rewrite that writes the config but not the rendezvous file or the windows leaves
+/// them naming the gone program; one that asks the socket again under launchd, where the look
+/// asked it, panics the stand-in.
+#[test]
+fn an_apply_steps_the_broker_before_the_command_and_only_what_is_due() {
+    use std::cell::Cell;
+    let scratch = crate::test_scratch_dir("en");
+    let dir = scratch.path();
+    let world = World::new(dir);
+    let gone = dir.join("removed/aterm").to_string_lossy().into_owned();
+    let kept = a_file(dir, "kept/aterm");
+    world.install_job(&kept);
+    let ours = world.written(&gone);
+    let want = world.written(&world.app);
+    world.configure(&ours);
+    let supervisor = |_: Service, _: &str| (Some(4242), Ok(true), false);
+    let broker = |view: &mut fabric::BrokerView| {
+        view.pid = Some(4242);
+        Ok(())
+    };
+    let asks = Asks {
+        supervisor: &supervisor,
+        broker: &broker,
+    };
+    let look = renew_with(
+        Some(ours.clone()),
+        Renew::Look,
+        |command: &[String]| world.look(command, Service::Launchd, &asks),
+        |_: &Found, _: Steps| panic!("a look steps nothing"),
+    );
+    assert_eq!(
+        look,
+        Ok(BrokerRenewal::Due {
+            from: format!(
+                "`[fabric] command` runs {gone}, which names no file now (the installed app is {})",
+                world.app
+            ),
+            to: format!("`[fabric] command` runs {}, the installed app", world.app),
+        })
+    );
+
+    let panes = Panes::default();
+    let reach = Reach {
+        broker: &|_, _, _, _| panic!("only the command moves: no broker step"),
+        answers: &|_| panic!("the look asked the socket under launchd"),
+        windows: &panes,
+    };
+    let renewed = renew_with(
+        Some(ours.clone()),
+        Renew::Apply,
+        |command: &[String]| world.look(command, Service::Launchd, &asks),
+        |at: &Found, steps: Steps| step_with(at, steps, &reach),
+    );
+    assert!(
+        matches!(&renewed, Ok(BrokerRenewal::Renewed(said))
+            if said.contains("ok updated [fabric] command")),
+        "{renewed:?}"
+    );
+    assert_eq!(world.configured(), Some(want.clone()), "aterm.toml");
+    let rendezvous = std::fs::read_to_string(world.p.rendezvous.as_ref().expect("its path"))
+        .expect("the rendezvous file");
+    assert_eq!(
+        Rendezvous::parse(&rendezvous)
+            .expect("a rendezvous")
+            .command,
+        want,
+        "the rendezvous file"
+    );
+    assert_eq!(
+        panes.armed(),
+        vec![(want.clone(), ArmWait::Connected)],
+        "the windows, waited for: the look found the broker answering"
+    );
+    let next = renew_with(
+        Some(want.clone()),
+        Renew::Look,
+        |command: &[String]| world.look(command, Service::Launchd, &asks),
+        |_: &Found, _: Steps| panic!("nothing is due"),
+    );
+    assert!(matches!(next, Ok(BrokerRenewal::Current(_))), "{next:?}");
+
+    world.install_job(&gone);
+    world.configure(&ours);
+    let panes = Panes::default();
+    let stepped = Cell::new(false);
+    let broker_step = |p: &Paths, _: &str, service: Service, _: &mut Out| {
+        assert_eq!(
+            world.configured(),
+            Some(ours.clone()),
+            "the broker step runs before the command is rewritten"
+        );
+        assert!(
+            panes.armed().is_empty(),
+            "and before any window is attached"
+        );
+        assert_eq!(
+            (p.aterm.as_str(), service),
+            (world.app.as_str(), Service::Launchd)
+        );
+        stepped.set(true);
+        true
+    };
+    let reach = Reach {
+        broker: &broker_step,
+        answers: &|_| panic!("the broker step says whether a broker answers"),
+        windows: &panes,
+    };
+    let renewed = renew_with(
+        Some(ours.clone()),
+        Renew::Apply,
+        |command: &[String]| world.look(command, Service::Launchd, &asks),
+        |at: &Found, steps: Steps| {
+            assert_eq!(
+                steps,
+                Steps {
+                    broker: true,
+                    command: true,
+                }
+            );
+            step_with(at, steps, &reach)
+        },
+    );
+    assert!(
+        matches!(renewed, Ok(BrokerRenewal::Renewed(_))),
+        "{renewed:?}"
+    );
+    assert!(stepped.get(), "the broker step ran");
+    assert_eq!(world.configured(), Some(want.clone()), "then the command");
+    assert_eq!(
+        panes.armed(),
+        vec![(want, ArmWait::Connected)],
+        "then the windows, waited for: the broker step went through"
+    );
+}
+
+/// Each part an apply steps is stepped on its own: a command rewrite that fails (aterm.toml's
+/// folder refuses the config service's write lock) still lets the broker step that is due run,
+/// and a broker step that fails still lets the command be rewritten, with the rendezvous file,
+/// and the windows attached to it but not waited for, no broker answering for them to connect
+/// to; either reads as the apply's failure, what each part did said.
+/// NEGATIVE CONTROLS: steps chained by `&&` (as the one before this was) skip the broker step
+/// after the failed rewrite, or the rewrite after the failed broker step, so a job whose program
+/// is gone keeps running it, or a command whose program is gone stays; waiting after a failed
+/// broker step waits a minute per window on a broker that does not answer, and fails each.
+#[test]
+fn a_failed_part_skips_none_of_the_other_parts_steps() {
+    use std::cell::Cell;
+    use std::os::unix::fs::PermissionsExt as _;
+    let scratch = crate::test_scratch_dir("en");
+    let dir = scratch.path();
+    let world = World::new(dir);
+    let gone = dir.join("removed/aterm").to_string_lossy().into_owned();
+    world.install_job(&gone);
+    let ours = world.written(&gone);
+    let want = world.written(&world.app);
+    world.configure(&ours);
+    let supervisor = |_: Service, _: &str| (Some(4242), Ok(true), false);
+    let broker = |view: &mut fabric::BrokerView| {
+        view.pid = Some(4242);
+        Ok(())
+    };
+    let asks = Asks {
+        supervisor: &supervisor,
+        broker: &broker,
+    };
+    let both = |at: &Found, steps: Steps, reach: &Reach<'_>| {
+        assert_eq!(
+            steps,
+            Steps {
+                broker: true,
+                command: true,
+            }
+        );
+        step_with(at, steps, reach)
+    };
+
+    let folder = world
+        .p
+        .config
+        .as_ref()
+        .and_then(|config| config.parent())
+        .expect("aterm.toml's folder")
+        .to_path_buf();
+    let chmod = |mode| {
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    };
+    let stepped = Cell::new(false);
+    let unwritten = Panes::default();
+    let reach = Reach {
+        broker: &|_, _, _, _| {
+            stepped.set(true);
+            true
+        },
+        answers: &|_| panic!("the broker step says whether a broker answers"),
+        windows: &unwritten,
+    };
+    chmod(0o555);
+    let renewed = renew_with(
+        Some(ours.clone()),
+        Renew::Apply,
+        |command: &[String]| world.look(command, Service::Launchd, &asks),
+        |at: &Found, steps: Steps| both(at, steps, &reach),
+    );
+    chmod(0o755);
+    assert!(
+        matches!(&renewed, Err(said)
+            if said.contains("config FAILED") && !said.contains("config done ")),
+        "the lock refused, so no edit landed: {renewed:?}"
+    );
+    assert!(stepped.get(), "the broker step that is due ran");
+    assert!(
+        unwritten.armed().is_empty(),
+        "no command was written to attach the windows to"
+    );
+    assert_eq!(
+        world.configured(),
+        Some(ours.clone()),
+        "aterm.toml unwritten"
+    );
+
+    let panes = Panes::default();
+    let reach = Reach {
+        broker: &|_, _, _, out| {
+            out.fail("broker", "the stand-in's broker did not start");
+            false
+        },
+        answers: &|_| panic!("the broker step says whether a broker answers"),
+        windows: &panes,
+    };
+    let renewed = renew_with(
+        Some(ours),
+        Renew::Apply,
+        |command: &[String]| world.look(command, Service::Launchd, &asks),
+        |at: &Found, steps: Steps| both(at, steps, &reach),
+    );
+    assert!(
+        matches!(&renewed, Err(said)
+            if said.contains("broker FAILED") && said.contains(UNWAITED)),
+        "{renewed:?}"
+    );
+    assert_eq!(
+        world.configured(),
+        Some(want.clone()),
+        "the command rewritten"
+    );
+    let rendezvous = std::fs::read_to_string(world.p.rendezvous.as_ref().expect("its path"))
+        .expect("the rendezvous file");
+    assert_eq!(
+        Rendezvous::parse(&rendezvous)
+            .expect("a rendezvous")
+            .command,
+        want,
+        "the rendezvous file"
+    );
+    assert_eq!(
+        panes.armed(),
+        vec![(want, ArmWait::Attached)],
+        "the windows attached, not waited for"
+    );
+}
+
+/// Where no broker step runs, the windows with no bridge are attached to the rewritten command
+/// whatever answers, and waited for to connect only where a broker answers: on the look's word
+/// where it asked the socket (the hand record keeps the broker, and the look found one
+/// answering, or none), and under the node service, whose look asks nothing of the broker, on
+/// the socket's word when the command is rewritten. Where none answers, aterm.toml and the
+/// rendezvous file are still rewritten, the apply goes through, and the line says the windows
+/// are attached and not waited for.
+/// NEGATIVE CONTROLS: arming nothing where no broker answers leaves the bridgeless windows so
+/// for good, since the next pass reads the command current and arms nothing; waiting whatever
+/// answers waits a minute per window on a socket nobody serves, and fails each; waiting on the
+/// look's `answers` under the node service, which reads `Ok` unasked, does the same.
+#[test]
+fn the_windows_are_waited_for_only_where_a_broker_answers_after_the_steps() {
+    use std::cell::Cell;
+    let scratch = crate::test_scratch_dir("en");
+    let dir = scratch.path();
+    let world = World::new(dir);
+    let gone = dir.join("removed/aterm").to_string_lossy().into_owned();
+    world.install_job(&a_file(dir, "kept/aterm"));
+    aterm_uds::private_file::write_private(&world.p.root, HAND_RECORD, b"").expect("by hand");
+    let ours = world.written(&gone);
+    let want = world.written(&world.app);
+    let supervisor = |_: Service, _: &str| (None, Ok(false), false);
+    let refuse = Asks {
+        supervisor: &|_, _| panic!("no supervisor is asked under the node service"),
+        broker: &|_| panic!("no broker is asked under the node service"),
+    };
+    for (service, look_answers, now_answers, wait) in [
+        (Service::Launchd, false, None, ArmWait::Attached),
+        (Service::Launchd, true, None, ArmWait::Connected),
+        (Service::Node, true, Some(false), ArmWait::Attached),
+        (Service::Node, true, Some(true), ArmWait::Connected),
+    ] {
+        let case = format!("{service:?}, look {look_answers}, now {now_answers:?}");
+        world.configure(&ours);
+        let broker = |_: &mut fabric::BrokerView| {
+            if look_answers {
+                Ok(())
+            } else {
+                Err("connect: no broker on the stand-in's socket".to_string())
+            }
+        };
+        let asks = Asks {
+            supervisor: &supervisor,
+            broker: &broker,
+        };
+        let asked = Cell::new(0);
+        let answers = |_: &Found| {
+            asked.set(asked.get() + 1);
+            now_answers.expect("the look's answer stands where it asked the socket")
+        };
+        let panes = Panes::default();
+        let reach = Reach {
+            broker: &|_, _, _, _| panic!("{case}: the broker is kept, no broker step"),
+            answers: &answers,
+            windows: &panes,
+        };
+        let renewed = renew_with(
+            Some(ours.clone()),
+            Renew::Apply,
+            |command: &[String]| {
+                world.look(
+                    command,
+                    service,
+                    if service == Service::Node {
+                        &refuse
+                    } else {
+                        &asks
+                    },
+                )
+            },
+            |at: &Found, steps: Steps| {
+                assert_eq!(
+                    steps,
+                    Steps {
+                        broker: false,
+                        command: true,
+                    },
+                    "{case}"
+                );
+                step_with(at, steps, &reach)
+            },
+        );
+        let Ok(BrokerRenewal::Renewed(said)) = &renewed else {
+            panic!("{case}: {renewed:?}");
+        };
+        assert_eq!(world.configured(), Some(want.clone()), "{case}: aterm.toml");
+        assert_eq!(
+            panes.armed(),
+            vec![(want.clone(), wait)],
+            "{case}: the windows"
+        );
+        assert_eq!(
+            said.contains(UNWAITED),
+            wait == ArmWait::Attached,
+            "{case}: {said}"
+        );
+        assert_eq!(asked.get(), usize::from(now_answers.is_some()), "{case}");
+    }
+}
+
+/// Stand-in windows for an apply's attach ([`Windows`]): one running window with no bridge (pid
+/// 4242), beside, where `already` names a command, one armed with it already (pid 4343). A
+/// window's control socket answers `fabric attach` OK and `fabric status` connected, each
+/// request recorded with the window it went to; a pause panics, as the bridge connects at the
+/// first ask.
+#[derive(Default)]
+struct Panes {
+    already: Option<Vec<String>>,
+    asked: std::cell::RefCell<Vec<(u32, String)>>,
+}
+
+impl Windows for Panes {
+    fn list(&self, _: &mut Out) -> (Vec<Instance>, Option<usize>) {
+        let window = |pid, command: Option<Vec<String>>| Instance {
+            pid,
+            sock: format!("stand-in-{pid}.sock"),
+            supervised: command.is_some(),
+            state: if command.is_some() { "connected" } else { "-" }.to_string(),
+            reason: "-".to_string(),
+            command,
+        };
+        let mut listed = vec![window(4242, None)];
+        listed.extend(
+            self.already
+                .clone()
+                .map(|command| window(4343, Some(command))),
+        );
+        let running = listed.len();
+        (listed, Some(running))
+    }
+
+    fn open<'a>(&'a self, inst: &Instance) -> io::Result<Request<'a>> {
+        let pid = inst.pid;
+        Ok(Box::new(move |line| {
+            self.asked.borrow_mut().push((pid, line.to_string()));
+            Ok(crate::ctl::Reply::Status(
+                if line == "fabric status" {
+                    "OK fabric state=connected reason=-"
+                } else {
+                    "OK attached command=-"
+                }
+                .to_string(),
+            ))
+        }))
+    }
+
+    fn pause(&self, _: Duration) {
+        panic!("the stand-in's bridge connects at the first ask")
+    }
+}
+
+impl Panes {
+    /// Each command a window was attached to, with whether it was then waited for: its
+    /// `fabric status` asked after the attach.
+    fn armed(&self) -> Vec<(Vec<String>, ArmWait)> {
+        let asked = self.asked.borrow();
+        asked
+            .iter()
+            .enumerate()
+            .filter_map(|(at, (pid, line))| {
+                let argv = line.strip_prefix("fabric attach ")?;
+                let waited = asked
+                    .get(at + 1)
+                    .is_some_and(|(next, line)| next == pid && line == "fabric status");
+                Some((
+                    argv.split(' ').map(str::to_owned).collect(),
+                    if waited {
+                        ArmWait::Connected
+                    } else {
+                        ArmWait::Attached
+                    },
+                ))
+            })
+            .collect()
+    }
+}
+
+/// `arm_instances` attaches each listed window that has no bridge, over that window's own
+/// control socket, and waits for it as it is told: under `ArmWait::Connected` the window's
+/// `fabric status` is asked after its attach, under `ArmWait::Attached` nothing is. A window
+/// armed with this command already is said as armed, and neither opened nor attached. The
+/// windows armed for the proof are the one armed already and, where it was waited for, the one
+/// that connected.
+/// NEGATIVE CONTROLS: an `arm_instances` that hands `attach_window` `ArmWait::Connected`
+/// whatever it is told asks the window's status under `Attached`, which with no broker fails
+/// the window a minute later; one that attaches an armed window sends it a second attach.
+#[test]
+fn arm_instances_attaches_the_bridgeless_windows_and_waits_as_told() {
+    let argv = words(
+        "/Applications/aterm.app/Contents/MacOS/aterm link serve --fleet local --broker /b.sock",
+    );
+    for (wait, for_the_proof) in [
+        (ArmWait::Connected, vec![4242, 4343]),
+        (ArmWait::Attached, vec![4343]),
+    ] {
+        let panes = Panes {
+            already: Some(argv.clone()),
+            ..Panes::default()
+        };
+        let mut out = Out::kept();
+        let (running, armed) = arm_instances(&argv, wait, &panes, &mut out);
+        let said = out.said();
+        assert_eq!(running, Some(2), "{wait:?}");
+        assert_eq!(
+            panes.armed(),
+            vec![(argv.clone(), wait)],
+            "{wait:?}: {said}"
+        );
+        assert!(
+            panes.asked.borrow().iter().all(|(pid, _)| *pid == 4242),
+            "{wait:?}: the armed window is not asked"
+        );
+        let mut pids: Vec<u32> = armed.iter().map(|inst| inst.pid).collect();
+        pids.sort_unstable();
+        assert_eq!(pids, for_the_proof, "{wait:?}: {said}");
+        assert!(!out.failed, "{wait:?}: {said}");
+        assert!(
+            said.contains("instance already 4343 is armed with this command"),
+            "{wait:?}: {said}"
+        );
+    }
+}
+
+/// A window with no bridge is sent `fabric attach` with the command under either wait. Under
+/// `ArmWait::Connected` it is then asked `fabric status` until its bridge connects, said as
+/// connected and counted armed; under `ArmWait::Attached` nothing more is asked and nothing
+/// waited on, and it is said as attached and not waited for, no failure. An attach the window
+/// refuses is said as that answer and fails, under either wait, and nothing more is asked: it is
+/// never read as a bridge that did not connect.
+/// NEGATIVE CONTROLS: an `Attached` that waits asks `fabric status` and pauses (the stand-ins
+/// panic), and with no broker would fail each window a minute later as not connected; one that
+/// sends no attach leaves the window bridgeless; a refused attach that went on to the wait
+/// would ask `fabric status` and say the bridge did not connect instead of the refusal.
+#[test]
+fn a_window_is_attached_and_waited_for_only_as_its_wait_says() {
+    use crate::ctl::Reply;
+    let argv = words(
+        "/Applications/aterm.app/Contents/MacOS/aterm link serve --fleet local --broker /b.sock",
+    );
+    let attach = format!("fabric attach {}", argv.join(" "));
+
+    let mut asked = Vec::new();
+    let mut out = Out::kept();
+    let state = attach_window(
+        4242,
+        &argv,
+        ArmWait::Attached,
+        &mut |line: &str| {
+            asked.push(line.to_string());
+            Ok(Reply::Status("OK attached command=x".to_string()))
+        },
+        |_| panic!("no wait where no broker answers"),
+        &mut out,
+    );
+    let said = out.said();
+    assert_eq!(state, None, "{said}");
+    assert_eq!(asked, [attach.clone()], "the attach alone");
+    assert!(!out.failed, "{said}");
+    assert!(
+        said.contains("instance - 4242 attached, not waited for"),
+        "{said}"
+    );
+
+    let mut asked = Vec::new();
+    let mut out = Out::kept();
+    let state = attach_window(
+        4242,
+        &argv,
+        ArmWait::Connected,
+        &mut |line: &str| {
+            asked.push(line.to_string());
+            Ok(Reply::Status(if line == "fabric status" {
+                "OK fabric state=connected reason=-".to_string()
+            } else {
+                "OK attached command=x".to_string()
+            }))
+        },
+        |_| panic!("connected at the first ask"),
+        &mut out,
+    );
+    let said = out.said();
+    assert_eq!(state.as_deref(), Some("connected"), "{said}");
+    assert_eq!(asked, [attach.clone(), "fabric status".to_string()]);
+    assert!(!out.failed, "{said}");
+    assert!(
+        said.contains("instance ok 4242 fabric=connected after "),
+        "{said}"
+    );
+
+    for wait in [ArmWait::Attached, ArmWait::Connected] {
+        let mut asked = Vec::new();
+        let mut out = Out::kept();
+        let state = attach_window(
+            4242,
+            &argv,
+            wait,
+            &mut |line: &str| {
+                asked.push(line.to_string());
+                Ok(Reply::Status(
+                    "ERR fabric not executable program=%2Fx reason=not-found".to_string(),
+                ))
+            },
+            |_| panic!("a refused attach is not waited on"),
+            &mut out,
+        );
+        let said = out.said();
+        assert_eq!(state, None, "{wait:?}: {said}");
+        assert_eq!(
+            asked,
+            [attach.clone()],
+            "{wait:?}: nothing after the refusal"
+        );
+        assert!(out.failed, "{wait:?}: {said}");
+        assert!(
+            said.contains("4242: fabric attach answered ERR fabric not executable"),
+            "{wait:?}: {said}"
+        );
+        assert!(
+            !said.contains("did not connect") && !said.contains("not waited for"),
+            "{wait:?}: {said}"
+        );
+    }
+}
+
+/// A save by another writer between `config_step`'s read of aterm.toml and its write (a
+/// Settings save of another key, which `ConfigEdit::replace` refuses as a change since the read)
+/// is no failure: the step reads aterm.toml again and writes the judged command over what the
+/// save left, the save's key kept; a save in that window that changed the judged command itself
+/// leaves it as it is, said as kept; a save in the second window too leaves a judged command for
+/// the next pass, said as aterm.toml changed again (not as the command changed), and fails
+/// `on`'s, which judges none, as a write error does. No outcome loses the other writer's save.
+/// The `done` line is said, and counted, once, for the edit that landed, and not at all where
+/// none did.
+/// NEGATIVE CONTROLS: a step that reads the refusal as a failed write (as the one before this
+/// did) says FAILED of an aterm.toml that a Settings save touched, and the renewal fails though
+/// nothing went wrong; one that writes over without reading again loses the save; one that says
+/// `done` before its replace says it of a refused edit, and counts a change none made.
+#[test]
+fn a_save_between_the_read_and_the_write_is_read_again_not_failed() {
+    let scratch = crate::test_scratch_dir("en");
+    let dir = scratch.path();
+    let world = World::new(dir);
+    let config = world.p.config.clone().expect("aterm.toml");
+    let gone = dir.join("removed/aterm").to_string_lossy().into_owned();
+    let ours = world.written(&gone);
+    let want = world.written(&world.app);
+    let save = {
+        let config = config.clone();
+        move |key: &str| {
+            let text = std::fs::read_to_string(&config).expect("aterm.toml");
+            std::fs::write(&config, format!("{key} = \"set\"\n{text}")).expect("a save");
+        }
+    };
+    let holds = |key: &str| {
+        std::fs::read_to_string(&config)
+            .expect("aterm.toml")
+            .starts_with(&format!("{key} = \"set\"\n"))
+    };
+
+    for judged in [Some(ours.as_slice()), None] {
+        world.configure(&ours);
+        let saved = save.clone();
+        between(move || saved("theme"));
+        let mut out = Out::kept();
+        let set = config_step(Some(&config), judged, &want, &mut out);
+        let said = out.said();
+        assert_eq!(set, ConfigSet::Set, "{judged:?}: {said}");
+        assert!(!out.failed, "{said}");
+        let lines: Vec<&str> = said.split("; ").collect();
+        let shown = config.display();
+        assert_eq!(
+            lines.first().copied(),
+            Some(
+                format!(
+                    "config - {shown} changed between this step's read and its write: reading it \
+                     again"
+                )
+                .as_str()
+            ),
+            "the refused edit says nothing of a write: {said}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("config done "))
+                .count(),
+            1,
+            "{said}"
+        );
+        assert!(
+            lines[1].starts_with(&format!("config done update [fabric] command in {shown}")),
+            "the landed edit's done line follows the refusal: {said}"
+        );
+        assert_eq!(out.changed, 1, "one change: {said}");
+        assert_eq!(world.configured(), Some(want.clone()), "{judged:?}");
+        assert!(holds("theme"), "the save's key kept");
+    }
+
+    world.configure(&ours);
+    let mut persons = world.written(&a_file(dir, "mine/aterm"));
+    persons.push("--verbose".to_string());
+    let (theirs, mine) = (persons.clone(), world.p.clone());
+    between(move || {
+        let (toml, _) = set_fabric_command("", &theirs).expect("a command");
+        std::fs::write(mine.config.as_ref().expect("aterm.toml"), toml).expect("a save");
+    });
+    let mut out = Out::kept();
+    let set = config_step(Some(&config), Some(&ours), &want, &mut out);
+    let said = out.said();
+    assert_eq!(set, ConfigSet::Changed, "{said}");
+    assert!(!out.failed, "{said}");
+    assert!(
+        said.contains("kept [fabric] command in ")
+            && said.contains("changed since it was read; the next pass judges it"),
+        "{said}"
+    );
+    assert!(!said.contains("config done "), "{said}");
+    assert_eq!(out.changed, 0, "{said}");
+    assert_eq!(
+        world.configured(),
+        Some(persons),
+        "the person's command stays"
+    );
+
+    for (judged, want_set) in [
+        (Some(ours.as_slice()), ConfigSet::Changed),
+        (None, ConfigSet::Failed),
+    ] {
+        world.configure(&ours);
+        let (first, second) = (save.clone(), save.clone());
+        between(move || {
+            first("theme");
+            between(move || second("font"));
+        });
+        let mut out = Out::kept();
+        let set = config_step(Some(&config), judged, &want, &mut out);
+        let said = out.said();
+        assert_eq!(set, want_set, "{judged:?}: {said}");
+        assert_eq!(out.failed, want_set == ConfigSet::Failed, "{said}");
+        let verdict = if judged.is_some() { "kept" } else { "FAILED" };
+        assert!(
+            said.ends_with(&format!(
+                "config {verdict} {} changed again between this step's read and its write; {}",
+                config.display(),
+                if judged.is_some() {
+                    "the next pass judges [fabric] command"
+                } else {
+                    "run this again"
+                }
+            )),
+            "{judged:?}: {said}"
+        );
+        assert!(
+            !said.contains("config done ") && !said.contains("changed since it was read"),
+            "{judged:?}: no edit landed, and the command did not change: {said}"
+        );
+        assert_eq!(out.changed, 0, "{judged:?}: {said}");
+        assert_eq!(world.configured(), Some(ours.clone()), "{judged:?}: left");
+        assert!(holds("font"), "the second save kept");
+    }
+}
+
+/// The rewrite is a compare-and-swap: a `[fabric] command` aterm.toml no longer holds as the
+/// look read it (a person's edit, or an `off` or `on`, between the look and the step) is left
+/// as it is, said as kept, and neither the rendezvous file nor any window is touched; the
+/// renewal is no failure, and the next pass judges what is there.
+/// NEGATIVE CONTROL: a rewrite that sets the command over whatever aterm.toml holds, as `on`
+/// does, replaces the person's newer command with the installed app's, and writes the
+/// rendezvous file and arms the windows with it.
+#[test]
+fn a_command_rewrite_leaves_one_that_changed_since_the_look() {
+    let scratch = crate::test_scratch_dir("en");
+    let dir = scratch.path();
+    let world = World::new(dir);
+    let gone = dir.join("removed/aterm").to_string_lossy().into_owned();
+    world.install_job(&a_file(dir, "kept/aterm"));
+    let ours = world.written(&gone);
+    world.configure(&ours);
+    let mut persons = world.written(&a_file(dir, "mine/aterm"));
+    persons.push("--verbose".to_string());
+    let supervisor = |_: Service, _: &str| (Some(4242), Ok(true), false);
+    let broker = |view: &mut fabric::BrokerView| {
+        view.pid = Some(4242);
+        Ok(())
+    };
+    let asks = Asks {
+        supervisor: &supervisor,
+        broker: &broker,
+    };
+    let panes = Panes::default();
+    let reach = Reach {
+        broker: &|_, _, _, _| panic!("only the command moves: no broker step"),
+        answers: &|_| panic!("the look asked the socket under launchd"),
+        windows: &panes,
+    };
+    let renewed = renew_with(
+        Some(ours),
+        Renew::Apply,
+        |command: &[String]| {
+            let at = world.look(command, Service::Launchd, &asks);
+            world.configure(&persons);
+            at
+        },
+        |at: &Found, steps: Steps| step_with(at, steps, &reach),
+    );
+    assert!(
+        matches!(&renewed, Ok(BrokerRenewal::Renewed(said))
+            if said.contains("config kept [fabric] command in ")
+                && said.contains("changed since it was read; the next pass judges it")),
+        "{renewed:?}"
+    );
+    assert_eq!(
+        world.configured(),
+        Some(persons),
+        "the person's command stays"
+    );
+    assert!(
+        !world.p.rendezvous.as_ref().expect("its path").exists(),
+        "no rendezvous file written"
+    );
+    assert!(panes.armed().is_empty(), "no window armed");
+}
+
+/// Under the node service a look judges the command alone: it asks neither the supervisor nor
+/// the socket, and does not judge the job's program, though a plist an earlier build installed
+/// names a program that is gone; the command aterm wrote, whose program is gone, still moves to
+/// the installed app. The same look under launchd asks each once and judges the job's program.
+/// NEGATIVE CONTROLS: a look that reads the job and the broker under the node service panics
+/// the stand-ins; one that leaves before judging the command (as the renewal's early exit for
+/// the node service once did) reads the command as staying. The launchd look is the control
+/// that the stand-ins are live.
+#[test]
+fn under_the_node_service_a_look_judges_the_command_alone() {
+    use std::cell::Cell;
+    let scratch = crate::test_scratch_dir("en");
+    let dir = scratch.path();
+    let world = World::new(dir);
+    let gone = dir.join("removed/aterm").to_string_lossy().into_owned();
+    world.install_job(&gone);
+    let ours = world.written(&gone);
+    world.configure(&ours);
+    let moved = Lasting::Moves(Moved {
+        from: gone.clone(),
+        to: world.app.clone(),
+    });
+    let refuse = Asks {
+        supervisor: &|_, _| panic!("no supervisor is asked under the node service"),
+        broker: &|_| panic!("no broker is asked under the node service"),
+    };
+    let at = world.look(&ours, Service::Node, &refuse).expect("the look");
+    assert_eq!(at.service, Service::Node);
+    assert_eq!(at.command_program, moved, "the command is judged");
+    assert_eq!(at.job_program, Lasting::Stays, "the job's program is not");
+    assert_eq!(
+        (at.job, at.loaded.clone(), at.disabled, at.answers.clone()),
+        (None, Ok(false), false, Ok(()))
+    );
+    assert_eq!(at.view.pid, None, "no holder read");
+
+    let asked = Cell::new(0);
+    let supervisor = |_: Service, _: &str| {
+        asked.set(asked.get() + 1);
+        (Some(4242), Ok(true), false)
+    };
+    let broker = |_: &mut fabric::BrokerView| {
+        asked.set(asked.get() + 1);
+        Ok(())
+    };
+    let asks = Asks {
+        supervisor: &supervisor,
+        broker: &broker,
+    };
+    let at = world
+        .look(&ours, Service::Launchd, &asks)
+        .expect("the look");
+    assert_eq!(asked.get(), 2, "the supervisor and the socket, once each");
+    assert_eq!(at.job_program, moved, "the job's program is judged");
+    assert_eq!(at.p.aterm, world.app);
+    assert_eq!(at.command_program, moved);
 }
 
 /// `aterm fabric off` boots out a job `print` did not say of: a print that said nothing is
@@ -1363,7 +2742,13 @@ fn a_kept_out_hands_back_its_lines_and_a_root_with_no_node_is_not_stepped() {
     assert_eq!(out.said(), "plist already /x.plist; broker done restarted");
     let mut nodeless = found(Service::Launchd, Some("/old/aterm"));
     nodeless.node = None;
-    let refused = step_on(&nodeless);
+    let refused = step_on(
+        &nodeless,
+        Steps {
+            broker: true,
+            command: false,
+        },
+    );
     assert!(
         refused
             .as_ref()
@@ -3048,9 +4433,12 @@ fn the_config_edit_reads_headers_and_keys_the_way_toml_does() {
 }
 
 /// A `[fabric]` edit whose folder flush fails after its rename is in effect: `on`'s and
-/// `off`'s config steps say ok beside a WARNING, not FAILED, and the run goes on. A flush
-/// that fails before the edit (its `.bak`'s) still fails the step, aterm.toml unchanged.
-/// With every replace error said as FAILED, as before, the step returned false.
+/// `off`'s config steps say ok beside a WARNING, not FAILED, and the run goes on; `on`'s says
+/// its done line and counts the change. A flush that fails before the edit (its `.bak`'s) still
+/// fails the step, aterm.toml unchanged, with no done line and no change counted.
+/// NEGATIVE CONTROLS: with every replace error said as FAILED, as before, the step returned
+/// false; a done line said only for an `Ok` replace drops the one of the edit in effect, and one
+/// said for every replace error says it of the edit that never landed.
 #[test]
 fn an_edit_in_effect_whose_folder_flush_failed_is_ok_beside_a_warning() {
     use aterm_durable::seam::{FailingDirs, EIO};
@@ -3061,12 +4449,25 @@ fn an_edit_in_effect_whose_folder_flush_failed_is_ok_beside_a_warning() {
         |config: &Path| fabric::command_in_toml(&std::fs::read_to_string(config).expect("config"));
     let cmd = &words("aterm link serve --fleet local --broker /b.sock");
 
-    let mut on = Out::new(false);
+    let mut on = Out::kept();
     {
         let _edits = FailingDirs::after(1, EIO);
-        assert!(config_step(Some(&config), cmd, &mut on), "the step is done");
+        assert_eq!(
+            config_step(Some(&config), None, cmd, &mut on),
+            ConfigSet::Set,
+            "the step is done"
+        );
     }
     assert!(!on.failed, "nothing FAILED");
+    assert_eq!(on.changed, 1, "the edit in effect is a change");
+    assert!(
+        on.said().contains(&format!(
+            "config done add [fabric] command in {} (previous saved as .bak)",
+            config.display()
+        )),
+        "its done line: {}",
+        on.said()
+    );
     assert_eq!(
         on.warned.get(),
         1,
@@ -3087,13 +4488,22 @@ fn an_edit_in_effect_whose_folder_flush_failed_is_ok_beside_a_warning() {
     assert_eq!(off.warned.get(), 1);
     assert_eq!(command(&config), Ok(None), "the removal is in effect");
 
-    let mut early = Out::new(false);
+    let mut early = Out::kept();
     {
         let _baks = FailingDirs::with(EIO);
-        assert!(!config_step(Some(&config), cmd, &mut early));
+        assert_eq!(
+            config_step(Some(&config), None, cmd, &mut early),
+            ConfigSet::Failed
+        );
     }
     assert!(early.failed, "the .bak's flush failed before any edit");
     assert_eq!(early.warned.get(), 0);
+    assert_eq!(early.changed, 0, "no edit landed");
+    assert!(
+        !early.said().contains("config done "),
+        "no done line: {}",
+        early.said()
+    );
     assert_eq!(command(&config), Ok(None), "aterm.toml unchanged");
 }
 
@@ -3110,7 +4520,10 @@ fn the_config_is_written_through_its_link_under_the_service_lock() {
     std::os::unix::fs::symlink("../../dotfiles/aterm.toml", &config).expect("link");
     let cmd = &words("aterm link serve --fleet local --broker /b.sock");
 
-    assert!(config_step(Some(&config), cmd, &mut Out::new(false)));
+    assert_eq!(
+        config_step(Some(&config), None, cmd, &mut Out::new(false)),
+        ConfigSet::Set
+    );
     let linked = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_symlink());
     assert!(linked(&config), "the link was replaced by a file");
     let text = std::fs::read_to_string(&target).expect("target");
@@ -3172,7 +4585,7 @@ fn a_no_op_through_a_link_into_a_read_only_dir_reads_already() {
     };
     chmod(0o555);
     let (mut on, mut off) = (Out::new(false), Out::new(false));
-    let on_ran = config_step(Some(&on_config), cmd, &mut on);
+    let on_ran = config_step(Some(&on_config), None, cmd, &mut on) == ConfigSet::Set;
     off_config_step(Some(&off_config), &mut off);
     chmod(0o755);
     assert!(
@@ -5160,40 +6573,96 @@ fn under_the_node_service_on_installs_no_job_and_records_a_named_tier() {
     );
 }
 
-/// Under the node service a configured fabric's renewal is left as it is, nothing looked at
-/// and nothing stepped, a look and an apply alike, so the converge pass's `sync.fabric`
-/// installs and restarts no broker job; with no command it still reads off.
-/// NEGATIVE CONTROL: the same replaced broker under launchd is renewed (the step runs), so
-/// a `renew_under` that ignores the service renews it under the node service too.
+/// Under the node service the broker is not judged and nothing of a job is stepped, a look and
+/// an apply alike, so the converge pass's `sync.fabric` installs and restarts no broker job: a
+/// configured fabric reads left to the node service even where the broker's build was
+/// replaced, and with no command it still reads off, nothing looked at. A `[fabric] command`
+/// aterm wrote whose program moves is still due there, and its apply runs the step for the
+/// command alone.
+/// NEGATIVE CONTROLS: the same replaced broker under launchd is renewed (the step runs), so a
+/// renewal that ignores the service renews it under the node service too; one that leaves
+/// before the look under the node service never rewrites the command whose program is gone.
 #[test]
 fn under_the_node_service_a_renewal_is_kept_and_steps_nothing() {
     let dir = crate::test_scratch_dir("en");
     let root = dir.path().join("root");
+    aterm_uds::private_file::ensure_private_dir(&root).expect("the root");
     let command = || Some(words("aterm link serve"));
+    // What `look_at` reads under the node service: no job, no supervisor, no holder.
+    let hosted = |replaced: Option<&str>| {
+        let mut at = rooted(found(Service::Node, replaced), &root);
+        at.job = None;
+        at.loaded = Ok(false);
+        at.view.pid = None;
+        at
+    };
     for renew in [Renew::Look, Renew::Apply] {
-        let kept = renew_under(
-            Service::Node,
+        let kept = renew_with(
             command(),
             renew,
-            |_: &[String]| panic!("nothing is looked at"),
-            |_: &Found| panic!("nothing is stepped"),
+            |_: &[String]| Ok(hosted(Some("/old/aterm"))),
+            |_: &Found, _: Steps| panic!("nothing is stepped"),
         );
         assert_eq!(kept, Ok(BrokerRenewal::Kept(NODE_HOSTS.to_owned())));
-        let off = renew_under(
-            Service::Node,
+        let off = renew_with(
             None,
             renew,
             |_: &[String]| panic!("nothing is looked at"),
-            |_: &Found| panic!("nothing is stepped"),
+            |_: &Found, _: Steps| panic!("nothing is stepped"),
         );
         assert_eq!(off, Ok(BrokerRenewal::Off));
     }
-    let renewed = renew_under(
-        Service::Launchd,
+    let app = "/Applications/aterm.app/Contents/MacOS/aterm";
+    let moved = || {
+        let mut at = hosted(None);
+        at.command_program = Lasting::Moves(Moved {
+            from: "/gone/aterm".to_string(),
+            to: app.to_string(),
+        });
+        at
+    };
+    let due = renew_with(
+        command(),
+        Renew::Look,
+        |_: &[String]| Ok(moved()),
+        |_: &Found, _: Steps| panic!("a look runs no step"),
+    );
+    assert!(
+        matches!(&due, Ok(BrokerRenewal::Due { from, to })
+            if from == &format!(
+                "`[fabric] command` runs /gone/aterm, which names no file now (the installed app \
+                 is {app})"
+            ) && to == &format!("`[fabric] command` runs {app}, the installed app")),
+        "{due:?}"
+    );
+    let rewritten = renew_with(
+        command(),
+        Renew::Apply,
+        |_: &[String]| Ok(moved()),
+        |at: &Found, steps: Steps| {
+            assert_eq!(at.broker_due(), None);
+            assert_eq!(
+                steps,
+                Steps {
+                    broker: false,
+                    command: true,
+                },
+                "no broker is stepped"
+            );
+            Ok("config done updated [fabric] command".to_string())
+        },
+    );
+    assert_eq!(
+        rewritten,
+        Ok(BrokerRenewal::Renewed(
+            "config done updated [fabric] command".to_string()
+        ))
+    );
+    let renewed = renew_with(
         command(),
         Renew::Apply,
         |_: &[String]| Ok(rooted(found(Service::Launchd, Some("/old/aterm")), &root)),
-        |_: &Found| Ok("broker done (re)started launchd".to_string()),
+        |_: &Found, _: Steps| Ok("broker done (re)started launchd".to_string()),
     );
     assert!(
         matches!(renewed, Ok(BrokerRenewal::Renewed(_))),
@@ -5502,4 +6971,24 @@ fn the_mesh_node_step_names_no_node_under_a_running_bridge() {
         "with no bridge running the key's node is recorded: {}",
         out.said()
     );
+}
+
+thread_local! {
+    /// What [`between_read_and_write`] runs next on this thread, once.
+    static BETWEEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The seam `config_edit` calls between its read of aterm.toml and its locked write: it runs
+/// what [`between`] set on this thread, once.
+pub(super) fn between_read_and_write() {
+    if let Some(run) = BETWEEN.with(|between| between.borrow_mut().take()) {
+        run();
+    }
+}
+
+/// Run `writer` the next time `config_edit` on this thread has read aterm.toml and not yet
+/// written it: another writer, a Settings save say, in that window.
+fn between(writer: impl FnOnce() + 'static) {
+    BETWEEN.with(|between| *between.borrow_mut() = Some(Box::new(writer)));
 }

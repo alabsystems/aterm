@@ -445,7 +445,7 @@ impl OutlookMemo {
     /// The wall second from which a read replays with no other cause, past or not: the earliest
     /// of [`Self::owed_terms`]. A read at it or later replays, and a read before it does not
     /// unless another cause moved ([`Self::at`]).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn replay_owed_at(&self) -> Option<i64> {
         self.owed_terms().min()
     }

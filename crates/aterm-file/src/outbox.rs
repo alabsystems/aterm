@@ -666,6 +666,8 @@ fn column_of(columns: &mut Vec<Column>, name: &str) {
             source: Source::Schema,
             read_only: false,
             refers: None,
+            ty: None,
+            null: None,
         },
     );
 }
@@ -798,6 +800,8 @@ pub(crate) fn overlay(
             source: Source::Pk,
             read_only: true,
             refers: None,
+            ty: None,
+            null: None,
         }],
         handles: Vec::new(),
         rows: Vec::new(),

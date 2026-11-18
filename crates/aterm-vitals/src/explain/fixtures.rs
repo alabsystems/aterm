@@ -571,6 +571,66 @@ pub fn spotlight_1032() -> Scene {
     }
 }
 
+/// The Spotlight family on m42 on 2026-11-15, constructed: a day after start-up, plain
+/// `mdworker`, `managedcorespotlightd` and `spotlightknowledged.updater` each lead a coalition
+/// at 180 millicores, mostly deferred: each under the activity's 200-millicore bar alone, the
+/// three 540 together. None of them is among the four members main counted before SD-93.
+#[must_use]
+pub fn spotlight_family_1115() -> Scene {
+    let start = USERSPACE_MS - 86_400_000;
+    let deferred = |id: u64| Coal {
+        deferred_mc: 150,
+        maint_mc: 50,
+        read_bps: 1_000_000,
+        footprint: Some(20 << 20),
+        ..Coal::new(id, 180)
+    };
+    Scene {
+        window_ms: 5000,
+        sweep_ms: 1000,
+        cores: 10,
+        busy_mc: 800,
+        self_pid: 1187,
+        self_uid: 501,
+        tabs: Vec::new(),
+        coalitions: vec![
+            Coal::new(1, 170),
+            deferred(610),
+            deferred(620),
+            deferred(630),
+        ],
+        procs: vec![
+            Proc::new(1, 0, 0, 1, LAUNCHD_MS - 86_400_000, "launchd", 170),
+            Proc::new(610, 1, 501, 610, start, "mdworker", 180),
+            Proc::new(620, 1, 501, 620, start, "managedcorespotlightd", 180),
+            Proc::new(630, 1, 501, 630, start, "spotlightknowledged.updater", 180),
+        ],
+        leads: vec![
+            apple(
+                1,
+                LAUNCHD_MS - 86_400_000,
+                "launchd",
+                "com.apple.xpc.launchd",
+            ),
+            apple(610, start, "mdworker", "com.apple.mdworker"),
+            apple(
+                620,
+                start,
+                "managedcorespotlightd",
+                "com.apple.managedcorespotlightd",
+            ),
+            apple(
+                630,
+                start,
+                "spotlightknowledged.updater",
+                "com.apple.spotlightknowledged.updater",
+            ),
+        ],
+        lane: CoalLane::On,
+        ..Scene::default()
+    }
+}
+
 /// SA's 14:21 window (§7.7, one 10 s window, two tabs building).
 #[must_use]
 pub fn two_coalitions_1421() -> Scene {

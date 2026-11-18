@@ -102,9 +102,6 @@ pub(super) fn exited(pid: u32) -> io::Result<bool> {
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
 pub(super) fn exit_status_unreaped(pid: u32) -> io::Result<Option<std::process::ExitStatus>> {
     use std::os::unix::process::ExitStatusExt as _;
-    if !observe_exit(pid, false)? {
-        return Ok(None);
-    }
     loop {
         let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
         // SAFETY: the caller still owns this unreaped child. WNOWAIT preserves that
@@ -120,6 +117,9 @@ pub(super) fn exit_status_unreaped(pid: u32) -> io::Result<Option<std::process::
         if result == 0 {
             // SAFETY: waitid initialized this zeroed record on success.
             let info = unsafe { info.assume_init() };
+            if info.si_signo == 0 {
+                return Ok(None);
+            }
             if info.si_signo != libc::SIGCHLD
                 // SAFETY: SIGCHLD selects the initialized pid arm.
                 || u32::try_from(unsafe { info.si_pid() }).ok() != Some(pid)
@@ -131,14 +131,18 @@ pub(super) fn exit_status_unreaped(pid: u32) -> io::Result<Option<std::process::
             // SAFETY: SIGCHLD selects the initialized status arm.
             let status = unsafe { info.si_status() };
             let raw = match info.si_code {
-                libc::CLD_EXITED if (0..=255).contains(&status) => status << 8,
+                // Darwin's waitid exposes wider native exit values; wait4 and ExitStatus
+                // represent their low eight bits. Use this same observation for both facts.
+                libc::CLD_EXITED => (status & 0xff) << 8,
                 libc::CLD_KILLED if (1..=126).contains(&status) => status,
                 // The Unix wait status's high signal bit records a core dump.
                 libc::CLD_DUMPED if (1..=126).contains(&status) => status | 0x80,
+                libc::CLD_STOPPED | libc::CLD_TRAPPED | libc::CLD_CONTINUED => return Ok(None),
                 _ => {
-                    return Err(io::Error::other(
-                        "owned child reported an invalid terminal status",
-                    ));
+                    return Err(io::Error::other(format!(
+                        "owned child {pid} reported an invalid terminal status: code={}, status={status}",
+                        info.si_code
+                    )));
                 }
             };
             return Ok(Some(std::process::ExitStatus::from_raw(raw)));

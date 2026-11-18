@@ -6,6 +6,9 @@
 #[path = "why_self_cpu.rs"]
 mod self_cpu;
 
+#[path = "why_memory_members.rs"]
+mod memory_members;
+
 use super::json::Jv;
 use super::query::{ScopeArg, SysQuery, View};
 use super::view::{
@@ -351,11 +354,12 @@ impl<'a> Reading<'a> {
     fn you_line(&self, subject: WhySubject) -> Line {
         let y = &self.a.you;
         let mut t = format!(
-            "you tab={} role=",
+            "you tab={} {} role=",
             self.ctx
                 .target
                 .tab
-                .map_or_else(|| "-".to_owned(), |n| n.to_string())
+                .map_or_else(|| "-".to_owned(), |n| n.to_string()),
+            super::view::session_words(self.ctx, self.ctx.target.key)
         );
         match y.role {
             Role::Unavailable(w) => t.push_str(&unavailable(w)),
@@ -517,17 +521,17 @@ impl<'a> Reading<'a> {
             }
             WhySubject::Mem => {
                 t.push_str(&format!(
-                    " fp_bytes={} live={}",
+                    " fp_bytes={} live={} fp_bytes_scope=coalition",
                     rec(r.footprint, "not_sampled"),
                     r.live
                 ));
+                t.push_str(&memory_members::text(&r.memory_members));
                 if let Some(account) = memory.filter(|account| {
                     matches!(
                         account.owner,
                         FootprintOwner::Mixed | FootprintOwner::Unknown
                     )
                 }) {
-                    t.push_str(" fp_bytes_scope=coalition");
                     if account.owner == FootprintOwner::Mixed {
                         t.push_str(&format!(
                             " app_fp_bytes={} outside_fp_bytes={}",
@@ -585,6 +589,9 @@ impl<'a> Reading<'a> {
         }
         if let Some(opened) = c.opened_unix_ms {
             t.push_str(&format!(" opened={}", clock_s(nonneg(opened))));
+        }
+        if let CauseId::TabWork(key) = cause.id {
+            t.push_str(&format!(" {}", super::view::session_words(self.ctx, key)));
         }
         match (&cause.id, &cause.evidence) {
             (_, Evidence::Activity { deferred_pm, .. }) => {
@@ -1042,6 +1049,10 @@ impl Reading<'_> {
         let y = &self.a.you;
         let mut o = Jv::obj([
             (
+                "sid",
+                super::view::session_json(self.ctx, self.ctx.target.key),
+            ),
+            (
                 "tab",
                 self.ctx
                     .target
@@ -1183,13 +1194,14 @@ impl Reading<'_> {
             WhySubject::Mem => {
                 o.set("fp_bytes", Jv::known_or(r.footprint, "not_sampled"));
                 o.set("live", Jv::u(u64::from(r.live)));
+                o.set("fp_bytes_scope", Jv::s("coalition"));
+                o.set("members", memory_members::json(&r.memory_members));
                 if let Some(account) = memory.filter(|account| {
                     matches!(
                         account.owner,
                         FootprintOwner::Mixed | FootprintOwner::Unknown
                     )
                 }) {
-                    o.set("fp_bytes_scope", Jv::s("coalition"));
                     if account.owner == FootprintOwner::Mixed {
                         o.set(
                             "app_fp_bytes",
@@ -1262,6 +1274,10 @@ impl Reading<'_> {
     fn cause_json(&self, c: &Shown) -> Jv {
         let cause = &c.cause;
         let mut o = Jv::obj([("cause", Jv::s(cause.id.word())), ("sure", Jv::s("held"))]);
+        if let CauseId::TabWork(key) = cause.id {
+            o.set("sid", super::view::session_json(self.ctx, key));
+            o.set("local", Jv::u(key));
+        }
         if let Some(since) = cause.since_ms {
             o.set("since_ms", Jv::u(nonneg(since)));
         }

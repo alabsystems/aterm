@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 use aterm_json::Value;
 
-use super::accounts::Cli;
+use super::account_names::{self, Word};
+use super::accounts::{Cli, Row};
 use super::accounts_step::Step;
 use super::codex_rollout::is_thread_id;
 use super::upgrade::{ArgvRefusal, Version};
@@ -639,23 +640,42 @@ pub fn auth_path_unread(program: &Path) -> Option<AuthPathUnread> {
 }
 
 /// The one act that runs Codex again while [`auth_path_unread`] refuses a row of its own: pin
-/// the roster's row on this machine's own login, `default` (the row with no `dir`), or, where
-/// the roster lists none, list that login as a row first.
+/// the roster's row on this machine's own login by its account's word, `default` (the row with
+/// no `dir`, [`pin_word`]), or, where the roster lists none, list that login as a row first.
 #[must_use]
-pub fn unread_fix(default: Option<&str>) -> String {
+pub fn unread_fix(default: Option<&Word>) -> String {
     match default {
-        Some(label) => Step::Use(Cli::Codex, label.to_owned()).to_string(),
-        None => Step::adopt_default(Cli::Codex).to_string(),
+        Some(word) => Step::Use(Cli::Codex, word.clone()).to_string(),
+        None => Step::AdoptDefault(Cli::Codex).to_string(),
     }
 }
 
-/// What a refusal under [`auth_path_unread`] tells the person to do: [`unread_fix`] (where the
-/// roster lists no row on this machine's own login, the listing and then its pin, since a listing
-/// alone leaves the pin where it is), and the pin's end (`accounts use --auto`) once atpkg serves
-/// a codex-alab that holds [`AUTH_PATH_MARK`]. It starts lower-case: [`only_default_in`] joins
-/// it after "; ".
+/// The word the pin of Codex's roster row `row` types, among the roster's rows `roster` and the
+/// lab this process holds ([`account_names::word_of_row`]): `None` for a row with no address,
+/// which no word names, so no step pins it.
 #[must_use]
-pub fn unread_advice(default: Option<&str>, served_by: &Step) -> String {
+pub fn pin_word(row: &Row, roster: &[Row]) -> Option<Word> {
+    let lab = super::alab_roster::current();
+    account_names::word_of_row(Cli::Codex, row, roster, lab.as_deref())
+}
+
+/// What a row on this machine's own login with no address takes before any pin: no word names
+/// it, so no step pins it until the row holds its address.
+#[must_use]
+pub fn no_pin_words(label: &str) -> String {
+    format!(
+        "`{label}` holds no address, so no step pins it until its row in the roster holds its \
+         `email`"
+    )
+}
+
+/// What a refusal under [`auth_path_unread`] tells the person to do: [`unread_fix`] by the
+/// account's word, `default` (where the roster lists no row on this machine's own login, the
+/// listing and then its pin, since a listing alone leaves the pin where it is), and the pin's
+/// end (`accounts use --auto`) once atpkg serves a codex-alab that holds [`AUTH_PATH_MARK`]. It
+/// starts lower-case: [`only_default_in`] joins it after "; ".
+#[must_use]
+pub fn unread_advice(default: Option<&Word>, served_by: &Step) -> String {
     let (pin, steps) = match default {
         Some(_) => (
             "pinning the account on this machine's own login",
@@ -666,7 +686,7 @@ pub fn unread_advice(default: Option<&str>, served_by: &Step) -> String {
             format!(
                 "`{}`, then `{}`",
                 unread_fix(None),
-                unread_fix(Some("<label>"))
+                unread_fix(Some(&Word::chosen()))
             ),
         ),
     };
@@ -689,13 +709,16 @@ pub enum DefaultRow {
     /// its own (its binding's earlier logins, [`super::accounts::Row::was`], hold the default
     /// home), and no row of the roster is on that login now.
     Moved(String),
-    /// The row, labelled so, can take the launch.
-    Serves(String),
+    /// The row, labelled so, can take the launch; with the word its pin types ([`pin_word`]),
+    /// `None` for a row with no address, which no word names.
+    Serves(String, Option<Word>),
     /// The row `label` stands at its `window` limit until `until`, the instant the pool takes it
     /// again; `reset` is the reset the server named, where it named one.
     Walled {
         /// The row's label.
         label: String,
+        /// The word its pin types ([`pin_word`]).
+        word: Option<Word>,
         /// The limit it stands at (`five_hour`, `seven_day`).
         window: String,
         /// The reset the server named.
@@ -709,6 +732,8 @@ pub enum DefaultRow {
     SignedOut {
         /// The row's label.
         label: String,
+        /// The word its pin types ([`pin_word`]).
+        word: Option<Word>,
         /// Whether a login of it is stored here, one the pool's records say ended
         /// ([`super::accounts::Condition::SignedOut`]); `false` where no login file of it is
         /// ([`super::accounts::Condition::NotEnrolled`], whether none was ever made here or one
@@ -725,6 +750,15 @@ pub enum DefaultRow {
         /// The pool's words for why.
         why: String,
     },
+}
+
+impl DefaultRow {
+    /// [`DefaultRow::Serves`] of `row`, a row of Codex's roster `roster`, with the word its pin
+    /// types ([`pin_word`]).
+    #[must_use]
+    pub fn serves(row: &Row, roster: &[Row]) -> Self {
+        Self::Serves(row.label.clone(), pin_word(row, roster))
+    }
 }
 
 /// Why a launch on a Codex program that keeps no row's login its own (`why`) cannot run under
@@ -841,9 +875,15 @@ fn only_default_in(
                     .to_string()
             }
         ),
-        DefaultRow::Serves(label) => unread_advice(Some(label), &served_by),
+        DefaultRow::Serves(_, Some(word)) => unread_advice(Some(word), &served_by),
+        DefaultRow::Serves(label, None) => format!(
+            "{}, and no other Codex account runs on this build until {}",
+            no_pin_words(label),
+            build_served()
+        ),
         DefaultRow::Walled {
             label,
+            word,
             window,
             reset,
             until,
@@ -858,10 +898,12 @@ fn only_default_in(
                     "`{label}`, the row on that login, is at its `{window}` limit ({reset}), and \
                      the owner's pin holds every launch to `{own}`, so no Codex account can run \
                      on this build until that pin ends and `{label}`'s wall ends at {until} \
-                     (`{}` ends the pin at any time, `{}` once that wall ends), or \
-                     until {}",
+                     (`{}` ends the pin at any time{}), or until {}",
                     unpin_fix(),
-                    unread_fix(Some(label)),
+                    word.as_ref().map_or_else(
+                        || format!("; {}", no_pin_words(label)),
+                        |word| format!(", `{}` once that wall ends", unread_fix(Some(word)))
+                    ),
                     build_served()
                 ),
                 None => format!(
@@ -872,14 +914,24 @@ fn only_default_in(
                 ),
             }
         }
-        DefaultRow::SignedOut { label, stored } => match pinned {
-            Some(own) => format!(
+        DefaultRow::SignedOut {
+            label,
+            word,
+            stored,
+        } => match (pinned, word) {
+            (Some(own), Some(word)) => format!(
                 "{}, and then its pin (`{}`) ends the owner's pin on `{own}`, which holds every \
                  launch to a row this build does not run",
                 signed_out_default(label, *stored),
-                unread_fix(Some(label))
+                unread_fix(Some(word))
             ),
-            None => signed_out_default(label, *stored),
+            (Some(own), None) => format!(
+                "{}; the owner's pin on `{own}` holds every launch to a row this build does not \
+                 run, and {}",
+                signed_out_default(label, *stored),
+                no_pin_words(label)
+            ),
+            (None, _) => signed_out_default(label, *stored),
         },
         DefaultRow::Other { label, why } => format!(
             "`{label}`, the row on that login, cannot take it now ({why}), and no other Codex \
@@ -895,9 +947,9 @@ fn only_default_in(
 /// (`harness_host::StartupHold::Refused`). `pinned` is the owner's pin on a row of its own, which
 /// no row's condition ends while it stands. A long label is what gets cut, never a command or a
 /// wall's end ([`clause_with_label`]), and a wall's window goes unnamed where its word leaves no
-/// room for that end. A row's pin must name its whole label, so where that does not fit the clause
-/// gives the report instead, which lists the row ([`Step::Report`]); the whole words after this
-/// clause keep the pin.
+/// room for that end. A row's pin must type its account's whole word ([`pin_word`]), so where
+/// that does not fit, or the row has none, the clause gives the report instead, which lists the
+/// row ([`Step::Report`]); the whole words after this clause keep the pin.
 fn only_default_short(default: &DefaultRow, pinned: Option<&str>, served_by: &Step) -> String {
     if let Some(own) = pinned {
         return clause_with_label("pinned `", own, &format!("` cannot run: `{}`", unpin_fix()));
@@ -906,12 +958,14 @@ fn only_default_short(default: &DefaultRow, pinned: Option<&str>, served_by: &St
         DefaultRow::Unlisted | DefaultRow::Moved(_) => {
             format!("no row is on the one login this Codex runs: `{served_by}`")
         }
-        DefaultRow::Serves(label) => {
-            let pin = format!(
-                "only `{label}` runs this Codex: `{}`",
-                unread_fix(Some(label))
-            );
-            if pin.len() <= REFUSAL_ROOM {
+        DefaultRow::Serves(label, word) => {
+            let pin = word.as_ref().map(|word| {
+                format!(
+                    "only `{label}` runs this Codex: `{}`",
+                    unread_fix(Some(word))
+                )
+            });
+            if let Some(pin) = pin.filter(|pin| pin.len() <= REFUSAL_ROOM) {
                 pin
             } else {
                 clause_with_label(
@@ -943,7 +997,7 @@ fn only_default_short(default: &DefaultRow, pinned: Option<&str>, served_by: &St
                 )
             }
         }
-        DefaultRow::SignedOut { label, stored } => clause_with_label(
+        DefaultRow::SignedOut { label, stored, .. } => clause_with_label(
             "only `",
             label,
             &format!(
@@ -1039,19 +1093,19 @@ pub const fn signed_out_says(stored: bool) -> (&'static str, &'static str) {
     }
 }
 
-/// Why a pool sign-in (`aterm harness accounts login|renew`) of `label`, the row on this
-/// machine's own login, is not made while this machine's Codex keeps no row's login its own
-/// (`why`): it would bind the row to a staged login of its own, which that build never runs, so
-/// no row of the pool would be left on the one login it runs. The row's sign-in there is
+/// Why a pool sign-in (`aterm harness accounts login|renew`) of the row on this machine's own
+/// login (`shown`, as a message names it) is not made while this machine's Codex keeps no row's
+/// login its own (`why`): it would bind the row to a staged login of its own, which that build
+/// never runs, so no row of the pool would be left on the one login it runs. The row's sign-in there is
 /// Codex's own ([`default_sign_in`]).
 #[must_use]
-pub fn default_row_staging(label: &str, why: &AuthPathUnread) -> String {
+pub fn default_row_staging(shown: &str, why: &AuthPathUnread) -> String {
     format!(
-        "`{label}` is the row on this machine's own login, the only login this machine's Codex \
-         runs ({why}): a sign-in here would bind `{label}` to a login of its own, which that \
-         build never runs, so it is not made; Codex's own sign-in in its default home, \
-         `{}` (while that login is signed out), signs this machine's own login in \
-         and keeps `{label}` on it, and this sign-in runs once {}; nothing was run",
+        "{shown} is the row on this machine's own login, the only login this machine's Codex \
+         runs ({why}): a sign-in here would bind it to a login of its own, which that build \
+         never runs, so it is not made; Codex's own sign-in in its default home, `{}` (while \
+         that login is signed out), signs this machine's own login in and keeps {shown} on it, \
+         and this sign-in runs once {}; nothing was run",
         default_sign_in(),
         build_served()
     )

@@ -18,8 +18,8 @@
 //!   journal ring, whose `ai/usage` rows it folds, and the registry it names accounts and seats
 //!   by) and refuses with either rather than fold without what that one says. A file that reads
 //!   the session's roster (`lab/machines`, for `=here`; a view, for the members) refuses where
-//!   the roster did not read, and the files that read none (`ai/accounts`, `ai/links` and the
-//!   journal ring's) go on.
+//!   the roster did not read, and the files that read none (`ai/accounts`, `ai/links`,
+//!   `lab/tracker`'s logs and the journal ring's) go on.
 //! - **Every refusal has a word.** Whatever stops a pass (`[commons]` policy, no membership, a
 //!   busy vault, missing keys, an undeclared table, damaged storage, a writer generation that
 //!   moved while the pass read) leaves the snapshot as it was and records `held` or `off` with
@@ -113,8 +113,8 @@ use crate::{
 use astream_wire::sync::{Actor, Digest};
 use aterm_digest::Sha256;
 use aterm_file::{
-    Column, File, Frontier, Kept, Look, Name, Opened, Projected, Recorded, Row, Snapshot, Source,
-    Why, Word, retain,
+    AccountNames, Column, File, Frontier, Kept, Look, Name, Opened, Projected, Recorded, Row,
+    Snapshot, Source, Why, Word, retain,
 };
 use aterm_json::{Map, Value};
 use aterm_secrets::{
@@ -696,7 +696,7 @@ fn text<'a>(row: &'a cell::Row, column: &str) -> Option<&'a str> {
 fn account_names_of(
     compiled: &Compiled,
     projections: &Projections<'_>,
-) -> BTreeMap<String, account_names::Names> {
+) -> BTreeMap<String, AccountNames> {
     let accounts = projections.project(&registry::ACCOUNT);
     let addresses = compiled
         .collection(registry::ADDRESS.name)
@@ -888,7 +888,8 @@ fn computed(
 
 /// Project `file` from the view `projections` projects: its snapshot (the revision unset), how
 /// many cells were left out for a value the guards refuse, and the baseline a write of this
-/// revision is read against (each cell's candidates, [`grid::Base::to_json`]).
+/// revision is read against (what each face cell showed and each cell's candidates,
+/// `super::face::Baseline`).
 fn table(
     file: &Type,
     compiled: &'static Compiled,
@@ -929,6 +930,14 @@ fn table(
                 },
                 _ => None,
             },
+            ty: match column.source {
+                grid::Source::Schema(schema) => Some(schema.ty.word()),
+                _ => None,
+            },
+            null: match column.source {
+                grid::Source::Schema(schema) => Some(schema.null),
+                _ => None,
+            },
         })
         .collect();
     columns.extend(file.computed.columns().iter().map(|name| Column {
@@ -936,12 +945,16 @@ fn table(
         source: Source::Derived,
         read_only: true,
         refers: None,
+        ty: None,
+        null: None,
     }));
     columns.push(Column {
         name: aterm_file::snapshot::PK.to_owned(),
         source: Source::Pk,
         read_only: true,
         refers: None,
+        ty: None,
+        null: None,
     });
     let mut computed = computed(file, compiled, projections, &projection, me);
     let mut withheld = 0_u64;
@@ -1000,29 +1013,44 @@ fn table(
             values,
         });
     }
-    Ok((
-        Snapshot {
-            name: file.file(),
-            kind: TABLE.to_owned(),
-            ext: TSV.to_owned(),
-            rev: 0,
-            complete: view.complete,
-            at_ms: now_ms,
-            columns,
-            handles: file.handles.iter().map(|name| (*name).to_owned()).collect(),
-            rows,
-        },
-        withheld,
-        // A baseline that cannot be written leaves the revision without one: a write of it
-        // then asks for a refresh rather than guess what its author saw.
-        aterm_json::to_vec(&export.base.to_json()).ok(),
-    ))
+    let snapshot = Snapshot {
+        name: file.file(),
+        kind: TABLE.to_owned(),
+        ext: TSV.to_owned(),
+        rev: 0,
+        complete: view.complete,
+        at_ms: now_ms,
+        columns,
+        handles: file.handles.iter().map(|name| (*name).to_owned()).collect(),
+        rows,
+    };
+    // A baseline that cannot be written leaves the revision without one: a write of it then
+    // asks for a refresh rather than guess what its author saw.
+    let baseline = super::face::Baseline::encode(&export.base, &snapshot);
+    Ok((snapshot, withheld, baseline))
 }
 
-/// A shown cell of a ring file and its typed value: the grid's spelling of `x` under `ty`, kept
-/// as a value only where it is one the type admits and the guards let a surface show; else the
-/// grid's refusal text, no value, and one more withheld cell.
-fn ring_cell(ty: Option<&Ty>, x: &Value, withheld: &mut u64) -> Option<(String, Option<Value>)> {
+/// Which guards the shown text of a stored cell is held to ([`ring_cell`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Held {
+    /// A file of the journal ring: every text, of a known type or none, to the guards every
+    /// surface keeps ([`guarded`]).
+    Ring,
+    /// A log of a catalog table: a value its column's type admits passed that type's own guard,
+    /// and shows as its table's grid shows it ([`grid::show`]), a whole commit, a command and
+    /// prose among them; any other text to the guards every surface keeps.
+    Table,
+}
+
+/// A shown cell of a ring file or a log and its typed value: the grid's spelling of `x` under
+/// `ty`, kept as a value only where it is one the type admits and the guards `held` names let a
+/// surface show; else the grid's refusal text, no value, and one more withheld cell.
+fn ring_cell(
+    ty: Option<&Ty>,
+    x: &Value,
+    held: Held,
+    withheld: &mut u64,
+) -> Option<(String, Option<Value>)> {
     if x.is_null() {
         return None;
     }
@@ -1037,7 +1065,12 @@ fn ring_cell(ty: Option<&Ty>, x: &Value, withheld: &mut u64) -> Option<(String, 
     if shown.is_empty() {
         return None;
     }
-    if !guarded(&shown) || shown.contains(grid::REFUSED) || shown.contains(secret::MASK) {
+    let shows = if admitted && held == Held::Table {
+        shown_by_this_build(&shown) == shown
+    } else {
+        guarded(&shown)
+    };
+    if !shows || shown.contains(grid::REFUSED) || shown.contains(secret::MASK) {
         *withheld += 1;
         return Some((grid::REFUSED.to_owned(), None));
     }
@@ -1047,18 +1080,16 @@ fn ring_cell(ty: Option<&Ty>, x: &Value, withheld: &mut u64) -> Option<(String, 
 /// The face columns of a ring file: `schema`'s, then `unknown` (columns a newer build wrote),
 /// then the computed ones, then the key; all read-only, since each Mac states its own rows and
 /// nobody types into another's.
-fn ring_columns(
-    schema: &[(&str, Option<&'static str>)],
-    unknown: &BTreeSet<String>,
-    computed: &[&str],
-) -> Vec<Column> {
+fn ring_columns(schema: &[Stated], unknown: &BTreeSet<String>, computed: &[&str]) -> Vec<Column> {
     let mut columns: Vec<Column> = schema
         .iter()
-        .map(|(name, refers)| Column {
-            name: (*name).to_owned(),
+        .map(|stated| Column {
+            name: stated.name.to_owned(),
             source: Source::Schema,
             read_only: true,
-            refers: refers.map(str::to_owned),
+            refers: stated.refers.map(str::to_owned),
+            ty: Some(stated.word.clone()),
+            null: stated.null,
         })
         .collect();
     columns.extend(unknown.iter().map(|name| Column {
@@ -1066,18 +1097,24 @@ fn ring_columns(
         source: Source::Unknown,
         read_only: true,
         refers: None,
+        ty: None,
+        null: None,
     }));
     columns.extend(computed.iter().map(|name| Column {
         name: (*name).to_owned(),
         source: Source::Derived,
         read_only: true,
         refers: None,
+        ty: None,
+        null: None,
     }));
     columns.push(Column {
         name: aterm_file::snapshot::PK.to_owned(),
         source: Source::Pk,
         read_only: true,
         refers: None,
+        ty: None,
+        null: None,
     });
     columns
 }
@@ -1090,57 +1127,159 @@ fn refers(ty: &Ty) -> Option<&'static str> {
     }
 }
 
-/// A ring collection's columns: each column's name and the type it shows, where it has one.
-type Columns = Vec<(&'static str, Option<&'static str>)>;
+/// One column a ring collection's schema states: its name, its type, and whether a row may
+/// leave it empty where the schema says (an event's member has no such statement).
+struct Stated {
+    name: &'static str,
+    /// The shared file its cells name the rows of.
+    refers: Option<&'static str>,
+    /// The type as a stored schema row spells it.
+    word: Value,
+    null: Option<bool>,
+}
+
+impl Stated {
+    fn of(name: &'static str, ty: &Ty, null: Option<bool>) -> Self {
+        Self {
+            name,
+            refers: refers(ty),
+            word: ty.word(),
+            null,
+        }
+    }
+}
+
+/// A ring collection's columns.
+type Columns = Vec<Stated>;
+
+/// The columns of an owned or log collection a face shows: each live one, stated as its schema
+/// states it.
+fn stored_columns(collection: &Collection) -> Columns {
+    collection
+        .columns
+        .iter()
+        .filter(|column| column.live_at(collection.version))
+        .map(|column| Stated::of(column.name, &column.ty, Some(column.null)))
+        .collect()
+}
+
+/// One stored row of an owned or log collection as a face row at `pk`: each field under its
+/// column's spelling (`ring_cell`, held to the guards `held` names), a field no column of this
+/// build names shown raw and added to `unknown`, and a refused cell counted in `withheld`. `None`
+/// for a value that is no object.
+fn stored_row(
+    collection: &Collection,
+    pk: &str,
+    value: &Value,
+    held: Held,
+    unknown: &mut BTreeSet<String>,
+    withheld: &mut u64,
+) -> Option<Row> {
+    let object = value.as_object()?;
+    let mut row = Row {
+        pk: keys::safe_key(pk).to_owned(),
+        live: true,
+        ..Row::default()
+    };
+    for (name, x) in object {
+        // `r` is the row's collection version, not a cell.
+        if name == "r" {
+            continue;
+        }
+        let ty = collection.column(name).map(|column| &column.ty);
+        if ty.is_none() {
+            unknown.insert(name.clone());
+        }
+        if let Some((shown, value)) = ring_cell(ty, x, held, withheld) {
+            row.cells.insert(name.clone(), shown);
+            if let Some(value) = value {
+                row.values.insert(name.clone(), value);
+            }
+        }
+    }
+    Some(row)
+}
 
 /// Each Mac's rows of an owned collection of the ring, `read` already judged by their keys
 /// (`owned::read_owned`: a row at a key that does not name its signer's machine is inert and
 /// never here): one row per key, `<pk>.<uuid32>`, its columns the collection's. Returns the
 /// columns, the rows and the cells withheld.
 fn mine(collection: &Collection, read: &OwnedRead) -> (Columns, BTreeSet<String>, Vec<Row>, u64) {
-    let schema: Vec<(&'static str, Option<&'static str>)> = collection
-        .columns
-        .iter()
-        .filter(|column| column.live_at(collection.version))
-        .map(|column| (column.name, refers(&column.ty)))
-        .collect();
     let mut unknown = BTreeSet::new();
     let mut withheld = 0;
-    let mut rows = Vec::with_capacity(read.rows.len());
-    for (key, owned) in &read.rows {
-        let mut row = Row {
-            pk: keys::safe_key(key).to_owned(),
-            live: true,
-            ..Row::default()
-        };
-        let Some(object) = owned.value.as_object() else {
-            continue;
-        };
-        for (name, x) in object {
-            // `r` is the row's collection version, not a cell.
-            if name == "r" {
-                continue;
-            }
-            let ty = collection.column(name).map(|column| &column.ty);
-            if ty.is_none() {
-                unknown.insert(name.clone());
-            }
-            if let Some((shown, value)) = ring_cell(ty, x, &mut withheld) {
-                row.cells.insert(name.clone(), shown);
-                if let Some(value) = value {
-                    row.values.insert(name.clone(), value);
-                }
-            }
-        }
-        rows.push(row);
-    }
-    (schema, unknown, rows, withheld)
+    let rows = read
+        .rows
+        .iter()
+        .filter_map(|(key, owned)| {
+            stored_row(
+                collection,
+                key,
+                &owned.value,
+                Held::Ring,
+                &mut unknown,
+                &mut withheld,
+            )
+        })
+        .collect();
+    (stored_columns(collection), unknown, rows, withheld)
+}
+
+/// Project a log of a catalog table (`lab/tracker`'s) from `view`: one row per entry the typed
+/// read holds ([`View::logs`], `owned::read_log`: an entry at a key that does not name its
+/// signer's machine, or at a key an earlier entry took, is inert and never here), keyed
+/// `<uuid32>.<n>` in (machine, counter) order, its columns the collection's, all read-only, each
+/// cell shown as the table's grid shows a value of its type ([`Held::Table`]). A catalog table
+/// forgets no record, so nothing is carried. Returns the snapshot (the revision
+/// unset) and the cells withheld.
+fn log_table(
+    file: &Type,
+    collection: &'static Collection,
+    view: &View,
+    now_ms: u64,
+) -> (Snapshot, u64) {
+    let mut unknown = BTreeSet::new();
+    let mut withheld = 0;
+    let rows = view
+        .logs
+        .get(collection.name)
+        .into_iter()
+        .flat_map(|read| &read.entries)
+        .filter_map(|entry| {
+            stored_row(
+                collection,
+                &owned::log_entry_key(&entry.machine, entry.n),
+                &entry.value,
+                Held::Table,
+                &mut unknown,
+                &mut withheld,
+            )
+        })
+        .collect();
+    let columns = ring_columns(
+        &stored_columns(collection),
+        &unknown,
+        file.computed_columns(),
+    );
+    (
+        Snapshot {
+            name: file.file(),
+            kind: file.kind().to_owned(),
+            ext: TSV.to_owned(),
+            rev: 0,
+            complete: view.complete,
+            at_ms: now_ms,
+            columns,
+            handles: file.handles.iter().map(|name| (*name).to_owned()).collect(),
+            rows,
+        },
+        withheld,
+    )
 }
 
 /// The columns of `ai/events`: each event field under a readable name, its wire key and its
 /// type. Times are Unix milliseconds, as every other time column of a shared file; an event
 /// states seconds.
-const EVENT_COLUMNS: [(&str, &str, Ty); 19] = [
+pub(super) const EVENT_COLUMNS: [(&str, &str, Ty); 19] = [
     ("at", "t", Ty::Time),
     ("kind", "k", Ty::Text(32)),
     ("account", "a", Ty::Ref("account")),
@@ -1173,7 +1312,7 @@ const EVENT_SECONDS: [&str; 3] = ["t", "r", "u"];
 fn events(read: &LogRead) -> (Columns, Vec<Row>, u64, u64) {
     let schema = EVENT_COLUMNS
         .iter()
-        .map(|(name, _, ty)| (*name, refers(ty)))
+        .map(|(name, _, ty)| Stated::of(name, ty, None))
         .collect();
     let mut withheld = 0;
     let mut unread = 0_u64;
@@ -1201,7 +1340,7 @@ fn events(read: &LogRead) -> (Columns, Vec<Row>, u64, u64) {
                     }
                     _ => x.clone(),
                 };
-                if let Some((shown, value)) = ring_cell(Some(ty), &x, &mut withheld) {
+                if let Some((shown, value)) = ring_cell(Some(ty), &x, Held::Ring, &mut withheld) {
                     row.cells.insert((*name).to_owned(), shown);
                     if let Some(value) = value {
                         row.values.insert((*name).to_owned(), value);
@@ -1383,12 +1522,16 @@ fn limits_file(
             source: Source::Derived,
             read_only: true,
             refers: (*name == "account").then(|| super::ACCOUNTS.name.to_owned()),
+            ty: None,
+            null: None,
         })
         .chain(std::iter::once(Column {
             name: aterm_file::snapshot::PK.to_owned(),
             source: Source::Pk,
             read_only: true,
             refers: None,
+            ty: None,
+            null: None,
         }))
         .collect();
     (
@@ -1410,11 +1553,13 @@ fn limits_file(
 /// How many retained records of `file`'s collection `view` holds inert (§5): automatic records
 /// past their writer's quota ([`crate::typed::owned::Quota::over`]); in a collection under the
 /// authority rules, each record holding a write they hold inert
-/// ([`crate::typed::authority::Inert::records`]); and, in an owned collection, each row at a key
+/// ([`crate::typed::authority::Inert::records`]); in an owned collection, each row at a key
 /// that does not name its signer's machine or that is no bounded object with a counter
-/// ([`OwnedRead::inert`]). They stay in history with their authors; the status counts them. A
-/// file of the journal ring counts its own read's (`ring_file`): a row or an entry at a key that
-/// is not its signer's, and an event this build's vocabulary does not read.
+/// ([`OwnedRead::inert`]); and, in a log, each entry at such a key or at a key an earlier entry
+/// took ([`crate::typed::owned::LogRead::inert`]). They stay in history with their authors; the
+/// status counts them. A file of the journal ring counts its own read's (`ring_file`): a row or
+/// an entry at a key that is not its signer's, and an event this build's vocabulary does not
+/// read.
 pub(crate) fn inert(file: &Type, view: &View) -> u64 {
     let Some(collection) = file.collection() else {
         return 0;
@@ -1431,13 +1576,19 @@ pub(crate) fn inert(file: &Type, view: &View) -> u64 {
         })
         .count();
     let owned = view.owned.get(collection.name).map_or(0, |read| read.inert);
+    let log = view.logs.get(collection.name).map_or(0, |read| read.inert);
     let authority = view
         .inert
         .records
         .get(collection.name)
         .copied()
         .unwrap_or(0);
-    u64::try_from(over.saturating_add(owned).saturating_add(authority)).unwrap_or(u64::MAX)
+    u64::try_from(
+        over.saturating_add(owned)
+            .saturating_add(log)
+            .saturating_add(authority),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 /// The operations that wrote `file`'s collection, oldest claim first (by the time each says it
@@ -1586,8 +1737,8 @@ fn family_into(sha: &mut Sha256, family: &Family) {
 
 /// The projection key of a file of a catalog table (docs/DESIGN-shared-files-2026-11-11.md
 /// §4): a digest of everything its projection reads but the history already written, which
-/// the skip checks on its own ([`opened`]). The projection ([`View::of`], [`table`],
-/// [`history`], [`inert`]) takes the family's log and resolution, `me` (this Mac's machine as
+/// the skip checks on its own ([`opened`]). The projection ([`View::of`], [`table`] or, of a
+/// log, [`log_table`], [`history`], [`inert`]) takes the family's log and resolution, `me` (this Mac's machine as
 /// the roster names it, for a file whose columns read it, [`Computed::reads_here`]; `None` for
 /// every other, whose key a roster that moves leaves alone), this build's compiled tables and
 /// the done markers, and nothing else: the frontier and the log's judgment fix the log's
@@ -1792,7 +1943,9 @@ fn opened(
     // The status describes the snapshot at the revision it records. One at another revision
     // was written by a pass killed before its status: it is projected again, and that pass
     // records the revision. So is one at that revision that says other than the status
-    // records (put back from a copy, written by another hand), and one that does not say its
+    // records (put back from a copy, written by another hand), one whose header states no type
+    // for a stored column (an earlier build's put back at that revision: the content leaves the
+    // types out, and this build's projection states one for each), and one that does not say its
     // inert count, which an older build leaves out when it rewrites a status a newer one
     // wrote: the count is unknown, never 0.
     let unchanged = !pass.again
@@ -1803,7 +1956,11 @@ fn opened(
                 && (snapshot_unkeyed
                     || (snapshot.ext == state.ext
                         && state.snapshot
-                            == Some(aterm_codec::hex::encode_lower(&snapshot.content()))))
+                            == Some(aterm_codec::hex::encode_lower(&snapshot.content()))
+                        && snapshot
+                            .columns
+                            .iter()
+                            .all(|column| column.source != Source::Schema || column.ty.is_some())))
         })
         && state.inert.is_some()
         && state.history.is_some()
@@ -1849,8 +2006,15 @@ fn opened_table(
         || {
             let projections = projector.projections();
             let view = projections.view();
-            let (snapshot, withheld, baseline) =
-                table(file, family.compiled, projections, me, pass.now_ms)?;
+            let (snapshot, withheld, baseline) = match file.collection() {
+                // A log is each Mac's entries: no grid laid it out, so no write is read
+                // against a baseline of it (`Type::edited`).
+                Some(collection) if collection.kind == Kind::Log => {
+                    let (snapshot, withheld) = log_table(file, collection, view, pass.now_ms);
+                    (snapshot, withheld, None)
+                }
+                _ => table(file, family.compiled, projections, me, pass.now_ms)?,
+            };
             Ok(Projected {
                 snapshot,
                 history: history(file, family, view, held),

@@ -482,8 +482,13 @@ impl Through {
         if self.ready.get().is_none() {
             let mut command = crate::spawnfd::command(path);
             command.arg(READY_VERB).process_group(0);
-            let output = crate::deadline::output_within(&mut command, execution_hang)
-                .map_err(|error| format!("tether helper did not prepare: {error}"))?;
+            let output = crate::deadline::output_while_process_progressing_complete_with_limit(
+                &mut command,
+                execution_hang,
+                "the retained tether helper's execution receipt",
+                4096,
+            )
+            .map_err(|error| format!("tether helper did not prepare: {error}"))?;
             if !output.status.success() || output.stdout != READY_LINE.as_bytes() {
                 return Err("tether helper returned no execution receipt".into());
             }
@@ -668,7 +673,7 @@ pub fn prepared_executable() -> Result<Option<&'static Path>, String> {
 
 /// Prepare the retained helper with the caller's execution hang detector. Native first-exec
 /// qualification can use [`crate::deadline::FIRST_EXEC_HANG`] before starting a separate
-/// consumer budget; [`prepared_executable`] keeps the ordinary one-minute bound.
+/// consumer budget; [`prepared_executable`] keeps the ordinary one-minute inactivity window.
 /// On macOS and Linux a successful execution receipt is required and cached for this process.
 /// Other platforms use [`executable`] without an extra execution.
 ///

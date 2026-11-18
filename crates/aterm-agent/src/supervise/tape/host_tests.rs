@@ -504,6 +504,16 @@ fn every_host_answer_reads_back_as_written() {
             ready: ready("pool-a"),
             held: None,
         }),
+        // The word that names the ready row's account rides along; a row with no address, and
+        // a tape an earlier build wrote, carry none (the cases above).
+        Some(RosterWord::Row {
+            next: None,
+            ready: Some(Ready {
+                label: "pool-a".to_string(),
+                word: Some("claude-ada-x".to_string()),
+            }),
+            held: Some(HeldBy::Pin),
+        }),
     ] {
         same(word);
     }
@@ -512,6 +522,7 @@ fn every_host_answer_reads_back_as_written() {
 fn ready(label: &str) -> Option<Ready> {
     Some(Ready {
         label: label.to_string(),
+        word: None,
     })
 }
 

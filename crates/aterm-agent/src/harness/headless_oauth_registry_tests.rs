@@ -352,8 +352,14 @@ fn a_vendor_sign_in_takes_the_registry_mailbox() {
     alab_roster::with_mail(vec![mailbox()], secrets(), || {
         let approver = VendorApprover::new(
             super::super::accounts::Cli::Claude,
-            "claude-1",
-            Some("ai1@example.test"),
+            (
+                &super::super::accounts::Row {
+                    label: "claude-1".to_owned(),
+                    email: Some("ai1@example.test".to_owned()),
+                    ..super::super::accounts::Row::default()
+                },
+                None,
+            ),
             &shared,
             Some(home.path()),
         );

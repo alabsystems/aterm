@@ -12,6 +12,17 @@ use std::num::NonZeroU32;
 mod seal;
 #[cfg(target_os = "macos")]
 pub use seal::{ExecutionSeal, fork_denied};
+/// Pure bounded protocol DATA; this grants no native execution capability.
+pub const MAX_CLOSED_EXEC_IMAGES: usize = 16;
+/// Pure per-name byte bound; paths alone create no original input owner.
+pub const MAX_CLOSED_EXEC_NAME_BYTES: usize = 4096;
+
+#[cfg(unix)]
+mod closed_exec;
+#[cfg(target_os = "macos")]
+pub use closed_exec::install_no_fork_closed_exec;
+#[cfg(unix)]
+pub use closed_exec::validate_closed_exec_names;
 #[cfg(target_os = "macos")]
 mod forking_group;
 #[cfg(target_os = "macos")]
@@ -23,7 +34,10 @@ pub use readonly_image::{RestrictedNativeImage, restrict_current_to_readonly_ima
 #[cfg(target_os = "macos")]
 mod native_entry;
 #[cfg(target_os = "macos")]
-pub use native_entry::{RestrictedNativeEntry, restrict_current_native_entry};
+pub use native_entry::{
+    RestrictedNativeEntry, restrict_current_native_entry,
+    revoke_current_bootstrap_and_registered_ports,
+};
 
 /// Apple's `spawn.h` defines the initialized attribute handle as `void *`.
 /// Its storage is owned by the native initializer, not by this library.
@@ -39,7 +53,10 @@ impl FootprintLimit {
     pub fn new(mib: u32) -> io::Result<Self> {
         let value = NonZeroU32::new(mib).filter(|v| v.get() <= i32::MAX as u32);
         value.map(Self).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "footprint MiB outside native range")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "footprint MiB outside native range",
+            )
         })
     }
 
@@ -64,8 +81,12 @@ impl FootprintLimit {
         ) -> libc::c_int;
         // SAFETY: a static NUL-terminated symbol name and the process-global dyld
         // handle; resolving a symbol does not call it or alter spawn attributes.
-        let symbol =
-            unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"posix_spawnattr_setjetsam_ext".as_ptr()) };
+        let symbol = unsafe {
+            libc::dlsym(
+                libc::RTLD_DEFAULT,
+                c"posix_spawnattr_setjetsam_ext".as_ptr(),
+            )
+        };
         if symbol.is_null() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -80,7 +101,11 @@ impl FootprintLimit {
         // the validated positive MiB values fit the ABI. 0x04/0x08 are Apple's
         // active/inactive fatal flags; the setter supplies JETSAM_SET internally.
         let result = unsafe { setter(attributes, 0x04 | 0x08, 0, mib, mib) };
-        if result == 0 { Ok(()) } else { Err(io::Error::from_raw_os_error(result)) }
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(result))
+        }
     }
 }
 

@@ -386,12 +386,28 @@ pub fn row_lines(
     wide: bool,
     top: usize,
     tab_number: &dyn Fn(u64) -> Option<usize>,
+    sid_of: &dyn Fn(u64) -> Option<String>,
 ) -> Vec<Line> {
     let mut out = Vec::new();
     for r in rows.iter().take(top) {
         let mut t = r.wire();
         if wide && let Some(n) = tab_number(r.tab) {
             t.push_str(&format!(" tab={n}"));
+        }
+        t.push_str(&format!(
+            " sid={}",
+            sid_of(r.tab).map_or_else(
+                || super::view::unavailable("not_sampled"),
+                |sid| super::pct(&sid)
+            )
+        ));
+        if r.named
+            .as_ref()
+            .and_then(|named| named.holder.as_ref())
+            .and_then(|holder| holder.tab)
+            .is_some()
+        {
+            t.push_str(" holder_sid=unavailable(not_sampled)");
         }
         out.push(value_line(format!("job {}:{}", r.tab, r.id), t));
     }
@@ -419,9 +435,17 @@ fn enum_word(w: &str) -> String {
 
 /// Formats one job row as JSON with integers in base units and `phi_m`.
 #[must_use]
-pub fn row_json(r: &JobRow, tab_number: Option<usize>) -> Jv {
+pub fn row_json(
+    r: &JobRow,
+    tab_number: Option<usize>,
+    sid_of: &dyn Fn(u64) -> Option<String>,
+) -> Jv {
     let mut o = Jv::obj([
         ("id", Jv::s(r.id.clone())),
+        (
+            "sid",
+            sid_of(r.tab).map_or_else(|| Jv::why("not_sampled"), Jv::s),
+        ),
         (
             "tab",
             tab_number.map_or_else(|| Jv::why("gone"), |n| Jv::u(n as u64)),
@@ -472,6 +496,8 @@ pub fn row_json(r: &JobRow, tab_number: Option<usize>) -> Jv {
                     ]);
                     if let Some(t) = h.tab {
                         hj.set("tab", Jv::u(u64::from(t)));
+                        // This holder retained only its ordinal, not an original session key.
+                        hj.set("sid", Jv::why("not_sampled"));
                     }
                     if let Some(c) = h.class {
                         hj.set("class", Jv::s(c.word()));

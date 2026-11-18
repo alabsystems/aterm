@@ -456,3 +456,138 @@ fn found_for_folds_and_marks_what_discovery_reads() {
 
     assert!(found_for(&scratch, Some(&prefix)).is_none());
 }
+
+#[cfg(unix)]
+#[test]
+fn the_shim_hop_uses_the_lock_where_the_call_builds() {
+    use crate::build_cache::Tool;
+    let scratch = crate::testdir::dir("atpkg-lock-directory-");
+    let prefix = scratch.join("pkg");
+    let first = store_build(&prefix, 16387);
+    let second = store_build(&prefix, 16500);
+    store_build(&prefix, 16600);
+    let launcher = scratch.join("launcher");
+    let destination = scratch.join("destination");
+    let bare = scratch.join("bare");
+    let broken = scratch.join("broken");
+    let unreadable = scratch.join("unreadable");
+    write_lock(&launcher, &lock_of(16387, &first));
+    write_lock(&destination, &lock_of(16500, &second));
+    std::fs::create_dir_all(destination.join("sub")).unwrap();
+    std::fs::create_dir_all(&bare).unwrap();
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(broken.join(LOCK_FILE), b"not a lock").unwrap();
+    std::fs::create_dir_all(unreadable.join(LOCK_FILE)).unwrap();
+    std::os::unix::fs::symlink(destination.join("sub"), scratch.join("alias")).unwrap();
+    let target = |build, tool| build_dir(&prefix, build).join("bin").join(tool);
+    let words = |items: &[&str]| {
+        items
+            .iter()
+            .map(|word| (*word).to_owned())
+            .collect::<Vec<_>>()
+    };
+    let resolve = |cwd: &Path, tool, placed, args: &[String]| {
+        let binary = if tool == Tool::Tippy {
+            "targo-tippy"
+        } else {
+            "targo"
+        };
+        shim_target_for_call(
+            &target(16600, binary),
+            cwd,
+            tool,
+            placed,
+            args,
+            &mut no_install,
+        )
+    };
+    let into = words(&[
+        "-Zunstable-options",
+        "-C",
+        "../destination/sub",
+        "--unverified",
+        "check",
+    ]);
+    for cwd in [&launcher, &bare, &broken, &unreadable] {
+        assert_eq!(
+            resolve(cwd, Tool::Targo, "-", &into),
+            Ok(Some(target(16500, "targo"))),
+            "{}",
+            cwd.display()
+        );
+    }
+    assert_eq!(
+        resolve(
+            &launcher,
+            Tool::Targo,
+            "-",
+            &words(&["-Zunstable-options", "-C../bare", "--unverified", "check"])
+        ),
+        Ok(None),
+        "an unlocked destination never inherits the launcher's lock",
+    );
+    // Kernel resolution of alias/.. reaches destination, unlike lexical normalization.
+    for directory in ["../alias/..", destination.join("sub").to_str().unwrap()] {
+        assert_eq!(
+            resolve(
+                &launcher,
+                Tool::Targo,
+                "-",
+                &words(&[
+                    "-Zunstable-options",
+                    "-C",
+                    directory,
+                    "--unverified",
+                    "check"
+                ])
+            ),
+            Ok(Some(target(16500, "targo"))),
+        );
+    }
+    for placed in ["config", "env"] {
+        let mut args = if placed == "config" {
+            words(&["--config", "build.build-dir='/tmp/.ubd/build.noindex'"])
+        } else {
+            Vec::new()
+        };
+        args.extend(into.clone());
+        assert_eq!(
+            resolve(&broken, Tool::Targo, placed, &args),
+            Ok(Some(target(16500, "targo")))
+        );
+    }
+    for args in [
+        words(&["--unverified", "check"]),
+        words(&["--unverified", "run", "--", "-C", "../destination"]),
+        words(&["--unverified", "check", "-C", "../destination"]),
+    ] {
+        assert_eq!(
+            resolve(&launcher, Tool::Targo, "-", &args),
+            Ok(Some(target(16387, "targo")))
+        );
+    }
+    assert_eq!(
+        resolve(&launcher, Tool::Tippy, "-", &words(&["-Copt-level=2"])),
+        Ok(Some(target(16387, "targo-tippy")))
+    );
+    for args in [
+        words(&["-C"]),
+        words(&["-C", ""]),
+        words(&["-C", "../missing", "--unverified", "check"]),
+        words(&[
+            "-C",
+            "../destination",
+            "-C",
+            "../bare",
+            "--unverified",
+            "check",
+        ]),
+        words(&["-C", "../broken", "--unverified", "check"]),
+    ] {
+        assert!(
+            resolve(&launcher, Tool::Targo, "-", &args).is_err(),
+            "{args:?}"
+        );
+    }
+    assert!(resolve(&launcher, Tool::Targo, "config", &into).is_err());
+}

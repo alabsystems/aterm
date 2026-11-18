@@ -4,7 +4,6 @@
 use super::login_tests::{Desk, NOW};
 use super::*;
 use aterm_spec::interp::State;
-use std::sync::{Arc, Mutex};
 
 #[test]
 fn source_path_uses_the_captured_session_directory() {
@@ -151,8 +150,11 @@ fn source_path_config_reader_and_refresh_probe_use_the_same_directory() {
     .unwrap();
     sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW).unwrap();
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
-    let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let (cooldown, rediscovery) = (
+        Watched::new("accounts_sync/sync_cooldown", None),
+        Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
+    );
+    let guard = AutoRenewGuard::default().shared();
     let fx = super::login_tests::upkeep_effects(
         &fetch_source_text,
         &spawn,

@@ -99,6 +99,7 @@ struct Edge {
     dxdy: f32,
 }
 
+#[derive(Default)]
 struct FillScratch {
     edges: Vec<Edge>,
     active: Vec<Edge>,
@@ -109,15 +110,8 @@ struct FillScratch {
 }
 
 thread_local! {
-    static FILL_SCRATCH: std::cell::RefCell<FillScratch> = const {
-        std::cell::RefCell::new(FillScratch {
-            edges: Vec::new(),
-            active: Vec::new(),
-            xs: Vec::new(),
-            spans: Vec::new(),
-            diff: Vec::new(),
-            extra: Vec::new(),
-        })
+    static FILL_SCRATCH: std::cell::RefCell<Option<Box<FillScratch>>> = const {
+        std::cell::RefCell::new(None)
     };
 }
 
@@ -133,7 +127,16 @@ pub fn fill_path(
     {
         return;
     }
-    FILL_SCRATCH.with_borrow_mut(|scratch| fill_scanline(tile, paths, rgb, alpha, t, scratch));
+    FILL_SCRATCH.with_borrow_mut(|scratch| {
+        fill_scanline(
+            tile,
+            paths,
+            rgb,
+            alpha,
+            t,
+            scratch.get_or_insert_with(Box::default),
+        );
+    });
 }
 
 fn fill_scanline(
@@ -351,8 +354,16 @@ pub fn fill_path_fixed(
     {
         return;
     }
-    FILL_SCRATCH
-        .with_borrow_mut(|scratch| fill_scanline_fixed(tile, paths, rgb, alpha, t, scratch));
+    FILL_SCRATCH.with_borrow_mut(|scratch| {
+        fill_scanline_fixed(
+            tile,
+            paths,
+            rgb,
+            alpha,
+            t,
+            scratch.get_or_insert_with(Box::default),
+        );
+    });
 }
 
 #[inline]

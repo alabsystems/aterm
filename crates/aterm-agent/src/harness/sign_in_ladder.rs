@@ -40,10 +40,19 @@
 //! window, and the headless route ends at Cloudflare's page.
 //!
 //! This module holds the ladder's words and its clocks; `accounts_sync` reads the machine and
-//! runs the routes.
+//! runs the routes. The clocks are monotonic instants the caller reads on the guard's clock
+//! (`accounts_sync`'s `MachineReads::clock`), and every wait they answer is judged through
+//! `aterm_uds::trace::Since` ([`reached`]): a run that finds a row's backoff or the vault's
+//! wait still standing records when it ends as its trace's monotonic deadline, and one that
+//! finds it over records nothing, since a later instant answers the same.
+//!
+//! Traced by the accounts keeper: what this file reads of the file system itself, it reads
+//! through `aterm_uds::trace::fs` (census `traced-reads`).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
+
+use aterm_uds::trace::{self, Since};
 
 /// What the row's own headless browser profile offers ([`super::headless_oauth::has_browser_profile`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,7 +106,7 @@ impl Mailbox {
 }
 
 /// What the LAN vault's refresh found ([`super::accounts_sync`]'s `run_vault_sync`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum Vault {
     /// This machine is in no vault (`~/.config/aterm/secrets/source.toml` is missing).
     NotMember,
@@ -549,8 +558,14 @@ pub(super) fn backoff_after(step: u32) -> Duration {
         .min(BACKOFF_MAX)
 }
 
+/// Whether `deadline` has come at `now` (`now >= deadline`), judged through [`Since`]: where it
+/// has not, the trace scope armed on this thread records `deadline` as its monotonic deadline.
+fn reached(deadline: Instant, now: Instant) -> bool {
+    Since::new(deadline).elapsed_at_least(Duration::ZERO, now)
+}
+
 /// One row's wait before its ladder runs again with the same inputs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Backoff {
     /// Not before this instant.
     next: Instant,
@@ -567,7 +582,7 @@ struct Backoff {
 
 /// The vault refresh's own clock: one `aterm secrets sync` at a time, and none sooner than its
 /// wait after the last, which doubles until a refresh applies the whole vault.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct VaultRun {
     /// The bounded local vault inputs observed before this refresh.
     context: VaultContext,
@@ -587,7 +602,7 @@ pub(super) type VaultContext = [u8; 32];
 
 /// What the ladder remembers in this process between upkeeps: each failing row's backoff, the
 /// vault refresh's clock, and the sign-in workflow whose vault route each row has refreshed for.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Hash)]
 pub(super) struct Ladder {
     backoff: BTreeMap<String, Backoff>,
     vault: Option<VaultRun>,
@@ -615,14 +630,15 @@ pub(super) enum VaultTurn {
 }
 
 impl Ladder {
-    /// The existing retry clock, without probing routes or advancing the ladder.
-    /// A row that waits for a person has none ([`Self::page_stopped`]).
+    /// The existing retry clock, without probing routes or advancing the ladder: when `label`'s
+    /// wait ends, where it has not ended at `now` ([`reached`]). A row that waits for a person has
+    /// none ([`Self::page_stopped`]).
     pub(super) fn retry_at(&self, label: &str, now: Instant) -> Option<Instant> {
         self.backoff
             .get(label)
             .filter(|backoff| !backoff.for_a_person)
             .map(|backoff| backoff.next)
-            .filter(|next| *next > now)
+            .filter(|next| !reached(*next, now))
     }
 
     /// Whether `label`'s ladder waits out its backoff at `now`: it does while the wait set at its
@@ -631,6 +647,8 @@ impl Ladder {
     /// page stopped is held on record before it gets here. Once a different input is observed,
     /// returning to the previous input cannot restore its wait. A row a bot protection stopped
     /// waits for a person whatever it reads and however long it waits ([`Self::page_stopped`]).
+    /// A wait that holds is judged through [`reached`], so a traced run that is held records when
+    /// the wait ends.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::spec_unmodeled(
@@ -673,7 +691,7 @@ impl Ladder {
         }
         self.backoff
             .get(label)
-            .is_some_and(|b| b.inputs == inputs && now < b.next)
+            .is_some_and(|b| b.inputs == inputs && !reached(b.next, now))
     }
 
     /// Notes a failure of `label`'s ladder at `now` over `inputs`, and returns the wait set: the
@@ -883,14 +901,18 @@ impl Ladder {
             .and_then(|run| run.seen.clone())
     }
 
-    /// Read a completed result without reserving a refresh the caller will not start.
+    /// Read a completed result without reserving a refresh the caller will not start: what the
+    /// last refresh found, for the same `context` and while its wait stands at `now`, judged
+    /// through [`Since`], so a traced run that reuses it records when it goes stale. A refresh
+    /// still running, one for another context and one invalidated compare no clock.
     pub(super) fn vault_result(&self, context: VaultContext, now: Instant) -> Option<Vault> {
         self.vault.as_ref().and_then(|run| {
+            let seen = run.seen.as_ref()?;
             (run.context == context
                 && !run.invalidated
-                && now.saturating_duration_since(run.at) < run.wait)
-                .then(|| run.seen.clone())
-                .flatten()
+                && !run.wait.is_zero()
+                && !Since::new(run.at).elapsed_at_least(run.wait, now))
+            .then(|| seen.clone())
         })
     }
 
@@ -1034,16 +1056,21 @@ impl Started {
 /// THE SPACING LAW. An automatic sign-in of `cli`'s `label` at `now` waits until the returned
 /// time when `last` is another account's start within [`SPACING_S`] of `now`, either way: a clock
 /// set back holds it at most [`SPACING_S`] past the record, never longer. The same account's
-/// own retries are the ladder's backoff's to space ([`backoff_after`]), not this law's.
+/// own retries are the ladder's backoff's to space ([`backoff_after`]), not this law's. It
+/// compares through `now` ([`trace::Now::within`]): a traced read that found no spacing stands
+/// until the first second that would.
 #[must_use]
 pub(super) fn spaced_until(
     last: Option<&Started>,
     cli: super::accounts::Cli,
     label: &str,
-    now: i64,
+    now: impl Into<trace::Now>,
 ) -> Option<i64> {
+    let now: trace::Now = now.into();
     let last = last.filter(|last| last.cli != cli.id() || last.label != label)?;
-    (now.abs_diff(last.at) < SPACING_S.unsigned_abs()).then(|| last.at.saturating_add(SPACING_S))
+    // `|now - at| < SPACING_S`: `at - SPACING_S < now < at + SPACING_S`.
+    now.within(last.at.saturating_sub(SPACING_S - 1), 2 * SPACING_S - 1)
+        .then(|| last.at.saturating_add(SPACING_S))
 }
 
 /// What [`space_token_capture`] found.
@@ -1350,7 +1377,7 @@ pub(super) enum Why {
     /// A session on this Mac runs on the row and its login is on record as signed out here, or a
     /// launch here starts on it and its own check refused its login.
     Session,
-    /// A person named the account: `accounts login|renew <label>`, `harness agy login
+    /// A person named the account: `accounts login|renew <account>`, `harness agy login
     /// <account>`, `signin --cli grok` (the default home, whose device code goes to them), or a
     /// selection saved from the window's account menu.
     Asked,
@@ -1665,7 +1692,7 @@ impl SignIn {
     pub(super) fn spaced(
         &self,
         store: &super::accounts::Store,
-        now: i64,
+        now: impl Into<trace::Now>,
     ) -> Result<Option<i64>, Refused> {
         if !self.why.spaced() {
             return Ok(None);
@@ -1936,10 +1963,12 @@ pub(super) fn begun_fixture(
     }
 }
 
-/// The `aterm.log` line one attempt of `label`'s ladder writes: how it ended and the routes.
-pub(super) fn log_line(label: &str, outcome: &str, words: &str) -> String {
+/// The `aterm.log` line one attempt of a row's ladder writes: the row as a log line names it
+/// (`logged`, its account's key with its slug, [`super::account_names::logged_row`]), how it
+/// ended and the routes.
+pub(super) fn log_line(logged: &str, outcome: &str, words: &str) -> String {
     format!(
-        "account {label}: automatic sign-in {outcome}: {}",
+        "account {logged}: automatic sign-in {outcome}: {}",
         super::one_line(words, 400)
     )
 }

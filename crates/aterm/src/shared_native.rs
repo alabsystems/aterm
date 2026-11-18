@@ -3,12 +3,16 @@
 
 //! Native API-key preparation from the current signed account decision. Local
 //! records are evidence only; every use rereads root and execution authority.
+//!
+//! Traced by the accounts keeper: what this file reads of the file system itself, it reads
+//! through `aterm_uds::trace::fs` (census `traced-reads`).
 
 use super::*;
 use aterm_agent::harness::native_keys::{self, Access, Inputs, Provider};
 use aterm_json::{Value, json};
 use aterm_secrets::commons::accounts::Action;
 use aterm_secrets::{fsx, text::Audience};
+use aterm_uds::trace::Watched;
 use native_keys::policy::{Assignment, ENTRY, Policy, Scope, Subject};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -21,7 +25,12 @@ mod input;
 
 const RECORDS: &str = "native-account-preparations.json";
 const SELECTION: &str = "native-account-selection.json";
-static PREPARATIONS: OnceLock<Mutex<native_keys::PreparationQueue>> = OnceLock::new();
+/// The native preparations' scheduling hints in this process, watched: a selection or a prune
+/// moves the generation, and a pass that selects nothing and prunes nothing leaves it.
+static PREPARATIONS: Watched<native_keys::PreparationQueue> = Watched::new(
+    "shared_native/preparations",
+    native_keys::PreparationQueue::new(),
+);
 static INPUT_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// One original deadline for a required native policy, intake, launch or preparation step.
@@ -38,13 +47,20 @@ struct Observation {
     input: Inputs,
 }
 
+/// Whether the step's `deadline` is still to come. One that has come records a retry in the
+/// trace scope armed on this thread: the step stopped short, so the accounts keeper keeps no
+/// verdict of the pass it ran in.
 fn check_time(deadline: Instant) -> Result<(), String> {
     if Instant::now() >= deadline {
-        Err("native preparation deadline expired".into())
+        aterm_uds::trace::retry(DEADLINE_EXPIRED);
+        Err(DEADLINE_EXPIRED.into())
     } else {
         Ok(())
     }
 }
+
+/// Why a native preparation step stopped short ([`check_time`]).
+const DEADLINE_EXPIRED: &str = "native preparation deadline expired";
 
 fn observation(approved: &Approved, deadline: Instant) -> Result<Observation, String> {
     #[cfg(test)]
@@ -588,7 +604,6 @@ fn discover(
     let candidates = candidates(home, step_deadline(Instant::now()))?;
     let selected = select_preparation(
         &mut PREPARATIONS
-            .get_or_init(|| Mutex::new(native_keys::PreparationQueue::default()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
         home,
@@ -771,10 +786,10 @@ fn program(provider: Provider, requested: &Path) -> Result<PathBuf, String> {
     let layout = atpkg::store::resolve_configured().ok_or("native package store is unavailable")?;
     let managed = aterm_agent::ai::facts::managed_of(&layout, provider.connector())
         .ok_or("native connector is not installed")?;
-    let canonical =
-        std::fs::canonicalize(&managed.path).map_err(|_| "native connector path is unavailable")?;
+    let canonical = aterm_uds::trace::fs::canonicalize(&managed.path)
+        .map_err(|_| "native connector path is unavailable")?;
     if requested != Path::new(provider.connector())
-        && std::fs::canonicalize(requested).ok().as_ref() != Some(&canonical)
+        && aterm_uds::trace::fs::canonicalize(requested).ok().as_ref() != Some(&canonical)
     {
         return Err("native key cannot be delivered to an unrelated executable".into());
     }
@@ -831,10 +846,9 @@ fn own_profile(provider: Provider, profile: &Path) -> Result<(), String> {
                 .map_err(|_| "native profile is not an owned private directory")?;
             let existing = fsx::read_private(&marker, 256).map_err(|e| e.to_string())?;
             if existing.is_none()
-                && std::fs::read_dir(profile)
+                && !aterm_uds::trace::fs::read_dir(profile)
                     .map_err(|_| "native profile cannot be inspected")?
-                    .next()
-                    .is_some()
+                    .is_empty()
             {
                 return Err("native profile has unrelated existing data".into());
             }

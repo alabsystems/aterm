@@ -62,14 +62,29 @@ fn survey_rows_are_read_per_host_and_report_rows_carry_their_cli() {
     let rows = survey_rows(&reply);
     assert_eq!(rows["n1"].len(), 2);
     assert!(rows["n2"].is_empty());
+    // The report's schema 3: a row with no address keeps its label; a row with an address (the
+    // heal lane's default row) is named by its account alone, and is read back to its laid label
+    // off its account's name.
     let report: aterm_json::Value = aterm_json::from_str(
-        r#"{"pools":[{"cli":"codex","rows":[{"label":"ax-in","condition":"usable"}]}]}"#,
+        r#"{"pools":[
+            {"cli":"codex","report":{"accounts":[{"label":"ax-in","condition":"usable"}]}},
+            {"cli":"claude","report":{"accounts":[{"ac":"ac-0123456789abcdef","slug":null,
+             "name":"claude bc-def@example.test","condition":"usable"}]}}]}"#,
     )
     .unwrap();
+    let rows = report_rows(&report);
     assert_eq!(
-        report_rows(&report).into_iter().collect::<Vec<_>>(),
-        vec![row("codex", "ax-in", "usable")]
+        rows.iter().cloned().collect::<Vec<_>>(),
+        vec![
+            row("claude", "bc-def", "usable"),
+            row("codex", "ax-in", "usable")
+        ]
     );
+    // The other Mac's addressed row in A's report is foreign. NEGATIVE CONTROL: with
+    // `laid_label` reading `label` alone, the addressed row is never read: `left: [Row { pool:
+    // "codex", label: "ax-in", condition: "usable" }]` (2026-11-16, by hand on SF-07H S7a's
+    // review settle, then restored).
+    assert_eq!(foreign('a', &rows), vec!["bc-def".to_string()]);
 }
 
 #[test]

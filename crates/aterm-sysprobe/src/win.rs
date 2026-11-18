@@ -434,9 +434,14 @@ pub(crate) fn own_session() -> Option<u32> {
 /// which every process started in that console shares. `None` for a process with no console,
 /// one that has exited, and one this process may not open.
 pub(crate) fn console_host(pid: u32) -> Option<u32> {
-    use std::os::windows::io::AsRawHandle as _;
+    use std::os::windows::io::AsHandle as _;
     let process =
         crate::win_paths::open_process(pid, crate::win_paths::PROCESS_QUERY_LIMITED_INFORMATION)?;
+    console_host_of(process.as_handle()).ok().flatten()
+}
+
+fn console_host_of(process: std::os::windows::io::BorrowedHandle<'_>) -> Result<Option<u32>, ()> {
+    use std::os::windows::io::AsRawHandle as _;
     let mut answer = 0u64;
     let mut got = 0u32;
     // SAFETY: `process` is a live handle opened with `PROCESS_QUERY_LIMITED_INFORMATION`, which
@@ -452,7 +457,41 @@ pub(crate) fn console_host(pid: u32) -> Option<u32> {
     };
     (status >= 0)
         .then(|| crate::windows::console_host_pid(answer))
-        .flatten()
+        .ok_or(())
+}
+
+/// Bind a console read and its host to the original census generations, using retained
+/// process handles. A PID reused after the sweep cannot supply either observation.
+pub(crate) fn checked_console(
+    row: &crate::ProcessReading,
+) -> Result<(u64, Option<(u32, u64)>), ()> {
+    use std::os::windows::io::AsHandle as _;
+    let start = row.start.filter(|start| *start > 0).ok_or(())?;
+    let process = crate::win_paths::open_process(
+        row.pid,
+        crate::win_paths::PROCESS_QUERY_LIMITED_INFORMATION | crate::win_paths::SYNCHRONIZE,
+    )
+    .ok_or(())?;
+    let (creation, _, _) = crate::win_paths::process_times(process.as_handle()).ok_or(())?;
+    if creation != start || !crate::win_paths::process_live(process.as_handle()) {
+        return Err(());
+    }
+    let Some(host_pid) = console_host_of(process.as_handle())? else {
+        return crate::win_paths::process_live(process.as_handle())
+            .then_some((creation, None))
+            .ok_or(());
+    };
+    let host = crate::win_paths::open_process(
+        host_pid,
+        crate::win_paths::PROCESS_QUERY_LIMITED_INFORMATION | crate::win_paths::SYNCHRONIZE,
+    )
+    .ok_or(())?;
+    let (creation, _, _) = crate::win_paths::process_times(host.as_handle()).ok_or(())?;
+    (creation > 0
+        && crate::win_paths::process_live(host.as_handle())
+        && crate::win_paths::process_live(process.as_handle()))
+    .then_some((start, Some((host_pid, creation))))
+    .ok_or(())
 }
 
 /// [`console_host`] of a sweep's row, for [`crate::windows::tree_adopting`]. The pid is

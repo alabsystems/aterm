@@ -1871,6 +1871,8 @@ enum Command {
     /// The window asks for agent `pid`'s settings default, for the permission chip's click and
     /// box ([`request_default`]): read where its last read is due ([`Asks::default`]), and no
     /// footer read with it.
+    /// A test build sends it only from the cause tests, which are Unix's (`cause_tests`).
+    #[cfg(any(not(test), unix))]
     Default(u32),
     /// A host fact a read takes moved ([`crate::host_facts`]): a window switch, a published
     /// snapshot or the lab's journal ([`host_moved`]), the wall clock or the local time zone
@@ -2284,6 +2286,7 @@ impl WatchSchedule {
                         accepted.execed.insert((pid, started));
                     }
                 }
+                #[cfg(any(not(test), unix))]
                 Command::Default(pid) => {
                     accepted.defaults.insert(pid);
                 }
@@ -3689,7 +3692,8 @@ enum Hearing<'a> {
     /// heard.
     Watch(&'a mut crate::claude_inputs::InputWatch),
     /// Nowhere: an exec is told only by a new registry row (a test's lone read).
-    #[cfg(test)]
+    /// Made only by [`resolve_and_post`], which only macOS tests call.
+    #[cfg(all(test, target_os = "macos"))]
     Deaf,
 }
 
@@ -3719,7 +3723,8 @@ impl Hearing<'_> {
 }
 
 /// [`resolve_and_post_hearing`] of a read that hears no exec ([`Hearing::Deaf`]).
-#[cfg(test)]
+/// Only macOS tests call it (`claude_footer_tests.rs`).
+#[cfg(all(test, target_os = "macos"))]
 fn resolve_and_post(
     known: &mut HashMap<u64, Identity>,
     tails: &mut ProcessTails,

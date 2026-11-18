@@ -36,9 +36,9 @@ fn inline(work: Box<dyn FnOnce() + Send>) -> io::Result<()> {
 /// as `ends` and each browser it is handed kept, and every line the ladder logs kept. A `live`
 /// bench scripts nothing: each run is the real one, of the `claude` the home holds.
 pub(super) struct Bench {
-    cooldown: Mutex<Option<Instant>>,
-    rediscovery: Mutex<Rediscovery>,
-    pub(super) guard: Arc<Mutex<AutoRenewGuard>>,
+    cooldown: Watched<Option<Instant>>,
+    rediscovery: Watched<Rediscovery>,
+    pub(super) guard: Arc<Watched<AutoRenewGuard>>,
     pub(super) browser: bool,
     logged: Arc<Mutex<Vec<String>>>,
     handed: Arc<Mutex<Vec<RenewBrowser>>>,
@@ -55,9 +55,9 @@ pub(super) struct Bench {
 impl Bench {
     pub(super) fn ending(ends: Renewal) -> Self {
         Self {
-            cooldown: Mutex::new(None),
-            rediscovery: Mutex::new(Rediscovery::default()),
-            guard: Arc::new(Mutex::new(AutoRenewGuard::default())),
+            cooldown: Watched::new("accounts_sync/sync_cooldown", None),
+            rediscovery: Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
+            guard: AutoRenewGuard::default().shared(),
             browser: false,
             logged: Arc::default(),
             handed: Arc::default(),
@@ -361,6 +361,110 @@ fn a_failed_sign_in_keeps_its_own_short_wait() {
     );
 }
 
+std::thread_local! {
+    /// The instant [`scripted`] reads on this thread.
+    #[cfg(unix)]
+    static SCRIPTED: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// A guard clock a test scripts ([`MachineReads::clock`]): the instant last set on this thread.
+/// The bench runs every sign-in inline, so the work a pass starts reads it too.
+#[cfg(unix)]
+fn scripted() -> Instant {
+    SCRIPTED
+        .get()
+        .expect("the test sets the scripted clock first")
+}
+
+/// L6, THE LADDER'S WAIT AS A DEADLINE: A ROW BACKED OFF ASKS EXACTLY ITS RETRY_AT, AND AT THAT
+/// DEADLINE ITS RENEWAL RUNS ONCE AND SPAWNS ONCE. A row whose sign-in failed waits out its
+/// backoff on the guard's clock, here scripted. Each renewal pass (the work of Claude Code's
+/// `ClaudeRenew` duty) while it waits, a minute in and a nanosecond short of its end, starts
+/// nothing, and the horizon of its trace asks for exactly the row's `retry_at` as its monotonic
+/// deadline: the wake a keeper takes from it. The pass at that deadline starts the row's sign-in
+/// once (one more run of `claude auth login`); that run fails too, and a pass after it at the
+/// same instant starts nothing and asks for the end of the doubled wait. The duty itself still
+/// takes the wall clock raw (`upkeep_claude`), so its trace is poisoned and reruns on the minute
+/// as well until that clock moves to `trace::Now`; this law is the deadline recorded beside it.
+///
+/// NEGATIVE CONTROL (2026-11-15): the design's `Since` recording nothing, made as
+/// `Ladder::held` comparing its wait raw (`now < b.next` in place of `!reached(b.next, now)`),
+/// the one mutation of its mutant build that reached this test and the ladder's own
+/// `a_rows_wait_that_holds_records_when_it_ends_and_one_over_records_nothing`: `the row due at
+/// retry_at was not retried: its held pass asked the keeper for None, not its retry_at` failed,
+/// left `None`, right the row's `retry_at`; restored, the file touched.
+#[cfg(unix)]
+#[test]
+fn a_backed_off_row_asks_exactly_its_retry_at_and_at_it_renews_once_and_spawns_once() {
+    let desk = Desk::new("m30");
+    hand_roster(&desk, false);
+    let store = desk.store();
+    fs::create_dir_all(crate::harness::headless_oauth::browser_profile_dir(
+        &store.dir,
+        Some("w3"),
+    ))
+    .unwrap();
+    let bench = Bench {
+        browser: true,
+        guard: guard_reading(MachineReads {
+            clock: scripted,
+            ..MachineReads::default()
+        }),
+        ..Bench::ending(Renewal::Failed)
+    };
+    // One renewal pass at guard clock `at` and wall `wall`: whether it started a sign-in, and
+    // the monotonic deadline its trace's horizon asks for.
+    let pass_at = |at: Instant, wall: i64| {
+        SCRIPTED.set(Some(at));
+        let (started, read) = trace::scope(|| bench.pass(&desk, wall));
+        (started, read.horizon().mono)
+    };
+    let first = Instant::now();
+    assert!(pass_at(first, NOW).0, "the first try");
+    assert_eq!(bench.handed().len(), 1);
+    // The first try's permit cooldown ends with the backoff's first wait: clear it, as the
+    // other ladder tests do, so the ladder's own wait alone holds the row.
+    bench.cool();
+    let retry_at = bench
+        .guard
+        .lock()
+        .unwrap()
+        .ladder
+        .retry_at("w3", first)
+        .expect("the failed row waits");
+    let wait = crate::harness::sign_in_ladder::BACKOFF_FIRST;
+    assert_eq!(retry_at, first + wait);
+
+    for (at, wall) in [
+        (first + Duration::from_secs(60), NOW + 60),
+        (retry_at - Duration::from_nanos(1), NOW + 899),
+    ] {
+        let (started, asked) = pass_at(at, wall);
+        assert!(!started, "the row waits");
+        assert_eq!(
+            asked,
+            Some(retry_at),
+            "the row due at retry_at was not retried: its held pass asked the keeper for \
+             {asked:?}, not its retry_at"
+        );
+    }
+    assert_eq!(bench.handed().len(), 1, "a held pass starts nothing");
+
+    assert!(
+        pass_at(retry_at, NOW + 900).0,
+        "at retry_at the row is tried"
+    );
+    assert_eq!(bench.handed().len(), 2, "once");
+    let (started, asked) = pass_at(retry_at, NOW + 900);
+    assert!(!started, "its second failure holds it");
+    assert_eq!(
+        asked,
+        Some(retry_at + wait * 2),
+        "the pass asks for the doubled wait's end, not the permit's cooldown"
+    );
+    assert_eq!(bench.handed().len(), 2);
+}
+
 #[cfg(unix)]
 #[test]
 fn a_repaired_profile_reopens_the_ladder_inside_its_wrong_account_wait_and_backoff() {
@@ -466,7 +570,7 @@ fn a_repaired_profile_reopens_non_ladder_admission_inside_the_wrong_account_wait
         let raw = Roster::load(&desk.roster()).unwrap();
         let logins = store.load_logins(NOW + 2).unwrap().0;
         let row = accounts::bound(&raw, &logins).row("w3").unwrap().clone();
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let queued_work = Arc::clone(&queued);
         let spawn = move |work: Box<dyn FnOnce() + Send>| {
@@ -885,20 +989,27 @@ fn a_roster_identity_edit_reconsiders_the_row_without_roster_rewrite_noise() {
     let desk = Desk::new("m30");
     hand_roster(&desk, false);
     let bench = Bench::ending(Renewal::AuthFailed);
-    let no_route_count = || {
+    // The log names the row by its account's key, which its address makes: the row before the
+    // edit and the row after it each have their own.
+    let first = logged_as(W3_EMAIL);
+    let no_route_count = |logged: &[&str]| {
         bench
             .logged()
             .iter()
-            .filter(|line| line.contains("account w3: automatic sign-in no-route"))
+            .filter(|line| {
+                logged.iter().any(|logged| {
+                    line.contains(&format!("account {logged}: automatic sign-in no-route"))
+                })
+            })
             .count()
     };
     assert!(!bench.pass(&desk, NOW));
-    assert_eq!(no_route_count(), 1);
+    assert_eq!(no_route_count(&[&first]), 1);
     let original = fs::read_to_string(desk.roster()).unwrap();
     fs::write(desk.roster(), format!("{original}\n# unchanged rows\n")).unwrap();
     assert!(!bench.pass(&desk, NOW + 1));
     assert_eq!(
-        no_route_count(),
+        no_route_count(&[&first]),
         1,
         "rewriting an unchanged roster keeps its wait"
     );
@@ -906,15 +1017,17 @@ fn a_roster_identity_edit_reconsiders_the_row_without_roster_rewrite_noise() {
     let replacement = original.replace("w3.m30.3@example.test", "new.m30.3@example.test");
     assert_ne!(replacement, original);
     fs::write(desk.roster(), replacement).unwrap();
+    let renamed = logged_as("new.m30.3@example.test");
+    assert_ne!(renamed, first, "a new address is a new account");
     assert!(!bench.pass(&desk, NOW + 2));
     assert_eq!(
-        no_route_count(),
+        no_route_count(&[&first, &renamed]),
         2,
         "the new row is reconsidered immediately"
     );
     assert!(!bench.pass(&desk, NOW + 3));
     assert_eq!(
-        no_route_count(),
+        no_route_count(&[&first, &renamed]),
         2,
         "the unchanged replacement keeps its own wait"
     );
@@ -922,6 +1035,7 @@ fn a_roster_identity_edit_reconsiders_the_row_without_roster_rewrite_noise() {
         bench.handed().is_empty(),
         "no provider request without a route"
     );
+    names_only_by_key(&bench.logged(), &[&first, &renamed]);
 }
 
 #[cfg(unix)]
@@ -1121,13 +1235,24 @@ fn an_unattended_run_is_never_handed_a_window_and_its_failure_is_on_record_and_h
     ] {
         assert!(attempt.routes.contains(part), "{part}: {}", attempt.routes);
     }
+    // NEGATIVE CONTROL: with the ladder naming the row as a message does (`shown_row` for
+    // `next_logged`), this fails on `account claude w3.m30.3@example.test: automatic sign-in
+    // failed: …` (2026-11-16, by hand, then restored).
     let lines = bench.logged();
+    let logged = logged_as(W3_EMAIL);
     let failed: Vec<&String> = lines
         .iter()
-        .filter(|l| l.contains("w3") && l.contains("failed"))
+        .filter(|l| l.starts_with(&format!("account {logged}: automatic sign-in failed: ")))
         .collect();
     assert_eq!(failed.len(), 1, "{lines:?}");
     assert!(failed[0].contains("profile:"), "{}", failed[0]);
+    assert!(
+        lines.contains(&format!(
+            "account {logged}: automatic sign-in started by its profile route"
+        )),
+        "{lines:?}"
+    );
+    names_only_by_key(&lines, &[&logged]);
 
     bench.cool();
     assert!(!bench.pass(&desk, NOW + 60), "the backoff holds");
@@ -1366,7 +1491,7 @@ fn a_person_turning_logins_off_stops_the_ladder() {
         let upkept = upkeep(
             &desk.home,
             &desk.state,
-            (&desk.roster(), NOW, UpkeepStep::Both),
+            (&desk.roster(), trace::Now::at(NOW), UpkeepStep::Both),
             &bench.fx(),
         );
         let started = logins == "renew";
@@ -1387,6 +1512,10 @@ fn a_row_changed_during_route_read_gets_no_stale_no_route_summary() {
     for changed in [false, true] {
         let desk = Desk::new("m30");
         hand_roster(&desk, false);
+        let no_route = format!(
+            "account {}: automatic sign-in no-route",
+            logged_as(W3_EMAIL)
+        );
         let path = desk.roster();
         let mailbox = move |_: &Path, _: &accounts::Store, _: &Row| {
             if changed {
@@ -1413,10 +1542,7 @@ fn a_row_changed_during_route_read_gets_no_stale_no_route_summary() {
         ));
         assert_eq!(attempt_of(&desk, "w3").is_some(), !changed);
         assert_eq!(
-            bench
-                .logged()
-                .iter()
-                .any(|line| line.contains("account w3: automatic sign-in no-route")),
+            bench.logged().iter().any(|line| line.contains(&no_route)),
             !changed
         );
         assert!(bench.handed().is_empty());
@@ -1425,11 +1551,12 @@ fn a_row_changed_during_route_read_gets_no_stale_no_route_summary() {
 
 /// A guard whose renewals read `reads` of the machine.
 #[cfg(unix)]
-fn guard_reading(reads: MachineReads) -> Arc<Mutex<AutoRenewGuard>> {
-    Arc::new(Mutex::new(AutoRenewGuard {
+fn guard_reading(reads: MachineReads) -> Arc<Watched<AutoRenewGuard>> {
+    AutoRenewGuard {
         reads,
         ..AutoRenewGuard::default()
-    }))
+    }
+    .shared()
 }
 
 /// What a Mac with a desk reads, with nothing of another machine's in it.
@@ -1693,6 +1820,42 @@ impl crate::harness::cli::AccountsHost for RenewAtTheDesk {
     }
 }
 
+/// What a verb's lines name the desk's row `w3` by ([`crate::harness::account_names::RowName`]).
+/// The desk's renewals run on unix alone, and so do the tests that read their lines.
+#[cfg(unix)]
+fn w3_named(desk: &Desk) -> crate::harness::account_names::RowName {
+    crate::harness::account_names::tests::row_name(Cli::Claude, &desk.roster(), "w3")
+}
+
+/// The desk's row `w3`'s address.
+const W3_EMAIL: &str = "w3.m30.3@example.test";
+
+/// How a log line names the Claude account of `email` with no lab: its key alone, made here from
+/// the address, never the address or the roster label (Decision 3).
+fn logged_as(email: &str) -> String {
+    aterm_db::typed::keys::account_pk("claude", email).expect("a key")
+}
+
+/// Panics where a line the ladder logged about an account (`account <name>: …`) names it by
+/// anything but `logged`, or holds an address or the roster label `w3` anywhere.
+fn names_only_by_key(lines: &[String], logged: &[&str]) {
+    for line in lines.iter().filter(|line| line.starts_with("account ")) {
+        assert!(
+            logged
+                .iter()
+                .any(|logged| line.starts_with(&format!("account {logged}: "))),
+            "a log line names its account by something but {logged:?}: {line}"
+        );
+        assert!(!line.contains('@'), "an address in a log line: {line}");
+        assert!(
+            !line
+                .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+                .any(|token| token == "w3"),
+            "the roster label in a log line: {line}"
+        );
+    }
+}
+
 /// Runs `accounts renew` at `at` on `desk` as [`RenewAtTheDesk`] does, for `w3` by name or, with
 /// `due`, as a `--due` sweep: its exit, the renewals it started and what it said.
 #[cfg(unix)]
@@ -1712,10 +1875,10 @@ fn renew_w3(
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = super::super::cli::run_accounts(
         &super::super::cli::AccountsCmd::Renew {
-            labels: if due {
+            accounts: if due {
                 Vec::new()
             } else {
-                vec!["w3".to_owned()]
+                vec!["w3.m30.3@example.test".to_owned()]
             },
             due,
             on: None,
@@ -1876,8 +2039,13 @@ fn a_claude_row_a_check_stopped_waits_for_a_person_at_every_door() {
     assert!(started.is_empty(), "an agent's renewal starts none: {said}");
     assert_eq!(code, ExitCode::from(1), "{said}");
     assert!(
-        said.contains(&super::super::cli::left_words(Cli::Claude, "w3"))
-            && said.contains("a person runs `aterm harness accounts renew w3`"),
+        said.contains(&super::super::cli::left_words(
+            Cli::Claude,
+            &w3_named(&desk)
+        )) && said.contains(&format!(
+            "a person runs `aterm harness accounts renew {}`",
+            w3_named(&desk).word
+        )),
         "it names the person's step, and who takes it: {said}"
     );
     let (_, started, said) = renew_w3(&desk, (false, MetWord::WindowHumanCheck), false, later);
@@ -2176,7 +2344,10 @@ fn a_checks_stop_outlasts_what_its_attempt_does_not() {
     assert!(started.is_empty(), "{said}");
     assert_eq!(code, ExitCode::from(1), "{said}");
     assert!(
-        said.contains(&super::super::cli::left_words(Cli::Claude, "w3")),
+        said.contains(&super::super::cli::left_words(
+            Cli::Claude,
+            &w3_named(&desk)
+        )),
         "{said}"
     );
     let bench = desk_upkeep();
@@ -2417,15 +2588,21 @@ fn an_agents_due_sweep_names_the_persons_step_for_a_row_left_to_a_person() {
     let (_, started, said) = renew_w3(&desk, (true, MetWord::BotCheck), true, NOW + 60);
     assert!(started.is_empty(), "{said}");
     assert!(
-        said.contains(&super::super::cli::left_words(Cli::Claude, "w3")),
+        said.contains(&super::super::cli::left_words(
+            Cli::Claude,
+            &w3_named(&desk)
+        )),
         "the person's step: {said}"
     );
-    assert!(!said.contains("w3: not run yet"), "{said}");
+    assert!(
+        !said.contains(&format!("{}: not run yet", w3_named(&desk).shown)),
+        "{said}"
+    );
 }
 
-/// Runs `accounts token w3` in `mode` at `at` on `desk` as [`RenewAtTheDesk`] does, at this Mac's
-/// desk, with no vault and no `claude` to run, under a test key for the lab's journal: its exit
-/// and what it said.
+/// Runs `accounts token claude <w3's address>` in `mode` at `at` on `desk` as [`RenewAtTheDesk`]
+/// does, at this Mac's desk, with no vault and no `claude` to run, under a test key for the lab's
+/// journal: its exit and what it said.
 #[cfg(unix)]
 fn token_w3(
     desk: &Desk,
@@ -2446,7 +2623,8 @@ fn token_w3(
         crate::harness::journal::with_keyer(crate::harness::accounts_tokens::tests::keyer, || {
             super::super::cli::run_accounts(
                 &super::super::cli::AccountsCmd::Token {
-                    name: "w3".to_owned(),
+                    // The verb names the row's account by its address, never its label.
+                    name: "claude w3.m30.3@example.test".to_owned(),
                     mode,
                 },
                 &env,
@@ -2477,11 +2655,11 @@ fn token_w3(
 #[test]
 fn an_agents_token_run_opens_nothing_for_a_row_left_to_a_person() {
     use super::super::cli::TokenMode;
+    let desk = desk_with_a_mail_folder();
     let refused = format!(
         "aterm harness accounts token: {}",
-        super::super::cli::left_words(Cli::Claude, "w3")
+        super::super::cli::left_words(Cli::Claude, &w3_named(&desk))
     );
-    let desk = desk_with_a_mail_folder();
     check_stopped(&desk, crate::harness::open_url::MetWord::BotCheck, NOW);
     for mode in [TokenMode::Make, TokenMode::Replace] {
         let (code, said) = token_w3(&desk, true, mode, NOW + 60);
@@ -3671,7 +3849,7 @@ fn a_saved_choice_with_nobody_here_holds_a_check_this_process_keeps() {
         let records = store
             .read_account_records(Some(&desk.roster()), NOW)
             .unwrap();
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         if kept {
             guard.lock().unwrap().unrecorded_checks.insert(
                 "w3".to_owned(),

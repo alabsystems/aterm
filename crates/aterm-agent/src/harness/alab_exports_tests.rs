@@ -75,6 +75,8 @@ fn lab() -> Lab {
         me: Some(test_machine("m3")),
         bound: Default::default(),
         accounts: vec![ann, bob, cy, dee],
+        names: Default::default(),
+        barred: Default::default(),
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
         #[cfg(unix)]

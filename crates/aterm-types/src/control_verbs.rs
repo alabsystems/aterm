@@ -2810,14 +2810,27 @@ pub const VERBS: &[VerbSpec] = &[
          commons_owner_ticks= commons_beacons= commons_announces= commons_signature_checks= \
          commons_deadline_spawns=`), and the accounts' upkeep's counts in this process since it \
          started, which no `reset` clears either: its passes, whatever each came to (one that \
-         only renews logins and one the accounts' off switch ends are among them), the other \
+         only renews logins and one the accounts' off switch ends are among them), and of them \
+         those the window's accounts' keeper made, those a session's thread made and those the \
+         network move's thread made; the keeper's wakes by cause (a file it read changed, the \
+         trace bell, a deadline, a minute spent waiting on a wall deadline, an asked re-tell, a \
+         forced turn, a minute with no file watch) and its turns that ran nothing; the files \
+         traced reads opened and the account stores' writer locks taken; the other \
          CLIs' pool syncs it ran and those of them that reached their roster's publication \
          holding a receipt guard (the lab is that CLI's source), the publications by any caller \
-         here that asked a receipt guard to admit them, and, on macOS and Linux, the registry reads those admissions made with the records and \
+         here that asked a receipt guard to admit them, the duties of the upkeep's own passes \
+         that ran, were skipped where their kept verdict stood, were kept as their verdict and \
+         were poisoned (a poisoned duty runs at every pass), and, on macOS and Linux, the registry reads those admissions made with the records and \
          payload bytes they decoded, and the strict registry reads that were no admission (the \
          lab view's read of the registry's mail metadata, which a sync's capture of its source \
-         can make) (`accounts_upkeep_passes= accounts_pool_syncs= accounts_pool_syncs_guarded= \
-         accounts_receipt_admissions= accounts_admission_reads= \
+         can make) (`accounts_upkeep_passes= accounts_upkeep_passes_keeper= \
+         accounts_upkeep_passes_session= accounts_upkeep_passes_moved= \
+         accounts_keeper_wakes_file= accounts_keeper_wakes_bell= accounts_keeper_wakes_deadline= \
+         accounts_keeper_wakes_wall= accounts_keeper_wakes_asked= accounts_keeper_wakes_forced= \
+         accounts_keeper_wakes_unwatched= accounts_keeper_unmoved= accounts_trace_opened= \
+         accounts_store_locks= accounts_pool_syncs= accounts_pool_syncs_guarded= \
+         accounts_receipt_admissions= accounts_duty_runs= accounts_duty_skips= \
+         accounts_duty_kept= accounts_duty_poisoned= accounts_admission_reads= \
          accounts_admission_records= accounts_admission_bytes= accounts_observation_reads=`). \
          `echo_*` is the child round trip; `input_*` is key to the next content present (or a \
          proven prediction, when `input_predicted=` > 0). Its start uses native arrival when \
@@ -4475,8 +4488,10 @@ pub const VERBS: &[VerbSpec] = &[
          `status program_state=`: a claim beside `agent=`), `human_ms=<ms|->`, `role=<pct|-> attention=<pct|-> user_title=<pct|->`, \
          `supervisor=<pct|-> supervisor_proven=<0|1>` (`1`: the live claim is a proven \
          self-claim or contract 3 claim, as `status` prints it), `supervisor_version=<pct|-> \
-         supervisor_vendor=<pct|->` (the harness version and vendor build a proven contract 3 \
-         claim announced, as `status` prints them; `-` otherwise), `autopilot=<off|cruise|land|->`, \
+         supervisor_vendor=<pct|->` (a proven scoped claim's harness version, read from the \
+         build its proof admitted and `link` for a development link, never the claim's own \
+         `version=`, and the vendor build the claim states, as `status` prints them; `-` \
+         otherwise), `autopilot=<off|cruise|land|->`, \
          `path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|->`, `copy=<managed|foreign|->`, \
          `upgrade=<-|<state>/<to>/<why>/<age>>`, `land_at=<unix-s|-> task=<open|landed|theirs|-> \
          pause=<unix-s|->`, `task_state=<working|done|exited|stalled|failed|-> task_rev=<n>`, \

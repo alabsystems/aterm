@@ -2932,7 +2932,11 @@ impl NodeConverge {
     ) {
         use crate::converge::Last;
         // Each look reaps a runner that ended, and lets its exit go.
-        let last = Last::of(&mut self.runner);
+        let result = crate::converge::RunnerResult::of(&mut self.runner);
+        if result.identity_complete {
+            self.due.identity_completed();
+        }
+        let last = result.last;
         if self.runner.is_none() {
             self.exit = None;
         }

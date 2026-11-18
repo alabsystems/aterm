@@ -2684,6 +2684,19 @@ impl MessageCenter {
     }
 
     fn quiet_record(&self, key: &str, ask: &LaterAsk, stamp: WallStamp) -> Option<MessageId> {
+        self.quiet_filing(key, ask.resurface(), stamp)
+            .map(|(id, _)| id)
+    }
+
+    /// The filing of the exception `key` that keeps a re-post of it quiet at `stamp`, and until
+    /// when (Unix ms): its last word, where a person filed it, backed off by `resurface` for
+    /// each filing of it since [`FILED_KEEP_MS`] before; `None` where none keeps it quiet then.
+    fn quiet_filing(
+        &self,
+        key: &str,
+        resurface: Resurface,
+        stamp: WallStamp,
+    ) -> Option<(MessageId, u64)> {
         let last = self.log.last_word(key, true)?;
         if !last.filed_exception() {
             return None;
@@ -2696,8 +2709,18 @@ impl MessageCenter {
             .log
             .filings_since(key, filed_at.saturating_sub(FILED_KEEP_MS))
             .max(1);
-        let until = filed_at.saturating_add(ask.resurface().backed_off(n));
-        (until > stamp.unix_ms).then_some(last.id)
+        let until = filed_at.saturating_add(resurface.backed_off(n));
+        (until > stamp.unix_ms).then_some((last.id, until))
+    }
+
+    /// Until when (Unix ms) a person's filing of the exception `key` (folded, dismissed or
+    /// answered), whose ask resurfaces after `resurface`, keeps a re-post of it quiet, as judged
+    /// at `stamp`: the moment [`Self::post`] would take a re-post of it as new again. `None`
+    /// where nothing keeps it quiet at `stamp`, so a re-post now would be taken.
+    #[must_use]
+    pub fn quiet_until(&self, key: &str, resurface: Resurface, stamp: WallStamp) -> Option<u64> {
+        self.quiet_filing(key, resurface, stamp)
+            .map(|(_, until)| until)
     }
 
     /// Whether the owner's own Dismiss of the exception `key` still keeps it quiet at `stamp`.

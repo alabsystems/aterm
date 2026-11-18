@@ -53,16 +53,6 @@ pub fn managed(build: u64, index_build: u64) -> String {
     s
 }
 
-/// `managed <to> — rolled back from <from>`: an index program a person rolled back.
-#[must_use]
-pub fn rolled_back(to: u64, from: u64) -> String {
-    let mut s = String::from(MANAGED_PREFIX);
-    s.push_str(&to.to_string());
-    s.push_str(" — rolled back from ");
-    s.push_str(&from.to_string());
-    s
-}
-
 /// `managed <version> — <vendor> latest`: a vendor-direct program atpkg installed from its vendor and keeps at the vendor's head.
 #[must_use]
 pub fn vendor_managed(version: &str, vendor: &str) -> String {

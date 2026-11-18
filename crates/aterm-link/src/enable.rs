@@ -1666,7 +1666,8 @@ pub fn remove_fabric_table(text: &str) -> Result<(String, Vec<String>), String> 
 }
 
 pub(crate) use aterm_uds::atomic_file::{
-    create_temp_beside, write as write_atomic, ConfigFile, EditLanded, LOCK_OPEN_FLAGS,
+    create_temp_beside, write as write_atomic, ChangedSinceRead, ConfigFile, EditLanded,
+    LOCK_OPEN_FLAGS,
 };
 
 /// `n` random bytes through the one audited entropy helper (`aterm_uds::rand`).
@@ -2170,17 +2171,104 @@ impl Out {
     }
 }
 
-fn config_step(config: Option<&Path>, command: &[String], out: &mut Out) -> bool {
+/// What [`config_step`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigSet {
+    /// `[fabric] command` is the command: written, or it was already.
+    Set,
+    /// aterm.toml no longer holds the command the caller judged: left as it is, and said.
+    Changed,
+    /// The step failed, and said why.
+    Failed,
+}
+
+/// `[fabric] command` in `config` set to `command` as `on` sets it, over whatever aterm.toml
+/// holds where `judged` is `None` (`on`), and only while it still holds `judged`, the command a
+/// renewal judged, otherwise: one that changed since (a person's edit, an `off` or `on` between
+/// the look and the step) is left as it is ([`ConfigSet::Changed`]). The text compared is the one
+/// the edit replaces: `ConfigEdit::replace`, under the config service's write lock, refuses bytes
+/// that changed since this step read them ([`ChangedSinceRead`]). Such a refusal (another writer,
+/// a Settings save of another key say, between the read and the write, or while the lock was
+/// waited for) is no failure: the step reads aterm.toml again, once, and judges and writes what
+/// it holds then. A second refusal leaves a judged command as it is, for the next pass (said:
+/// aterm.toml changed again, not that the command did), and fails `on`'s, as a write or lock
+/// error does. The `done` line is said, and counted in `out.changed`, only for the edit that
+/// landed (or, in a dry run, would be made).
+fn config_step(
+    config: Option<&Path>,
+    judged: Option<&[String]>,
+    command: &[String],
+    out: &mut Out,
+) -> ConfigSet {
     let Some(config) = config else {
         out.fail(
             "config",
             "no config path: neither $XDG_CONFIG_HOME nor $HOME is set",
         );
-        return false;
+        return ConfigSet::Failed;
     };
+    if let Some(set) = config_edit(config, judged, command, out) {
+        return set;
+    }
+    out.note(
+        "config",
+        &format!(
+            "{} changed between this step's read and its write: reading it again",
+            config.display()
+        ),
+    );
+    match config_edit(config, judged, command, out) {
+        Some(set) => set,
+        None if judged.is_some() => {
+            out.line(
+                "config",
+                "kept",
+                &format!(
+                    "{} changed again between this step's read and its write; the next pass \
+                     judges [fabric] command",
+                    config.display()
+                ),
+            );
+            ConfigSet::Changed
+        }
+        None => {
+            out.fail(
+                "config",
+                &format!(
+                    "{} changed again between this step's read and its write; run this again",
+                    config.display()
+                ),
+            );
+            ConfigSet::Failed
+        }
+    }
+}
+
+/// The kept line of a `[fabric] command` aterm.toml no longer holds as it was judged.
+fn changed_since_read(out: &Out, config: &Path) {
+    out.line(
+        "config",
+        "kept",
+        &format!(
+            "[fabric] command in {} changed since it was read; the next pass judges it",
+            config.display()
+        ),
+    );
+}
+
+/// One read and write of [`config_step`]'s, its lines said: `None`, saying nothing of the edit,
+/// where it was refused because aterm.toml changed between this read and the write
+/// ([`ChangedSinceRead`]), and every other outcome, a write or lock error's FAILED included, as
+/// a [`ConfigSet`]. The `done` line is said only where the edit landed, or in a dry run.
+fn config_edit(
+    config: &Path,
+    judged: Option<&[String]>,
+    command: &[String],
+    out: &mut Out,
+) -> Option<ConfigSet> {
     let fail = |out: &mut Out, e: &dyn std::fmt::Display| {
         out.fail("config", &format!("{}: {e}", config.display()));
-        false
+        Some(ConfigSet::Failed)
     };
     let file = match ConfigFile::open(config) {
         Ok(file) => file,
@@ -2190,13 +2278,19 @@ fn config_step(config: Option<&Path>, command: &[String], out: &mut Out) -> bool
         Ok(text) => (text.unwrap_or(""), text.is_some()),
         Err(e) => return fail(out, &e),
     };
+    if let Some(judged) = judged {
+        if !matches!(fabric::command_in_toml(text), Ok(Some(now)) if now == judged) {
+            changed_since_read(out, config);
+            return Some(ConfigSet::Changed);
+        }
+    }
     let new_text = match set_fabric_command(text, command) {
         Ok((_, false)) => {
             out.already(
                 "config",
                 &format!("[fabric] command in {} is this command", config.display()),
             );
-            return true;
+            return Some(ConfigSet::Set);
         }
         Ok((new_text, true)) => new_text,
         Err(e) => return fail(out, &e),
@@ -2206,27 +2300,39 @@ fn config_step(config: Option<&Path>, command: &[String], out: &mut Out) -> bool
     } else {
         ("add", "added")
     };
-    out.done(
-        "config",
-        &format!(
-            "{word} [fabric] command in {}{}",
-            config.display(),
-            if existed {
-                " (previous saved as .bak)"
-            } else {
-                ""
-            }
-        ),
-        "",
+    let plan = format!(
+        "{word} [fabric] command in {}{}",
+        config.display(),
+        if existed {
+            " (previous saved as .bak)"
+        } else {
+            ""
+        }
     );
     if out.dry_run {
-        return true;
+        out.done("config", &plan, "");
+        return Some(ConfigSet::Set);
     }
-    said_replaced(
-        out,
-        config,
-        file.lock().and_then(|edit| edit.replace(&new_text)),
-        |saved| format!("{did} [fabric] command in {}{saved}", config.display()),
+    #[cfg(test)]
+    tests::between_read_and_write();
+    let replaced = match file.lock().and_then(|edit| edit.replace(&new_text)) {
+        Err(refused) if ChangedSinceRead::of(&refused).is_some() => return None,
+        replaced => replaced,
+    };
+    if replaced
+        .as_ref()
+        .map_or_else(|e| EditLanded::of(e).is_some(), |_| true)
+    {
+        out.done("config", &plan, "");
+    }
+    Some(
+        if said_replaced(out, config, replaced, |saved| {
+            format!("{did} [fabric] command in {}{saved}", config.display())
+        }) {
+            ConfigSet::Set
+        } else {
+            ConfigSet::Failed
+        },
     )
 }
 
@@ -4383,19 +4489,158 @@ fn node_broker_step(
 pub enum BrokerRenewal {
     /// No `[fabric] command`: the fabric is off, and nothing of it was read or changed.
     Off,
-    /// The broker runs the build on disk: what was found.
+    /// The broker runs the build on disk, and the programs aterm wrote (the job's, and `[fabric]
+    /// command`'s) each name a file: what was found.
     Current(String),
-    /// The broker runs a build an update replaced, or none holds its socket, and `aterm fabric
-    /// on`'s job does not keep it (the person runs it: `--service none`, or a broker that is not
-    /// the job `on` installed; the command names another socket than its root's; no gui domain
-    /// here to load the job in; or `aterm fabric off`'s record stands): it is left as it is, and
-    /// why.
+    /// Nothing due is renewed, and why: `aterm fabric off`'s record stands, or an `off` or `on`
+    /// runs now; the broker is due (below) and `aterm fabric on`'s job does not keep it (the
+    /// person runs it: `--service none`, or a broker that is not the job `on` installed; the
+    /// command names another socket than its root's; no gui domain here to load the job in); or
+    /// a program aterm wrote names no file and no installed app is known to run instead. Under
+    /// [`Service::Node`] with nothing due, that the node service hosts the bus ([`NODE_HOSTS`]).
     Kept(String),
-    /// The broker runs a build an update replaced, or none holds its socket while the job `on`
-    /// installed is not loaded or runs no broker, and a look ([`Renew::Look`]) leaves it: which.
-    Due(String),
-    /// It was due, and `aterm fabric on`'s broker step renewed it: what that step said.
+    /// A look ([`Renew::Look`]) leaves something due: the broker runs a build an update replaced
+    /// or that is gone, none holds its socket while the job `on` installed is not loaded or runs
+    /// no broker, or a program aterm wrote (the job's, or `[fabric] command`'s) names no file
+    /// while the installed app is known. A `[fabric] command` aterm wrote is judged apart from
+    /// the broker, so it is due whatever keeps the broker, which `to` then names.
+    Due {
+        /// What is due.
+        from: String,
+        /// What an apply ([`Renew::Apply`]) leaves: the installed app the programs that move are
+        /// pointed at, the broker renewed where it is due, and what is left as it is.
+        to: String,
+    },
+    /// It was due, and `aterm fabric on`'s own steps renewed it (the config steps for a
+    /// rewritten `[fabric] command`, the program link and broker steps for the broker): what they
+    /// said, and what was left as it is.
     Renewed(String),
+}
+
+/// What an apply leaves of a broker that is due while its job's program stays: the broker that
+/// job runs.
+const RENEWED_TO: &str = "the broker runs the build on disk, under the job `aterm fabric on` \
+                          installed";
+
+/// A program aterm wrote (a broker job's, or `[fabric] command`'s) that names no file, and the
+/// installed app the renewal points it at ([`lasting`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Moved {
+    /// The program as written.
+    from: String,
+    /// The installed app's executable, which it is rewritten to.
+    to: String,
+}
+
+/// What a program aterm wrote comes to against the installed app ([`lasting`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Lasting {
+    /// It stays as written: it names a regular file, whatever file that is, or it cannot be
+    /// judged (a relative path, a path that cannot be read).
+    Stays,
+    /// It names no file, and is rewritten to the installed app.
+    Moves(Moved),
+    /// It names no file, and no installed app is known to point it at: the path as written.
+    Nowhere(String),
+}
+
+impl Lasting {
+    /// Where it moves, if it does.
+    fn moved(&self) -> Option<&Moved> {
+        match self {
+            Lasting::Moves(moved) => Some(moved),
+            Lasting::Stays | Lasting::Nowhere(_) => None,
+        }
+    }
+
+    /// What it says of `what` (`the broker job`, `` `[fabric] command` ``): `None` where it stays.
+    fn said(&self, what: &str) -> Option<String> {
+        match self {
+            Lasting::Stays => None,
+            Lasting::Moves(Moved { from, to }) => Some(format!(
+                "{what} runs {}, which names no file now (the installed app is {})",
+                safe(from, 256),
+                safe(to, 256)
+            )),
+            Lasting::Nowhere(from) => Some(format!(
+                "{what} runs {}, which names no file now, and no installed aterm is known to run \
+                 instead",
+                safe(from, 256)
+            )),
+        }
+    }
+}
+
+/// What `written`, a program aterm wrote, comes to against `installed`, the installed app's
+/// executable as the caller names it (`sync.node`'s program): it moves to `installed` only where
+/// it is an absolute path that names no regular file ([`fabric::regular_file_at`]: it is gone, a
+/// dangling link, a path under a file, or a directory) and `installed` names a regular file;
+/// with none to move to it is [`Lasting::Nowhere`]. Every other stays: a relative path, one
+/// whose file cannot be read for another reason (no evidence it is gone), and one that names a
+/// regular file, whatever file that is. A program that names a file other than the installed
+/// app (a newer copy elsewhere, an older copy a pass runs from, a dev build the fabric was
+/// pointed at, the `$PATH` aterm a turn-on wrote) still starts: moving it onto `installed` would
+/// downgrade a newer broker, flip the job between two copies on alternating passes, undo that
+/// choice, and reload a broker a turn-on just started.
+fn lasting(written: &str, installed: Option<&Path>) -> Lasting {
+    if !written.starts_with('/') || !matches!(fabric::regular_file_at(Path::new(written)), Ok(None))
+    {
+        return Lasting::Stays;
+    }
+    match installed.filter(|app| matches!(fabric::regular_file_at(app), Ok(Some(_)))) {
+        Some(app) => Lasting::Moves(Moved {
+            from: written.to_owned(),
+            to: app.to_string_lossy().into_owned(),
+        }),
+        None => Lasting::Nowhere(written.to_owned()),
+    }
+}
+
+/// `p` running `program`, the argv0 of the job `on` installed, judged against `installed`
+/// ([`lasting`]): `p.aterm` is `program`, or the installed app where it moves, so the broker step
+/// writes and loads the job onto that.
+fn job_lasting(p: &mut Paths, program: String, installed: Option<&Path>) -> Lasting {
+    let judged = lasting(&program, installed);
+    p.aterm = match &judged {
+        Lasting::Moves(Moved { to, .. }) => to.clone(),
+        Lasting::Stays | Lasting::Nowhere(_) => program,
+    };
+    judged
+}
+
+/// What `command`'s program comes to against `installed` ([`lasting`]) where aterm wrote the
+/// command: it came from aterm.toml (`in_file`; never `$ATERM_FABRIC_COMMAND`) and is the one
+/// `on` writes for `p`'s root with the root's `node` ([`written_by_on`]), so one that moves names
+/// its root's own socket (`--broker`, which the root was read off) and a node id the root holds.
+/// [`Lasting::Stays`] for any other, a person's, which is never rewritten, and where the root
+/// holds no node id.
+fn command_lasting(
+    p: &Paths,
+    node: Option<&str>,
+    command: &[String],
+    in_file: bool,
+    installed: Option<&Path>,
+) -> Lasting {
+    match (node, command.first()) {
+        (Some(node), Some(program)) if in_file && written_by_on(p, node, command) => {
+            lasting(program, installed)
+        }
+        _ => Lasting::Stays,
+    }
+}
+
+/// Whether `command` is the bridge command `aterm fabric on` writes for `p`'s root, fleet and
+/// `node`, whatever program it runs: every word after its program is what [`Paths::bridge_command`]
+/// writes with that program as `p`'s aterm. Any other command is a person's, and the renewal
+/// never rewrites it.
+fn written_by_on(p: &Paths, node: &str, command: &[String]) -> bool {
+    command.first().is_some_and(|program| {
+        let as_written = Paths {
+            aterm: program.clone(),
+            ..p.clone()
+        };
+        as_written.bridge_command(node) == command
+    })
 }
 
 /// Whether [`renew_replaced_broker`] renews a replaced or absent broker, or only looks.
@@ -4410,11 +4655,23 @@ pub enum Renew {
 /// The fabric root `[fabric] command` names, as `aterm fabric on` would resolve it, and its
 /// broker as the report names it.
 struct Found {
+    /// The root; its `aterm` is the program the job `on` installed runs, or the installed app
+    /// where that one moves ([`Self::job_program`]).
     p: Paths,
     /// The root's node id; `None` where it holds none (the step then cannot run).
     node: Option<String>,
-    /// The supervisor `on`'s installed job names; [`Service::None`] where it installed none.
+    /// The supervisor `on`'s installed job names; [`Service::None`] where it installed none, and
+    /// [`Service::Node`] where the node service hosts the bus (no job is judged).
     service: Service,
+    /// What the job's program comes to against the installed app ([`lasting`]);
+    /// [`Lasting::Stays`] where `on` installed no job.
+    job_program: Lasting,
+    /// The `[fabric] command` judged; a rewrite replaces it only while aterm.toml still holds it
+    /// ([`config_step`]).
+    command: Vec<String>,
+    /// What `[fabric] command`'s program comes to against the installed app, where aterm wrote
+    /// the command ([`written_by_on`], read from aterm.toml); [`Lasting::Stays`] for any other.
+    command_program: Lasting,
     /// The pid that job runs now; `None` where it is not loaded or not running.
     job: Option<u32>,
     /// Whether launchd holds that job (systemd: whether its unit runs a process), or why launchd
@@ -4423,87 +4680,98 @@ struct Found {
     loaded: Result<bool, String>,
     /// Whether launchd has that job disabled ([`launchd_disabled`]).
     disabled: bool,
-    /// Whether a broker answers on the socket ([`fabric::answers`]), or why none does.
+    /// Whether a broker answers on the socket ([`fabric::answers`]), or why none does; not asked
+    /// under [`Service::Node`] (`Ok`), where the broker is not judged.
     answers: Result<(), String>,
     view: fabric::BrokerView,
 }
 
-/// Renew this Mac's fabric broker where it runs a build an update replaced, or where no broker
-/// answers on its socket while the job `on` installed is not loaded, runs none, or runs one that
-/// does not answer (an update's restart that left it unloaded, say), with `aterm fabric on`'s broker step alone (its job restarted or
-/// loaded as `on` does it, then waited for), nothing else of `on`: the converge pass's
-/// `sync.fabric`. Where `[fabric] command` is unset nothing is read and nothing changes, so it
-/// never turns the fabric on; a broker the person keeps (`--service none`, or one that is not the
-/// job `on` installed, or may not be, as which process holds its socket is unknown), one at
+/// Renew this Mac's fabric where it is due, with `aterm fabric on`'s own steps and nothing else
+/// of `on`: the converge pass's `sync.fabric`. Due are a broker that runs a build an update
+/// replaced or that is gone, a socket where no broker answers while the job `on` installed is not
+/// loaded, runs none, or runs one that does not answer (an update's restart that left it
+/// unloaded, say), and a program aterm wrote, the job's or `[fabric] command`'s, that names no
+/// file while `installed`, the installed app's executable as the caller names it (`sync.node`'s
+/// program; `None` where none is known), names one ([`lasting`]; a program that names a file
+/// stays, whatever file it is). The broker's job is restarted or loaded as `on` does it, then
+/// waited for, onto the installed app where its program moves; then a command that moves is
+/// rewritten as `on` writes it, with the rendezvous file, while aterm.toml still holds the
+/// command judged, and the running windows that have no bridge are armed with it where a broker
+/// answers. Where `[fabric] command` is unset nothing is read
+/// and nothing changes, so it never turns the fabric on, and where `aterm fabric off`'s record
+/// stands nothing changes either. A broker the person keeps (`--service none`, or one that is not
+/// the job `on` installed, or may not be, as which process holds its socket is unknown), one at
 /// another socket than the command's root's, one whose job launchd has disabled or cannot be
-/// asked about here, and any broker of a root where `aterm fabric off`'s record stands are left
-/// as they are. [`Renew::Look`] reads alone.
+/// asked about here, and a job's program that names no file with no installed app known are left
+/// as they are; a `[fabric] command` aterm wrote is judged apart from them, and a person's own is
+/// never touched. [`Renew::Look`] reads alone.
 ///
 /// # Errors
-/// aterm.toml, the root's role or installed job, or the command cannot be read, or the step
+/// aterm.toml, the root's role or installed job, or the command cannot be read, or a step
 /// failed (what it said).
-pub fn renew_replaced_broker(renew: Renew) -> Result<BrokerRenewal, String> {
-    renew_replaced_broker_with(renew, Service::default_here())
+pub fn renew_replaced_broker(
+    renew: Renew,
+    installed: Option<&Path>,
+) -> Result<BrokerRenewal, String> {
+    renew_replaced_broker_with(renew, Service::default_here(), installed)
 }
 
 /// [`renew_replaced_broker`] with `service` keeping the broker ([`Service::default_for`] the
-/// caller's mesh switch, read once): under [`Service::Node`] a configured fabric reads
-/// [`BrokerRenewal::Kept`] and nothing is looked at or stepped ([`renew_under`]).
+/// caller's mesh switch, read once): under [`Service::Node`] no job is judged or stepped and the
+/// broker is not judged (the node service hosts `bus.log` and renews it), so only a `[fabric]
+/// command` aterm wrote can be due.
 ///
 /// # Errors
 /// As [`renew_replaced_broker`].
-pub fn renew_replaced_broker_with(renew: Renew, service: Service) -> Result<BrokerRenewal, String> {
-    renew_under(service, configured_command()?, renew, look_at, step_on)
+pub fn renew_replaced_broker_with(
+    renew: Renew,
+    service: Service,
+    installed: Option<&Path>,
+) -> Result<BrokerRenewal, String> {
+    let configured = configured_command()?;
+    let in_file = matches!(configured, Some((fabric::Source::File(_), _)));
+    renew_with(
+        configured.map(|(_, command)| command),
+        renew,
+        |command| look_at(command, service, in_file, installed),
+        step_on,
+    )
 }
 
-/// Why nothing renews a broker under [`Service::Node`].
+/// What a renewal under [`Service::Node`] leaves of the broker.
 const NODE_HOSTS: &str = "the node service (systems.alab.aterm-node) hosts bus.log and renews it \
      itself, and retires a broker job an earlier build installed: no job to install or renew \
      (`sync.node` keeps the node service)";
 
-/// [`renew_with`] under `service`: [`Service::Node`] hosts `bus.log` in the node service, so a
-/// configured `command` reads [`BrokerRenewal::Kept`] ([`NODE_HOSTS`]) with no look and no step,
-/// whatever the root holds (a job an earlier build installed included); no command still reads
-/// [`BrokerRenewal::Off`], which the pass's turn-on reads further.
-fn renew_under(
-    service: Service,
-    command: Option<Vec<String>>,
-    renew: Renew,
-    look: impl FnOnce(&[String]) -> Result<Found, String>,
-    step: impl FnOnce(&Found) -> Result<String, String>,
-) -> Result<BrokerRenewal, String> {
-    if service == Service::Node {
-        return Ok(match command {
-            None => BrokerRenewal::Off,
-            Some(_) => BrokerRenewal::Kept(NODE_HOSTS.to_owned()),
-        });
-    }
-    renew_with(command, renew, look, step)
-}
-
-/// The configured fabric command as the app reads it (`[fabric] command` in aterm.toml), `None`
-/// where there is no file or no command.
-fn configured_command() -> Result<Option<Vec<String>>, String> {
-    Ok(fabric::resolve_command(
+/// The configured fabric command as the app reads it (`$ATERM_FABRIC_COMMAND`, else `[fabric]
+/// command` in aterm.toml) and where it came from, `None` where there is no file or no command.
+fn configured_command() -> Result<Option<(fabric::Source, Vec<String>)>, String> {
+    fabric::resolve_command(
         fabric::command_seam().as_deref(),
         fabric::config_path().as_deref(),
-    )?
-    .map(|(_, command)| command))
+    )
 }
 
 /// [`renew_replaced_broker`] over the configured `command`, with `look` resolving its root and
-/// naming its broker, and `step` running the broker step: nothing is looked at without a
-/// command, and the step runs only to [`Renew::Apply`] a replaced or missing broker `on`'s job
-/// keeps. An apply holds [`SWITCH_LOCK`], tried once, from before it reads the off's record to
-/// the step's end: an `aterm fabric off` or `on` running now leaves the broker for the next pass,
-/// and one that starts meanwhile waits for the step. A lock that cannot be taken (not held: the
-/// root cannot be made, say) is said beside the step's lines, and the apply goes on without it,
-/// as `off` does.
+/// naming its broker and programs, and `step` running the steps of `on`'s an apply names
+/// ([`Steps`]): nothing is looked at without a command, and the step runs only to
+/// [`Renew::Apply`] what is due and renewable. An apply holds [`SWITCH_LOCK`], tried once, from
+/// before it reads the off's record to the step's end: an `aterm fabric off` or `on` running now
+/// leaves the fabric for the next pass, and one that starts meanwhile waits for the step. A lock
+/// that cannot be taken (not held: the root cannot be made, say) is said beside the step's
+/// lines, and the apply goes on without it, as `off` does. `aterm fabric off`'s record keeps
+/// everything as it is. The broker ([`Found::broker_part`]) and `[fabric] command`
+/// ([`Found::command_part`]) are judged apart: a command aterm wrote whose program names no file
+/// is rewritten whatever keeps the broker (the hand record `on --service none` wrote, a job that
+/// is not `on`'s, is disabled or cannot be asked about), and what keeps the broker is said
+/// beside it. Nothing due reads [`BrokerRenewal::Current`], or under [`Service::Node`]
+/// [`BrokerRenewal::Kept`] ([`NODE_HOSTS`]); something kept with nothing due reads
+/// [`BrokerRenewal::Kept`].
 fn renew_with(
     command: Option<Vec<String>>,
     renew: Renew,
     look: impl FnOnce(&[String]) -> Result<Found, String>,
-    step: impl FnOnce(&Found) -> Result<String, String>,
+    step: impl FnOnce(&Found, Steps) -> Result<String, String>,
 ) -> Result<BrokerRenewal, String> {
     let Some(command) = command else {
         return Ok(BrokerRenewal::Off);
@@ -4544,37 +4812,170 @@ fn renew_with(
         )));
     }
     let hand = found.p.root.join(HAND_RECORD);
-    if record_in_owned_dir(&hand).unwrap_or(false) {
-        return Ok(BrokerRenewal::Kept(format!(
-            "you run the broker: `aterm fabric on --service none` recorded it ({}); `aterm \
-             fabric on` hands it to launchd or systemd",
-            hand.display()
-        )));
+    let by_hand = record_in_owned_dir(&hand)
+        .unwrap_or(false)
+        .then_some(hand.as_path());
+    let broker = found.broker_part(by_hand);
+    let rewrite = found.command_part();
+    let steps = Steps {
+        broker: matches!(broker, Part::Due { .. }),
+        command: matches!(rewrite, Part::Due { .. }),
+    };
+    let (mut due, mut leaves, mut kept) = (Vec::new(), Vec::new(), Vec::new());
+    for part in [broker, rewrite] {
+        match part {
+            Part::Clear => {}
+            Part::Kept(why) => kept.push(why),
+            Part::Due { from, to } => {
+                due.push(from);
+                leaves.push(to);
+            }
+        }
     }
-    let pid = found
-        .view
-        .pid
-        .map_or_else(|| "-".to_string(), |pid| pid.to_string());
-    let which = match (found.view.replaced.as_deref(), &found.answers) {
-        (Some(exe), _) => format!(
-            "the broker (pid {pid}) runs a replaced build ({} is another file now)",
-            safe(exe, 256)
-        ),
-        (None, Ok(())) => {
-            return Ok(BrokerRenewal::Current(format!(
+    if due.is_empty() {
+        return Ok(if !kept.is_empty() {
+            BrokerRenewal::Kept(kept.join("; "))
+        } else if found.service == Service::Node {
+            BrokerRenewal::Kept(NODE_HOSTS.to_owned())
+        } else {
+            let pid = found
+                .view
+                .pid
+                .map_or_else(|| "-".to_string(), |pid| pid.to_string());
+            BrokerRenewal::Current(format!(
                 "the broker (pid {pid}) answers on {}, on the build on disk",
                 safe(&found.view.endpoint, 256)
-            )));
-        }
-        (None, Err(why)) => unserved(&found, why),
-    };
-    if let Some(why) = kept(&found) {
-        return Ok(BrokerRenewal::Kept(format!("{which}; {why}")));
+            ))
+        });
     }
+    let left = if kept.is_empty() {
+        String::new()
+    } else {
+        format!("; left as it is: {}", kept.join("; "))
+    };
     match renew {
-        Renew::Look => Ok(BrokerRenewal::Due(which)),
-        Renew::Apply => {
-            step(&found).map(|said| BrokerRenewal::Renewed(format!("{said}{unlocked}")))
+        Renew::Look => Ok(BrokerRenewal::Due {
+            from: due.join("; "),
+            to: format!("{}{left}", leaves.join("; ")),
+        }),
+        Renew::Apply => step(&found, steps)
+            .map(|said| BrokerRenewal::Renewed(format!("{said}{left}{unlocked}"))),
+    }
+}
+
+/// What a renewal reads of one of the two parts it judges apart: the broker (its job and the
+/// process on its socket, [`Found::broker_part`]) and `[fabric] command`
+/// ([`Found::command_part`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Part {
+    /// Nothing of it is due.
+    Clear,
+    /// Something of it is due, and is left as it is: what, and why.
+    Kept(String),
+    /// Something of it is due that `on`'s steps renew: what, and what the apply leaves.
+    Due { from: String, to: String },
+}
+
+/// Which of `on`'s steps an apply runs ([`step_on`]): the parts [`renew_with`] read due.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Steps {
+    /// The broker's: the program link where the job's program moves, then the broker step.
+    broker: bool,
+    /// `[fabric] command` rewritten ([`rewrite_command`]).
+    command: bool,
+}
+
+impl Found {
+    /// Why the broker is due a restart by its job: it runs a replaced build, or one that is gone
+    /// ([`fabric::BrokerView::replaced`]), or none answers on its socket ([`unserved`]); `None`
+    /// where it answers on the build on disk, and under [`Service::Node`], where the node service
+    /// renews it.
+    fn broker_due(&self) -> Option<String> {
+        if self.service == Service::Node {
+            return None;
+        }
+        let pid = self
+            .view
+            .pid
+            .map_or_else(|| "-".to_string(), |pid| pid.to_string());
+        match (self.view.replaced.as_deref(), &self.answers) {
+            (Some(exe), _) => Some(format!(
+                "the broker (pid {pid}) runs a replaced build ({} {})",
+                safe(exe, 256),
+                fabric::replaced_now(exe)
+            )),
+            (None, Ok(())) => None,
+            (None, Err(why)) => Some(unserved(self, why)),
+        }
+    }
+
+    /// The broker's part: kept where the person runs it (`by_hand`, the record `aterm fabric on
+    /// --service none` wrote, where it stands); else what is due of it ([`Self::broker_due`], and
+    /// the job's program, [`Lasting::said`]), kept where `on`'s job does not keep it ([`kept`])
+    /// or the job's program names no file with no installed app known (a restart of the job
+    /// would start none: said as stopping the broker that still serves where one answers), and
+    /// otherwise due, leaving the job on the installed app where its program moves, else
+    /// [`RENEWED_TO`].
+    fn broker_part(&self, by_hand: Option<&Path>) -> Part {
+        if let Some(hand) = by_hand {
+            return Part::Kept(format!(
+                "you run the broker: `aterm fabric on --service none` recorded it ({}); `aterm \
+                 fabric on` hands it to launchd or systemd",
+                hand.display()
+            ));
+        }
+        let due: Vec<String> = [self.broker_due(), self.job_program.said("the broker job")]
+            .into_iter()
+            .flatten()
+            .collect();
+        if due.is_empty() {
+            return Part::Clear;
+        }
+        let which = due.join("; ");
+        if let Some(why) = kept(self) {
+            return Part::Kept(format!("{which}; {why}"));
+        }
+        if matches!(self.job_program, Lasting::Nowhere(_)) {
+            let restart = if self.answers.is_ok() {
+                "would stop the broker that still serves and start none, so it is left serving"
+            } else {
+                "would start none, as its program names no file, so it is left as it is"
+            };
+            return Part::Kept(format!(
+                "{which}: a restart of its job {restart}; `aterm fabric on` from the aterm you \
+                 keep points the job at it"
+            ));
+        }
+        Part::Due {
+            from: which,
+            to: self.job_program.moved().map_or_else(
+                || RENEWED_TO.to_owned(),
+                |Moved { to, .. }| {
+                    format!("the broker job runs {}, the installed app", safe(to, 256))
+                },
+            ),
+        }
+    }
+
+    /// `[fabric] command`'s part, judged apart from the broker: clear where its program stays
+    /// ([`Self::command_program`]: a person's command, or one whose program names a file), due
+    /// where it moves to the installed app, and kept where it names no file with no installed
+    /// app known.
+    fn command_part(&self) -> Part {
+        let Some(said) = self.command_program.said("`[fabric] command`") else {
+            return Part::Clear;
+        };
+        match self.command_program.moved() {
+            Some(Moved { to, .. }) => Part::Due {
+                from: said,
+                to: format!(
+                    "`[fabric] command` runs {}, the installed app",
+                    safe(to, 256)
+                ),
+            },
+            None => Part::Kept(format!(
+                "{said}: `aterm fabric on` from the aterm you keep points it at that aterm"
+            )),
         }
     }
 }
@@ -4671,57 +5072,119 @@ fn kept(found: &Found) -> Option<String> {
     }
 }
 
-/// The root `command` points into, resolved as `on` resolves it (fleet, durability and node
-/// kept), its broker named as `aterm fabric` names it (the process holding the socket and
-/// whether an update replaced its build), the pid the job `on` installed runs now and whether a
-/// person turned that job off in launchd or systemd, and whether a broker answers on the socket
-/// ([`asked_twice`]; nothing is attached or read). A supervisor that does not say is an error in
-/// `loaded`. The program is the one the installed job runs, not `on`'s (the `aterm` on `$PATH`):
-/// the renewal restarts the job onto the file an update put at its path and never points it at
-/// another aterm, so the plist `on` wrote stays as it is.
-fn look_at(command: &[String]) -> Result<Found, String> {
+/// [`look_from`] over the root this environment resolves ([`Paths::resolve`]), with the live
+/// asks: launchd's or systemd's word on the job `on` installed, and the process on the socket
+/// ([`fabric::BrokerView::locate`], [`answered`]).
+fn look_at(
+    command: &[String],
+    service: Service,
+    in_file: bool,
+    installed: Option<&Path>,
+) -> Result<Found, String> {
+    look_from(
+        Paths::resolve(None)?,
+        command,
+        service,
+        in_file,
+        installed,
+        &Asks {
+            supervisor: &|service, label| match service {
+                Service::Launchd => with_disabled(
+                    launchd_state(launchd_job(label), label),
+                    launchd_disabled(label),
+                ),
+                Service::Systemd => systemd_state(systemd_unit(label)),
+                Service::None | Service::Node => (None, Ok(false), false),
+            },
+            broker: &|view| {
+                view.locate();
+                answered(
+                    view,
+                    || fabric::answers(&view.endpoint),
+                    || std::thread::sleep(RETRY_PAUSE),
+                )
+            },
+        },
+    )
+}
+
+/// What a look asks past the files of the fabric root and its job ([`look_from`]): [`look_at`]'s
+/// are the live ones, and tests stand in for them.
+struct Asks<'a> {
+    /// What `service`'s supervisor says of the job `label`: the pid it runs, whether it holds
+    /// it (or why that is not known), and whether a person turned it off.
+    supervisor: &'a dyn Fn(Service, &str) -> (Option<u32>, Result<bool, String>, bool),
+    /// The view named (which process holds its socket, and whether its build was replaced),
+    /// and whether a broker answers on its socket.
+    broker: &'a dyn Fn(&mut fabric::BrokerView) -> Result<(), String>,
+}
+
+/// The root `command` points into, `p` resolved as `on` resolves it (fleet, durability and node
+/// kept), the job `on` installed there ([`installed_job`], its plist or unit), and through
+/// `asks` the pid that job runs now and whether a person turned it off in launchd or systemd,
+/// the broker named as `aterm fabric` names it (the process holding the socket and whether an
+/// update replaced its build), and whether a broker answers on the socket ([`asked_twice`];
+/// nothing is attached or read). A supervisor that does not say is an error in `loaded`. The
+/// programs aterm wrote are judged against `installed` ([`lasting`]): the job's (`p.aterm` is
+/// the one it runs, or the installed app where it moves, never `on`'s `$PATH` aterm), and
+/// `command`'s where it is the one `on` writes for this root ([`written_by_on`]) and it came from
+/// aterm.toml (`in_file`; never `$ATERM_FABRIC_COMMAND`). Under [`Service::Node`] the command
+/// alone is judged: nothing is asked, and neither the job's program nor its durability is read.
+fn look_from(
+    mut p: Paths,
+    command: &[String],
+    service: Service,
+    in_file: bool,
+    installed: Option<&Path>,
+    asks: &Asks<'_>,
+) -> Result<Found, String> {
     let cfg = fabric::bridge_config(command)?;
-    let mut p = Paths::resolve(None)?;
     if let Some(root) = root_of(&cfg.broker) {
         p.root = root;
     }
     if let Some(fleet) = Role::of(&p).map_err(|e| e.to_string())?.fleet() {
         p.fleet = fleet.to_string();
     }
-    p.durability = kept_durability(&p)?.0;
     let node = read_node(&p.state());
-    let service = match installed_job(&p).map_err(|e| e.to_string())? {
-        Some((service, argv)) => {
-            if let Some(program) = argv.into_iter().next() {
-                p.aterm = program;
-            }
-            service
-        }
-        None => Service::None,
-    };
-    let label = p.label();
-    let (job, loaded, disabled) = match service {
-        Service::Launchd => with_disabled(
-            launchd_state(launchd_job(&label), &label),
-            launchd_disabled(&label),
-        ),
-        Service::Systemd => systemd_state(systemd_unit(&label)),
-        Service::None | Service::Node => (None, Ok(false), false),
-    };
+    let command_program = command_lasting(&p, node.as_deref(), command, in_file, installed);
     let mut view = fabric::BrokerView {
         endpoint: cfg.broker,
         ..fabric::BrokerView::default()
     };
-    view.locate();
-    let answers = answered(
-        &view,
-        || fabric::answers(&view.endpoint),
-        || std::thread::sleep(RETRY_PAUSE),
-    );
+    if service == Service::Node {
+        return Ok(Found {
+            p,
+            node,
+            service,
+            job_program: Lasting::Stays,
+            command: command.to_vec(),
+            command_program,
+            job: None,
+            loaded: Ok(false),
+            disabled: false,
+            answers: Ok(()),
+            view,
+        });
+    }
+    p.durability = kept_durability(&p)?.0;
+    let (service, job_program) = match installed_job(&p).map_err(|e| e.to_string())? {
+        Some((service, argv)) => (
+            service,
+            argv.into_iter().next().map_or(Lasting::Stays, |program| {
+                job_lasting(&mut p, program, installed)
+            }),
+        ),
+        None => (Service::None, Lasting::Stays),
+    };
+    let (job, loaded, disabled) = (asks.supervisor)(service, &p.label());
+    let answers = (asks.broker)(&mut view);
     Ok(Found {
         p,
         node,
         service,
+        job_program,
+        command: command.to_vec(),
+        command_program,
         job,
         loaded,
         disabled,
@@ -4798,9 +5261,46 @@ fn asked_twice(
     }
 }
 
-/// `aterm fabric on`'s broker step over `found`, its lines kept: what it said, an error where it
-/// failed.
-fn step_on(found: &Found) -> Result<String, String> {
+/// [`step_with`] the live steps: `on`'s broker step, whether a broker answers on the socket
+/// ([`fabric::answers`]), and this login's running windows ([`LiveWindows`]).
+fn step_on(found: &Found, steps: Steps) -> Result<String, String> {
+    step_with(
+        found,
+        steps,
+        &Reach {
+            broker: &|p, node, service, out| broker_step(p, node, service, false, out),
+            answers: &|found| fabric::answers(&found.view.endpoint).is_ok(),
+            windows: &LiveWindows,
+        },
+    )
+}
+
+/// The steps of an apply that reach past the fabric's own files ([`step_with`]): [`step_on`]'s
+/// are the live ones, and tests stand in for them.
+struct Reach<'a> {
+    /// `on`'s broker step for `p`'s root and `node` under `service`: the job written and
+    /// (re)started, then waited for ([`broker_step`], which runs `launchctl` or `systemctl`).
+    broker: &'a dyn Fn(&Paths, &str, Service, &mut Out) -> bool,
+    /// Whether a broker answers on `found`'s socket now: asked only under [`Service::Node`],
+    /// whose look asks nothing of the broker, where no broker step ran.
+    answers: &'a dyn Fn(&Found) -> bool,
+    /// The running windows, those with no bridge attached to a bridge command ([`arm_instances`]).
+    windows: &'a dyn Windows,
+}
+
+/// `aterm fabric on`'s steps over what `steps` names due of `found`, in `on`'s order, their lines
+/// kept, the steps past the fabric's own files through `reach`. First the broker part where it is
+/// due: the program link where the job's program moves (`found.p` already runs the installed
+/// app), then the broker step, which rewrites and reloads a job whose arguments changed. Then,
+/// where `[fabric] command`'s program moves, the command part ([`rewrite_command`]), whatever the
+/// broker part did: the rewrite is a compare-and-swap of the command judged, so the broker step's
+/// wait in between changes nothing it writes over. Each part is stepped on its own, a failed one
+/// skipping none of the other's steps. The windows with no bridge are attached to the rewritten
+/// command whatever the broker did, and waited for to connect only where a broker answers after
+/// the steps ([`broker_serves`]): where none does, each is attached and not waited for
+/// ([`ArmWait::Attached`]), since nothing after this pass would attach it (the next pass reads
+/// the command current). What they said; an error where either part failed.
+fn step_with(found: &Found, steps: Steps, reach: &Reach<'_>) -> Result<String, String> {
     let node = found.node.as_deref().ok_or_else(|| {
         format!(
             "{} holds no node id: `aterm fabric on` provisions one",
@@ -4808,13 +5308,80 @@ fn step_on(found: &Found) -> Result<String, String> {
         )
     })?;
     let mut out = Out::kept();
-    let ok = broker_step(&found.p, node, found.service, false, &mut out);
-    if ok {
+    let broker_ok = !steps.broker
+        || ((found.job_program.moved().is_none() || program_step(&found.p, &mut out))
+            && (reach.broker)(&found.p, node, found.service, &mut out));
+    let command_ok = !steps.command
+        || found.command_program.moved().is_none_or(|moved| {
+            let wait = if broker_serves(found, steps, broker_ok, reach) {
+                ArmWait::Connected
+            } else {
+                ArmWait::Attached
+            };
+            rewrite_command(found, node, moved, wait, reach.windows, &mut out)
+        });
+    if broker_ok && command_ok && !out.failed {
         Ok(out.said())
     } else {
         Err(out.said())
     }
 }
+
+/// Whether a broker answers after [`step_with`]'s broker part: the broker step went through where
+/// it ran (`broker_ok`); where none ran, the look found one answering on the socket, or, under
+/// [`Service::Node`], whose look asks nothing of the broker, one answers now (`reach.answers`).
+fn broker_serves(found: &Found, steps: Steps, broker_ok: bool, reach: &Reach<'_>) -> bool {
+    if steps.broker {
+        broker_ok
+    } else if found.service == Service::Node {
+        (reach.answers)(found)
+    } else {
+        found.answers.is_ok()
+    }
+}
+
+/// `[fabric] command` rewritten to run `moved`'s installed app as `aterm fabric on` writes it for
+/// `found`'s root, with `on`'s own steps: the program link where that path is not a plain word,
+/// then the config step over `found.command`, the command judged, alone ([`config_step`]): one
+/// aterm.toml no longer holds is left as it is, and so are the rendezvous file and the windows;
+/// else the rendezvous file, which names the same command ([`rendezvous_step`]), and the
+/// `windows` running that have no bridge attached to it ([`arm_instances`]), each waited for as
+/// `wait` says, which [`ArmWait::Attached`] also says on `out` ([`UNWAITED`]). No proof is
+/// posted. Whether every step went through, a command left as it is included.
+fn rewrite_command(
+    found: &Found,
+    node: &str,
+    moved: &Moved,
+    wait: ArmWait,
+    windows: &dyn Windows,
+    out: &mut Out,
+) -> bool {
+    let to = Paths {
+        aterm: moved.to.clone(),
+        ..found.p.clone()
+    };
+    let argv = to.bridge_command(node);
+    if !program_step(&to, out) {
+        return false;
+    }
+    match config_step(to.config.as_deref(), Some(&found.command), &argv, out) {
+        ConfigSet::Failed => false,
+        ConfigSet::Changed => true,
+        ConfigSet::Set => {
+            rendezvous_step(&to, node, &argv, out, false);
+            if wait == ArmWait::Attached {
+                out.note("instances", UNWAITED);
+            }
+            let _ = arm_instances(&argv, wait, windows, out);
+            true
+        }
+    }
+}
+
+/// What [`rewrite_command`] says where no broker answers after the steps ([`ArmWait::Attached`]).
+const UNWAITED: &str = "no broker answers after these steps: each window with no bridge is \
+                        attached and not waited for; its bridge connects once a broker answers \
+                        (the window relaunches it with back-off)";
 
 struct Instance {
     pid: u32,
@@ -4925,10 +5492,53 @@ fn wait_for_arm_state(
     }
 }
 
-fn arm_instances(argv: &[String], out: &mut Out) -> (Option<usize>, Vec<Instance>) {
+/// What [`arm_instances`] reaches past its arguments: the running windows and their control
+/// sockets. [`LiveWindows`] are this login's, and tests stand in for them.
+trait Windows {
+    /// The running windows, and how many run (`None` where they could not be listed), any that
+    /// could not be asked said on `out` ([`instances`]).
+    fn list(&self, out: &mut Out) -> (Vec<Instance>, Option<usize>);
+    /// `inst`'s control socket, opened: a request on it, answered.
+    fn open<'a>(&'a self, inst: &Instance) -> io::Result<Request<'a>>;
+    /// The pause between two `fabric status` asks while a bridge is waited for.
+    fn pause(&self, pause: Duration);
+}
+
+/// A request on one window's control socket ([`Windows::open`]).
+type Request<'a> = Box<dyn FnMut(&str) -> io::Result<crate::ctl::Reply> + 'a>;
+
+/// This login's running windows ([`aterm_ctl::local_instances`]), each asked over its own
+/// control socket.
+struct LiveWindows;
+
+impl Windows for LiveWindows {
+    fn list(&self, out: &mut Out) -> (Vec<Instance>, Option<usize>) {
+        instances(out)
+    }
+
+    fn open<'a>(&'a self, inst: &Instance) -> io::Result<Request<'a>> {
+        let mut ctl = Ctl::open(&inst.sock)?;
+        let _ = ctl.get_ref().set_read_timeout(Some(io_timeout()));
+        Ok(Box::new(move |line| ctl.request(line)))
+    }
+
+    fn pause(&self, pause: Duration) {
+        std::thread::sleep(pause);
+    }
+}
+
+/// The running `windows` that have no bridge armed attached to `argv` ([`attach_window`]), each
+/// waited for as `wait` says; a window armed already is said as it is. The windows running (where
+/// they could be listed) and those armed, for the proof.
+fn arm_instances(
+    argv: &[String],
+    wait: ArmWait,
+    windows: &dyn Windows,
+    out: &mut Out,
+) -> (Option<usize>, Vec<Instance>) {
     let ours = fabric::serve_flags(argv);
     let our_program = fabric::bridge_program(argv);
-    let (found, running) = instances(out);
+    let (found, running) = windows.list(out);
     if running == Some(0) {
         out.note(
             "instances",
@@ -4992,86 +5602,133 @@ fn arm_instances(argv: &[String], out: &mut Out) -> (Option<usize>, Vec<Instance
             armed.push(inst);
             continue;
         }
-        let Ok(mut ctl) = Ctl::open(&inst.sock) else {
+        let Ok(mut request) = windows.open(&inst) else {
             out.fail("instance", &format!("{pid}: the control socket went away"));
             continue;
         };
-        let _ = ctl.get_ref().set_read_timeout(Some(io_timeout()));
-        let line = format!("fabric attach {}", argv.join(" "));
-        match ctl.request(&line) {
-            Ok(r) if r.ok() => {}
-            Ok(r) => {
-                out.fail(
-                    "instance",
-                    &format!("{pid}: fabric attach answered {}", safe(r.header(), 256)),
-                );
-                continue;
-            }
-            Err(e) => {
-                out.fail("instance", &format!("{pid}: fabric attach: {e}"));
-                continue;
-            }
-        }
-        let started = Instant::now();
-        let (state, reason) = wait_for_arm_state(
-            || {
-                let header = ctl
-                    .request("fabric status")
-                    .ok()
-                    .map(|r| r.header().to_string())
-                    .unwrap_or_default();
-                let state = kv(&header, "state").unwrap_or("-").to_string();
-                let reason = kv(&header, "reason").unwrap_or("-").to_string();
-                (state, reason)
-            },
-            started,
-            std::thread::sleep,
-        );
-        if state == "connected" {
-            out.ok(
-                "instance",
-                &format!(
-                    "{pid} fabric=connected after {} ms",
-                    started.elapsed().as_millis()
-                ),
-            );
+        if let Some(state) = attach_window(
+            pid,
+            argv,
+            wait,
+            &mut *request,
+            |pause| windows.pause(pause),
+            out,
+        ) {
             inst.supervised = true;
             inst.state = state;
             armed.push(inst);
-        } else if state == "stalled" && reason == "starting" {
-            out.note(
-                "instance",
-                &format!(
-                    "{pid} armed; its bridge has not reported its broker link after \
-                     {ARM_DEADLINE:?} — the proof decides"
-                ),
-            );
-            inst.supervised = true;
-            inst.state = state;
-            armed.push(inst);
-        } else if state == "stalled" && reason == "state-locked" {
-            out.note("instance", &format!("{pid} armed; {STANDBY_NOTE}"));
-        } else if state == "stalled" {
-            out.fail(
-                "instance",
-                &format!(
-                    "{pid} armed, but its broker link is down after {ARM_DEADLINE:?} \
-                     (reason={})",
-                    safe(&reason, 16)
-                ),
-            );
-        } else {
-            out.fail(
-                "instance",
-                &format!(
-                    "{pid} armed, but its bridge did not connect within {ARM_DEADLINE:?} \
-                     (fabric={})",
-                    safe(&state, 16)
-                ),
-            );
         }
     }
     (running, armed)
+}
+
+/// Whether [`arm_instances`] waits, for each window it attaches, for its bridge to connect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArmWait {
+    /// A broker answers: each bridge is waited for until it connects, [`ARM_DEADLINE`] at most,
+    /// as `on` arms them ([`attach_window`] says what one that did not connect reads as).
+    Connected,
+    /// No broker answers: each window is attached and not waited for. Its bridge is no less
+    /// armed: the window's supervisor relaunches a bridge that exits, with back-off, and a bridge
+    /// redials a broker link that is down, so it connects once a broker binds the socket.
+    Attached,
+}
+
+/// One window with no bridge armed (`pid`) attached to `argv` by `request` (its control
+/// socket's): `fabric attach`, then, under [`ArmWait::Connected`], `fabric status` until
+/// [`wait_for_arm_state`] ends, `pause` between two. What it did is said on `out`; a refused
+/// attach fails, named as the attach's answer, and under [`ArmWait::Attached`] a bridge that has
+/// not connected is said as attached and not waited for, no failure. The window's state where it
+/// counts as armed for the proof: connected, or armed and not yet reporting its broker link.
+fn attach_window(
+    pid: u32,
+    argv: &[String],
+    wait: ArmWait,
+    request: &mut dyn FnMut(&str) -> io::Result<crate::ctl::Reply>,
+    pause: impl FnMut(Duration),
+    out: &mut Out,
+) -> Option<String> {
+    let line = format!("fabric attach {}", argv.join(" "));
+    match request(&line) {
+        Ok(r) if r.ok() => {}
+        Ok(r) => {
+            out.fail(
+                "instance",
+                &format!("{pid}: fabric attach answered {}", safe(r.header(), 256)),
+            );
+            return None;
+        }
+        Err(e) => {
+            out.fail("instance", &format!("{pid}: fabric attach: {e}"));
+            return None;
+        }
+    }
+    if wait == ArmWait::Attached {
+        out.note(
+            "instance",
+            &format!(
+                "{pid} attached, not waited for: no broker answers yet, and its bridge connects \
+                 once one does"
+            ),
+        );
+        return None;
+    }
+    let started = Instant::now();
+    let (state, reason) = wait_for_arm_state(
+        || {
+            let header = request("fabric status")
+                .ok()
+                .map(|r| r.header().to_string())
+                .unwrap_or_default();
+            let state = kv(&header, "state").unwrap_or("-").to_string();
+            let reason = kv(&header, "reason").unwrap_or("-").to_string();
+            (state, reason)
+        },
+        started,
+        pause,
+    );
+    if state == "connected" {
+        out.ok(
+            "instance",
+            &format!(
+                "{pid} fabric=connected after {} ms",
+                started.elapsed().as_millis()
+            ),
+        );
+        Some(state)
+    } else if state == "stalled" && reason == "starting" {
+        out.note(
+            "instance",
+            &format!(
+                "{pid} armed; its bridge has not reported its broker link after \
+                 {ARM_DEADLINE:?} — the proof decides"
+            ),
+        );
+        Some(state)
+    } else if state == "stalled" && reason == "state-locked" {
+        out.note("instance", &format!("{pid} armed; {STANDBY_NOTE}"));
+        None
+    } else if state == "stalled" {
+        out.fail(
+            "instance",
+            &format!(
+                "{pid} armed, but its broker link is down after {ARM_DEADLINE:?} \
+                 (reason={})",
+                safe(&reason, 16)
+            ),
+        );
+        None
+    } else {
+        out.fail(
+            "instance",
+            &format!(
+                "{pid} armed, but its bridge did not connect within {ARM_DEADLINE:?} \
+                 (fabric={})",
+                safe(&state, 16)
+            ),
+        );
+        None
+    }
 }
 
 fn proof_skipped(running: Option<usize>) -> &'static str {
@@ -5729,30 +6386,15 @@ fn on_steps(
     finish(p, &node, &argv, out, opts.dry_run, proof)
 }
 
-/// `on`'s steps after the broker: `[fabric] command`, the rendezvous file, the armed instances
-/// and, where `proof` says, the proof.
-fn finish(
-    p: &Paths,
-    node: &str,
-    argv: &[String],
-    out: &mut Out,
-    dry_run: bool,
-    proof: Proof,
-) -> Result<Proved, ExitCode> {
-    let node = node.to_string();
-    let state = p.state();
-    let sock = p.sock();
-    let cap = p.cap();
-    if !config_step(p.config.as_deref(), argv, out) {
-        return Err(ExitCode::FAILURE);
-    }
-
+/// The rendezvous file `on` writes for `p`'s root and `node`, naming `argv` as the bridge
+/// command (0600, its folder 0700); already so where it holds those bytes, private.
+fn rendezvous_step(p: &Paths, node: &str, argv: &[String], out: &mut Out, dry_run: bool) {
     let rendezvous = Rendezvous {
         fleet: p.fleet.clone(),
-        broker: sock.clone(),
-        node: node.clone(),
-        cap_file: cap.to_string_lossy().into_owned(),
-        state: state.to_string_lossy().into_owned(),
+        broker: p.sock(),
+        node: node.to_string(),
+        cap_file: p.cap().to_string_lossy().into_owned(),
+        state: p.state().to_string_lossy().into_owned(),
         command: argv.to_vec(),
     };
     match p.rendezvous.clone() {
@@ -5805,8 +6447,24 @@ fn finish(
             }
         }
     }
+}
 
-    let (running, armed) = arm_instances(argv, out);
+/// `on`'s steps after the broker: `[fabric] command`, the rendezvous file, the armed instances
+/// and, where `proof` says, the proof.
+fn finish(
+    p: &Paths,
+    node: &str,
+    argv: &[String],
+    out: &mut Out,
+    dry_run: bool,
+    proof: Proof,
+) -> Result<Proved, ExitCode> {
+    if config_step(p.config.as_deref(), None, argv, out) != ConfigSet::Set {
+        return Err(ExitCode::FAILURE);
+    }
+    rendezvous_step(p, node, argv, out, dry_run);
+
+    let (running, armed) = arm_instances(argv, ArmWait::Connected, &LiveWindows, out);
 
     Ok(if proof == Proof::Skip {
         out.note(
@@ -6820,10 +7478,10 @@ fn retire_ghosts_action(yes: bool) -> ExitCode {
         Ok(ghosts) => ghosts,
         Err(silent) => {
             println!(
-            "refused: {} local instance(s) did not answer, so no row on this node can be shown \
+                "refused: {} local instance(s) did not answer, so no row on this node can be shown \
              unhosted:",
-            silent.len()
-        );
+                silent.len()
+            );
             for why in &silent {
                 println!("  ! {why}");
             }

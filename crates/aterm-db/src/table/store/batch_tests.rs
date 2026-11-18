@@ -195,11 +195,13 @@ fn ingest_batch_refuses_late_authentication_and_every_aggregate_capacity_before_
             std::fs::read(store.data_dir.join("table.checkpoint")).unwrap(),
             std::fs::read(store.claim_dir.join(&store.claim_name)).unwrap(),
         ];
-        assert!(
-            store
-                .ingest_batch(&session, &[&wires[0], &wires[1]])
-                .is_err(),
-            "case {refusal}"
+        let error = store
+            .ingest_batch(&session, &[&wires[0], &wires[1]])
+            .unwrap_err();
+        assert_eq!(
+            error.is_capacity_exhausted(),
+            matches!(refusal, 1..=3),
+            "case {refusal}: only retained-evidence admission is a capacity refusal: {error}"
         );
         assert!(
             !store.poisoned,

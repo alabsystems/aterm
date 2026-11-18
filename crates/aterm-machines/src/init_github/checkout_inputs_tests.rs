@@ -271,7 +271,24 @@ fn a_53_repository_round_observes_each_distinct_component_once() {
     .unwrap();
     sys.vault_set(&user.home, inventory::ENTRY, &bytes);
     inventory::Inventory::read(&sys, &user).unwrap();
-    let scope = Checkouts::capture(&sys, &user);
+    let selected = selected(&sys, &user).unwrap();
+    let mut capture_calls = BTreeMap::<PathBuf, usize>::new();
+    let scope = Checkouts::capture_with(&sys, &user, &selected, &mut |path| {
+        *capture_calls.entry(path.to_path_buf()).or_default() += 1;
+        sys.scoped_path_metadata(path)
+    });
+    eprintln!(
+        "checkout capture: repositories={} metadata_reads={} distinct_paths={} home_reads={} max_reads={}",
+        selected.len(),
+        capture_calls.values().sum::<usize>(),
+        capture_calls.len(),
+        capture_calls.get(home).copied().unwrap_or_default(),
+        capture_calls.values().max().copied().unwrap_or_default()
+    );
+    assert!(
+        capture_calls.values().all(|count| *count <= 2),
+        "each component is read at most once for discovery and once for final observation"
+    );
     let mut calls = BTreeMap::<PathBuf, usize>::new();
     let observed = scope.observe_with(&mut |path| {
         *calls.entry(path.to_path_buf()).or_default() += 1;
@@ -312,6 +329,41 @@ fn a_53_repository_round_observes_each_distinct_component_once() {
             .any(|path| path.starts_with(blocked.join("library"))),
         "a newly linked parent stops deeper metadata reads in the next round"
     );
+
+    directory(&sys, &user, &blocked);
+    let mut replaced = false;
+    let captured = Checkouts::capture_with(&sys, &user, &selected, &mut |path| {
+        // The first checkout was discovered before the second. Change its parent while
+        // discovery continues, independently of whether final observation reads it again.
+        if path == home.join("code-1") && !replaced {
+            sys.stat_of(
+                blocked.to_str().unwrap(),
+                crate::port::Stat {
+                    uid: user.uid,
+                    gid: user.gid,
+                    mode: 0o700,
+                    dir: false,
+                    symlink: true,
+                    len: 0,
+                },
+            );
+            replaced = true;
+        }
+        sys.scoped_path_metadata(path)
+    });
+    assert!(replaced);
+    assert!(
+        captured
+            .metadata()
+            .shapes
+            .iter()
+            .any(|(path, shape)| path == &blocked && shape.is_err()),
+        "discovery's old parent admission must not become final metadata"
+    );
+    assert!(
+        captured.metadata() == captured.observe(&sys),
+        "the captured metadata must agree with an independently admitted final observation"
+    );
 }
 
 #[cfg(unix)]
@@ -338,7 +390,24 @@ fn replacing_a_checked_parent_cannot_cross_the_scoped_metadata_boundary() {
         admin: false,
     };
     let sys = crate::port::Live::new();
-    let scope = Checkouts::capture(&sys, &user);
+    let selected = selected(&sys, &user).unwrap();
+    let mut calls = BTreeMap::<PathBuf, usize>::new();
+    let scope = Checkouts::capture_with(&sys, &user, &selected, &mut |path| {
+        *calls.entry(path.to_path_buf()).or_default() += 1;
+        sys.scoped_path_metadata(path)
+    });
+    eprintln!(
+        "native checkout capture: repositories={} metadata_reads={} distinct_paths={} home_reads={} max_reads={}",
+        selected.len(),
+        calls.values().sum::<usize>(),
+        calls.len(),
+        calls.get(&home).copied().unwrap_or_default(),
+        calls.values().max().copied().unwrap_or_default()
+    );
+    assert!(
+        calls.values().all(|count| *count <= 2),
+        "discovery admission is bounded, and final metadata is freshly observed"
+    );
     let config = root.join(".git/config");
     assert!(
         scope

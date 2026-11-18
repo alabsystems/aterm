@@ -4786,6 +4786,37 @@ fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
                     "{preserved}: no first checkout"
                 );
             }
+            if preserved == "recorded repair" {
+                assert_eq!(
+                    Reading::of(stage(&applied)),
+                    Some(signed_in(all_ready(1))),
+                    "a local repair retains its last verified empty-origin observation"
+                );
+                // A subsequent refresh learns the remote's first commit. The develop
+                // checkout still belongs to its owner and is never initialized over.
+                let renewed = run_captured(
+                    &sys,
+                    &ctx,
+                    Mode::Apply,
+                    RepositoryWork::Refresh,
+                    RepositorySteps::Both,
+                    InitialRepositoryInputs::capture(&sys, &ctx).unwrap(),
+                    Box::new(|| Ok(true)),
+                )
+                .unwrap();
+                assert!(
+                    !head().success(),
+                    "the refresh preserves the develop checkout"
+                );
+                assert_eq!(
+                    Reading::of(stage(&renewed)),
+                    Some(signed_in(RepositoryCounts {
+                        preserved: 1,
+                        ..RepositoryCounts::default()
+                    }))
+                );
+                continue;
+            }
             // Owner work found before the first checkout is preserved; a collision only the
             // checkout itself meets fails that checkout's line, still without a commit.
             let counts = if preserved == "late ignored" {

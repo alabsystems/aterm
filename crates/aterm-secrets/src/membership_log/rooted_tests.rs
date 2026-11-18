@@ -67,11 +67,11 @@ struct Op {
 }
 
 /// Three Macs writing a vault on their own logs and syncing now and then.
-struct World {
+pub(in crate::membership_log) struct World {
     macs: [Mac; 3],
     logs: Vec<Log>,
     ops: BTreeMap<RecordId, Op>,
-    clock: u64,
+    pub(in crate::membership_log) clock: u64,
     next_value: u64,
     removed: bool,
     /// The Mac that sleeps across the cut, if any: B, silent from 42 days before it until after
@@ -88,7 +88,11 @@ fn label(mac: Mac) -> String {
     format!("m{}", mac.0)
 }
 
-fn entry(audience: &EpochAudience, name: &str, value: &[u8]) -> Entry {
+pub(in crate::membership_log) fn entry(
+    audience: &EpochAudience,
+    name: &str,
+    value: &[u8],
+) -> Entry {
     Entry {
         name: name.to_owned(),
         value: crate::SecretBytes::from(value),
@@ -443,23 +447,44 @@ impl World {
     /// Every Mac takes every other's log and signs a share of `body`, so each log that holds the
     /// shares holds it settled ([`checkpoint::settled`]) whatever its finality, and a Mac that
     /// prunes at it drops only what a settled prune drops ([`checkpoint::gone`]).
-    fn settle(&mut self, body: &Body) {
+    /// A Mac that already signed a share of `body` ([`World::share`]) signs none again.
+    pub(in crate::membership_log) fn settle(&mut self, body: &Body) {
         let whole = self.whole();
         for m in 0..self.macs.len() {
-            let mac = self.macs[m];
-            self.logs[m].merge(&whole).unwrap();
-            let record = two(
-                draft(&self.logs[m], mac, self.clock, body.clone()),
-                mac,
-                None,
-            );
-            assert_eq!(self.logs[m].insert(record).unwrap(), Inserted::Held);
+            self.share_from(m, &whole, body);
         }
         self.clock += 1;
     }
 
+    /// Mac `m` alone takes every other's log and signs a share of `body`: a minority share,
+    /// which settles nothing where the cut's other recent seats sign none.
+    fn share(&mut self, m: usize, body: &Body) {
+        let whole = self.whole();
+        self.share_from(m, &whole, body);
+        self.clock += 1;
+    }
+
+    /// Mac `m` takes `whole` and signs a share of `body`, unless it holds one of its own.
+    fn share_from(&mut self, m: usize, whole: &Log, body: &Body) {
+        let mac = self.macs[m];
+        self.logs[m].merge(whole).unwrap();
+        let id = checkpoint_id(body);
+        if self.logs[m]
+            .records()
+            .any(|r| r.actor() == &mac.id() && checkpoint_id(r.body()) == id)
+        {
+            return;
+        }
+        let record = two(
+            draft(&self.logs[m], mac, self.clock, body.clone()),
+            mac,
+            None,
+        );
+        assert_eq!(self.logs[m].insert(record).unwrap(), Inserted::Held);
+    }
+
     /// `steps` more steps after the cut, from a generator of their own.
-    fn run(&mut self, seed: u64, steps: usize) {
+    pub(in crate::membership_log) fn run(&mut self, seed: u64, steps: usize) {
         let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1);
         for _ in 0..steps {
             self.step(&mut rng, false);
@@ -467,7 +492,7 @@ impl World {
     }
 
     /// Every Mac's log merged.
-    fn whole(&self) -> Log {
+    pub(in crate::membership_log) fn whole(&self) -> Log {
         let mut whole = self.logs[0].clone();
         for log in &self.logs[1..] {
             whole.merge(log).unwrap();
@@ -480,7 +505,7 @@ impl World {
 /// quiet fortnight) for the 20 days before it (about `before` steps in all), and `after` steps
 /// after it. In every other seed B sleeps from the quiet fortnight until after `T`, so it is no
 /// recent seat, and wakes on its stale log ([`World::wake`]).
-fn random_vault(seed: u64, before: usize, after: usize) -> World {
+pub(in crate::membership_log) fn random_vault(seed: u64, before: usize, after: usize) -> World {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let mut world = World::new(T - 50 * DAY_MS);
     let early = before / 3;
@@ -514,7 +539,7 @@ fn random_vault(seed: u64, before: usize, after: usize) -> World {
 /// values, audiences), conflicts, whether an epoch is hidden from it, and what of them C, if out,
 /// could read after its cutoff. The epochs a Mac unwrapped are left out: a prune drops the old
 /// ones.
-fn evaluated(log: &Log) -> String {
+pub(in crate::membership_log) fn evaluated(log: &Log) -> String {
     let membership = log.membership();
     let mut out = format!(
         "seats {:?}\nout {:?}\nquorums {:?}\n",
@@ -573,10 +598,13 @@ fn evaluated_registers(log: &Log, skip: &BTreeSet<String>) -> String {
                 .filter(|(key, _)| keep(key))
                 .collect::<BTreeMap<_, _>>()
         };
-        let concurrent: BTreeMap<(Audience, String), Vec<RecordId>> = o
+        // The siblings as a set: their order is the log's, which follows the order its records
+        // came in, so two logs that took the same records otherwise list them otherwise.
+        let concurrent: BTreeMap<(Audience, String), BTreeSet<RecordId>> = o
             .concurrent
             .into_iter()
             .filter(|(key, _)| keep(key))
+            .map(|(key, siblings)| (key, siblings.into_iter().collect()))
             .collect();
         let carried: BTreeMap<RecordId, RecordId> = o
             .carried
@@ -609,7 +637,12 @@ fn evaluated_registers(log: &Log, skip: &BTreeSet<String>) -> String {
 
 /// Whether `rooted` evaluates as `whole`: membership, entries and registers, the heads and their
 /// digest.
-fn assert_evaluates_as(seed: u64, phase: &str, rooted: &Log, whole: &Log) {
+pub(in crate::membership_log) fn assert_evaluates_as(
+    seed: u64,
+    phase: &str,
+    rooted: &Log,
+    whole: &Log,
+) {
     assert_eq!(
         rooted.heads_digest(),
         whole.heads_digest(),
@@ -686,7 +719,7 @@ struct Coverage {
     kept_stubs: usize,
 }
 
-const SEEDS: u64 = 32;
+pub(in crate::membership_log) const SEEDS: u64 = 32;
 
 /// Over seeded random vaults (three Macs, version-1 and version-2 `Put`s and `Delete`s, carries
 /// that name their representative, `[everyone]` rotations, host audiences, a removal before the
@@ -994,15 +1027,15 @@ fn same_log(left: &Log, right: &Log) -> bool {
 /// A Mac that slept across the cut: C saw A's first `Put` of `a.key` and wrote on it after the
 /// cut's day, when A's version-2 `Put` had superseded that first one and the prune drops it. `L1`
 /// lacks C's record and `L2` holds it; both hold the cut.
-struct Sleeper {
-    l1: Log,
-    l2: Log,
-    body: Body,
-    slept: RecordId,
-    dropped: RecordId,
+pub(in crate::membership_log) struct Sleeper {
+    pub(in crate::membership_log) l1: Log,
+    pub(in crate::membership_log) l2: Log,
+    pub(in crate::membership_log) body: Body,
+    pub(in crate::membership_log) slept: RecordId,
+    pub(in crate::membership_log) dropped: RecordId,
 }
 
-fn sleeper() -> Sleeper {
+pub(in crate::membership_log) fn sleeper() -> Sleeper {
     let mut log = found(&[A, B, C]);
     let t0 = T - 5 * DAY_MS;
     let (e, key) = epoch(&mut log, A, t0, EpochAudience::Everyone, 1, &[A, B, C]);
@@ -1125,7 +1158,7 @@ fn vault_checkpoint_prune_of_a_union_equals_the_union_of_prunes() {
 }
 
 /// A store whose log is `log`.
-fn store_of(log: Log) -> Store {
+pub(in crate::membership_log) fn store_of(log: Log) -> Store {
     let mut store = Store::with_compiled(None);
     store.insert(log.genesis().clone()).unwrap();
     store.log = Some(log);
@@ -1270,13 +1303,13 @@ fn vault_checkpoint_a_rooted_log_checks_a_record_against_a_dropped_one() {
 
 /// The common past of a split and the epoch both sides write under: A's first `Put` of `a.key`,
 /// `a0`, and a `Name` of B's.
-struct Common {
-    log: Log,
-    a0: Record,
-    put: Box<dyn Fn(&Log, Mac, u64, &str, &[u8]) -> Draft>,
+pub(in crate::membership_log) struct Common {
+    pub(in crate::membership_log) log: Log,
+    pub(in crate::membership_log) a0: Record,
+    pub(in crate::membership_log) put: Box<dyn Fn(&Log, Mac, u64, &str, &[u8]) -> Draft>,
 }
 
-fn common() -> Common {
+pub(in crate::membership_log) fn common() -> Common {
     let mut log = found(&[A, B, C]);
     let (e, key) = epoch(
         &mut log,
@@ -1309,14 +1342,14 @@ fn common() -> Common {
 
 /// B's side of a split a month on: `b2`, then `b3` superseding it, then a `Name` after its cut's
 /// day; B's checkpoint at that `Name` (it drops `b2`), shared by B.
-struct SideB {
-    log: Log,
-    b2: Record,
-    b3: Record,
-    body: Body,
+pub(in crate::membership_log) struct SideB {
+    pub(in crate::membership_log) log: Log,
+    pub(in crate::membership_log) b2: Record,
+    pub(in crate::membership_log) b3: Record,
+    pub(in crate::membership_log) body: Body,
 }
 
-fn side_b(common: &Common) -> SideB {
+pub(in crate::membership_log) fn side_b(common: &Common) -> SideB {
     let put = &common.put;
     let mut log = common.log.clone();
     let record = one(put(&log, B, SPLIT - 2 * DAY_MS, "b.key", b"b2"), B);
@@ -1522,8 +1555,8 @@ fn vault_checkpoint_a_stub_place_resolves_in_one_walk() {
         epoch: None,
         supersedes: Vec::new(),
         shares: None,
-        gone: false,
         parents,
+        frame: None,
     };
     let levels = 20u8;
     let mut stubs = BTreeMap::new();
@@ -1543,6 +1576,7 @@ fn vault_checkpoint_a_stub_place_resolves_in_one_walk() {
     log.rooting = Some(Arc::new(Rooting {
         roots: Vec::new(),
         stubs,
+        earlier: Vec::new(),
     }));
     assert_eq!(
         log.placed(&id(0, 0)),
@@ -1767,7 +1801,9 @@ fn vault_checkpoint_a_remove_whose_cutoff_was_dropped_counts() {
 /// held A's first two ops alone, and reseals the value, stating that it carries the reseal's
 /// and replaces both.
 /// Returns the whole log, its proposal, C's reseal and A's first `Put`.
-fn carry_of_dropped(resealed: bool) -> (Log, checkpoint::Plan, RecordId, RecordId) {
+pub(in crate::membership_log) fn carry_of_dropped(
+    resealed: bool,
+) -> (Log, checkpoint::Plan, RecordId, RecordId) {
     let mut log = found(&[A, B, C]);
     let t0 = T - 5 * DAY_MS;
     let (e, key) = epoch(&mut log, A, t0, EpochAudience::Everyone, 1, &[A, B, C]);
@@ -3082,4 +3118,525 @@ fn vault_checkpoint_a_removed_keys_forged_checkpoint_drops_no_other_seats_op() {
         ("k1".to_owned(), b"c1".to_vec()),
     ]);
     assert_eq!(values(&log, B), want, "B reads C's ops");
+}
+
+/// A vault whose stub a later cut holds gone and an earlier cut keeps. `K`, at day `dk`, drops
+/// A's `x` (A's `x2` superseded it); past `dk`, B's `y` carries `x`'s value, so `E`, two days on,
+/// keeps `x` for `y`'s carry, its cut holding no share of `K`. A and B then share `K`, past
+/// `E`'s cut and before `L`'s, two days later: `K` is settled in `L`'s cut, so `x` counts nowhere
+/// there and `L` drops it. A and B share `L` past its cut, and `E` past it too or, with
+/// `early_in_late`, before it: then `E` is final in `L`'s cut, `L` follows it, and `L`'s prune
+/// keeps `E`'s shares and drops every share of `K`, which `E`'s cut nests. Returns the whole
+/// log, `K`, `E`, `L` and `x`'s id.
+fn gone_between_cuts(early_in_late: bool) -> (Log, Body, Body, Body, RecordId) {
+    let mut log = found(&[A, B, C]);
+    let dk = T - 30 * DAY_MS;
+    let t0 = dk - 5 * DAY_MS;
+    let (e, key) = epoch(&mut log, A, t0, EpochAudience::Everyone, 1, &[A, B, C]);
+    let put = |log: &Log, by: Mac, at: u64, value: &[u8]| {
+        log.draft_put(
+            &by.id(),
+            at,
+            e,
+            &key,
+            &entry(&EpochAudience::Everyone, "x.key", value),
+        )
+        .unwrap()
+    };
+    let x = held!(
+        log,
+        two(
+            put(&log, A, t0 + HOUR, b"x"),
+            A,
+            Some(&Statement::default())
+        )
+    );
+    held!(
+        log,
+        two(
+            put(&log, A, t0 + 2 * HOUR, b"x2"),
+            A,
+            Some(&supersedes(&[&x], None))
+        )
+    );
+    held!(log, one(draft(&log, B, t0 + 3 * HOUR, name("b1")), B));
+    let k = plan_at(&log, dk, &log.heads()).unwrap();
+    assert_eq!(k.dropped, vec![*x.id()], "`K` drops `x`");
+    held!(
+        log,
+        two(
+            put(&log, B, dk + HOUR, b"x"),
+            B,
+            Some(&supersedes(&[], Some(&x)))
+        )
+    );
+    held!(log, one(draft(&log, A, dk + 2 * HOUR, name("a1")), A));
+    let d1 = dk + 2 * DAY_MS;
+    let early = plan_at(&log, d1, &log.heads()).unwrap();
+    assert!(early.keep.contains(x.id()), "`E` keeps `x` for `y`'s carry");
+    share_at(&mut log, A, &k.body, d1 + HOUR);
+    share_at(&mut log, B, &k.body, d1 + 2 * HOUR);
+    if early_in_late {
+        share_at(&mut log, A, &early.body, d1 + 3 * HOUR);
+        share_at(&mut log, B, &early.body, d1 + 4 * HOUR);
+    }
+    held!(log, one(draft(&log, A, d1 + 5 * HOUR, name("a2")), A));
+    let d2 = d1 + 2 * DAY_MS;
+    let late = plan_at(&log, d2, &log.heads()).unwrap();
+    assert!(
+        late.dropped.contains(x.id()),
+        "`L`'s cut holds `K` settled, so `L` drops `x`"
+    );
+    let shared_late: Vec<&Body> = if early_in_late {
+        vec![&late.body]
+    } else {
+        vec![&early.body, &late.body]
+    };
+    for (n, body) in (0..).zip(shared_late) {
+        share_at(&mut log, A, body, d2 + (2 * n + 1) * HOUR);
+        share_at(&mut log, B, body, d2 + (2 * n + 2) * HOUR);
+    }
+    (log, k.body, early.body, late.body, *x.id())
+}
+
+/// A stub a later cut holds gone reads, in an earlier cut, as the whole log reads its record
+/// there. In [`gone_between_cuts`] the log rooted at `L` holds `x` as a stub `L`'s cut held gone,
+/// by `K`, whose settling shares lie past `E`'s cut: at `E`'s cut `x` counts, as in the whole
+/// log, and `E` keeps it for `y`'s carry, so the rooted log computes `E`, judges it and holds it
+/// settled as the whole log does, and proposes the whole log's next checkpoint. Where `L` follows
+/// `E` its prune drops every share of `K`, which the rooted log still knows, its body read off a
+/// dropped share's frame, and holds settled as the whole log does. In both, every stub of the
+/// rooted log counts nowhere in it.
+///
+/// NEGATIVE CONTROLS, each run from the test's first line and seen to fail:
+/// - `Mutant::GoneFromTheLastCut` (a stub reads gone in every cut where a later prune's cut held
+///   it so, as FL-148C's `gone` flag did): ``assertion `left == right` failed: the rooted log
+///   judges `E` as the whole log (`E` shared past `L`'s cut)``, `left` `recomputed: false` against
+///   `right` `recomputed: true`.
+/// - `Mutant::ShareBodiesUnread` (no dropped share's body is read, as before this slice):
+///   ``assertion `left == right` failed: the rooted log holds settled what the whole log does
+///   (`E` shared within `L`'s cut)``, `left` one checkpoint against `right` three: without `K`'s
+///   body `x` counts at `L`'s cut, `L` keeps it there, and the rooted log recomputes neither `K`
+///   nor `L`.
+#[test]
+fn vault_checkpoint_a_stub_gone_at_an_earlier_cut_recomputes_as_the_whole_log() {
+    for early_in_late in [false, true] {
+        let which = if early_in_late {
+            "`E` shared within `L`'s cut"
+        } else {
+            "`E` shared past `L`'s cut"
+        };
+        let (log, k, early, late, x) = gone_between_cuts(early_in_late);
+        let rooted = log.adopt(&late).unwrap();
+        assert!(rooted.is_dropped(&x));
+        let k_shares_held = rooted
+            .records()
+            .any(|record| checkpoint_id(record.body()) == checkpoint_id(&k));
+        assert_eq!(
+            k_shares_held, !early_in_late,
+            "`L`'s prune drops every share of `K` where it follows `E` ({which})"
+        );
+        let settled = |log: &Log| -> Vec<RecordId> {
+            checkpoint::settled(log).iter().map(|s| s.id).collect()
+        };
+        assert_eq!(
+            settled(&log).len(),
+            3,
+            "the whole log holds `K`, `E` and `L` settled ({which})"
+        );
+        assert_eq!(
+            checkpoint::judge(&rooted, &early).unwrap(),
+            checkpoint::judge(&log, &early).unwrap(),
+            "the rooted log judges `E` as the whole log ({which})"
+        );
+        assert_eq!(
+            settled(&rooted),
+            settled(&log),
+            "the rooted log holds settled what the whole log does ({which})"
+        );
+        let gone = checkpoint::gone(&rooted).unwrap_or_default();
+        for id in rooted.rooting().unwrap().stubs.keys() {
+            assert!(
+                gone.contains(&rooted.position(id).unwrap()),
+                "every stub counts nowhere in the rooted log ({which})"
+            );
+        }
+        assert_eq!(evaluated(&rooted), evaluated(&log));
+        let now = T + MIN_AGE_MS + budgets::WINDOW_SKEW_MS + HOUR;
+        let next = propose(&log, now).expect("a next checkpoint");
+        assert_eq!(
+            propose(&rooted, now).and_then(|plan| checkpoint_id(&plan.body)),
+            checkpoint_id(&next.body),
+            "the rooted log proposes the whole log's next checkpoint ({which})"
+        );
+    }
+}
+
+/// What [`vault_checkpoint_chains_of_cuts_read_each_stub_as_the_whole_log_over_random_dags`]
+/// exercises, so the law is not met vacuously.
+#[derive(Debug, Default)]
+struct ChainCoverage {
+    /// Chains of three settled cuts compared, and of them those whose last prune dropped every
+    /// share of the first checkpoint, and those where A shared `K` inside `E`'s cut.
+    chains: usize,
+    first_shares_all_dropped: usize,
+    minority: usize,
+    /// Records the first checkpoint drops that the second keeps (no share of the first lies in
+    /// its cut) and the third drops again (its cut holds the first settled).
+    kept_between: usize,
+    /// Version-1 ops in the second cut over an op the second keeps and the third drops.
+    version_one_between: usize,
+    /// Rooted logs whose next proposal was compared with the whole log's.
+    next_proposals: usize,
+    /// Logs pruned at several cuts of a chain in turn (on the whole log, and as each cut came),
+    /// unions of the Macs' own prunes, and Macs at `K`'s cut caught up from a peer at `L`.
+    successive: usize,
+    unions: usize,
+    caught_up: usize,
+}
+
+/// Over the seeded random vaults of
+/// [`vault_checkpoint_pruning_preserves_the_evaluated_state_over_random_dags`], a chain of three
+/// cuts: `K` at the first, `E` at a later one before any Mac but A shares `K` (A shares it inside
+/// `E`'s cut in every other seed, a minority), and then, every Mac having shared `K` (and, in
+/// every other run, `E`), `L` at a third, which every Mac shares (and `E` with it, where it did
+/// not before; A shares `E` inside `L`'s cut in every other seed). So `L`'s cut holds `K`
+/// settled, and drops again what `K` drops that `E`, whose cut holds `K` unsettled, keeps (B's
+/// undo share of A's removal of C names a cutoff A superseded before `K`'s cut, which `E` keeps
+/// and `K` drops); and, where `E` is settled in `L`'s cut, `L` follows `E` and drops every share
+/// of `K`; and a version-1 op in `E`'s cut over an op `E` keeps and `L` drops reads, at `E`'s
+/// cut, a frontier with that op in the whole log and without it in a log pruned at `L`, which no
+/// plan reads (`rooted.rs`'s "A version-1 op beside a cut"). Each of these logs holds settled
+/// the checkpoints the whole log does, judges `E` as it
+/// does, holds every stub counting nowhere, evaluates as it does, and proposes its next
+/// checkpoint: the whole log rooted at `L`; the whole log pruned at `K`, `E` and `L` in turn, at
+/// `K` and `L`, and at `E` and `L`; and a Mac that pruned at each cut as it came, at `K` on the
+/// log of `K`'s proposal, at `E` on that merged with the log of `E`'s, and at `L` on that merged
+/// with the whole log. Each Mac pruning its own log at `L` (A and C at `K` first) and the three
+/// merging hold what the whole log rooted at `L` holds, and a Mac that holds `K`'s cut catches
+/// up from the log rooted at `L` and from the one pruned at `K`, `E` and `L`, holding what that
+/// peer holds and evaluating as the whole log.
+///
+/// NEGATIVE CONTROLS, each run from the test's first line and seen to fail (record ids hold
+/// random salts, so the failing seed may differ from run to run):
+/// - `Mutant::GoneFromTheLastCut` (a stub reads gone in every cut where a later prune's cut
+///   held it so, as FL-148C's `gone` flag did): ``assertion `left == right` failed: seed 1
+///   (`E` settled in `L`'s cut, at `L`): the rooted log holds settled what the whole log
+///   does``; with the check of the log rooted at `L` skipped, the same at ``seed 1 (`E`
+///   settled in `L`'s cut, `K`, `E`, `L` in turn)``.
+/// - `Mutant::ShareBodiesUnread` (no dropped share's body is read): the same two failures.
+/// - `Mutant::HeldNesting` (a plan reads a checkpoint as nested in the newest final one's cut
+///   among the held records alone, as before this slice, so it keeps every share of one whose
+///   head a prune dropped): ``assertion `left == right` failed: seed 1 (`E` settled past `L`'s
+///   cut, at `L`): the rooted log proposes the whole log's next checkpoint``; with that check
+///   skipped, the same at ``seed 1 (`E` settled past `L`'s cut, `K`, `E`, `L` in turn)``.
+/// - `Mutant::StubsDroppedForGood` (a stub is superseded for good), with the log rooted at `L`
+///   unchecked: ``seed 1 (`E` settled past `L`'s cut, `K`, `E`, `L`): a prune in turn: this log
+///   computes another checkpoint at those heads``.
+/// - `Mutant::HeldProposal` (a checkpoint is computed from the held records alone): ``seed 1
+///   (`E` settled past `L`'s cut): a prune at `E` as it comes: this log computes another
+///   checkpoint at those heads``.
+/// - `Mutant::NoEarlierRoots` (a prune keeps no root it nests): ``assertion `left == right`
+///   failed: seed 2 (`E` settled past `L`'s cut): a Mac at `K` holds what its peer `K`, `E`,
+///   `L` in turn holds``, the records each holds differing.
+/// - `Mutant::KeepNestedRoots` (a prune keeps every root it nests among its roots): ``seed 1
+///   (`E` settled past `L`'s cut): the union of the Macs' prunes is the prune of the union``.
+#[test]
+fn vault_checkpoint_chains_of_cuts_read_each_stub_as_the_whole_log_over_random_dags() {
+    use crate::membership_log::served::tests::{catch_up, holding};
+    let mut coverage = ChainCoverage::default();
+    let settled =
+        |log: &Log| -> Vec<RecordId> { checkpoint::settled(log).iter().map(|s| s.id).collect() };
+    let cut_ms = |body: &Body| match body {
+        Body::Checkpoint { cut_ms, .. } => *cut_ms,
+        _ => panic!("a checkpoint"),
+    };
+    let later = |world: &World| world.clock + MIN_AGE_MS + budgets::WINDOW_SKEW_MS + HOUR;
+    for seed in 1..=SEEDS {
+        let minority = seed % 2 == 1;
+        for early_in_late in [false, true] {
+            let phase = if early_in_late {
+                "`E` settled in `L`'s cut"
+            } else {
+                "`E` settled past `L`'s cut"
+            };
+            let mut world = random_vault(seed, 100, 30);
+            let Some(k) = propose(&world.whole(), NOW) else {
+                continue;
+            };
+            let at_k = world.whole();
+            let k_then = at_k.rooted_at(&k.body).unwrap_or_else(|e| {
+                panic!("seed {seed} ({phase}): a prune at `K` as it comes: {e}")
+            });
+            world.run(seed, 120);
+            if minority {
+                world.share(0, &k.body);
+            }
+            let Some(early) = propose(&world.whole(), later(&world)) else {
+                continue;
+            };
+            let mut e_then = k_then;
+            e_then.merge(&world.whole()).unwrap();
+            let e_then = e_then.rooted_at(&early.body).unwrap_or_else(|e| {
+                panic!("seed {seed} ({phase}): a prune at `E` as it comes: {e}")
+            });
+            // `K`'s shares, A's apart, lie past `E`'s cut.
+            world.clock = world.clock.max(cut_ms(&early.body) + HOUR);
+            world.settle(&k.body);
+            if early_in_late {
+                world.settle(&early.body);
+            } else if minority {
+                world.share(0, &early.body);
+            }
+            world.run(seed + 1000, 120);
+            let Some(late) = propose(&world.whole(), later(&world)) else {
+                continue;
+            };
+            world.clock = world.clock.max(cut_ms(&late.body) + HOUR);
+            if !early_in_late {
+                world.settle(&early.body);
+            }
+            world.settle(&late.body);
+            let whole = world.whole();
+            let ids = [&k, &early, &late].map(|plan| checkpoint_id(&plan.body).unwrap());
+            if !ids.iter().all(|id| settled(&whole).contains(id)) {
+                // No seat was heard in the month before one of the cuts: no Mac prunes there.
+                continue;
+            }
+            let rooted = whole
+                .rooted_at(&late.body)
+                .unwrap_or_else(|e| panic!("seed {seed} ({phase}): a prune at `L`: {e}"));
+            coverage.chains += 1;
+            coverage.minority += usize::from(minority);
+            coverage.first_shares_all_dropped += usize::from(
+                !rooted
+                    .records()
+                    .any(|record| checkpoint_id(record.body()) == Some(ids[0])),
+            );
+            coverage.kept_between += late
+                .dropped
+                .iter()
+                .filter(|id| k.dropped.contains(id) && early.keep.contains(*id))
+                .count();
+            // A version-1 op in `E`'s cut over an op `E` keeps and `L` drops: `E`'s cut does not
+            // hold `L` settled, so the whole log reads its frontier there with that op and the
+            // rooted log without it, and `E` computes alike only as no plan reads that frontier.
+            let early_heads = heads_of(&early.body);
+            let kept_by_early: Vec<&RecordId> = late
+                .dropped
+                .iter()
+                .filter(|id| early.keep.contains(*id))
+                .collect();
+            coverage.version_one_between += rooted
+                .records()
+                .filter(|r| r.version() == 1 && matches!(r.kind(), Kind::Put | Kind::Delete))
+                .filter(|r| whole.in_cut_of(&early_heads, r.id()))
+                .filter(|r| kept_by_early.iter().any(|id| whole.reaches(&[*r.id()], id)))
+                .count();
+            let now = later(&world) + DAY_MS;
+            let next = propose(&whole, now).map(|plan| checkpoint_id(&plan.body));
+            coverage.next_proposals += usize::from(next.is_some());
+            let as_whole = |log: &Log, which: &str| {
+                assert_eq!(
+                    settled(log),
+                    settled(&whole),
+                    "seed {seed} ({phase}, {which}): the rooted log holds settled what the whole \
+                     log does"
+                );
+                assert_eq!(
+                    checkpoint::judge(log, &early.body).unwrap(),
+                    checkpoint::judge(&whole, &early.body).unwrap(),
+                    "seed {seed} ({phase}, {which}): the rooted log judges `E` as the whole log"
+                );
+                let gone = checkpoint::gone(log).unwrap_or_default();
+                assert!(
+                    log.rooting()
+                        .unwrap()
+                        .stubs
+                        .keys()
+                        .all(|id| gone.contains(&log.position(id).unwrap())),
+                    "seed {seed} ({phase}, {which}): every stub counts nowhere in the rooted log"
+                );
+                assert_evaluates_as(seed, &format!("{phase}, {which}"), log, &whole);
+                assert_eq!(
+                    propose(log, now).map(|plan| checkpoint_id(&plan.body)),
+                    next,
+                    "seed {seed} ({phase}, {which}): the rooted log proposes the whole log's next \
+                     checkpoint"
+                );
+            };
+            as_whole(&rooted, "at `L`");
+
+            let in_turn = |bodies: &[&Body], which: &str| {
+                bodies.iter().fold(whole.clone(), |log, body| {
+                    log.rooted_at(body).unwrap_or_else(|e| {
+                        panic!("seed {seed} ({phase}, {which}): a prune in turn: {e}")
+                    })
+                })
+            };
+            let k_e_l = in_turn(&[&k.body, &early.body, &late.body], "`K`, `E`, `L`");
+            as_whole(&k_e_l, "`K`, `E`, `L` in turn");
+            let k_l = in_turn(&[&k.body, &late.body], "`K`, `L`");
+            as_whole(&k_l, "`K`, `L` in turn");
+            let e_l = in_turn(&[&early.body, &late.body], "`E`, `L`");
+            as_whole(&e_l, "`E`, `L` in turn");
+            let mut l_then = e_then;
+            l_then.merge(&whole).unwrap();
+            let l_then = l_then.rooted_at(&late.body).unwrap_or_else(|e| {
+                panic!("seed {seed} ({phase}): a prune at `L` as it comes: {e}")
+            });
+            as_whole(&l_then, "each cut as it came");
+            coverage.successive += 4;
+
+            let mut union: Option<Log> = None;
+            for (m, log) in world.logs.iter().enumerate() {
+                let bodies: &[&Body] = if m == 1 {
+                    &[&late.body]
+                } else {
+                    &[&k.body, &late.body]
+                };
+                let own = bodies.iter().fold(log.clone(), |log, body| {
+                    log.rooted_at(body).unwrap_or_else(|e| {
+                        panic!("seed {seed} ({phase}): Mac {m} prunes its own log: {e}")
+                    })
+                });
+                match union.as_mut() {
+                    None => union = Some(own),
+                    Some(union) => union.merge(&own).unwrap(),
+                }
+            }
+            let union = union.unwrap().rooted_at(&late.body).unwrap();
+            assert!(
+                same_log(&union, &rooted),
+                "seed {seed} ({phase}): the union of the Macs' prunes is the prune of the union"
+            );
+            coverage.unions += 1;
+
+            for (which, peer) in [("at `L`", &rooted), ("`K`, `E`, `L` in turn", &k_e_l)] {
+                let receiver = catch_up(peer, &at_k).unwrap_or_else(|e| {
+                    panic!("seed {seed} ({phase}): a Mac at `K` catches up from {which}: {e}")
+                });
+                let log = receiver.log().unwrap();
+                assert_eq!(
+                    holding(log),
+                    holding(peer),
+                    "seed {seed} ({phase}): a Mac at `K` holds what its peer {which} holds"
+                );
+                assert_evaluates_as(seed, &format!("{phase}, caught up {which}"), log, &whole);
+                coverage.caught_up += 1;
+            }
+        }
+    }
+    eprintln!("{coverage:?}");
+    assert!(
+        coverage.chains * 2 >= usize::try_from(SEEDS).unwrap(),
+        "{coverage:?}"
+    );
+    assert!(
+        coverage.first_shares_all_dropped > 0
+            && coverage.kept_between > 0
+            && coverage.version_one_between > 0
+            && coverage.minority > 0,
+        "{coverage:?}"
+    );
+    assert!(coverage.next_proposals > 0, "{coverage:?}");
+    assert_eq!(
+        (coverage.successive, coverage.unions, coverage.caught_up),
+        (4 * coverage.chains, coverage.chains, 2 * coverage.chains),
+        "{coverage:?}"
+    );
+}
+
+/// What C, waking on the log it took when it held A's first `Put` of `a.key` alone, writes
+/// beside the cut of [`final_cut_over_a_superseded_put`], whose prune dropped that `Put`: a
+/// version-1 `Put` of the value it read (a reseal, a carry where that `Put` counts), of another
+/// value, or a version-1 `Delete`.
+#[derive(Clone, Copy, Debug)]
+enum Beside {
+    Reseal,
+    Edit,
+    Delete,
+}
+
+/// A version-1 op beside a final cut over an op its prune dropped reads as the whole log reads
+/// it, whether the rooted log took it before its prune or after. It states nothing, and reads by
+/// the counting ops of its frontier; the cut is settled in every log that holds its shares, so
+/// the dropped op counts nowhere there, the whole log's frontier lacks it as the rooted log's
+/// does ([`checkpoint::gone`]), and C's op is an edit beside A's second `Put` in both: `a.key`
+/// reads in conflict, where C's reseal would have carried a value that counts. That is the cost
+/// of the rule, alike in every log; a rooted log refuses no such record, which an honest Mac
+/// that slept across the cut may write.
+///
+/// NEGATIVE CONTROL: `Mutant::Revives` (a record a settled prune dropped counts as its
+/// evaluation alone says), run from the test's first line and seen to fail with
+/// ``assertion `left == right` failed: the rooted log reads `a.key`'s conflicts as the whole log
+/// (Reseal, taken after the prune)``, `left: {"a.key"}` against `right: {}`: the whole log reads
+/// C's reseal by a frontier that holds A's first `Put`, as a carry its second replaced, and the
+/// rooted log by one that lost it, as an edit.
+#[test]
+fn vault_checkpoint_a_version_one_op_beside_a_cut_reads_as_the_whole_log() {
+    for beside in [Beside::Reseal, Beside::Edit, Beside::Delete] {
+        for after in [true, false] {
+            let when = if after {
+                "taken after the prune"
+            } else {
+                "held before the prune"
+            };
+            let (mut whole, body, first, stale) = final_cut_over_a_superseded_put();
+            let keys = stale.unwrap_epochs(&C.identity()).unwrap();
+            let epoch = stale.newest_epochs(&EpochAudience::Everyone)[0];
+            let key = &keys[&epoch];
+            let at = T + 3 * DAY_MS;
+            let drafted = match beside {
+                Beside::Reseal | Beside::Edit => {
+                    let value: &[u8] = if matches!(beside, Beside::Reseal) {
+                        b"one"
+                    } else {
+                        b"c's"
+                    };
+                    stale.draft_put(
+                        &C.id(),
+                        at,
+                        epoch,
+                        key,
+                        &entry(&EpochAudience::Everyone, "a.key", value),
+                    )
+                }
+                Beside::Delete => stale.draft_delete(&C.id(), at, epoch, key, "a.key"),
+            };
+            let record = one(drafted.unwrap(), C);
+            assert_eq!(record.version(), 1);
+            assert!(
+                record.parents().contains(&first),
+                "C's op follows A's first `Put`"
+            );
+            let rooted = if after {
+                let mut rooted = whole.adopt(&body).unwrap();
+                hold(&mut whole, record.clone());
+                assert_eq!(rooted.insert(record).unwrap(), Inserted::Held);
+                rooted
+            } else {
+                hold(&mut whole, record);
+                whole.adopt(&body).unwrap()
+            };
+            assert!(rooted.is_dropped(&first));
+            assert_eq!(
+                conflicted(&rooted, B),
+                conflicted(&whole, B),
+                "the rooted log reads `a.key`'s conflicts as the whole log ({beside:?}, {when})"
+            );
+            assert_eq!(
+                conflicted(&whole, B),
+                BTreeSet::from(["a.key".to_owned()]),
+                "C's op is an edit beside A's second `Put` ({beside:?}, {when})"
+            );
+            assert_eq!(values(&rooted, B), values(&whole, B));
+            assert_eq!(evaluated(&rooted), evaluated(&whole));
+            assert_eq!(
+                evaluated_registers(&rooted, &BTreeSet::new()),
+                evaluated_registers(&whole, &BTreeSet::new()),
+                "the rooted log reads its registers as the whole log ({beside:?}, {when})"
+            );
+        }
+    }
 }

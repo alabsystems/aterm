@@ -4,8 +4,10 @@
 //! FILES, WRITTEN THE CAREFUL WAY AND READ WITHIN A BOUND.
 //!
 //! The bounded regular-file readers ([`read_regular`], [`read_regular_text`]) and the bounded
-//! reader of a user-named input ([`read_bounded_stream`]) run on every platform. The whole-file
-//! writer runs on Unix and Windows; Unix modes apply only on Unix.
+//! reader of a user-named input ([`read_bounded_stream`]) run on every platform. With a trace
+//! scope armed on the calling thread ([`crate::trace`]), each records the stamp of the path it
+//! reads, or that nothing is there, before its open. The whole-file writer runs on Unix and
+//! Windows; Unix modes apply only on Unix.
 //! aterm.toml's (`ConfigFile`, under the config service's write lock) is Unix-only, since its
 //! modes and `flock` have no counterpart elsewhere.
 
@@ -34,21 +36,32 @@ pub const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 /// Symbolic links are followed. Use [`crate::regular_file::open`] when the final component
 /// must itself be a regular file.
 ///
+/// With a trace scope armed it records `path`'s stamp before the open (a link's target's too),
+/// which decides a missing path, a file that is no regular one and one past `max_bytes`; an
+/// open, a look or a read that fails otherwise records a retry where no stamp decides it
+/// ([`crate::trace::fs::failed`]).
+///
 /// # Errors
 /// Returns an error if `path` cannot be opened, is not a regular file, or exceeds `max_bytes`.
 pub fn read_regular(path: &Path, max_bytes: u64) -> io::Result<(Vec<u8>, std::fs::Metadata)> {
     use std::io::Read as _;
+    crate::trace::fs::opening(path);
+    let failed = |error: io::Error| {
+        crate::trace::fs::failed(path, &error);
+        error
+    };
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt as _;
         std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(path)?
+            .open(path)
+            .map_err(failed)?
     };
     #[cfg(not(unix))]
-    let file = std::fs::File::open(path)?;
-    let meta = file.metadata()?;
+    let file = std::fs::File::open(path).map_err(failed)?;
+    let meta = file.metadata().map_err(failed)?;
     if !meta.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -64,7 +77,8 @@ pub fn read_regular(path: &Path, max_bytes: u64) -> io::Result<(Vec<u8>, std::fs
     let cap = usize::try_from(meta.len().min(max_bytes).saturating_add(1)).unwrap_or(0);
     let mut buf = Vec::with_capacity(cap);
     file.take(max_bytes.saturating_add(1))
-        .read_to_end(&mut buf)?;
+        .read_to_end(&mut buf)
+        .map_err(failed)?;
     if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -80,14 +94,23 @@ pub fn read_regular(path: &Path, max_bytes: u64) -> io::Result<(Vec<u8>, std::fs
 /// close-on-exec. A directory, a block device or a socket is refused, and so is an input longer
 /// than `max_bytes`, which is detected by reading one byte past the bound.
 ///
+/// With a trace scope armed it records `path`'s stamp before the open, as [`read_regular`] does,
+/// and a stream's read poisons the scope ([`crate::trace::poison`]): what a stream yields is no
+/// file's, so no stamp decides it.
+///
 /// # Errors
 /// Returns an error if `path` cannot be opened or read, names a directory, block device or
 /// socket, or yields more than `max_bytes` bytes.
 pub fn read_bounded_stream(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
     use std::io::Read as _;
+    crate::trace::fs::opening(path);
+    let failed = |error: io::Error| {
+        crate::trace::fs::failed(path, &error);
+        error
+    };
     // std opens with `O_CLOEXEC` on Unix and without `O_NONBLOCK`, so a FIFO waits for its writer.
-    let file = std::fs::File::open(path)?;
-    let kind = file.metadata()?.file_type();
+    let file = std::fs::File::open(path).map_err(failed)?;
+    let kind = file.metadata().map_err(failed)?.file_type();
     #[cfg(unix)]
     let stream = {
         use std::os::unix::fs::FileTypeExt as _;
@@ -101,9 +124,13 @@ pub fn read_bounded_stream(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
             "not a regular file, FIFO or character device",
         ));
     }
+    if stream {
+        crate::trace::poison("a stream's bytes, which no stamp decides");
+    }
     let mut buf = Vec::new();
     file.take(max_bytes.saturating_add(1))
-        .read_to_end(&mut buf)?;
+        .read_to_end(&mut buf)
+        .map_err(failed)?;
     if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

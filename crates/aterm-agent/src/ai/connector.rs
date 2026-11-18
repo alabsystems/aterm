@@ -435,7 +435,7 @@ pub enum RowKeys {
 }
 
 /// A sign-in flow a row may ask for ([`RowKeys::Flow`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Flow {
     /// The browser flow with a loopback callback.
     Browser,
@@ -465,7 +465,7 @@ impl Flow {
 }
 
 /// A Kimi account system ([`RowKeys::Region`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Region {
     /// kimi.ai.
     Global,
@@ -1447,14 +1447,15 @@ fn is_kimi_env_credential(path: &std::path::Path) -> bool {
 }
 
 /// The stored login file under `home` (`stat`ed, never opened): a connector's literal path, or
-/// Kimi Code's environment-scoped `credentials/kimi-code-env-<id>.json`.
+/// Kimi Code's environment-scoped `credentials/kimi-code-env-<id>.json`. Each literal path's look
+/// is recorded in an armed trace scope (`aterm_uds::trace::fs`); Kimi Code's listing is not.
 #[must_use]
 pub fn stored_login_file(c: &Connector, home: &std::path::Path) -> Option<std::path::PathBuf> {
     if let Some(file) = c
         .stores
         .iter()
         .map(|relative| home.join(relative))
-        .find(|path| path.is_file())
+        .find(|path| aterm_uds::trace::fs::is_file(path))
     {
         return Some(file);
     }
@@ -1594,12 +1595,12 @@ pub fn test_on_login_platform<R>(file: bool, read: impl FnOnce() -> R) -> R {
 /// `claudeAiOauth` object ([`stored_login_held`]). The bytes and the parsed tree are scrubbed
 /// before it returns.
 fn claude_credentials_held(file: &std::path::Path) -> Option<bool> {
-    if !std::fs::symlink_metadata(file)
+    if !aterm_uds::trace::fs::symlink_metadata(file)
         .is_ok_and(|m| m.is_file() && m.len() <= CLAUDE_CREDENTIAL_MAX)
     {
         return None;
     }
-    let bytes = aterm_uds::secret::Secret::from_vec(std::fs::read(file).ok()?);
+    let bytes = aterm_uds::secret::Secret::from_vec(aterm_uds::trace::fs::read(file).ok()?);
     let value = aterm_json::from_slice::<aterm_json::Value>(bytes.expose()).ok()?;
     let token = |name: &str| {
         value["claudeAiOauth"][name]

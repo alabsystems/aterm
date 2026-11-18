@@ -1873,6 +1873,7 @@ fn a_due_flush_waits_out_held_custody_until_the_hang_detector() {
                 &spool,
                 &Presence::default,
                 &|| None,
+                &mine::Unreported,
                 &|| None,
                 false,
                 now,
@@ -2450,4 +2451,1018 @@ fn a_usage_rows_sources_are_event_sources() {
     }
     let src = USAGE.column("src").unwrap();
     assert!(matches!(src.ty, crate::typed::Ty::Enum(words) if words == READING_SOURCES));
+}
+
+/// One login this Mac's harness reports of `account`, signed in since `since`: Claude Code's
+/// default home, idle, linked, no sign-in attempt, on the `max` plan.
+fn login(account: Pk, since: u64) -> mine::Login {
+    mine::Login {
+        account,
+        cli: mine::Cli::Claude,
+        place: mine::Place::Default,
+        state: mine::State::SignedIn,
+        proof: mine::Proof::Status,
+        src: mine::Src::Profile,
+        use_: mine::Use::Idle,
+        tabs: 0,
+        held: mine::Held::Linked,
+        since,
+        served_at: None,
+        ends_by: None,
+        ended_at: None,
+        attempt: mine::Attempt::None,
+        attempt_at: None,
+        attempt_route: None,
+        plan: Word::new("max"),
+    }
+}
+
+/// A report of Claude Code's `logins` alone.
+fn claude(logins: &[mine::Login]) -> mine::Reports {
+    [(mine::Cli::Claude, Some(logins.to_vec()))].into()
+}
+
+/// A login source for a test: the report it is set to, whether a file it reads from moved, and
+/// how often it was read. A report clears `moved`, as the executable's stamps do.
+#[derive(Default)]
+struct Reported {
+    report: std::cell::RefCell<mine::Reports>,
+    moved: std::cell::Cell<bool>,
+    reads: std::cell::Cell<usize>,
+}
+
+impl mine::Source for Reported {
+    fn moved(&self) -> bool {
+        self.moved.get()
+    }
+
+    fn report(&self) -> Option<mine::Reports> {
+        self.reads.set(self.reads.get() + 1);
+        self.moved.set(false);
+        Some(self.report.borrow().clone())
+    }
+}
+
+impl Reported {
+    /// Change the Claude Code logins it reports, as a write to a file they are read from does.
+    fn edit(&self, change: impl FnOnce(&mut Vec<mine::Login>)) {
+        let mut report = self.report.borrow_mut();
+        change(
+            report
+                .entry(mine::Cli::Claude)
+                .or_insert_with(|| Some(Vec::new()))
+                .get_or_insert_with(Vec::new),
+        );
+        self.moved.set(true);
+    }
+}
+
+/// A wall of `window` on `account` at `t`, standing until `until`.
+fn wall(t: u64, account: Pk, window: Window, until: u64) -> Event {
+    Event {
+        window: Some(window),
+        until: Some(until),
+        src: Source::Statusline,
+        ..ev(t, Kind::Wall, account)
+    }
+}
+
+/// The plan words a `login` or `usage` row may carry: the harness's (`journal::PLANS`).
+const PLAN_WORDS: [&str; 10] = [
+    "free",
+    "go",
+    "plus",
+    "pro",
+    "prolite",
+    "max",
+    "team",
+    "business",
+    "enterprise",
+    "edu",
+];
+
+/// Every cell of `row` is a value its column of `collection` admits (`typed::cell::validate`),
+/// and no text in it is anything but a closed word, a key or a plan word: no address, path,
+/// link, token or other free text.
+fn value_free(collection: &crate::typed::Collection, row: &Value) {
+    use crate::typed::Ty;
+    for (key, x) in row.as_object().unwrap() {
+        if key == "r" {
+            assert_eq!(x, &json!(1));
+            continue;
+        }
+        let column = collection
+            .column(key)
+            .unwrap_or_else(|| panic!("{}.{key} is no column", collection.name));
+        crate::typed::cell::validate(collection, column, x).unwrap();
+        let Some(text) = x.as_str() else { continue };
+        assert!(
+            !text.contains(['@', '/', ':', '=']),
+            "{}.{key} holds {text:?}",
+            collection.name
+        );
+        match column.ty {
+            Ty::Enum(words) => assert!(words.contains(&text)),
+            Ty::Ref(_) => assert!(Pk::new(text).is_some(), "{key}: {text:?}"),
+            Ty::Hex(_) => {}
+            Ty::Text(_) => assert!(
+                key == "plan" && PLAN_WORDS.contains(&text),
+                "{}.{key} holds free text {text:?}",
+                collection.name
+            ),
+            _ => panic!("{}.{key} holds text of {:?}", collection.name, column.ty),
+        }
+    }
+}
+
+/// SF-08b's exit test: this Mac's flusher states its own `login` rows (from the harness's
+/// report) and `usage` rows (from its book's readings) at `<account pk>.<uuid32>` in the same
+/// record as its `sum`, `ev`, `use` and `place` rows, every cell value-free and every time in
+/// milliseconds; a minute in which nothing moved reads no store and writes nothing; a routine
+/// change waits for the hour and only its latest value is written, once, and a file that moved
+/// for one alone makes no record; an urgent one goes in the next pass, inside the hour, whether
+/// the harness noted a sharp event beside it (signed out, a wall hit, a blocked sign-in in the
+/// form a v0.201.0 peer reads) or only a file it is read from moved (a blocked renewal of a
+/// login that still works, a login the report no longer names, which is stated once as no longer
+/// held here); and the first record of the next week restates each login the report still
+/// carries and each used account's usage beside the `use` and `place` rows, at a new counter and
+/// with the same content, and not the login it released.
+///
+/// NEGATIVE CONTROLS, each run: with `Book::row_due` never carrying (`let carry = false;`), the
+/// week-two login row keeps its earlier counter: `` the week's first record restates ann's
+/// login `` (`left: 7 right: 10`); with `mine::urgent` always false, the sign-out waits for the
+/// hour: `` signed out inside the hour `` (`left: 1 right: 3`); with `Event::sharp` not reading a
+/// `sign-in-failed`'s why (`matches!(self.kind, Kind::Error)`), `` a blocked sign-in is due:
+/// Idle ``; with the gate not asking `Source::moved` (`let moved = false;`), a moved file is never
+/// read: `` a moved file is read `` (`left: (1, 1) right: (2, 1)`).
+#[test]
+fn the_flusher_states_this_macs_login_and_usage_rows_beside_its_use_and_place_rows_and_restates_them_each_week()
+ {
+    use place::{Holding, Why};
+    let lab = Lab::new(&[Role::Writer]);
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let spool = &spools(scratch.path(), 1)[0];
+    let paths = &lab.paths[0];
+    let (ann, bob, cy) = (pk("ada@x.example"), pk("bo@x.example"), pk("cy@x.example"));
+    let t0 = W * WEEK + 2 * 86_400;
+    let source = Reported::default();
+    source.edit(|logins| {
+        *logins = vec![
+            mine::Login {
+                held: mine::Held::Fill,
+                ..login(ann, t0 - 3600)
+            },
+            login(bob, t0 - 7200),
+        ];
+    });
+    let holdings = || {
+        Some(vec![Holding {
+            account: ann,
+            why: Why::Fill,
+        }])
+    };
+    let pass = |now: u64| {
+        flush::pass_observed(
+            paths,
+            spool,
+            &Presence::default,
+            &holdings,
+            &source,
+            &|| None,
+            false,
+            now,
+        )
+        .unwrap()
+    };
+    // What the harness notes at `t` is taken then, and absorbed by the next pass.
+    let note = |events: &[Event], t: u64| {
+        for event in events {
+            assert_eq!(spool.append(event).unwrap(), Appended::Written);
+        }
+        flush::take_in(spool, false, t).unwrap();
+    };
+    let me = hex::encode_lower(&window_at(paths, t0).0);
+    let row = |collection: &crate::typed::Collection, account: Pk, now: u64| {
+        rows(paths, now, collection)
+            .rows
+            .get(&format!("{}.{me}", account.as_str()))
+            .map(|row| row.value.clone())
+            .unwrap_or_else(|| panic!("no {} row of {account:?}", collection.name))
+    };
+    let n = || Book::load(spool).n;
+    let edit = |account: Pk, change: &dyn Fn(&mut mine::Login)| {
+        source.edit(|logins| change(logins.iter_mut().find(|l| l.account == account).unwrap()));
+    };
+
+    // (a) One record: the week's `sum`, the `ev` batch, and ann's `use`, `place`, `login` and
+    // `usage` rows, with bob's `login` row (a login nothing was read of yet).
+    note(
+        &[
+            ev(t0 - 120, Kind::SessionStart, ann),
+            quota(t0 - 110, ann, Window::Week, 420),
+            quota(t0 - 110, ann, Window::FiveHour, 130),
+        ],
+        t0 - 100,
+    );
+    assert!(matches!(pass(t0), Flushed::Wrote { events: 3, .. }));
+    let n1 = n();
+    let sums = rows(paths, t0 + 1, &SUM);
+    assert_eq!(sums.rows[&me].value["n"], json!(n1));
+    assert_eq!(own_published(paths, t0 + 1).len(), 3);
+    for (collection, account) in [
+        (&USE, ann),
+        (&PLACE, ann),
+        (&LOGIN, ann),
+        (&LOGIN, bob),
+        (&USAGE, ann),
+    ] {
+        assert_eq!(
+            row(collection, account, t0 + 1)["n"],
+            json!(n1),
+            "one record"
+        );
+    }
+    let ada = row(&LOGIN, ann, t0 + 1);
+    value_free(&LOGIN, &ada);
+    assert_eq!(
+        (&ada["state"], &ada["held"], &ada["since"], &ada["at"]),
+        (
+            &json!("signed-in"),
+            &json!("fill"),
+            &json!((t0 - 3600) * 1000),
+            &json!(t0 * 1000)
+        )
+    );
+    let bo = row(&LOGIN, bob, t0 + 1);
+    value_free(&LOGIN, &bo);
+    assert_eq!(bo["held"], json!("linked"), "no place names it");
+    let usage = row(&USAGE, ann, t0 + 1);
+    value_free(&USAGE, &usage);
+    assert_eq!(
+        usage,
+        json!({"r": 1, "n": n1, "account": ann.as_str(), "w5h": 130, "w7d": 420,
+            "w5h_reset": (t0 + 3490) * 1000, "w7d_reset": (t0 + 3490) * 1000, "wall": "none",
+            "src": "statusline", "read_at": (t0 - 110) * 1000, "at": t0 * 1000,
+            "sessions_7d": 1, "last_start": (t0 - 120) * 1000})
+    );
+    assert!(
+        rows(paths, t0 + 1, &USAGE).rows.len() == 1,
+        "bob was read nothing of"
+    );
+    let reads = source.reads.get();
+
+    // (b) A minute later with nothing moved: nothing is due, and no store is read.
+    assert_eq!(pass(t0 + 60), Flushed::Idle);
+    assert_eq!(source.reads.get(), reads, "a quiet minute reads no store");
+
+    // (c) A routine change (a tab on ann) moves a file: the logins are read and nothing is
+    // written; with a record going for something else, ann's row still waits for the hour.
+    edit(ann, &|l| {
+        l.tabs = 1;
+        l.use_ = mine::Use::Running;
+    });
+    assert_eq!(
+        pass(t0 + 300),
+        Flushed::Idle,
+        "a routine change makes no record"
+    );
+    assert_eq!(
+        (source.reads.get(), n()),
+        (reads + 1, n1),
+        "a moved file is read"
+    );
+    note(&[ev(t0 + 590, Kind::SignedIn, cy)], t0 + 595);
+    assert!(matches!(pass(t0 + 600), Flushed::Wrote { .. }));
+    assert_eq!(row(&LOGIN, ann, t0 + 601)["tabs"], json!(0), "hourly");
+
+    // (d) Urgent: ann signs out and hits its five-hour wall, each noted sharp as the harness
+    // notes it; both rows go in the next pass, inside the hour, while its `use` row keeps to it.
+    edit(ann, &|l| {
+        l.state = mine::State::SignedOut;
+        l.since = t0 + 1190;
+    });
+    note(
+        &[
+            ev(t0 + 1190, Kind::SignedOut, ann),
+            wall(t0 + 1190, ann, Window::FiveHour, t0 + 9000),
+        ],
+        t0 + 1195,
+    );
+    assert!(matches!(pass(t0 + 1200), Flushed::Wrote { .. }));
+    let n4 = n();
+    let ada = row(&LOGIN, ann, t0 + 1201);
+    assert_eq!(ada["n"], json!(n4), "signed out inside the hour");
+    assert_eq!(
+        (&ada["state"], &ada["tabs"]),
+        (&json!("signed-out"), &json!(1))
+    );
+    let usage = row(&USAGE, ann, t0 + 1201);
+    assert_eq!(usage["n"], json!(n4), "a wall inside the hour");
+    assert_eq!(
+        (&usage["wall"], &usage["wall_until"]),
+        (&json!("5h"), &json!((t0 + 9000) * 1000))
+    );
+    assert_eq!(
+        row(&USE, ann, t0 + 1201)["n"],
+        json!(n1),
+        "the use row is hourly"
+    );
+
+    // (e) Routine again: written only an hour after the last statement, its latest value, once.
+    edit(ann, &|l| l.tabs = 2);
+    note(&[ev(t0 + 1790, Kind::SignedIn, cy)], t0 + 1795);
+    assert!(matches!(pass(t0 + 1800), Flushed::Wrote { .. }));
+    assert_eq!(row(&LOGIN, ann, t0 + 1801)["n"], json!(n4), "hourly");
+    edit(ann, &|l| l.tabs = 3);
+    let hour = t0 + 1200 + book::USE_EVERY + 60;
+    note(&[ev(hour - 10, Kind::SignedIn, cy)], hour - 5);
+    assert!(matches!(pass(hour), Flushed::Wrote { .. }));
+    let n6 = n();
+    let ada = row(&LOGIN, ann, hour + 1);
+    assert_eq!(
+        (&ada["n"], &ada["tabs"]),
+        (&json!(n6), &json!(3)),
+        "the latest"
+    );
+    note(&[ev(hour + 50, Kind::SignedIn, cy)], hour + 55);
+    assert!(matches!(pass(hour + 60), Flushed::Wrote { .. }));
+    assert_eq!(row(&LOGIN, ann, hour + 61)["n"], json!(n6), "once");
+
+    // (f) A blocked sign-in of ann's signed-out login, noted as the harness notes it
+    // (`sign-in-failed`, why `blocked`), is due by itself, and its event is in a kind and form
+    // v0.201.0 reads (`file::tests::KINDS_0_201`; its `why` is a free word), not the
+    // `sign-in-blocked` it drops.
+    edit(ann, &|l| {
+        l.attempt = mine::Attempt::Blocked;
+        l.attempt_at = Some(hour + 590);
+    });
+    source.moved.set(false);
+    let blocked = Event {
+        why: Word::new("blocked"),
+        src: Source::SigninFlow,
+        ..ev(hour + 590, Kind::SignInFailed, ann)
+    };
+    note(&[blocked], hour + 595);
+    let flushed = pass(hour + 600);
+    assert!(
+        matches!(flushed, Flushed::Wrote { .. }),
+        "a blocked sign-in is due: {flushed:?}"
+    );
+    let n8 = n();
+    let ada = row(&LOGIN, ann, hour + 601);
+    assert_eq!(
+        (&ada["n"], &ada["attempt"]),
+        (&json!(n8), &json!("blocked"))
+    );
+    let said = own_published(paths, hour + 601)
+        .into_iter()
+        .find(|event| *event == blocked)
+        .unwrap()
+        .to_value();
+    assert_eq!(
+        (&said["k"], &said["why"]),
+        (&json!("sign-in-failed"), &json!("blocked"))
+    );
+    let week_one = mine::content(&ada);
+
+    // (g) An urgent change with no sharp event beside it: bob's renewal is blocked while his
+    // login still works. Only a file it is read from moved, and nothing else is due (no event
+    // waits, the routine interval has not passed); the next pass reads the logins and writes his
+    // row.
+    edit(bob, &|l| {
+        l.attempt = mine::Attempt::Blocked;
+        l.attempt_at = Some(hour + 1190);
+    });
+    let flushed = pass(hour + 1200);
+    assert!(
+        matches!(flushed, Flushed::Wrote { .. }),
+        "a moved file makes an urgent row due: {flushed:?}"
+    );
+    let bo = row(&LOGIN, bob, hour + 1201);
+    assert_eq!(
+        (&bo["n"], &bo["state"], &bo["attempt"]),
+        (&json!(n()), &json!("signed-in"), &json!("blocked"))
+    );
+
+    // (h) The report no longer names bob (his roster row left this Mac): his row is stated once
+    // more as no longer held here, signed out with no session on it, in the next pass.
+    source.edit(|logins| logins.retain(|l| l.account == ann));
+    assert!(matches!(pass(hour + 1260), Flushed::Wrote { .. }));
+    let n10 = n();
+    let bo = row(&LOGIN, bob, hour + 1261);
+    value_free(&LOGIN, &bo);
+    assert_eq!(
+        (
+            &bo["n"],
+            &bo["state"],
+            &bo["use"],
+            &bo["tabs"],
+            &bo["since"]
+        ),
+        (
+            &json!(n10),
+            &json!("signed-out"),
+            &json!("idle"),
+            &json!(0),
+            &json!((hour + 1260) * 1000)
+        ),
+        "released"
+    );
+    assert!(
+        !Book::load(spool).logins.contains_key(&bob),
+        "then forgotten"
+    );
+
+    // (i) The next week's first record restates ann's login (same content, new counter) and
+    // usage beside its `use` and `place` rows; bob, released, is not restated.
+    let w2 = (W + 1) * WEEK + 60;
+    assert!(matches!(pass(w2), Flushed::Wrote { .. }));
+    let n11 = n();
+    let ada = row(&LOGIN, ann, w2 + 1);
+    assert_eq!(
+        ada["n"],
+        json!(n11),
+        "the week's first record restates ann's login"
+    );
+    assert_eq!(mine::content(&ada), week_one, "the same content");
+    assert_eq!(ada["at"], json!(w2 * 1000));
+    for collection in [&USAGE, &USE, &PLACE] {
+        assert_eq!(
+            row(collection, ann, w2 + 1)["n"],
+            json!(n11),
+            "{}",
+            collection.name
+        );
+    }
+    let usage = row(&USAGE, ann, w2 + 1);
+    value_free(&USAGE, &usage);
+    assert_eq!(usage["wall"], json!("none"), "the wall lapsed");
+    assert_eq!(
+        row(&LOGIN, bob, w2 + 1)["n"],
+        json!(n10),
+        "bob is not restated"
+    );
+}
+
+/// A routine change of a `login` or `usage` row (a tab on the login, a new reading) is written
+/// at most hourly and only its latest value; an unchanged row is never written again within a
+/// week.
+/// NEGATIVE CONTROL, run: with `Book::row_due` taking any change as eligible (`let eligible =
+/// true;`), the second reading goes at once: `` early `` (`left: (1, 1) right: (0, 0)`).
+#[test]
+fn login_and_usage_rows_coalesce_to_their_latest_value_at_most_hourly() {
+    let ann = pk("ada@x.example");
+    let now = W * WEEK + 86_400;
+    let mut book = Book::default();
+    book.fold(&[quota(now - 60, ann, Window::Week, 100)]);
+    book.take_logins(&claude(&[login(ann, now - 600)]), now);
+    let planned = |book: &Book, n, now| book::Planned {
+        logins: book.logins_due(n, W, now),
+        usages: book.usages_due(n, W, now),
+        ..Default::default()
+    };
+    let first = planned(&book, 1, now);
+    assert_eq!((first.logins.len(), first.usages.len()), (1, 1));
+    book.wrote(&first, 1, W, now);
+    let unchanged = planned(&book, 2, now + 2 * book::USE_EVERY);
+    assert_eq!((unchanged.logins.len(), unchanged.usages.len()), (0, 0));
+
+    book.fold(&[quota(now + 60, ann, Window::Week, 150)]);
+    book.take_logins(
+        &claude(&[mine::Login {
+            tabs: 1,
+            use_: mine::Use::Running,
+            ..login(ann, now - 600)
+        }]),
+        now + 60,
+    );
+    let early = planned(&book, 2, now + 600);
+    assert_eq!((early.logins.len(), early.usages.len()), (0, 0), "early");
+    book.fold(&[quota(now + 900, ann, Window::Week, 200)]);
+    book.take_logins(
+        &claude(&[mine::Login {
+            tabs: 2,
+            use_: mine::Use::Running,
+            ..login(ann, now - 600)
+        }]),
+        now + 900,
+    );
+    let hour = planned(&book, 3, now + book::USE_EVERY);
+    assert_eq!((hour.logins.len(), hour.usages.len()), (1, 1));
+    assert_eq!(hour.logins[0].1["tabs"], json!(2), "the latest");
+    assert_eq!(hour.usages[0].1["w7d"], json!(200), "the latest");
+    book.wrote(&hour, 3, W, now + book::USE_EVERY);
+    let again = planned(&book, 4, now + 3 * book::USE_EVERY);
+    assert_eq!((again.logins.len(), again.usages.len()), (0, 0), "once");
+}
+
+/// An urgent change goes at once whatever the hour (`mine::urgent`), and makes a record due
+/// (`Book::logins_urgent`, `Book::due`) as a sharp event does: a login signed out, ended, on the
+/// wrong account or blocked, and back from any of them; a wall hit or cleared. A change of
+/// anything else waits and makes no record due.
+/// NEGATIVE CONTROL, run: with `mine::urgent` always false, the sign-out waits: `` signed-out:
+/// urgent ``.
+#[test]
+fn an_urgent_login_or_usage_change_is_due_at_once_and_a_routine_one_waits() {
+    let ann = pk("ada@x.example");
+    let now = W * WEEK + 86_400;
+    let mut book = Book::default();
+    book.fold(&[quota(now - 60, ann, Window::FiveHour, 100)]);
+    book.take_logins(&claude(&[login(ann, now - 600)]), now);
+    let first = book::Planned {
+        logins: book.logins_due(1, W, now),
+        usages: book.usages_due(1, W, now),
+        ..Default::default()
+    };
+    book.wrote(&first, 1, W, now);
+    book.sum_period = Some(W);
+    book.flushed_at = now;
+    let mut t = now;
+    let mut due_after = |book: &mut Book, change: &dyn Fn(&mut mine::Login), why: &str| {
+        t += 60;
+        let mut changed = login(ann, now - 600);
+        change(&mut changed);
+        book.take_logins(&claude(&[changed]), t);
+        assert!(book.logins_urgent(t), "{why}: urgent");
+        assert!(
+            book.due(&[], true, t, W, true, false),
+            "{why}: a record is due"
+        );
+        let due = book.logins_due(2, W, t);
+        assert_eq!(due.len(), 1, "{why}");
+        let planned = book::Planned {
+            logins: due,
+            ..Default::default()
+        };
+        book.wrote(&planned, 2, W, t);
+        assert!(!book.logins_urgent(t), "{why}: stated");
+    };
+    due_after(
+        &mut book,
+        &|l| l.state = mine::State::SignedOut,
+        "signed-out",
+    );
+    due_after(&mut book, &|_| {}, "signed back in");
+    due_after(&mut book, &|l| l.state = mine::State::Ended, "ended");
+    due_after(
+        &mut book,
+        &|l| l.state = mine::State::WrongAccount,
+        "wrong account",
+    );
+    due_after(
+        &mut book,
+        &|l| l.attempt = mine::Attempt::Blocked,
+        "blocked",
+    );
+    due_after(&mut book, &|_| {}, "unblocked");
+    // Routine: a tab, a plan, a proof.
+    for change in [
+        &(|l: &mut mine::Login| l.tabs = 4) as &dyn Fn(&mut mine::Login),
+        &|l: &mut mine::Login| l.plan = Word::new("pro"),
+        &|l: &mut mine::Login| l.proof = mine::Proof::Page,
+    ] {
+        let mut changed = login(ann, now - 600);
+        change(&mut changed);
+        book.take_logins(&claude(&[changed]), t + 60);
+        assert!(book.logins_due(3, W, t + 60).is_empty(), "routine");
+        assert!(!book.logins_urgent(t + 60), "routine");
+        assert!(!book.due(&[], true, t + 60, W, true, false), "routine");
+    }
+
+    // A wall hit and cleared is due at once; a new reading inside the hour is not.
+    book.fold(&[quota(t + 100, ann, Window::FiveHour, 300)]);
+    assert!(book.usages_due(3, W, t + 120).is_empty(), "a reading waits");
+    book.fold(&[wall(t + 200, ann, Window::FiveHour, t + 9000)]);
+    let due = book.usages_due(3, W, t + 220);
+    assert_eq!(due.len(), 1, "a wall hit");
+    assert_eq!(due[0].1["wall"], json!("5h"));
+    book.wrote(
+        &book::Planned {
+            usages: due,
+            ..Default::default()
+        },
+        3,
+        W,
+        t + 220,
+    );
+    book.fold(&[Event {
+        window: Some(Window::FiveHour),
+        src: Source::Statusline,
+        ..ev(t + 300, Kind::WallCleared, ann)
+    }]);
+    let due = book.usages_due(4, W, t + 320);
+    assert_eq!(due.len(), 1, "a wall cleared");
+    assert_eq!(due[0].1["wall"], json!("none"));
+}
+
+/// The weekly restatement: the week's first record restates every login the harness reported
+/// this week or the last and the usage row of every account used in the last 180 days,
+/// unchanged, at the new counter; an account used longer ago is not restated. A login the report
+/// of its CLI no longer names is stated once as no longer held here (signed out, idle, no tabs,
+/// since then) and then forgotten, never restated; one never stated is forgotten at once.
+/// NEGATIVE CONTROL, run: with `Book::take_logins` forgetting every login its CLI's report no
+/// longer names (`if login.stated.is_none() || true`), bob is never released: `` released ``
+/// (`left: 0 right: 1`).
+#[test]
+fn the_weekly_restatement_carries_reported_logins_and_used_accounts_usage_rows_only() {
+    let (ann, bob, cy, dee) = (
+        pk("ada@x.example"),
+        pk("bo@x.example"),
+        pk("cy@x.example"),
+        pk("dee@x.example"),
+    );
+    let now = W * WEEK + 3600;
+    let mut book = Book::default();
+    book.fold(&[quota(now - 60, ann, Window::Week, 100)]);
+    book.fold(&[quota(now - book::CARRY_S - WEEK, cy, Window::Week, 100)]);
+    book.take_logins(
+        &claude(&[login(ann, now - 600), login(bob, now - 600)]),
+        now,
+    );
+    let first = book::Planned {
+        logins: book.logins_due(1, W, now),
+        usages: book.usages_due(1, W, now),
+        ..Default::default()
+    };
+    assert_eq!((first.logins.len(), first.usages.len()), (2, 2));
+    book.wrote(&first, 1, W, now);
+    assert!(book.logins_due(2, W, now + 7200).is_empty());
+    assert!(book.usages_due(2, W, now + 7200).is_empty());
+
+    // Bob leaves the report; dee joins it and leaves again before any row of hers is written.
+    book.take_logins(
+        &claude(&[login(ann, now - 600), login(dee, now)]),
+        now + 7200,
+    );
+    book.take_logins(&claude(&[login(ann, now - 600)]), now + 7260);
+    assert!(!book.logins.contains_key(&dee), "never stated: forgotten");
+    let released = book.logins_due(2, W, now + 7260);
+    assert_eq!(released.len(), 1, "released");
+    let (pk_, row) = &released[0];
+    assert_eq!(*pk_, bob);
+    assert_eq!(
+        (&row["state"], &row["use"], &row["tabs"], &row["since"]),
+        (
+            &json!("signed-out"),
+            &json!("idle"),
+            &json!(0),
+            &json!((now + 7200) * 1000)
+        ),
+        "released when the report first left it out"
+    );
+    mine::checked(&LOGIN, row).unwrap();
+    book.wrote(
+        &book::Planned {
+            logins: released,
+            ..Default::default()
+        },
+        2,
+        W,
+        now + 7260,
+    );
+    assert!(!book.logins.contains_key(&bob), "stated, then forgotten");
+
+    let next = (W + 1) * WEEK + 60;
+    let keys = |due: Vec<(Pk, Value)>| due.into_iter().map(|(pk, _)| pk).collect::<Vec<_>>();
+    book.take_logins(&claude(&[login(ann, now - 600)]), next);
+    let logins = book.logins_due(3, W + 1, next);
+    assert_eq!(keys(logins.clone()), vec![ann]);
+    let ann_first = first.logins.iter().find(|(pk, _)| *pk == ann).unwrap();
+    assert_eq!(mine::content(&logins[0].1), mine::content(&ann_first.1));
+    assert_eq!(logins[0].1["n"], json!(3));
+    assert_eq!(keys(book.usages_due(3, W + 1, next)), vec![ann]);
+}
+
+/// A CLI whose store did not read keeps its logins as they were, and the other CLIs' rows go on
+/// moving: one store's failure freezes no other's. Its rows are restated in a new week while it
+/// read this week or the last, and then lapse with their weeks: a login nobody reads is never
+/// restated as current, and it is not released either, since nothing says it went.
+/// NEGATIVE CONTROL, run: with `Book::logins_due` carrying whatever the report's age (`let
+/// carries = !login.gone;`), cody is restated two weeks after his store last read: `` lapses ``
+/// (two keys on the left, ann's alone on the right).
+#[test]
+fn a_login_whose_store_did_not_read_is_kept_and_lapses_after_a_week() {
+    let (ann, cody) = (pk("ada@x.example"), pk("cody@x.example"));
+    let codex = |since| mine::Login {
+        cli: mine::Cli::Codex,
+        src: mine::Src::AuthFile,
+        ..login(cody, since)
+    };
+    let report = |claude: Option<Vec<mine::Login>>, codex: Option<Vec<mine::Login>>| {
+        mine::Reports::from([(mine::Cli::Claude, claude), (mine::Cli::Codex, codex)])
+    };
+    let now = W * WEEK + 3600;
+    let mut book = Book::default();
+    book.take_logins(
+        &report(
+            Some(vec![login(ann, now - 600)]),
+            Some(vec![codex(now - 600)]),
+        ),
+        now,
+    );
+    let first = book::Planned {
+        logins: book.logins_due(1, W, now),
+        ..Default::default()
+    };
+    assert_eq!(first.logins.len(), 2);
+    book.wrote(&first, 1, W, now);
+
+    // Codex's store stops reading while ann signs out: cody is kept as he was, ann moves.
+    book.take_logins(
+        &report(
+            Some(vec![mine::Login {
+                state: mine::State::SignedOut,
+                ..login(ann, now + 60)
+            }]),
+            None,
+        ),
+        now + 60,
+    );
+    assert_eq!(book.logins[&cody].content, codex(now - 600).content());
+    assert!(!book.logins[&cody].gone, "kept, not released");
+    assert_eq!(book.logins[&cody].reported_at, now);
+    let due = book.logins_due(2, W, now + 120);
+    assert_eq!(due.iter().map(|(pk, _)| *pk).collect::<Vec<_>>(), vec![ann]);
+    book.wrote(
+        &book::Planned {
+            logins: due,
+            ..Default::default()
+        },
+        2,
+        W,
+        now + 120,
+    );
+    // A report that names no Codex at all is as one that did not read.
+    book.take_logins(&claude(&[login(ann, now + 60)]), now + 180);
+    assert!(book.logins.contains_key(&cody));
+
+    // The next week restates both: cody read last week.
+    let w1 = (W + 1) * WEEK + 60;
+    book.take_logins(&report(Some(vec![login(ann, now + 60)]), None), w1);
+    let due = book.logins_due(3, W + 1, w1);
+    assert_eq!(due.len(), 2, "cody read last week");
+    book.wrote(
+        &book::Planned {
+            logins: due,
+            ..Default::default()
+        },
+        3,
+        W + 1,
+        w1,
+    );
+    // The week after, cody's store has still not read: his row lapses; ann's is restated.
+    let w2 = (W + 2) * WEEK + 60;
+    book.take_logins(&report(Some(vec![login(ann, now + 60)]), None), w2);
+    let due = book.logins_due(4, W + 2, w2);
+    assert_eq!(
+        due.iter().map(|(pk, _)| *pk).collect::<Vec<_>>(),
+        vec![ann],
+        "lapses"
+    );
+    book.wrote(
+        &book::Planned {
+            logins: due,
+            ..Default::default()
+        },
+        4,
+        W + 2,
+        w2,
+    );
+    // Codex reads again: cody is reported now and restated.
+    book.take_logins(&report(None, Some(vec![codex(now - 600)])), w2 + 60);
+    assert_eq!(book.logins[&cody].reported_at, w2 + 60);
+    assert_eq!(book.logins_due(5, W + 2, w2 + 60).len(), 1, "cody again");
+}
+
+/// The rows builds before SF-08 read come first: in a record too small for every row due, the
+/// `use`, `place` and `relay` rows are all kept and the routine `login` and `usage` rows spill
+/// into the next record, while an urgent `login` row goes ahead of them all.
+/// NEGATIVE CONTROL, run: with every `login` and `usage` row planned ahead of the `use` rows
+/// (all `mine_due` taken as urgent, `partition(|_| true)`), use rows spill: `` every use row ``
+/// (`left: 4 right: 30`).
+#[test]
+fn a_full_record_keeps_the_older_rows_and_spills_the_routine_login_and_usage_rows() {
+    let now = W * WEEK + 3600;
+    let mut book = Book::default();
+    let accounts: Vec<Pk> = (0..30).map(|i| pk(&format!("a{i}@x.example"))).collect();
+    for (i, account) in accounts.iter().enumerate() {
+        book.fold(&[
+            ev(now - 120, Kind::SessionStart, *account),
+            quota(now - 100 + i as u64, *account, Window::Week, 100),
+        ]);
+    }
+    let mut logins: Vec<mine::Login> = accounts.iter().map(|a| login(*a, now - 600)).collect();
+    logins[29].state = mine::State::SignedOut;
+    book.take_logins(&claude(&logins), now);
+    book.sum_period = Some(W);
+    let planned = book
+        .plan(
+            &[],
+            &Heard::default(),
+            &Presence::default(),
+            &[1; 16],
+            1,
+            W,
+            now,
+            false,
+        )
+        .unwrap();
+    assert_eq!(planned.uses.len(), accounts.len(), "every use row");
+    let spilled = 2 * accounts.len() - planned.logins.len() - planned.usages.len();
+    assert!(
+        spilled > 0,
+        "the routine rows spill: {}",
+        planned.changes.len()
+    );
+    assert!(
+        planned.logins.iter().any(|(pk, _)| *pk == accounts[29]),
+        "the urgent login row goes"
+    );
+    let first_mine = planned
+        .changes
+        .iter()
+        .position(|change| matches!(change.collection.as_str(), "login" | "usage"))
+        .unwrap();
+    assert_eq!(planned.changes[first_mine].collection, "login");
+    assert!(
+        planned.changes[first_mine]
+            .key
+            .starts_with(accounts[29].as_str()),
+        "the urgent row first"
+    );
+    let last_use = planned
+        .changes
+        .iter()
+        .rposition(|change| change.collection == "use")
+        .unwrap();
+    assert!(
+        planned.changes[last_use + 1..]
+            .iter()
+            .all(|change| matches!(change.collection.as_str(), "login" | "usage")),
+        "the routine rows after the older ones"
+    );
+}
+
+/// No credential-shaped value reaches a `login` or `usage` row: the guard every row passes
+/// before the flusher writes it (`mine::checked`) refuses a cell its column's type or the text
+/// guard does not admit (a token-shaped plan word, a token, a cookie, an OAuth code, a refresh
+/// token, an address or a path in a cell; a column the collection lacks; a missing one), and
+/// `Book::plan` writes the other rows of the record; a usage row states a plan only where it is
+/// a plan word the registry seeds.
+/// NEGATIVE CONTROL, run: with `Book::plan` not calling `mine::checked`, ann's row with the
+/// token-shaped plan is written beside bob's: the `written("login")` assertion prints both keys
+/// on the left and bob's alone on the right.
+#[test]
+fn no_credential_shaped_value_reaches_a_login_or_usage_row() {
+    let (ann, bob) = (pk("ada@x.example"), pk("bo@x.example"));
+    let now = W * WEEK + 3600;
+    // 16 bytes of `[a-z0-9-]`: a word the `Login` type holds, shaped as a Claude token.
+    let token = concat!("sk-", "ant-", "oat01-x9q");
+    assert_eq!(token.len(), 16);
+    let shaped = Word::new(token).unwrap();
+    let mut book = Book::default();
+    book.take_logins(
+        &claude(&[
+            mine::Login {
+                plan: Some(shaped),
+                ..login(ann, now - 600)
+            },
+            login(bob, now - 600),
+        ]),
+        now,
+    );
+    book.fold(&[Event {
+        plan: Word::new(concat!("sk-", "ant-", "o1")),
+        ..ev(now - 60, Kind::PlanSeen, bob)
+    }]);
+    book.fold(&[quota(now - 50, bob, Window::Week, 100)]);
+    assert!(
+        !book.logins_urgent(now),
+        "a row the guard refuses makes no record due"
+    );
+    let planned = book
+        .plan(
+            &[],
+            &Heard::default(),
+            &Presence::default(),
+            &[1; 16],
+            1,
+            W,
+            now,
+            false,
+        )
+        .unwrap();
+    let written = |collection: &str| {
+        planned
+            .changes
+            .iter()
+            .filter(|change| change.collection == collection)
+            .map(|change| change.key.clone())
+            .collect::<Vec<_>>()
+    };
+    let uuid = hex::encode_lower(&[1; 16]);
+    assert_eq!(written("login"), vec![format!("{}.{uuid}", bob.as_str())]);
+    assert_eq!(
+        written("usage"),
+        vec![format!("{}.{uuid}", bob.as_str())],
+        "written without the token-shaped plan word bob's events said"
+    );
+    for change in planned
+        .changes
+        .iter()
+        .filter(|change| matches!(change.collection.as_str(), "login" | "usage"))
+    {
+        let text = String::from_utf8(aterm_json::to_vec(&change.value).unwrap()).unwrap();
+        assert!(!text.contains("sk-"), "{text}");
+    }
+
+    // The guard itself, cell by cell.
+    let good = mine::row(&login(ann, now).content(), 1, now);
+    mine::checked(&LOGIN, &good).unwrap();
+    let with = |key: &str, value: Value| {
+        let mut row = good.clone();
+        set(&mut row, key, value);
+        row
+    };
+    for (key, value) in [
+        ("plan", json!(token)),
+        ("plan", json!(concat!("gh", "p_", "abcdef"))),
+        ("plan", json!("ada@x.example")),
+        ("plan", json!("/Users//ada")),
+        ("state", json!("sessionKey=abc")),
+        ("account", json!("ada@x.example")),
+        ("since", json!("1d")),
+        ("cookie", json!("sessionKey=abc")),
+        ("refresh_token", json!("rt-abc")),
+        ("code", json!("4/0Ab-oauth")),
+    ] {
+        assert!(
+            mine::checked(&LOGIN, &with(key, value)).is_err(),
+            "{key} passed"
+        );
+    }
+    let mut missing = good.clone();
+    missing.as_object_mut().unwrap().remove("state");
+    assert!(mine::checked(&LOGIN, &missing).is_err(), "a missing column");
+}
+
+/// What makes the `login` or `usage` row it changes go in the next pass is sharp: a blocked
+/// sign-in, as `sign-in-failed` or, of a login that still works here, as the `error` the harness
+/// notes (`journal::settle`); a displacement by the vendor's own sign-in, a sign-out; a cleared
+/// wall. A failed sign-in with any other reason, a no-route one and any other `error` are not.
+/// NEGATIVE CONTROL, run: with `Event::sharp` reading the why of a `sign-in-failed` alone
+/// (`matches!(self.kind, Kind::SignInFailed)`), the working login's blocked renewal is not sharp:
+/// `` blocked error ``.
+#[test]
+fn a_blocked_sign_in_a_displacement_and_a_cleared_wall_are_sharp() {
+    let ann = pk("ada@x.example");
+    let with = |kind: Kind, why: &str| Event {
+        why: Word::new(why),
+        ..ev(1, kind, ann)
+    };
+    assert!(with(Kind::SignInFailed, "blocked").sharp(), "blocked");
+    assert!(with(Kind::Error, "blocked").sharp(), "blocked error");
+    assert!(!with(Kind::SignInFailed, "failed").sharp());
+    assert!(!with(Kind::SignInFailed, "no-route").sharp());
+    assert!(!with(Kind::Error, "sign-in-failed").sharp());
+    assert!(!with(Kind::Error, "wrong-account").sharp());
+    assert!(!with(Kind::Error, "reset-failed").sharp());
+    assert!(ev(1, Kind::Displaced, ann).sharp(), "displaced");
+    assert!(ev(1, Kind::WallCleared, ann).sharp());
+    assert!(ev(1, Kind::SignInBlocked, ann).sharp());
+}
+
+/// The book keeps the logins it was reported (when each was last reported, and one released),
+/// what each row last said and each account's usage statement and newest reading across a save;
+/// a book saved before them loads with none.
+#[test]
+fn the_book_keeps_its_login_and_usage_statements_across_a_save() {
+    let (ann, bob) = (pk("ada@x.example"), pk("bo@x.example"));
+    let now = W * WEEK + 3600;
+    let mut book = Book::default();
+    book.fold(&[wall(now - 60, ann, Window::Week, now + 86_400)]);
+    book.take_logins(
+        &claude(&[login(ann, now - 600), login(bob, now - 600)]),
+        now,
+    );
+    let planned = book::Planned {
+        logins: book.logins_due(1, W, now),
+        usages: book.usages_due(1, W, now),
+        ..Default::default()
+    };
+    assert_eq!(planned.usages.len(), 1, "a wall alone is a reading");
+    assert_eq!(planned.usages[0].1["read_at"], json!((now - 60) * 1000));
+    book.wrote(&planned, 1, W, now);
+    book.take_logins(&claude(&[login(ann, now - 600)]), now + 60);
+    assert!(book.logins[&bob].gone);
+    let saved = Book::from_value(&book.to_value());
+    assert_eq!(saved.logins, book.logins);
+    assert_eq!(saved.logins[&ann].reported_at, now + 60);
+    assert_eq!(saved.accounts[&ann].usage, book.accounts[&ann].usage);
+    assert_eq!(saved.accounts[&ann].read, book.accounts[&ann].read);
+    let mut old = book.to_value();
+    old.as_object_mut().unwrap().remove("logins");
+    let old = Book::from_value(&old);
+    assert!(old.logins.is_empty());
+    assert!(old.logins_due(2, W, now + 60).is_empty());
 }

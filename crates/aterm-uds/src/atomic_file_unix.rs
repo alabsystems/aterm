@@ -263,7 +263,7 @@ impl ConfigFile {
 
     /// `Ok` while the target holds the bytes [`Self::open`] read.
     /// # Errors
-    /// It changed — or appeared, or went — since; or the read's own error.
+    /// It changed — or appeared, or went — since ([`ChangedSinceRead`]); or the read's own error.
     fn unchanged(&self) -> io::Result<()> {
         let now = match read_regular(&self.target, MAX_CONFIG_BYTES) {
             Ok((bytes, _)) => Some(bytes),
@@ -273,10 +273,39 @@ impl ConfigFile {
         if now.as_deref() == self.before.as_ref().map(|(b, _)| b.as_slice()) {
             Ok(())
         } else {
-            Err(io::Error::other(
-                "aterm.toml changed while this was editing it; run again",
-            ))
+            Err(io::Error::other(ChangedSinceRead {
+                target: self.target.clone(),
+            }))
         }
+    }
+}
+
+/// [`ConfigEdit::replace`]'s refusal of a target whose bytes changed (or that appeared, or went)
+/// since [`ConfigFile::open`] read them: another writer (a Settings save, an editor) wrote it in
+/// between, and the target is left as that writer left it. It is the payload of the
+/// [`io::Error`] `replace` returns, whether the check before the `.bak` or the one before the
+/// rename refused, so a caller can tell it from a write or lock error ([`Self::of`]) and read the
+/// file again.
+#[derive(Debug)]
+pub struct ChangedSinceRead {
+    /// The file whose bytes changed.
+    pub target: PathBuf,
+}
+
+impl std::fmt::Display for ChangedSinceRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("aterm.toml changed while this was editing it; run again")
+    }
+}
+
+impl std::error::Error for ChangedSinceRead {}
+
+impl ChangedSinceRead {
+    /// The [`ChangedSinceRead`] `error` carries as its payload; `None` for any other error, a
+    /// write's or a lock's.
+    #[must_use]
+    pub fn of(error: &io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref()
     }
 }
 

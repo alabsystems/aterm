@@ -13,6 +13,8 @@
 //! - [`read`]: the offered records. [`read::At`] is a value with its read time and has no
 //!   `Default`, so an unread value is never a zero.
 //! - [`fold`]: the join, its inputs and each input's state (`live`, `held`, `never`, `off`).
+//! - [`band`]: what the Fleet display draws, as data: the member machines with their accounts
+//!   and agents, each lane's counts and eight days of their sums. No fold fills it yet.
 //! - [`command`]: `aterm db fleet machines|accounts|agents|schema`.
 //! - [`fixture`]: a whole fleet at the lab's real scale, for a lab instance and the tests.
 //!
@@ -24,6 +26,7 @@
 //! when an offer changed an input or a row is due to change by itself
 //! ([`fold::Folded::next_change_ms`]).
 
+pub mod band;
 pub mod command;
 pub mod fixture;
 pub mod fold;

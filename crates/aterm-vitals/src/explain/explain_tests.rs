@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use super::fixtures::{Scene, calm_1510, spotlight_1032, tab};
+use super::fixtures::{Scene, calm_1510, liar_1032, spotlight_1032, spotlight_family_1115, tab};
 use super::*;
 use crate::model::{MemSample, Pressure, ProcSample, Thermal, Throttle, Vitals};
 use crate::published_cpu::{CpuAccounting, CpuExecutionWindow};
@@ -214,6 +214,74 @@ fn machine_contexts_follow_current_readings_without_cpu_covering_claims() {
     samples[4].thermal = None;
     let current = model.absorb(&samples[4]);
     assert!(causes(&current).is_empty());
+}
+
+/// The four Spotlight members main counted before SD-93.
+const MAIN_FOUR: &[&str] = &[
+    "com.apple.mds",
+    "com.apple.mds_stores",
+    "com.apple.mdworker_shared",
+    "com.apple.corespotlightd",
+];
+
+/// Spotlight's family is read whole: plain `mdworker`, `managedcorespotlightd` and
+/// `spotlightknowledged.updater`, each under the 200-millicore bar alone, read indexing
+/// together at 540 millicores of reported growth in the reading the `sys` line, its history and
+/// `await sys spotlight=` take, and the activity's members are the reading's nine. No CPU cause
+/// is claimed: published counter growth establishes none (SD-91).
+/// NEGATIVE CONTROL: the same split's rows read with the four members main counted leave the
+/// three out: no share, no growth, idle.
+#[test]
+fn spotlights_cause_sums_every_process_of_its_family() {
+    let s = snap(&spotlight_family_1115());
+    assert_eq!(
+        ActivityId::Spotlight.activity().members,
+        crate::spotlight::MEMBERS
+    );
+    let r = s.spotlight.as_ref().expect("a split reading");
+    assert_eq!(
+        (r.cpu_mc, r.read_bps, r.footprint_bytes(), r.shares.len()),
+        (540, 3_000_000, Some(3 * (20 << 20)), 3)
+    );
+    assert_eq!(r.state, crate::spotlight::State::Indexing);
+    let mut ids: Vec<&str> = r.shares.iter().map(|m| m.signing_id).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        [
+            "com.apple.managedcorespotlightd",
+            "com.apple.mdworker",
+            "com.apple.spotlightknowledged.updater"
+        ]
+    );
+    assert!(causes(&s).is_empty(), "{:?}", causes(&s));
+
+    let f = s.why.as_ref().expect("facts");
+    let control = crate::spotlight::reading_of(&f.split.rows, MAIN_FOUR, None, 0, 0, 5000);
+    assert_eq!(
+        (control.shares.len(), control.cpu_mc, control.state),
+        (0, 0, crate::spotlight::State::Idle),
+        "the control: main's four leave the three out"
+    );
+}
+
+/// The liar: `mds` and `mds_stores` under ad-hoc signatures with Apple's signing ids, which
+/// the family's reading (the `sys` line, its history and `await sys spotlight=`) does not
+/// count. CONTROL: vouched, the same two are shares.
+#[test]
+fn a_claimed_signing_id_never_joins_the_spotlight_family() {
+    let liar = snap(&liar_1032());
+    let r = liar.spotlight.as_ref().expect("a split reading");
+    assert_eq!((r.shares.len(), r.cpu_mc, r.read_bps), (0, 0, 0));
+    let honest = snap(&spotlight_1032());
+    let r = honest.spotlight.as_ref().expect("a split reading");
+    let mut ids: Vec<&str> = r.shares.iter().map(|m| m.signing_id).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        ["com.apple.mds", "com.apple.mds_stores"],
+        "the control"
+    );
 }
 
 /// The snapshot of `scene`'s second split tick, through a fresh model.

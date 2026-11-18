@@ -10,7 +10,8 @@
 //!   ([`Handle::diff`]), apply a grid save with compare-before-write, revert one operation,
 //!   read history in pages ([`history`]), and list every value one cell held and what one write
 //!   replaced and had not seen ([`Handle::cell_values`], [`Handle::wrote`]), for any table in
-//!   [`TABLES`].
+//!   [`TABLES`]; append to a log at keys per writer ([`Handle::append_log`]), and read it typed
+//!   ([`View::logs`]).
 //! - [`command`]: `aterm db table ls|schema|get|scan|history|diff|check|revert|export|apply|edit`,
 //!   and the amacs grid round trip. A secret cell shows as the name of its secret-store entry
 //!   ([`typed::secret`]); nothing here holds a secret's value.
@@ -29,6 +30,7 @@ use crate::{
     catalog::Descriptor,
     database::{Change, Command, MAX_WRITES},
     documents::{application, log::Log},
+    lab::tracker,
     table::Session,
     typed::{
         self, Collection, Table,
@@ -47,9 +49,9 @@ pub use diff::{CellDiff, Delta, Diff, Maker, Point};
 pub(crate) use edit::edit as edit_grid;
 pub use edit::{Edited, Opener, amacs, open_every_ordinary, open_ordinary};
 pub use history::{
-    Ask, Cursor, Entry, EntryKind, Filter, Inert, Mac, Macs, Page, Revision, Writer,
+    Ask, Cursor, Entry, EntryKind, Filter, Inert, Kept, Mac, Macs, Page, Revision, Writer,
 };
-pub use values::{Held, Source, Wrote};
+pub use values::{Held, Source, Written, Wrote};
 
 /// How a table keys the row a new grid row becomes, from the typed values of its cells and the
 /// table's cells as they are (an account's key needs its login's address).
@@ -139,15 +141,52 @@ impl Compiled {
         view: &View,
         author: Author,
     ) -> Result<Option<Refused>> {
-        if author == Author::Owner {
-            if let Some(refused) = typed::check::fixed_after_birth(self.table, rows, &view.cells) {
-                return Ok(Some(refused));
-            }
-            if let Some(refused) = (self.guard)(rows, &view.cells)? {
-                return Ok(Some(refused));
-            }
+        if let Some(refused) = self.owner_rules(rows, &view.cells, author)? {
+            return Ok(Some(refused));
         }
         Ok(typed::check::refused(self.table, rows, view, self.seeded))
+    }
+
+    /// The rules of [`Self::rules`] held to the owner's own word, which read only the table's
+    /// `cells`: a fixed column is written only at its row's birth, and the table's own
+    /// ([`Self::guard`]), which may add derived cells to a row's record.
+    fn owner_rules(
+        &self,
+        rows: &mut [Vec<Change>],
+        cells: &Cells,
+        author: Author,
+    ) -> Result<Option<Refused>> {
+        if author != Author::Owner {
+            return Ok(None);
+        }
+        if let Some(refused) = typed::check::fixed_after_birth(self.table, rows, cells) {
+            return Ok(Some(refused));
+        }
+        (self.guard)(rows, cells)
+    }
+
+    /// The records a grid save of `plan` to `collection` appends where it lands on the table as
+    /// `cells` hold it, in the order the save appends them: the plan settled against those cells
+    /// ([`grid::settle`]), with what the owner's rules add to it ([`Self::rules`]), in the form
+    /// and the records [`records`] packs it in, as [`Handle::apply`] writes it. `None` where
+    /// those rules refuse it, so the save writes nothing. A page that holds a read's cells asks
+    /// it, before a Write, which record carries each cell (a claim one record begins comes after
+    /// one an earlier record begins); the rules every table keeps, which read the whole view,
+    /// refuse a save but add nothing to it, and are the save's to judge.
+    ///
+    /// # Errors
+    /// A change is not a typed cell of its collection, or one row passes a record's limits.
+    pub fn appended(
+        &self,
+        collection: &Collection,
+        plan: &Plan,
+        cells: &Cells,
+    ) -> Result<Option<Vec<Vec<Change>>>> {
+        let mut rows = grid::settle(collection, plan, cells).rows;
+        if self.owner_rules(&mut rows, cells, Author::Owner)?.is_some() {
+            return Ok(None);
+        }
+        records(self.table, rows).map(Some)
     }
 
     /// The key a new grid row in `collection` is born under ([`Birth`]), refused when the
@@ -183,7 +222,7 @@ impl Compiled {
             .is_some_and(|role| role == self.table.role)
     }
 
-    /// The cells or owned collection named `name`.
+    /// The collection named `name`: cells, owned or a log.
     ///
     /// # Errors
     /// The table has no such collection.
@@ -243,7 +282,40 @@ pub const REGISTRY_4: Compiled = Compiled {
     successor: None,
 };
 
-/// Every typed catalog table this build compiles.
+/// `lab/tracker`, the lab tracker's tables (docs/DESIGN-lab-tracker-2026-11-14.md); this build
+/// compiles its logs (`crate::lab::tracker`). Nothing but a log is written to it yet, so it
+/// guards no owner write, holds no seed and births no row.
+pub const TRACKER: Compiled = Compiled {
+    table: &tracker::TRACKER,
+    version: tracker::VERSION,
+    birth: no_birth,
+    guard: no_guard,
+    seeded: no_seed,
+    generation: 1,
+    successor: None,
+};
+
+/// No row of a family without cells collections is born through the grid.
+fn no_birth(collection: &Collection, _: &BTreeMap<String, Value>, _: &Cells) -> Result<String> {
+    Err(Error::new(&format!(
+        "{}: rows are not born through the grid here",
+        collection.name
+    )))
+}
+
+/// No rule beyond the ones every table keeps.
+fn no_guard(_: &mut [Vec<Change>], _: &Cells) -> Result<Option<Refused>> {
+    Ok(None)
+}
+
+/// No row is compiled in.
+fn no_seed(_: &str, _: &str) -> bool {
+    false
+}
+
+/// Every typed catalog table the `aterm db table` verbs, checkpoints and roll reach: the
+/// registry's generations. `lab/tracker` ([`TRACKER`]) is written and read through [`Handle`] and
+/// its shared files; TK-06 brings every compiled family to the verbs.
 pub const TABLES: &[Compiled] = &[REGISTRY, REGISTRY_2, REGISTRY_3, REGISTRY_4];
 
 /// The generation of `chain` (oldest first) readers and writers use in `snapshot`: the oldest
@@ -471,10 +543,19 @@ pub fn find(name: &str) -> Result<&'static Compiled> {
         })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many typed records [`decode`] decoded on this thread: what a test reads to learn
+    /// whether a read decoded the table again.
+    pub(crate) static DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A typed record: a canonical `Write` or `Revert`. A write never stops a cell (clearing
 /// writes `x: null`, design §3.2), so a bare absence is refused; a revert may restore one.
 /// Typed values are judged by the readers, so a newer build's collection or column stays.
 pub(crate) fn decode(payload: &[u8]) -> Result<Command> {
+    #[cfg(test)]
+    DECODED.set(DECODED.get() + 1);
     let command = Command::decode(payload)?;
     if command.encode()? != payload {
         return Err(Error::new("typed table payload is not canonical"));
@@ -569,6 +650,19 @@ impl View {
                 (collection.name, read)
             })
             .collect();
+        // A log's entries are this generation's alone: a roll carries owned rows
+        // (`resolved.carried`, read above), and no log is compiled in a family that rolls.
+        let logs = table
+            .collections
+            .iter()
+            .filter(|collection| collection.kind == typed::Kind::Log)
+            .map(|collection| {
+                (
+                    collection.name,
+                    owned::read_log(collection, within, resolve),
+                )
+            })
+            .collect();
         // A later generation is whole only once a roll's cover row is here: before that its
         // history is still arriving from the Macs that restated it.
         let restated = table.collection(registry::ROLL.name).is_none()
@@ -591,6 +685,7 @@ impl View {
             ops,
             quota,
             owned,
+            logs,
         }
     }
 }
@@ -896,6 +991,19 @@ pub(crate) fn archived_records(resolved: &Resolved, ops: &[Op]) -> Vec<(Digest, 
             Some((ops[*first].id, carried.op.clone()))
         })
         .collect()
+}
+
+/// The records a grid save appends of `rows` (each row's changes, settled and passed by the
+/// rules), in order: each change in the form this generation writes it ([`conform`]), packed
+/// ([`pack`]).
+///
+/// # Errors
+/// A change is not a typed cell of its collection, or one row passes a record's limits.
+pub fn records(table: &Table, mut rows: Vec<Vec<Change>>) -> Result<Vec<Vec<Change>>> {
+    for row in &mut rows {
+        conform(table, row)?;
+    }
+    pack(rows)
 }
 
 /// Pack rows of changes into records of at most [`MAX_WRITES`] changes and a payload within
@@ -1383,9 +1491,8 @@ impl Handle {
                         ..Applied::default()
                     });
                 }
-                for row in &mut settled.rows {
-                    conform(table, row)?;
-                }
+                // What waits is judged by each change's row, which the form [`records`] writes
+                // the change in keeps.
                 if let Some(why) = view.holds_back(&settled.rows) {
                     return Err(Error::new(&format!(
                         "this table's {why}; a grid save of that row waits for it"
@@ -1398,7 +1505,7 @@ impl Handle {
                     retired: settled.retired,
                     ..Applied::default()
                 };
-                for changes in pack(settled.rows)? {
+                for changes in records(table, settled.rows)? {
                     let count = changes.len();
                     let command = Command::Write {
                         request: crate::crypto::random()?,
@@ -1622,6 +1729,111 @@ impl Handle {
         })
     }
 
+    /// Append `rows` to the log `collection` of this table as this Mac's entries, in as few
+    /// records as a record's limits allow ([`pack`]: one, for up to 64 small rows), declaring
+    /// the table first where this Mac's catalog does not yet: each at the key
+    /// `<uuid32>.<n>`, this Mac's Commons machine uuid and its own counter, one past the highest
+    /// it has spent in the log ([`owned::log_spent`]). The counter is read and the record
+    /// appended under this Mac's Commons writer lock and the table's, which every writer of the
+    /// Mac takes, so two agents on one Mac appending at once get two counters, in whichever order
+    /// the lock admits them; two Macs never share a key, since the uuid is the signer's. No key
+    /// is read off a clock: two entries stated in one millisecond are two entries. Returns each
+    /// entry's key, in `rows`' order.
+    ///
+    /// A retry after a failure whose outcome is unknown appends again, at the next counter:
+    /// each entry is a statement made once, and a log keeps every one.
+    ///
+    /// # Errors
+    /// `collection` names no log of this table, or `rows` is empty; a row breaks its schema
+    /// ([`owned::log_row`]) or passes a record's limits; no Commons writer, or this Mac is not
+    /// in its own roster; this writer's history here is withheld or forked; or a record cannot
+    /// be written.
+    pub fn append_log(
+        &self,
+        collection: &Collection,
+        rows: &[aterm_json::Map],
+    ) -> Result<Vec<String>> {
+        // The table's own declaration of the log, named as the caller names it: a constant's
+        // address is no identity across crates.
+        let Some(collection) = self
+            .compiled
+            .table
+            .collection(collection.name)
+            .filter(|held| held.kind == typed::Kind::Log && held.version == collection.version)
+        else {
+            return Err(Error::new(&format!(
+                "{}: no log {} in this table",
+                self.compiled.name(),
+                collection.name
+            )));
+        };
+        if rows.is_empty() {
+            return Err(Error::new(&format!(
+                "{}: nothing to append",
+                collection.name
+            )));
+        }
+        // Every row is checked before the lock is taken: a refused one writes nothing.
+        for row in rows {
+            owned::log_row(collection, row, 1)?;
+        }
+        application::with_store_until(
+            &self.paths,
+            true,
+            self.descriptor(),
+            crate::admission::deadline(),
+            |session, store, scope| {
+                session.writer()?;
+                let log = Log::read_with(session, store, scope, decode)?;
+                log.writable(session.actor())?;
+                let me = session
+                    .members()?
+                    .iter()
+                    .find(|binding| binding.actor() == session.actor())
+                    .map(|binding| *binding.machine())
+                    .ok_or_else(|| Error::new("this Mac is not in its own Commons roster"))?;
+                let ops: Vec<Op> = log
+                    .eligible_iter()
+                    .filter_map(|(operation, command)| Op::from_eligible(0, operation, command))
+                    .collect();
+                let spent =
+                    owned::log_spent(collection, &ops, owned::commons::historical(session), &me);
+                let mut keys = Vec::with_capacity(rows.len());
+                let mut changes = Vec::with_capacity(rows.len());
+                for (i, row) in (1_u64..).zip(rows) {
+                    let n = spent
+                        .checked_add(i)
+                        .ok_or_else(|| Error::new("this Mac's log counter is spent"))?;
+                    #[cfg(test)]
+                    let n = if log_seam::keys_by_clock() {
+                        row.get("at").and_then(Value::as_u64).unwrap_or(n)
+                    } else {
+                        n
+                    };
+                    let key = owned::log_entry_key(&me, n);
+                    changes.push(vec![Change {
+                        collection: collection.name.to_owned(),
+                        key: key.clone(),
+                        value: Some(owned::log_row(collection, row, n)?),
+                    }]);
+                    keys.push(key);
+                }
+                for changes in pack(changes)? {
+                    let command = Command::Write {
+                        request: crate::crypto::random()?,
+                        changes,
+                    };
+                    let payload = command.encode()?;
+                    // A record this build's own reader would refuse is never signed: it would
+                    // read as refused history and stop this writer.
+                    decode(&payload)?;
+                    application::append(session, store, &payload)?;
+                }
+                Ok(keys)
+            },
+        )
+    }
+
     /// Append the exact compensation of `operation` while every key it wrote still holds it as
     /// the sole candidate (`Log::compensate`); a later edit stays. The target, current value and
     /// preimage use the same history as [`Self::view`]: past-quota records and the writes the
@@ -1823,3 +2035,9 @@ pub(crate) fn read_regular_utf8(
 
 #[cfg(test)]
 mod tests;
+
+/// The log keys a clock would make: the negative control of the exit test of `lab/tracker`'s
+/// logs (`file::tests`).
+#[cfg(test)]
+#[path = "att_log_seam_tests.rs"]
+pub(crate) mod log_seam;

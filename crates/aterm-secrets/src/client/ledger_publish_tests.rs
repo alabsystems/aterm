@@ -1291,12 +1291,12 @@ fn unused_peer_selection_does_not_skip_envelope_failover() {
     let found = |_: &Config| candidates.clone();
     let found = PeerDiscovery::supplied(&found);
     let said = std::cell::Cell::new(SourceSaid::AtOnce);
-    let first = sync_found(&at.member, None, &found, &said)
+    let first = sync_found(&at.member, None, &found, &said, None)
         .expect("the primary serves a newer verified envelope");
     primary.answer_with(Some(
         b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
     ));
-    let recovered = sync_found(&at.member, None, &found, &said);
+    let recovered = sync_found(&at.member, None, &found, &said, None);
     drop(primary);
     for server in at.servers {
         server.stop();
@@ -1319,7 +1319,7 @@ fn an_exact_peer_recovers_a_damaged_cache_after_a_bodyless_primary_response() {
         let browse = |_: &Config| candidates.to_vec();
         let found = PeerDiscovery::supplied(&browse);
         let said = std::cell::Cell::new(SourceSaid::AtOnce);
-        sync_found(&at.member, None, &found, &said).unwrap();
+        sync_found(&at.member, None, &found, &said, None).unwrap();
         let before = load_state(&at.member).unwrap();
         assert_eq!(before.seq, 3);
         let primary = StandIn::at(&at.url_primary, Duration::ZERO, Some(ok_with(&fresh)));
@@ -1812,8 +1812,9 @@ fn an_intact_cache_repairs_an_unrecorded_apply_when_every_endpoint_fails() {
         );
         unrecord_apply(&at.member);
         let said = std::cell::Cell::new(SourceSaid::AtOnce);
-        let (_, outcome) = subscriber_pass_saying(&at.member, &mut repaired, &FOUND_NONE, &said)
-            .expect("offline cache repairs the unrecorded apply");
+        let (_, outcome) =
+            subscriber_pass_saying(&at.member, &mut repaired, &FOUND_NONE, &said, None)
+                .expect("offline cache repairs the unrecorded apply");
         assert!(matches!(outcome, SyncOutcome::Applied { seq: 3, .. }));
         assert!(load_state(&at.member).unwrap().held.is_some());
         assert_eq!(
@@ -1974,7 +1975,7 @@ fn a_failover_pass_with_nothing_new_is_not_followed_at_once() {
     // The source's address takes each request and drops it after more than a second.
     let source = StandIn::at(&at.url_primary, HELD + Duration::from_millis(200), None);
     let said = std::cell::Cell::new(SourceSaid::AtOnce);
-    let (config, outcome) = subscriber_pass_saying(&at.member, &mut None, &found, &said)
+    let (config, outcome) = subscriber_pass_saying(&at.member, &mut None, &found, &said, None)
         .expect("the browsed server serves");
     assert_eq!(outcome, SyncOutcome::Unchanged { seq: 3 });
     assert!(source.asked() >= 1, "the pass asked its source first");

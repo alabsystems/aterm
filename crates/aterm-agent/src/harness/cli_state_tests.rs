@@ -114,9 +114,18 @@ fn unreadable_login_bindings_produce_a_structured_refusal_for_every_pool() {
         let tmp = tmp_dir("logins-read-refusal");
         let env = env_at(&tmp);
         let path = env.accounts_roster_for(cli).unwrap();
+        // `main` holds an address (Kimi Code's in a region), so `accounts use` can name it.
+        let region = if cli == Cli::Kimi {
+            "region = \"global\"\n"
+        } else {
+            ""
+        };
         std::fs::write(
             &path,
-            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n",
+            format!(
+                "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = \
+                 \"main@x.example\"\n{region}"
+            ),
         )
         .unwrap();
         let store = env.accounts_store_for(cli).unwrap();
@@ -149,9 +158,24 @@ fn unreadable_login_bindings_produce_a_structured_refusal_for_every_pool() {
         let mut out = Vec::new();
         let mut err = Vec::new();
         assert_eq!(
-            run_accounts_use((cli, &NoUsage), &env, Some("main"), &mut out, &mut err),
+            run_accounts_use(
+                (cli, &NoUsage),
+                &env,
+                Some("main@x.example"),
+                &mut out,
+                &mut err
+            ),
             ExitCode::from(1)
         );
+        let err = String::from_utf8(err).unwrap();
+        // The bindings' refusal, past the word's resolve: the account was named.
+        assert!(
+            err.starts_with("aterm harness accounts use: logins.json: not JSON")
+                && err.ends_with("; nothing was selected\n"),
+            "{}: {err}",
+            cli.id()
+        );
+        assert!(out.is_empty(), "{}", cli.id());
         assert!(!store.state_file().exists(), "no selection was persisted");
         assert_eq!(std::fs::read(store.logins_file()).unwrap(), bytes);
     }

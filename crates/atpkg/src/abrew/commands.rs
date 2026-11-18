@@ -16217,11 +16217,33 @@ mod livecheck {
         if let Some(su) = &meta.strategy_url {
             url_fields.push(("strategy".to_string(), jstr(su)));
         }
+        let mut option_fields: Vec<(String, JVal)> = Vec::new();
         if let Some(ua) = &meta.ua_option {
-            url_fields.push((
-                "options".to_string(),
-                JVal::Obj(vec![("user_agent".to_string(), jstr(ua))]),
+            option_fields.push(("user_agent".to_string(), jstr(ua)));
+        }
+        if let Some(form) = &meta.post_form {
+            option_fields.push((
+                "post_form".to_string(),
+                JVal::Obj(form.iter().map(|(k, v)| (k.clone(), jstr(v))).collect()),
             ));
+        }
+        if let Some(json) = &meta.post_json
+            && let Ok(value) = aterm_json::from_slice::<aterm_json::Value>(json.as_bytes())
+        {
+            option_fields.push(("post_json".to_string(), JVal::Val(value)));
+        }
+        if let Some(headers) = &meta.header {
+            if headers.len() == 1 {
+                option_fields.push(("header".to_string(), jstr(&headers[0])));
+            } else {
+                option_fields.push((
+                    "header".to_string(),
+                    JVal::Arr(headers.iter().map(|h| jstr(h)).collect()),
+                ));
+            }
+        }
+        if !option_fields.is_empty() {
+            url_fields.push(("options".to_string(), JVal::Obj(option_fields)));
         }
         if let Some(f) = &meta.final_url {
             url_fields.push(("final".to_string(), jstr(f)));
@@ -16560,20 +16582,27 @@ mod livecheck {
             // version against the API's. The tap record's URL
             // heuristic is cruder than brew's `Version.detect`
             // (`squirrel_3_2_stable` -> "3", `nauty2_9_3` ->
-            // "9"), so where the file has no explicit
+            // "9"), so where the file has no explicit spec
             // `version` stanza the gate uses the faithful
-            // detector instead (r408 corpus).
-            let has_stanza = text.lines().any(|l| {
-                l.trim()
-                    .strip_prefix("version")
-                    .is_some_and(|r| r.trim_start().starts_with(['"', '\'']))
-            });
-            let version = if has_stanza {
-                f.version
-            } else {
-                version_parse(&f.stable_url).unwrap_or(f.version)
+            // detector instead (r408 corpus). The stanza
+            // must be spec-scoped: an unscoped scan reads
+            // `fails_with` floors and resource versions as
+            // the formula version (micromamba "13").
+            // A platform-conditional spec (`on_macos`
+            // / `on_arm`) loads with the host's URL in
+            // brew; the gate compares that one.
+            let file_url = tap::spec_platform_url(&text).unwrap_or(f.stable_url);
+            let version = match tap::spec_version_stanza(&text) {
+                Some(v) => v,
+                // A git spec's version detects from its
+                // `tag:` (the URL itself carries only
+                // the project name: `k9s.git` -> "9").
+                None => tap::spec_git_tag(&text, &file_url)
+                    .and_then(|tag| version_parse(&tag))
+                    .or_else(|| version_parse(&file_url))
+                    .unwrap_or(f.version),
             };
-            (version, f.stable_url)
+            (version, file_url)
         };
         // Brew's cask `url.unversioned?`: the raw `url "..."`
         // string carries no interpolation (beyond `#{arch}`).
@@ -16607,7 +16636,11 @@ mod livecheck {
                 && s.yaml_block.is_none()
                 && s.plist_block.is_none()
                 && s.page_block.is_none()
-                && s.ghrel_block.is_none())
+                && s.ghrel_block.is_none()
+                && s.git_block.is_none()
+                && s.latest_block.is_none()
+                && s.sparkle_block.is_none()
+                && s.header_block.is_none())
                 || s.url_options
         })
     }
@@ -17042,8 +17075,9 @@ mod livecheck {
             if pkg.spec.as_ref().and_then(|s| s.strategy.as_deref()) == Some("extract_plist") {
                 // Brew enables ExtractPlist for a lone cask or
                 // with the flag; multiple casks without it
-                // skip. Enabled-but-not-native (non-zip
-                // container, unreduced block) delegates.
+                // skip. Enabled-but-not-native (pkg or
+                // extensionless container, unreduced block)
+                // delegates.
                 let enabled = total == 1 || extract_plist_flag;
                 let native = pkg.spec.as_ref().is_some_and(|s| {
                     let url = match &s.url {
@@ -17051,7 +17085,9 @@ mod livecheck {
                         _ => pkg.stable_url.as_str(),
                     };
                     let path = url.split(['?', '#']).next().unwrap_or(url);
-                    path.to_ascii_lowercase().ends_with(".zip")
+                    let lower = path.to_ascii_lowercase();
+                    (lower.ends_with(".zip")
+                        || (cfg!(target_os = "macos") && lower.ends_with(".dmg")))
                         && (!s.strategy_block || s.plist_block.is_some())
                 });
                 if enabled && native {
@@ -17170,6 +17206,57 @@ mod livecheck {
     /// are always line anchors (`(?m)`), `\h` is hex. A
     /// quantified first capture group (Ruby yields its last
     /// iteration, unrecoverable by re-search) is outside.
+    /// Ruby pattern syntax the regex engine rejects,
+    /// translated before compile: `{,n}` open-below
+    /// quantifiers become `{0,n}`, and `x`-mode free
+    /// whitespace plus `#` comments (outside character
+    /// classes, unescaped) drop out.
+    fn ruby_pattern_translate(pattern: &str, x_mode: bool) -> String {
+        let mut out = String::with_capacity(pattern.len());
+        let mut in_class = false;
+        let mut chars = pattern.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                out.push(c);
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+                continue;
+            }
+            match c {
+                '[' => in_class = true,
+                ']' => in_class = false,
+                _ => {}
+            }
+            if !in_class {
+                if x_mode && matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{c}') {
+                    continue;
+                }
+                if x_mode && c == '#' {
+                    for next in chars.by_ref() {
+                        if next == '\n' {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if c == '{' && chars.peek() == Some(&',') {
+                    // Peek past the comma with a clone:
+                    // only `{,N}` is a quantifier.
+                    let mut probe = chars.clone();
+                    probe.next();
+                    if probe.peek().is_some_and(char::is_ascii_digit) {
+                        out.push_str("{0,");
+                        chars.next();
+                        continue;
+                    }
+                }
+            }
+            out.push(c);
+        }
+        out
+    }
+
     fn lc_regex(pattern: &str, flags: &str) -> Result<LcRegex, Outside> {
         let mut src = String::from("(?m)");
         if flags.contains('i') {
@@ -17178,11 +17265,8 @@ mod livecheck {
         if flags.contains('m') {
             src.push_str("(?s)");
         }
-        if flags.contains('x') {
-            return Err(Outside);
-        }
         src.push_str(
-            &pattern
+            &ruby_pattern_translate(pattern, flags.contains('x'))
                 .replace("\\h", "[0-9A-Fa-f]")
                 .replace("\\H", "[^0-9A-Fa-f]"),
         );
@@ -17228,15 +17312,21 @@ mod livecheck {
                     (
                         Some(compile(&flag_prefix(&sub))?),
                         Some(compile(&anchored(&sub))?),
+                        // A group inside an alternation
+                        // branch leaves the split parts
+                        // unbalanced (the `(?:` opens in
+                        // the prefix, its closer lands in
+                        // the suffix); rebalance like the
+                        // extra-group splits below.
                         if prefix.is_empty() {
                             None
                         } else {
-                            Some(compile(&anchored(&prefix))?)
+                            Some(compile(&anchored(&rebalance_prefix(&prefix)))?)
                         },
                         if suffix.is_empty() {
                             None
                         } else {
-                            Some(compile(&anchored(&suffix))?)
+                            Some(compile(&anchored(&rebalance_suffix(&suffix)))?)
                         },
                         lazy,
                         group_lazy,
@@ -17468,10 +17558,9 @@ mod livecheck {
     /// stay; `anchored` re-wraps them).
     fn rebalance_prefix(prefix: &str) -> String {
         let bytes = prefix.as_bytes();
-        let mut stack: Vec<(usize, usize)> = Vec::new(); // (pos, marker len) in output coords
+        let mut stack: Vec<(usize, usize)> = Vec::new(); // (pos, marker len) in prefix coords
         let mut in_class = false;
         let mut i = 0;
-        let mut spans: Vec<(usize, usize)> = Vec::new();
         while i < bytes.len() {
             match bytes[i] {
                 b'\\' => i += 1,
@@ -17491,12 +17580,9 @@ mod livecheck {
             }
             i += 1;
         }
-        for (pos, len) in stack {
-            spans.push((pos, len));
-        }
         let mut out = prefix.to_string();
-        for (pos, len) in spans.iter().rev() {
-            out.replace_range(*pos..*pos + *len, "");
+        for (pos, len) in stack.into_iter().rev() {
+            out.replace_range(pos..pos + len, "");
         }
         out
     }
@@ -17733,6 +17819,102 @@ mod livecheck {
         }
         let m = re.whole.find(text)?;
         extract_group(re, m.as_str())
+    }
+
+    /// A Ruby `MatchData` as data: the whole match
+    /// first, then each capture (nils as `None`).
+    fn search_groups(re: &LcRegex, text: &str) -> Option<Vec<Option<String>>> {
+        let m = re.whole.find(text)?;
+        let mut out = vec![Some(m.as_str().to_string())];
+        out.extend(extract_groups(re, m.as_str()));
+        Some(out)
+    }
+
+    /// Every capture index a reduced sparkle block
+    /// reads must have working split machinery
+    /// (group 1 rides the primary split; group N≥2
+    /// needs `extra_groups[N-2]`).
+    /// Every capture a reduced yaml render reads
+    /// must extract, and a `sub(/…/, …)` tail's
+    /// literal regex must compile.
+    fn yaml_caps_ok(block: &super::super::formula::YamlBlock, re: Option<&LcRegex>) -> bool {
+        use super::super::formula::{YamlPart, YamlRender, YamlShape, YamlTail};
+        let parts_ok = |parts: &[YamlPart]| {
+            parts.iter().all(|p| match p {
+                YamlPart::Cap(n) => match n {
+                    0 => true,
+                    1 => re.is_some_and(|r| r.has_group),
+                    g => re.is_some_and(|r| r.extra_groups.get(g - 2).is_some_and(Option::is_some)),
+                },
+                _ => true,
+            })
+        };
+        match &block.shape {
+            YamlShape::FilesMap { render, .. } | YamlShape::RootMatch { render, .. } => {
+                match render {
+                    YamlRender::Template(parts) => parts_ok(parts),
+                    YamlRender::PresentElse { cap, then, els } => {
+                        parts_ok(&[YamlPart::Cap(*cap)]) && parts_ok(then) && parts_ok(els)
+                    }
+                }
+            }
+            YamlShape::DigTail(_, YamlTail::SubRe(pat, flags, _)) => lc_regex(pat, flags).is_ok(),
+            _ => true,
+        }
+    }
+
+    fn sparkle_caps_ok(block: &super::super::formula::SparkleBlock, re: &LcRegex) -> bool {
+        use super::super::formula::{SpExpr, SpPart};
+        let cap_ok = |n: usize, scan: bool| {
+            // In a scan, index N is capture N+1.
+            let group = if scan { n + 1 } else { n };
+            match group {
+                0 => !scan,
+                1 => re.has_group,
+                g => re.extra_groups.get(g - 2).is_some_and(Option::is_some),
+            }
+        };
+        let parts_ok = |parts: &[SpPart], scan: bool| {
+            parts.iter().all(|p| match p {
+                SpPart::Cap(n) | SpPart::CapTr(n, ..) | SpPart::CapOr(n, _) => cap_ok(*n, scan),
+                SpPart::FieldIndex(_, n) => cap_ok(*n, false),
+                _ => true,
+            })
+        };
+        match &block.expr {
+            SpExpr::FieldIndex(_, n) => cap_ok(*n, false),
+            SpExpr::CapturesJoin(_) => re.extra_groups.iter().all(Option::is_some),
+            SpExpr::Template { parts, local, .. } => {
+                parts_ok(parts, false) && local.is_none_or(|(_, n)| cap_ok(n, false))
+            }
+            SpExpr::EqElse {
+                a,
+                b,
+                then,
+                els,
+                local,
+                ..
+            } => {
+                use super::super::formula::SpOp;
+                let op_ok = |o: &SpOp| match o {
+                    SpOp::Cap(n) => cap_ok(*n, false),
+                    SpOp::Field(_) => true,
+                };
+                op_ok(a)
+                    && op_ok(b)
+                    && parts_ok(then, false)
+                    && parts_ok(els, false)
+                    && local.is_none_or(|(_, n)| cap_ok(n, false))
+            }
+            SpExpr::CapElse { cap, then, els, .. } => {
+                cap_ok(*cap, false) && parts_ok(then, false) && parts_ok(els, false)
+            }
+            SpExpr::BlankElse { blank, parts, .. } => {
+                parts_ok(blank, false) && parts_ok(parts, false)
+            }
+            SpExpr::Scan { parts, .. } => parts_ok(parts, true),
+            _ => true,
+        }
     }
 
     #[derive(Clone, Copy, PartialEq)]
@@ -18459,17 +18641,20 @@ mod livecheck {
                 .map_or("", |(_, p)| p);
             return path.starts_with("downloads/") || path.starts_with("gems/");
         }
-        h == "www.apache.org"
-            || h == "archive.apache.org"
-            || h == "dlcdn.apache.org"
-            || h == "downloads.apache.org"
-            || h == "files.pythonhosted.org"
+        // The Apache hosts are not here: the Apache
+        // strategy is native, and a URL its input-value
+        // regex does not match (a bare dist directory)
+        // is PageMatch territory in the oracle too.
+        h == "files.pythonhosted.org"
     }
 
     struct RunPlan {
         strat: Strat,
         /// The URL after strategy preprocessing (brew's `url`).
         url: String,
+        /// `compressed: false`: fetch without
+        /// `--compressed`.
+        uncompressed: bool,
         re: Option<LcRegex>,
         /// Brew's candidate strategy names for this URL
         /// (verbose meta), highest priority first.
@@ -18498,6 +18683,21 @@ mod livecheck {
         page_block: Option<super::super::formula::PageBlock>,
         /// A reduced `:github_releases` strategy block.
         ghrel_block: Option<super::super::formula::GhRelBlock>,
+        /// A reduced `:git` strategy block.
+        git: Option<super::super::formula::GitBlock>,
+        /// A reduced `:sparkle` strategy block.
+        sparkle_block: Option<super::super::formula::SparkleBlock>,
+        /// A reduced `:header_match` strategy block.
+        header_block: Option<super::super::formula::HeaderBlock>,
+        /// A reduced `:github_latest` strategy block.
+        latest: Option<super::super::formula::LatestBlock>,
+        /// The spec's `post_json:` url option (generated JSON text).
+        post_json: Option<String>,
+        /// The spec's `header:` url option(s).
+        headers: Vec<String>,
+        /// The spec's `post_form:` url option,
+        /// version-substituted at plan time.
+        post_form: Option<Vec<(String, String)>>,
         /// The checked unit's `version.major_minor`, for
         /// guarded `:json` map conditions.
         major_minor: String,
@@ -18867,6 +19067,7 @@ mod livecheck {
         Ok(UrlPlan::Run(Box::new(RunPlan {
             strat: Strat::Bitbucket,
             url: url.to_string(),
+            uncompressed: false,
             re,
             candidates,
             strategy_url: Some(values.0.clone()),
@@ -18879,6 +19080,13 @@ mod livecheck {
             yaml: None,
             page_block: None,
             ghrel_block: None,
+            git: None,
+            latest: None,
+            sparkle_block: None,
+            header_block: None,
+            post_form: None,
+            post_json: None,
+            headers: Vec::new(),
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
@@ -18900,6 +19108,7 @@ mod livecheck {
         Ok(UrlPlan::Run(Box::new(RunPlan {
             strat: Strat::Apache,
             url: url.to_string(),
+            uncompressed: false,
             re,
             candidates,
             strategy_url: Some(values.0.clone()),
@@ -18912,6 +19121,13 @@ mod livecheck {
             yaml: None,
             page_block: None,
             ghrel_block: None,
+            git: None,
+            latest: None,
+            sparkle_block: None,
+            header_block: None,
+            post_form: None,
+            post_json: None,
+            headers: Vec::new(),
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
@@ -19009,6 +19225,7 @@ mod livecheck {
         Ok(UrlPlan::Run(Box::new(RunPlan {
             strat: Strat::Sourceforge,
             url: url.to_string(),
+            uncompressed: false,
             re,
             candidates,
             strategy_url: values.0.clone(),
@@ -19021,6 +19238,13 @@ mod livecheck {
             yaml: None,
             page_block: None,
             ghrel_block: None,
+            git: None,
+            latest: None,
+            sparkle_block: None,
+            header_block: None,
+            post_form: None,
+            post_json: None,
+            headers: Vec::new(),
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
@@ -19074,6 +19298,7 @@ mod livecheck {
         Ok(UrlPlan::Run(Box::new(RunPlan {
             strat: Strat::Gnome,
             url: url.to_string(),
+            uncompressed: false,
             re,
             candidates,
             strategy_url: Some(format!(
@@ -19088,6 +19313,13 @@ mod livecheck {
             yaml: None,
             page_block: None,
             ghrel_block: None,
+            git: None,
+            latest: None,
+            sparkle_block: None,
+            header_block: None,
+            post_form: None,
+            post_json: None,
+            headers: Vec::new(),
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
@@ -19115,10 +19347,15 @@ mod livecheck {
     }
 
     fn gnome_versions(rp: &RunPlan) -> Found {
-        let found = page_versions(
+        let post = rp_post(rp);
+        let found = page_versions_block(
             rp.strategy_url.as_deref().unwrap_or(&rp.url),
             rp.re.as_ref().unwrap(),
             rp.ua.as_deref(),
+            rp.page_block.as_ref(),
+            post.as_ref(),
+            &rp.headers,
+            !rp.uncompressed,
         );
         if !rp.gnome_filter {
             return found;
@@ -19237,6 +19474,7 @@ mod livecheck {
         Ok(UrlPlan::Run(Box::new(RunPlan {
             strat: Strat::Xorg,
             url: url.to_string(),
+            uncompressed: false,
             re,
             candidates,
             strategy_url: Some(values.0.clone()),
@@ -19249,6 +19487,13 @@ mod livecheck {
             yaml: None,
             page_block: None,
             ghrel_block: None,
+            git: None,
+            latest: None,
+            sparkle_block: None,
+            header_block: None,
+            post_form: None,
+            post_json: None,
+            headers: Vec::new(),
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
@@ -19360,6 +19605,7 @@ mod livecheck {
         Ok(UrlPlan::Run(Box::new(RunPlan {
             strat: Strat::Cpan,
             url: url.to_string(),
+            uncompressed: false,
             re,
             candidates,
             strategy_url: Some(values.0.clone()),
@@ -19372,6 +19618,13 @@ mod livecheck {
             yaml: None,
             page_block: None,
             ghrel_block: None,
+            git: None,
+            latest: None,
+            sparkle_block: None,
+            header_block: None,
+            post_form: None,
+            post_json: None,
+            headers: Vec::new(),
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
@@ -19431,6 +19684,7 @@ mod livecheck {
         Ok(UrlPlan::Run(Box::new(RunPlan {
             strat: Strat::CrateStrategy,
             url: url.to_string(),
+            uncompressed: false,
             re,
             candidates,
             strategy_url: Some(crate_index_url(package)),
@@ -19443,6 +19697,13 @@ mod livecheck {
             yaml: None,
             page_block: None,
             ghrel_block: None,
+            git: None,
+            latest: None,
+            sparkle_block: None,
+            header_block: None,
+            post_form: None,
+            post_json: None,
+            headers: Vec::new(),
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
@@ -19539,6 +19800,7 @@ mod livecheck {
         Ok(UrlPlan::Run(Box::new(RunPlan {
             strat: Strat::Hackage,
             url: url.to_string(),
+            uncompressed: false,
             re,
             candidates,
             strategy_url: Some(values.0.clone()),
@@ -19551,6 +19813,13 @@ mod livecheck {
             yaml: None,
             page_block: None,
             ghrel_block: None,
+            git: None,
+            latest: None,
+            sparkle_block: None,
+            header_block: None,
+            post_form: None,
+            post_json: None,
+            headers: Vec::new(),
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
@@ -19700,6 +19969,7 @@ mod livecheck {
         Ok(UrlPlan::Run(Box::new(RunPlan {
             strat: Strat::Launchpad,
             url: url.to_string(),
+            uncompressed: false,
             re,
             candidates,
             strategy_url: Some(format!("https://launchpad.net/{project}/")),
@@ -19712,6 +19982,13 @@ mod livecheck {
             yaml: None,
             page_block: None,
             ghrel_block: None,
+            git: None,
+            latest: None,
+            sparkle_block: None,
+            header_block: None,
+            post_form: None,
+            post_json: None,
+            headers: Vec::new(),
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
@@ -19739,6 +20016,7 @@ mod livecheck {
         Ok(UrlPlan::Run(Box::new(RunPlan {
             strat: Strat::Gnu,
             url: url.to_string(),
+            uncompressed: false,
             re,
             candidates,
             strategy_url: Some(format!("https://ftpmirror.gnu.org/{project}/")),
@@ -19751,6 +20029,13 @@ mod livecheck {
             yaml: None,
             page_block: None,
             ghrel_block: None,
+            git: None,
+            latest: None,
+            sparkle_block: None,
+            header_block: None,
+            post_form: None,
+            post_json: None,
+            headers: Vec::new(),
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
@@ -19766,8 +20051,68 @@ mod livecheck {
         let ua = spec_ua(spec);
         let ghrel_block = if strat == Strat::GithubReleases {
             let block = spec.and_then(|sp| sp.ghrel_block.clone());
-            if let Some((pat, flags)) = block.as_ref().and_then(|b| b.name_skip.as_ref())
-                && lc_regex(pat, flags).is_err()
+            // Every literal regex the reduced block
+            // carries must compile at plan time.
+            if let Some(b) = &block {
+                use super::super::formula::{GhRelPart, GhRelThen};
+                let mut lits: Vec<&(String, String)> = Vec::new();
+                if let Some(l) = &b.name_skip {
+                    lits.push(l);
+                }
+                if let Some(l) = &b.fallback_tag {
+                    lits.push(l);
+                }
+                if let Some(l) = b.pre_capture.as_ref().and_then(|c| c.lit.as_ref()) {
+                    lits.push(l);
+                }
+                if let Some((pat, flags)) = match &b.asset_any {
+                    Some(super::super::formula::GhRelAny::NameMatch(p, f)) => Some((p, f)),
+                    _ => None,
+                } && lc_regex(pat, flags).is_err()
+                {
+                    return Err(Outside);
+                }
+                for (pat, flags) in lits {
+                    if lc_regex(pat, flags).is_err() {
+                        return Err(Outside);
+                    }
+                }
+                let mut tag_lits: Vec<(&str, &str)> = Vec::new();
+                let mut part_sets: Vec<&[GhRelPart]> = Vec::new();
+                match &b.then {
+                    GhRelThen::Template(parts) => part_sets.push(parts),
+                    GhRelThen::EqElse { then, els, .. }
+                    | GhRelThen::TruthyElse { then, els, .. } => {
+                        part_sets.push(then);
+                        part_sets.push(els);
+                    }
+                    _ => {}
+                }
+                for parts in part_sets {
+                    for p in parts {
+                        if let GhRelPart::TagCapture(pat, flags) = p {
+                            tag_lits.push((pat, flags));
+                        }
+                    }
+                }
+                for (pat, flags) in tag_lits {
+                    if lc_regex(pat, flags).is_err() {
+                        return Err(Outside);
+                    }
+                }
+            }
+            block
+        } else {
+            None
+        };
+        let latest_block = if strat == Strat::GithubLatest {
+            let block = spec.and_then(|sp| sp.latest_block.clone());
+            // A body reading `regex` without declaring
+            // it needs the spec's own regex (see the
+            // `:git` plan); a scan body reads capture
+            // arrays, so the regex must capture.
+            if block.as_ref().is_some_and(|b| b.needs_spec_regex)
+                && spec.and_then(|sp| sp.regex.as_ref()).is_none()
             {
                 return Err(Outside);
             }
@@ -19775,6 +20120,107 @@ mod livecheck {
         } else {
             None
         };
+        let re = github_regex(spec)?;
+        if latest_block.as_ref().is_some_and(|b| b.scan) && !re.has_group {
+            return Err(Outside);
+        }
+        // Every capture a latest render reads must
+        // extract (scan renders index captures from 0).
+        if let Some(b) = &latest_block {
+            use super::super::formula::{LatestPart, LatestRender};
+            let md_ok = |n: usize| match n {
+                0 => true,
+                1 => re.has_group,
+                g => re.extra_groups.get(g - 2).is_some_and(Option::is_some),
+            };
+            let scan_ok = |n: usize| match n {
+                0 => re.has_group,
+                g => re.extra_groups.get(g - 1).is_some_and(Option::is_some),
+            };
+            let parts_ok = |parts: &[LatestPart], scan: bool| {
+                parts.iter().all(|p| match p {
+                    LatestPart::Cap(n) => {
+                        if scan {
+                            scan_ok(*n)
+                        } else {
+                            md_ok(*n)
+                        }
+                    }
+                    LatestPart::Lit(_) | LatestPart::Local => true,
+                })
+            };
+            let ok = match &b.render {
+                LatestRender::Capture | LatestRender::TwoEq => true,
+                LatestRender::Template(parts) => parts_ok(parts, false),
+                LatestRender::EqElse {
+                    a,
+                    b: bb,
+                    then,
+                    els,
+                } => {
+                    use super::super::formula::LatestOp;
+                    let op_ok = |o: &LatestOp| match o {
+                        LatestOp::Cap(n) => md_ok(*n),
+                        LatestOp::Local => true,
+                    };
+                    op_ok(a) && op_ok(bb) && parts_ok(then, false) && parts_ok(els, false)
+                }
+                LatestRender::PresentElse { cap, then, els }
+                | LatestRender::TruthyElse { cap, then, els } => {
+                    md_ok(*cap) && parts_ok(then, false) && parts_ok(els, false)
+                }
+                LatestRender::ScanTemplate(parts) => parts_ok(parts, true),
+                LatestRender::ScanPresentElse { cap, then, els } => {
+                    scan_ok(*cap) && parts_ok(then, true) && parts_ok(els, true)
+                }
+            };
+            if !ok {
+                return Err(Outside);
+            }
+            if let Some((pat, flags)) = b.pre_capture.as_ref().and_then(|c| c.lit.as_ref())
+                && lc_regex(pat, flags).is_err()
+            {
+                return Err(Outside);
+            }
+        }
+        // Every capture a ghrel render reads must have
+        // working extraction machinery.
+        if let Some(b) = &ghrel_block {
+            use super::super::formula::{GhRelOp, GhRelPart, GhRelThen};
+            let cap_ok = |n: usize| match n {
+                0 => true,
+                1 => re.has_group,
+                g => re.extra_groups.get(g - 2).is_some_and(Option::is_some),
+            };
+            let parts_ok = |parts: &[GhRelPart]| {
+                parts.iter().all(|p| match p {
+                    GhRelPart::Cap(n) => cap_ok(*n),
+                    _ => true,
+                })
+            };
+            let ok = match &b.then {
+                GhRelThen::Template(parts) => parts_ok(parts),
+                GhRelThen::EqElse {
+                    a,
+                    b: bb,
+                    then,
+                    els,
+                } => {
+                    let op_ok = |o: &GhRelOp| match o {
+                        GhRelOp::Cap(n) => cap_ok(*n),
+                        GhRelOp::Local | GhRelOp::Tag => true,
+                    };
+                    op_ok(a) && op_ok(bb) && parts_ok(then) && parts_ok(els)
+                }
+                GhRelThen::TruthyElse { cap, then, els } => {
+                    cap_ok(*cap) && parts_ok(then) && parts_ok(els)
+                }
+                _ => true,
+            };
+            if !ok {
+                return Err(Outside);
+            }
+        }
         let (user, repo) = github_repo(url).ok_or(Outside)?;
         // brew names the REST endpoint as the strategy URL. agh's origin builds it, so no
         // shipped line here spells a GitHub API host beside the GHCR Bearer headers this file
@@ -19791,7 +20237,8 @@ mod livecheck {
         Ok(UrlPlan::Run(Box::new(RunPlan {
             strat,
             url: url.to_string(),
-            re: Some(github_regex(spec)?),
+            uncompressed: false,
+            re: Some(re),
             candidates,
             strategy_url: Some(api),
             ua: ua.0,
@@ -19803,6 +20250,13 @@ mod livecheck {
             yaml: None,
             page_block: None,
             ghrel_block,
+            git: None,
+            sparkle_block: None,
+            header_block: None,
+            latest: latest_block,
+            post_form: None,
+            post_json: None,
+            headers: Vec::new(),
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
@@ -19910,7 +20364,19 @@ mod livecheck {
         let explicit = spec.and_then(|s| s.strategy.as_deref());
         let spec_regex = || -> Result<Option<LcRegex>, Outside> {
             match spec.and_then(|s| s.regex.as_ref().map(|r| (r, &s.regex_flags))) {
-                Some((p, f)) => Ok(Some(lc_regex(p, f)?)),
+                Some((p, f)) => {
+                    if p.contains(super::super::formula::MAJOR_MINOR_SENTINEL) {
+                        if major_minor.is_empty() {
+                            return Err(Outside);
+                        }
+                        let owned = p.replace(
+                            super::super::formula::MAJOR_MINOR_SENTINEL,
+                            &ruby_regex_escape(major_minor),
+                        );
+                        return Ok(Some(lc_regex(&owned, f)?));
+                    }
+                    Ok(Some(lc_regex(p, f)?))
+                }
                 None => Ok(None),
             }
         };
@@ -19924,6 +20390,7 @@ mod livecheck {
             UrlPlan::Run(Box::new(RunPlan {
                 strat,
                 url: run_url,
+                uncompressed: spec.is_some_and(|sp| sp.compressed_false),
                 re,
                 candidates: candidates.clone(),
                 strategy_url,
@@ -19936,6 +20403,13 @@ mod livecheck {
                 yaml: None,
                 page_block: None,
                 ghrel_block: None,
+                git: None,
+                latest: None,
+                sparkle_block: None,
+                header_block: None,
+                post_form: None,
+                post_json: None,
+                headers: Vec::new(),
                 major_minor: major_minor.to_string(),
                 plist: None,
                 apps: Vec::new(),
@@ -19952,8 +20426,32 @@ mod livecheck {
                     });
                 }
                 "git" => {
+                    let block = spec.and_then(|sp| sp.git_block.clone());
+                    if spec.is_some_and(|sp| sp.strategy_block) && block.is_none() {
+                        return Err(Outside);
+                    }
+                    if let Some(block) = &block {
+                        // A body reading `regex` without
+                        // declaring it needs the spec's own
+                        // regex; the oracle yields none to
+                        // it otherwise. A `gsub` pattern
+                        // must compile at plan time.
+                        if block.needs_spec_regex && spec.and_then(|sp| sp.regex.as_ref()).is_none()
+                        {
+                            return Err(Outside);
+                        }
+                        if let super::super::formula::GitOp::GsubRe(pat, flags, _) = &block.op {
+                            lc_regex(pat, flags)?;
+                        }
+                    }
                     return Ok(match git_match(url) {
-                        Some(processed) => run(Strat::Git, processed, Some(git_regex(spec)?), None),
+                        Some(processed) => {
+                            let mut plan = run(Strat::Git, processed, Some(git_regex(spec)?), None);
+                            if let UrlPlan::Run(rp) = &mut plan {
+                                rp.git = block;
+                            }
+                            plan
+                        }
                         None => UrlPlan::SkipUrl,
                     });
                 }
@@ -20032,7 +20530,55 @@ mod livecheck {
                     let Some(block) = spec.and_then(|sp| sp.json_block.clone()) else {
                         return Err(Outside);
                     };
+                    // Literal projection regexes in a
+                    // guarded map must compile at plan
+                    // time.
+                    let plan_guard = match &block.shape {
+                        super::super::formula::JsonShape::MapGuarded(_, guard) => Some(guard),
+                        super::super::formula::JsonShape::ValuesMap(_, _, guard) => Some(guard),
+                        _ => None,
+                    };
+                    if let Some(guard) = plan_guard {
+                        if let super::super::formula::MapCapture::Literal(pat, flags) =
+                            &guard.capture
+                        {
+                            lc_regex(pat, flags)?;
+                        }
+                        if let Some((pat, flags, _)) = &guard.sub {
+                            lc_regex(pat, flags)?;
+                        }
+                    }
                     let re = spec_regex()?;
+                    if let super::super::formula::JsonShape::Template(tmpl) = &block.shape {
+                        use super::super::formula::{JsonLocal, JsonPart, JsonRender, JsonValue};
+                        for local in &tmpl.locals {
+                            match local {
+                                JsonLocal::DigCaptureLit(_, pat, flags)
+                                | JsonLocal::DigSubRe(_, pat, flags, _) => {
+                                    lc_regex(pat, flags)?;
+                                }
+                                _ => {}
+                            }
+                        }
+                        let cap_ok = |n: usize| match n {
+                            0 => true,
+                            1 => re.as_ref().is_some_and(|r| r.has_group),
+                            g => re.as_ref().is_some_and(|r| {
+                                r.extra_groups.get(g - 2).is_some_and(Option::is_some)
+                            }),
+                        };
+                        let caps_ok = match &tmpl.render {
+                            JsonRender::Template(parts) => parts.iter().all(|p| match p {
+                                JsonPart::Cap(n) => cap_ok(*n),
+                                _ => true,
+                            }),
+                            JsonRender::Value(JsonValue::Cap(n), _) => cap_ok(*n),
+                            _ => true,
+                        };
+                        if !caps_ok {
+                            return Err(Outside);
+                        }
+                    }
                     let mut plan = run(Strat::Json, url.to_string(), re, None);
                     if let UrlPlan::Run(rp) = &mut plan {
                         rp.json = Some(block);
@@ -20040,11 +20586,16 @@ mod livecheck {
                     return Ok(plan);
                 }
                 "extract_plist" => {
-                    // Only zip containers are native (the
-                    // URL's extension is the plan-time
-                    // evidence; dmg/pkg delegate).
+                    // Zip and (on macOS, via the install
+                    // path's read-only mount) dmg
+                    // containers are native; the URL's
+                    // extension is the plan-time evidence,
+                    // pkg delegates (installer-gated).
                     let path = url.split(['?', '#']).next().unwrap_or(url);
-                    if !path.to_ascii_lowercase().ends_with(".zip") {
+                    let lower = path.to_ascii_lowercase();
+                    if !(lower.ends_with(".zip")
+                        || (cfg!(target_os = "macos") && lower.ends_with(".dmg")))
+                    {
                         return Err(Outside);
                     }
                     let sp = spec.and_then(|sp| sp.plist_block.clone());
@@ -20063,9 +20614,15 @@ mod livecheck {
                         return Ok(UrlPlan::SkipUrl);
                     }
                     let re = spec_regex()?;
+                    let yblock = spec.and_then(|sp| sp.yaml_block.clone());
+                    if let Some(b) = &yblock
+                        && !yaml_caps_ok(b, re.as_ref())
+                    {
+                        return Err(Outside);
+                    }
                     let mut plan = run(Strat::ElectronBuilder, url.to_string(), re, None);
                     if let UrlPlan::Run(rp) = &mut plan {
-                        rp.yaml = spec.and_then(|sp| sp.yaml_block.clone());
+                        rp.yaml = yblock;
                     }
                     return Ok(plan);
                 }
@@ -20074,6 +20631,9 @@ mod livecheck {
                         return Err(Outside);
                     };
                     let re = spec_regex()?;
+                    if !yaml_caps_ok(&block, re.as_ref()) {
+                        return Err(Outside);
+                    }
                     let mut plan = run(Strat::Yaml, url.to_string(), re, None);
                     if let UrlPlan::Run(rp) = &mut plan {
                         rp.yaml = Some(block);
@@ -20135,27 +20695,92 @@ mod livecheck {
                     if !url.starts_with("https://") && !url.starts_with("http://") {
                         return Ok(UrlPlan::SkipUrl);
                     }
+                    let block = spec.and_then(|sp| sp.header_block.clone());
+                    if spec.is_some_and(|sp| sp.strategy_block) && block.is_none() {
+                        return Err(Outside);
+                    }
+                    let re = spec_regex()?;
+                    if let Some(block) = &block {
+                        use super::super::formula::{HeaderShape, PagePart};
+                        let cap_ok = |n: usize, scan: bool| {
+                            let g = if scan { n + 1 } else { n };
+                            match g {
+                                0 => !scan,
+                                1 => re.as_ref().is_some_and(|r| r.has_group),
+                                g => re.as_ref().is_some_and(|r| {
+                                    r.extra_groups.get(g - 2).is_some_and(Option::is_some)
+                                }),
+                            }
+                        };
+                        let parts_ok = |parts: &[PagePart], scan: bool| {
+                            parts.iter().all(|p| match p {
+                                PagePart::Cap(n) | PagePart::CapTr(n, ..) => cap_ok(*n, scan),
+                                _ => true,
+                            })
+                        };
+                        let ok = match &block.shape {
+                            HeaderShape::Template(parts) => parts_ok(parts, false),
+                            HeaderShape::ScanTemplate(parts) => parts_ok(parts, true),
+                            HeaderShape::ScanFlatten(_) => re.as_ref().is_some_and(|r| {
+                                r.has_group && r.extra_groups.iter().all(Option::is_some)
+                            }),
+                            HeaderShape::CsvOpt => cap_ok(2, false),
+                            HeaderShape::Bare => true,
+                        };
+                        if !ok {
+                            return Err(Outside);
+                        }
+                    }
                     // Without a regex brew detects the
                     // version from each header value
                     // (`Version.parse` — the r408 port).
-                    return Ok(run(
-                        Strat::HeaderMatch,
-                        url.to_string(),
-                        spec_regex()?,
-                        None,
-                    ));
+                    let mut plan = run(Strat::HeaderMatch, url.to_string(), re, None);
+                    if let UrlPlan::Run(rp) = &mut plan {
+                        rp.header_block = block;
+                    }
+                    return Ok(plan);
                 }
                 "sparkle" => {
                     if !url.starts_with("https://") && !url.starts_with("http://") {
                         return Ok(UrlPlan::SkipUrl);
                     }
-                    if spec.is_some_and(|s| s.regex.is_some()) {
+                    let block = spec.and_then(|sp| sp.sparkle_block.clone());
+                    if spec.is_some_and(|sp| sp.strategy_block) && block.is_none() {
+                        return Err(Outside);
+                    }
+                    if let Some(block) = &block
+                        && block.needs_spec_regex
+                        && spec.and_then(|sp| sp.regex.as_ref()).is_none()
+                    {
+                        return Err(Outside);
+                    }
+                    if block.is_none() && spec.is_some_and(|s| s.regex.is_some()) {
                         return Ok(UrlPlan::Raised(
                             "Sparkle only supports a regex when using a `strategy` block"
                                 .to_string(),
                         ));
                     }
-                    return Ok(run(Strat::Sparkle, url.to_string(), None, None));
+                    let re = if block
+                        .as_ref()
+                        .is_some_and(|b: &super::super::formula::SparkleBlock| b.needs_spec_regex)
+                    {
+                        let re = spec_regex()?;
+                        // Captures past the first need
+                        // their split machinery.
+                        if let Some(re) = &re
+                            && !sparkle_caps_ok(block.as_ref().unwrap(), re)
+                        {
+                            return Err(Outside);
+                        }
+                        re
+                    } else {
+                        None
+                    };
+                    let mut plan = run(Strat::Sparkle, url.to_string(), re, None);
+                    if let UrlPlan::Run(rp) = &mut plan {
+                        rp.sparkle_block = block;
+                    }
+                    return Ok(plan);
                 }
                 other if KNOWN_STRATEGIES.contains(&other) => return Err(Outside),
                 // Unknown symbol: brew's `from_symbol` is nil
@@ -20317,16 +20942,23 @@ mod livecheck {
         /// The `user_agent:` option's rendering for the
         /// verbose url `options` object.
         ua_option: Option<String>,
+        /// The `post_form:` option, for the verbose
+        /// url `options` object.
+        post_form: Option<Vec<(String, String)>>,
+        /// The `post_json:` option (generated JSON).
+        post_json: Option<String>,
+        /// The `header:` option(s).
+        header: Option<Vec<String>>,
         throttle: Option<u64>,
         throttle_days: Option<u64>,
     }
 
     /// Ruby `Regexp#inspect`: `/source/flags`, unescaped
     /// slashes escaped.
-    fn regex_inspect(re: &LcRegex) -> String {
+    fn regex_inspect_src(source: &str, flags: &str) -> String {
         let mut out = String::from("/");
         let mut escaped = false;
-        for c in re.src.chars() {
+        for c in source.chars() {
             if c == '/' && !escaped {
                 out.push_str("\\/");
             } else {
@@ -20335,12 +20967,32 @@ mod livecheck {
             escaped = c == '\\' && !escaped;
         }
         out.push('/');
-        for f in ['i', 'm', 'x'] {
-            if re.flags.contains(f) {
+        for f in ['m', 'i', 'x'] {
+            if flags.contains(f) {
                 out.push(f);
             }
         }
         out
+    }
+
+    fn regex_inspect(re: &LcRegex) -> String {
+        regex_inspect_src(&re.src, &re.flags)
+    }
+
+    /// The spec regex's inspect rendering: the oracle
+    /// prints it before the fetch (`Regex:`), and the
+    /// strategy's own regex after (`Regex (strategy):`)
+    /// only when the two differ.
+    fn spec_regex_inspect(
+        spec: Option<&LivecheckSpec>,
+        own: &str,
+        is_cask: bool,
+    ) -> Option<String> {
+        let spec = spec?;
+        spec.regex.as_ref().map(|src| {
+            let substituted = substitute_version_tokens(src, own, is_cask);
+            regex_inspect_src(substituted.as_deref().unwrap_or(src), &spec.regex_flags)
+        })
     }
 
     /// One formula resource to check under `--resources`.
@@ -20352,6 +21004,9 @@ mod livecheck {
         /// Whether the resource's check used a livecheck
         /// block (verbose meta's `livecheck_defined`).
         spec_defined: bool,
+        /// The resource spec regex's inspect rendering
+        /// (debug pre/post regex lines).
+        spec_inspect: Option<String>,
         /// Reference hops, for verbose meta.
         references: RefHops,
         /// Reuse the parent formula's own result instead of
@@ -20425,7 +21080,13 @@ mod livecheck {
                 ));
             }
         };
-        let plans = plan_urls(eff_box.spec.as_ref(), urls, &own_version, &eff_box.apps)?;
+        let plans = plan_urls(
+            eff_box.spec.as_ref(),
+            urls,
+            &own_version,
+            &eff_box.apps,
+            eff_box.is_cask,
+        )?;
         let resources = if want_resources && !pkg.is_cask {
             resource_plans(pkg)?
         } else {
@@ -20440,31 +21101,87 @@ mod livecheck {
         ))
     }
 
+    /// One `version…` interpolation token's value:
+    /// cask `DSL::Version` chains for casks, the
+    /// formula component accessors otherwise.
+    fn version_chain_value(own: &str, token: &str, is_cask: bool) -> Option<String> {
+        if token == "version[0]" {
+            return own.chars().next().map(|c| c.to_string());
+        }
+        if is_cask {
+            return super::super::formula::cask_version_token(own, token);
+        }
+        let mut nums: Vec<&str> = own.split('.').collect();
+        while nums.len() < 3 {
+            nums.push("0");
+        }
+        Some(match token {
+            "version" => own.to_string(),
+            "version.major" => nums[0].to_string(),
+            "version.minor" => nums[1].to_string(),
+            "version.patch" => nums[2].to_string(),
+            "version.major_minor" => format!("{}.{}", nums[0], nums[1]),
+            "version.major_minor_patch" => format!("{}.{}.{}", nums[0], nums[1], nums[2]),
+            _ => return None,
+        })
+    }
+
+    /// Substitute every `#{version…}` interpolation
+    /// (and the major-minor sentinel) in `text` with
+    /// the checked unit's own version components.
+    /// `None` when a token is outside the modeled
+    /// chain surface.
+    fn substitute_version_tokens(text: &str, own: &str, is_cask: bool) -> Option<String> {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        loop {
+            let interp = rest.find("#{");
+            let sentinel = rest.find(super::super::formula::MAJOR_MINOR_SENTINEL);
+            let use_interp = match (interp, sentinel) {
+                (None, None) => break,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (Some(i), Some(j)) => i < j,
+            };
+            if use_interp {
+                let i = interp.unwrap();
+                out.push_str(&rest[..i]);
+                let j = rest[i + 2..].find('}')?;
+                let token = rest[i + 2..i + 2 + j].trim();
+                let value = if let Some(inner) = token
+                    .strip_prefix("Regexp.escape(")
+                    .and_then(|t| t.strip_suffix(')'))
+                {
+                    ruby_regex_escape(&version_chain_value(own, inner.trim(), is_cask)?)
+                } else {
+                    version_chain_value(own, token, is_cask)?
+                };
+                out.push_str(&value);
+                rest = &rest[i + 2 + j + 1..];
+            } else {
+                let j = sentinel.unwrap();
+                out.push_str(&rest[..j]);
+                out.push_str(&ruby_regex_escape(&version_chain_value(
+                    own,
+                    "version.major_minor",
+                    is_cask,
+                )?));
+                rest = &rest[j + super::super::formula::MAJOR_MINOR_SENTINEL.len()..];
+            }
+        }
+        out.push_str(rest);
+        Some(out)
+    }
+
     /// (original, fetch) forms of a checkable URL: `#{version}`
     /// component accessors evaluate in both (the oracle's
     /// `original` is already evaluated for those), while
     /// `<FORMULA_LATEST_VERSION>` stays in the original and
     /// substitutes only in the fetched form (`processed`).
-    fn substitute_url_versions(url: &str, own: &str) -> (String, String) {
-        let mut nums: Vec<&str> = own.split('.').collect();
-        while nums.len() < 3 {
-            nums.push("0");
-        }
-        let original = url
-            .replace(
-                "#{version.major_minor_patch}",
-                &format!("{}.{}.{}", nums[0], nums[1], nums[2]),
-            )
-            .replace(
-                "#{version.major_minor}",
-                &format!("{}.{}", nums[0], nums[1]),
-            )
-            .replace("#{version.major}", nums[0])
-            .replace("#{version.minor}", nums[1])
-            .replace("#{version.patch}", nums[2])
-            .replace("#{version}", own);
+    fn substitute_url_versions(url: &str, own: &str, is_cask: bool) -> Option<(String, String)> {
+        let original = substitute_version_tokens(url, own, is_cask)?;
         let fetch = original.replace("<FORMULA_LATEST_VERSION>", own);
-        (original, fetch)
+        Some((original, fetch))
     }
 
     /// `version.major_minor` for the checked unit (the
@@ -20482,16 +21199,38 @@ mod livecheck {
         urls: Vec<String>,
         own_version: &str,
         apps: &[String],
+        is_cask: bool,
     ) -> Result<Vec<(String, UrlPlan)>, Outside> {
+        // Version interpolations in the spec regex
+        // evaluate against the checked unit's own
+        // version (brew evaluates the literal when
+        // the DSL loads); substitute once here so
+        // every plan compiles the final pattern.
+        let substituted: Option<LivecheckSpec> = match spec {
+            Some(sp)
+                if sp.regex.as_ref().is_some_and(|r| {
+                    r.contains("#{") || r.contains(super::super::formula::MAJOR_MINOR_SENTINEL)
+                }) =>
+            {
+                let mut owned = sp.clone();
+                owned.regex = Some(
+                    substitute_version_tokens(
+                        owned.regex.as_deref().unwrap(),
+                        own_version,
+                        is_cask,
+                    )
+                    .ok_or(Outside)?,
+                );
+                Some(owned)
+            }
+            _ => None,
+        };
+        let spec = substituted.as_ref().map_or(spec, Some);
         let mut plans = Vec::new();
         let mut seen: Vec<String> = Vec::new();
         for url in urls {
-            // CSV (cask) versions have richer component
-            // semantics than this substitution.
-            if own_version.contains(',') && url.contains("#{version") {
-                return Err(Outside);
-            }
-            let (original, fetch) = substitute_url_versions(&url, own_version);
+            let (original, fetch) =
+                substitute_url_versions(&url, own_version, is_cask).ok_or(Outside)?;
             if seen.contains(&original) {
                 continue;
             }
@@ -20556,21 +21295,159 @@ mod livecheck {
                             .re
                             .as_ref()
                             .is_some_and(|re| re.extra_groups.iter().all(Option::is_some)),
-                        super::super::formula::PageShape::ScanCsvOpt => {
+                        super::super::formula::PageShape::ScanCsvOpt
+                        | super::super::formula::PageShape::ScanCsvOptTr(..) => {
                             rp.re.as_ref().is_some_and(|re| {
                                 re.group_count >= 2
                                     && re.extra_groups.first().is_some_and(Option::is_some)
                             })
                         }
+                        super::super::formula::PageShape::ScanTemplate(parts) => {
+                            rp.re.as_ref().is_some_and(|re| {
+                                parts.iter().all(|p| match p {
+                                    super::super::formula::PagePart::Cap(n)
+                                    | super::super::formula::PagePart::CapTr(n, ..) => {
+                                        // Scan index n is capture n+1.
+                                        match n + 1 {
+                                            1 => re.has_group,
+                                            g => re
+                                                .extra_groups
+                                                .get(g - 2)
+                                                .is_some_and(Option::is_some),
+                                        }
+                                    }
+                                    _ => true,
+                                })
+                            })
+                        }
+                        super::super::formula::PageShape::MatchTemplate(parts) => {
+                            rp.re.as_ref().is_some_and(|re| {
+                                parts.iter().all(|p| match p {
+                                    super::super::formula::PagePart::Cap(n)
+                                    | super::super::formula::PagePart::CapTr(n, ..) => match *n {
+                                        0 => true,
+                                        1 => re.has_group,
+                                        g => {
+                                            re.extra_groups.get(g - 2).is_some_and(Option::is_some)
+                                        }
+                                    },
+                                    _ => true,
+                                })
+                            })
+                        }
+                        // Flatten emits every capture; the
+                        // scan loop carries group 1 only.
+                        super::super::formula::PageShape::ScanSelectLt(_) => {
+                            rp.re.as_ref().is_some_and(|re| re.group_count == 1)
+                        }
+                        super::super::formula::PageShape::HopScan(hop) => match &hop.hop_re {
+                            Some((pat, flags)) => lc_regex(pat, flags).is_ok_and(|re| re.has_group),
+                            None => true,
+                        },
                         _ => true,
                     };
                     match (
-                        matches!(rp.strat, Strat::PageMatch | Strat::Sourceforge),
+                        matches!(
+                            rp.strat,
+                            Strat::PageMatch | Strat::Sourceforge | Strat::Gnome
+                        ),
                         rp.re.as_ref().is_some_and(|re| re.has_group),
                         sub_ok,
                     ) {
                         (true, true, true) => rp.page_block = Some(pb),
                         _ => return Err(Outside),
+                    }
+                }
+                if rp
+                    .re
+                    .as_ref()
+                    .is_some_and(|re| re.src.contains(super::super::formula::MAJOR_MINOR_SENTINEL))
+                {
+                    return Err(Outside);
+                }
+                // A `post_form:` option rides the
+                // page-fetching strategies (their
+                // executors thread it to the fetch);
+                // API/git/header/plist fetches have no
+                // form to carry, and a DirWalk's second
+                // fetch is the block's own (option-free
+                // in the oracle).
+                if let Some(form) = spec.and_then(|sp| sp.post_form.as_ref()) {
+                    let supported = matches!(
+                        rp.strat,
+                        Strat::PageMatch
+                            | Strat::Sourceforge
+                            | Strat::Json
+                            | Strat::Xml
+                            | Strat::Yaml
+                            | Strat::ElectronBuilder
+                            | Strat::Sparkle
+                            | Strat::Bitbucket
+                            | Strat::Apache
+                            | Strat::Launchpad
+                            | Strat::Gnu
+                            | Strat::Hackage
+                            | Strat::Cpan
+                            | Strat::Xorg
+                            | Strat::Gnome
+                            | Strat::HeaderMatch
+                    ) && !matches!(
+                        rp.page_block.as_ref().map(|b| &b.shape),
+                        Some(super::super::formula::PageShape::DirWalk(_))
+                    );
+                    if !supported {
+                        return Err(Outside);
+                    }
+                    let mut substituted_form = Vec::new();
+                    for (k, v) in form {
+                        substituted_form.push((
+                            k.clone(),
+                            substitute_url_versions(v, own_version, is_cask)
+                                .ok_or(Outside)?
+                                .1,
+                        ));
+                    }
+                    rp.post_form = Some(substituted_form);
+                }
+                // `post_json:`/`header:` ride the same
+                // page-fetching strategies.
+                let has_post_json = spec.and_then(|sp| sp.post_json.as_ref()).is_some();
+                let has_headers = spec.and_then(|sp| sp.header.as_ref()).is_some();
+                if has_post_json || has_headers {
+                    let supported = matches!(
+                        rp.strat,
+                        Strat::PageMatch
+                            | Strat::Sourceforge
+                            | Strat::Json
+                            | Strat::Xml
+                            | Strat::Yaml
+                            | Strat::ElectronBuilder
+                            | Strat::Sparkle
+                            | Strat::Bitbucket
+                            | Strat::Apache
+                            | Strat::Launchpad
+                            | Strat::Gnu
+                            | Strat::Hackage
+                            | Strat::Cpan
+                            | Strat::Xorg
+                            | Strat::Gnome
+                            | Strat::HeaderMatch
+                    ) && !matches!(
+                        rp.page_block.as_ref().map(|b| &b.shape),
+                        Some(super::super::formula::PageShape::DirWalk(_))
+                    );
+                    if !supported {
+                        return Err(Outside);
+                    }
+                    if let Some(json) = spec.and_then(|sp| sp.post_json.as_ref()) {
+                        rp.post_json = Some(
+                            substitute_url_versions(json, own_version, is_cask)
+                                .ok_or(Outside)?
+                                .1,
+                        );
+                    }
+                    if let Some(headers) = spec.and_then(|sp| sp.header.as_ref()) {
+                        rp.headers.clone_from(headers);
                     }
                 }
             }
@@ -20633,10 +21510,13 @@ mod livecheck {
             if current.is_none() && (any_run || parent_ref) {
                 return Err(Outside);
             }
+            let spec_inspect =
+                spec_regex_inspect(spec.as_ref(), current.as_deref().unwrap_or_default(), false);
             out.push(ResPlan {
                 name,
                 current,
                 spec_defined,
+                spec_inspect,
                 references,
                 parent_ref,
                 plans,
@@ -20658,7 +21538,7 @@ mod livecheck {
     ) -> Result<ResourcePlans, Outside> {
         let Some(spec) = spec else {
             return Ok(ResourcePlans::Urls(
-                plan_urls(None, vec![res_url.to_string()], &pkg.current, &[])?,
+                plan_urls(None, vec![res_url.to_string()], &pkg.current, &[], false)?,
                 Vec::new(),
             ));
         };
@@ -20703,7 +21583,7 @@ mod livecheck {
             None => vec![res_url.to_string()],
         };
         Ok(ResourcePlans::Urls(
-            plan_urls(Some(&eff_spec), urls, &pkg.current, &[])?,
+            plan_urls(Some(&eff_spec), urls, &pkg.current, &[], false)?,
             Vec::new(),
         ))
     }
@@ -20791,7 +21671,12 @@ mod livecheck {
 
     /// The lines of one URL's `--debug` block that precede
     /// its fetch.
-    fn debug_url_pre(symbol: Option<&str>, original: &str, rp: &RunPlan) {
+    fn debug_url_pre(
+        symbol: Option<&str>,
+        original: &str,
+        rp: &RunPlan,
+        spec_inspect: Option<&str>,
+    ) {
         println!();
         let label = match symbol {
             Some(sym) => format!("URL ({sym}):"),
@@ -20801,15 +21686,42 @@ mod livecheck {
         if rp.url != original {
             dbg_label("URL (processed):", &rp.url);
         }
+        let mut options: Vec<String> = Vec::new();
         if let Some(opt) = &rp.ua_option {
             let rendered = if rp.ua_symbol {
                 ":browser".to_string()
             } else {
                 format!("\"{}\"", opt.replace('\\', "\\\\").replace('"', "\\\""))
             };
-            dbg_label("URL Options:", &format!("{{user_agent: {rendered}}}"));
+            options.push(format!("user_agent: {rendered}"));
+        }
+        if let Some(form) = &rp.post_form {
+            let entries: Vec<String> = form
+                .iter()
+                .map(|(k, v)| format!("{k}: \"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")))
+                .collect();
+            options.push(format!("post_form: {{{}}}", entries.join(", ")));
+        }
+        if let Some(json) = &rp.post_json {
+            options.push(format!("post_json: {}", ruby_inspect_json_text(json)));
+        }
+        if !rp.headers.is_empty() {
+            let rendered =
+                |h: &String| format!("\"{}\"", h.replace('\\', "\\\\").replace('"', "\\\""));
+            if rp.headers.len() == 1 {
+                options.push(format!("header: {}", rendered(&rp.headers[0])));
+            } else {
+                let items: Vec<String> = rp.headers.iter().map(rendered).collect();
+                options.push(format!("header: [{}]", items.join(", ")));
+            }
+        }
+        if !options.is_empty() {
+            dbg_label("URL Options:", &format!("{{{}}}", options.join(", ")));
         }
         dbg_label("Strategy:", strat_name(rp.strat));
+        if let Some(re) = spec_inspect {
+            dbg_label("Regex:", re);
+        }
     }
 
     /// The closing debug lines for a URL whose check
@@ -20821,7 +21733,7 @@ mod livecheck {
         original_url: &str,
         head_only: bool,
         references: RefHops,
-        spec_has_regex: bool,
+        spec_inspect: Option<String>,
     ) {
         let meta = LcMeta {
             head_only,
@@ -20834,35 +21746,33 @@ mod livecheck {
             final_url: None,
             strategy: strat_name(rp.strat),
             strategies: rp.candidates.clone(),
-            regex_inspect: if rp.strat == Strat::Git && !spec_has_regex {
+            regex_inspect: if rp.strat == Strat::Git && spec_inspect.is_none() {
                 None
             } else {
                 rp.re.as_ref().map(regex_inspect)
             },
             ua_option: rp.ua_option.clone(),
+            post_form: rp.post_form.clone(),
+            post_json: rp.post_json.clone(),
+            header: (!rp.headers.is_empty()).then(|| rp.headers.clone()),
             throttle: None,
             throttle_days: None,
         };
-        debug_url_post(&meta, spec_has_regex);
+        debug_url_post(&meta, spec_inspect.as_deref());
     }
 
     /// The post-fetch lines of a winning URL's block.
-    fn debug_url_post(meta: &LcMeta, spec_has_regex: bool) {
+    fn debug_url_post(meta: &LcMeta, spec_inspect: Option<&str>) {
         if let Some(su) = &meta.strategy_url {
             dbg_label("URL (strategy):", su);
         }
         if let Some(fin) = &meta.final_url {
             dbg_label("URL (final):", fin);
         }
-        if let Some(re) = &meta.regex_inspect {
-            dbg_label(
-                if spec_has_regex {
-                    "Regex:"
-                } else {
-                    "Regex (strategy):"
-                },
-                re,
-            );
+        if let Some(re) = &meta.regex_inspect
+            && Some(re.as_str()) != spec_inspect
+        {
+            dbg_label("Regex (strategy):", re);
         }
     }
 
@@ -20958,6 +21868,9 @@ mod livecheck {
                                         strategies: Vec::new(),
                                         regex_inspect: None,
                                         ua_option: None,
+                                        post_form: None,
+                                        post_json: None,
+                                        header: None,
                                         throttle: None,
                                         throttle_days: None,
                                     }),
@@ -20974,40 +21887,73 @@ mod livecheck {
     }
 
     fn run_strat(rp: &RunPlan) -> Found {
+        let post = rp_post(rp);
         match rp.strat {
-            Strat::Git => git_versions(&rp.url, rp.re.as_ref().unwrap()),
-            Strat::GithubLatest => github_latest_versions(&rp.url, rp.re.as_ref().unwrap()),
+            Strat::Git => git_versions(&rp.url, rp.re.as_ref().unwrap(), rp.git.as_ref()),
+            Strat::GithubLatest => {
+                github_latest_versions(&rp.url, rp.re.as_ref().unwrap(), rp.latest.as_ref())
+            }
             Strat::GithubReleases => {
                 github_releases_versions(&rp.url, rp.re.as_ref().unwrap(), rp.ghrel_block.as_ref())
             }
-            Strat::HeaderMatch => header_versions(&rp.url, rp.re.as_ref(), rp.ua.as_deref()),
-            Strat::Sparkle => sparkle_versions(&rp.url, rp.ua.as_deref()),
+            Strat::HeaderMatch => header_versions(
+                &rp.url,
+                rp.re.as_ref(),
+                rp.ua.as_deref(),
+                rp.header_block.as_ref(),
+                post.as_ref(),
+                &rp.headers,
+            ),
+            Strat::Sparkle => sparkle_versions(
+                &rp.url,
+                rp.ua.as_deref(),
+                post.as_ref(),
+                &rp.headers,
+                !rp.uncompressed,
+                rp.sparkle_block.as_ref(),
+                rp.re.as_ref(),
+            ),
             Strat::PageMatch => page_versions_block(
                 &rp.url,
                 rp.re.as_ref().unwrap(),
                 rp.ua.as_deref(),
                 rp.page_block.as_ref(),
+                post.as_ref(),
+                &rp.headers,
+                !rp.uncompressed,
             ),
             Strat::Bitbucket => page_versions(
                 rp.strategy_url.as_deref().unwrap_or(&rp.url),
                 rp.re.as_ref().unwrap(),
                 rp.ua.as_deref(),
+                post.as_ref(),
+                &rp.headers,
+                !rp.uncompressed,
             ),
             Strat::Apache => page_versions(
                 rp.strategy_url.as_deref().unwrap_or(&rp.url),
                 rp.re.as_ref().unwrap(),
                 rp.ua.as_deref(),
+                post.as_ref(),
+                &rp.headers,
+                !rp.uncompressed,
             ),
             Strat::Gnome => gnome_versions(rp),
             Strat::Launchpad => page_versions(
                 rp.strategy_url.as_deref().unwrap_or(&rp.url),
                 rp.re.as_ref().unwrap(),
                 rp.ua.as_deref(),
+                post.as_ref(),
+                &rp.headers,
+                !rp.uncompressed,
             ),
             Strat::Gnu => page_versions(
                 rp.strategy_url.as_deref().unwrap_or(&rp.url),
                 rp.re.as_ref().unwrap(),
                 rp.ua.as_deref(),
+                post.as_ref(),
+                &rp.headers,
+                !rp.uncompressed,
             ),
             Strat::Json => json_versions(rp),
             Strat::Xml => xml_versions(rp),
@@ -21019,11 +21965,17 @@ mod livecheck {
                 rp.re.as_ref().unwrap(),
                 rp.ua.as_deref(),
                 rp.page_block.as_ref(),
+                post.as_ref(),
+                &rp.headers,
+                !rp.uncompressed,
             ),
             Strat::Hackage => page_versions(
                 rp.strategy_url.as_deref().unwrap_or(&rp.url),
                 rp.re.as_ref().unwrap(),
                 rp.ua.as_deref(),
+                post.as_ref(),
+                &rp.headers,
+                !rp.uncompressed,
             ),
             Strat::CrateStrategy => crate_versions(
                 rp.strategy_url.as_deref().unwrap_or(&rp.url),
@@ -21034,11 +21986,17 @@ mod livecheck {
                 rp.strategy_url.as_deref().unwrap_or(&rp.url),
                 rp.re.as_ref().unwrap(),
                 rp.ua.as_deref(),
+                post.as_ref(),
+                &rp.headers,
+                !rp.uncompressed,
             ),
             Strat::Xorg => page_versions(
                 rp.strategy_url.as_deref().unwrap_or(&rp.url),
                 rp.re.as_ref().unwrap(),
                 rp.ua.as_deref(),
+                post.as_ref(),
+                &rp.headers,
+                !rp.uncompressed,
             ),
             Strat::RubyGems => npm_versions(
                 rp.strategy_url.as_deref().unwrap_or(&rp.url),
@@ -21079,7 +22037,7 @@ mod livecheck {
                 UrlPlan::Run(rp) => rp,
             };
             if debug {
-                debug_url_pre(None, original_url, rp);
+                debug_url_pre(None, original_url, rp, res.spec_inspect.as_deref());
             }
             let (mut versions, final_url) = match run_strat(rp) {
                 Found::Versions(v, fin) => (v, fin),
@@ -21090,7 +22048,7 @@ mod livecheck {
                             original_url,
                             false,
                             res.references.clone(),
-                            res.spec_defined,
+                            res.spec_inspect.clone(),
                         );
                     }
                     // Strategy messages go to stdout in text
@@ -21119,16 +22077,19 @@ mod livecheck {
                             final_url: None,
                             strategy: strat_name(rp.strat),
                             strategies: rp.candidates.clone(),
-                            regex_inspect: if rp.strat == Strat::Git && !res.spec_defined {
+                            regex_inspect: if rp.strat == Strat::Git && res.spec_inspect.is_none() {
                                 None
                             } else {
                                 rp.re.as_ref().map(regex_inspect)
                             },
                             ua_option: rp.ua_option.clone(),
+                            post_form: rp.post_form.clone(),
+                            post_json: rp.post_json.clone(),
+                            header: (!rp.headers.is_empty()).then(|| rp.headers.clone()),
                             throttle: None,
                             throttle_days: None,
                         };
-                        debug_url_post(&raised_meta, res.spec_defined);
+                        debug_url_post(&raised_meta, res.spec_inspect.as_deref());
                     }
                     return err(vec![msg]);
                 }
@@ -21149,12 +22110,15 @@ mod livecheck {
                     .filter(|f| *f != rp.url && rp.strategy_url.as_deref() != Some(f.as_str())),
                 strategy: strat_name(rp.strat),
                 strategies: rp.candidates.clone(),
-                regex_inspect: if rp.strat == Strat::Git && !res.spec_defined {
+                regex_inspect: if rp.strat == Strat::Git && res.spec_inspect.is_none() {
                     None
                 } else {
                     rp.re.as_ref().map(regex_inspect)
                 },
                 ua_option: rp.ua_option.clone(),
+                post_form: rp.post_form.clone(),
+                post_json: rp.post_json.clone(),
+                header: (!rp.headers.is_empty()).then(|| rp.headers.clone()),
                 throttle: None,
                 throttle_days: None,
             };
@@ -21162,12 +22126,12 @@ mod livecheck {
                 // A failed URL's debug block still gets
                 // its closing lines (final URL, regex).
                 if debug {
-                    debug_url_post(&meta, res.spec_defined);
+                    debug_url_post(&meta, res.spec_inspect.as_deref());
                 }
                 continue;
             };
             if debug {
-                debug_url_post(&meta, res.spec_defined);
+                debug_url_post(&meta, res.spec_inspect.as_deref());
                 puts_line(&format!(
                     "\nMatched Versions:\n{}",
                     debug_matched(&versions)
@@ -21207,6 +22171,7 @@ mod livecheck {
         }
         let mut last_messages: Option<Vec<String>> = None;
         let mut first_run = true;
+        let spec_inspect = spec_regex_inspect(pkg.spec.as_ref(), &pkg.current, pkg.is_cask);
         for (original_url, plan) in plans {
             let rp = match plan {
                 UrlPlan::SkipUrl => continue,
@@ -21224,7 +22189,7 @@ mod livecheck {
                 } else {
                     None
                 };
-                debug_url_pre(symbol, original_url, rp);
+                debug_url_pre(symbol, original_url, rp, spec_inspect.as_deref());
             }
             first_run = false;
             let found = run_strat(rp);
@@ -21237,7 +22202,7 @@ mod livecheck {
                             original_url,
                             pkg.head_only,
                             Vec::new(),
-                            pkg.spec.as_ref().is_some_and(|s| s.regex.is_some()),
+                            spec_inspect.clone(),
                         );
                     }
                     if !json {
@@ -21264,21 +22229,19 @@ mod livecheck {
                             final_url: None,
                             strategy: strat_name(rp.strat),
                             strategies: rp.candidates.clone(),
-                            regex_inspect: if rp.strat == Strat::Git
-                                && !pkg.spec.as_ref().is_some_and(|s| s.regex.is_some())
-                            {
+                            regex_inspect: if rp.strat == Strat::Git && spec_inspect.is_none() {
                                 None
                             } else {
                                 rp.re.as_ref().map(regex_inspect)
                             },
                             ua_option: rp.ua_option.clone(),
+                            post_form: rp.post_form.clone(),
+                            post_json: rp.post_json.clone(),
+                            header: (!rp.headers.is_empty()).then(|| rp.headers.clone()),
                             throttle: None,
                             throttle_days: None,
                         };
-                        debug_url_post(
-                            &raised_meta,
-                            pkg.spec.as_ref().is_some_and(|s| s.regex.is_some()),
-                        );
+                        debug_url_post(&raised_meta, spec_inspect.as_deref());
                     }
                     return Outcome::RaisedErrored(vec![msg.clone()], msg, Vec::new());
                 }
@@ -21304,21 +22267,19 @@ mod livecheck {
                         }),
                         strategy: strat_name(rp.strat),
                         strategies: rp.candidates.clone(),
-                        regex_inspect: if rp.strat == Strat::Git
-                            && !pkg.spec.as_ref().is_some_and(|s| s.regex.is_some())
-                        {
+                        regex_inspect: if rp.strat == Strat::Git && spec_inspect.is_none() {
                             None
                         } else {
                             rp.re.as_ref().map(regex_inspect)
                         },
                         ua_option: rp.ua_option.clone(),
+                        post_form: rp.post_form.clone(),
+                        post_json: rp.post_json.clone(),
+                        header: (!rp.headers.is_empty()).then(|| rp.headers.clone()),
                         throttle: None,
                         throttle_days: None,
                     };
-                    debug_url_post(
-                        &empty_meta,
-                        pkg.spec.as_ref().is_some_and(|s| s.regex.is_some()),
-                    );
+                    debug_url_post(&empty_meta, spec_inspect.as_deref());
                 }
                 continue;
             }
@@ -21386,19 +22347,20 @@ mod livecheck {
                 // Git's built-in tag pattern is not reported;
                 // a spec regex (and other strategies' defaults)
                 // are.
-                regex_inspect: if rp.strat == Strat::Git
-                    && !pkg.spec.as_ref().is_some_and(|s| s.regex.is_some())
-                {
+                regex_inspect: if rp.strat == Strat::Git && spec_inspect.is_none() {
                     None
                 } else {
                     rp.re.as_ref().map(regex_inspect)
                 },
                 ua_option: rp.ua_option.clone(),
+                post_form: rp.post_form.clone(),
+                post_json: rp.post_json.clone(),
+                header: (!rp.headers.is_empty()).then(|| rp.headers.clone()),
                 throttle: pkg.spec.as_ref().and_then(|s| s.throttle),
                 throttle_days: pkg.spec.as_ref().and_then(|s| s.throttle_days),
             };
             if debug {
-                debug_url_post(&meta, pkg.spec.as_ref().is_some_and(|s| s.regex.is_some()));
+                debug_url_post(&meta, spec_inspect.as_deref());
                 puts_line(&format!("\nMatched Versions:\n{}", debug_matched(&matched)));
                 if throttled_set {
                     println!("\nMatched Throttled Versions:");
@@ -21639,20 +22601,144 @@ mod livecheck {
     /// user agent (the deprecated fallback, warning once).
     /// (body, final URL after redirects)
     fn page_get(url: &str, spec_ua: Option<&str>) -> Result<(String, String), Vec<String>> {
+        page_fetch(url, spec_ua, None, &[], true)
+    }
+
+    /// Ruby `URI.encode_www_form`: alphanumerics and
+    /// `*-._` pass, space is `+`, the rest `%XX`.
+    fn www_form_encode(pairs: &[(String, String)]) -> String {
+        fn enc(s: &str, out: &mut String) {
+            for b in s.bytes() {
+                match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => {
+                        out.push(b as char)
+                    }
+                    b' ' => out.push('+'),
+                    _ => out.push_str(&format!("%{b:02X}")),
+                }
+            }
+        }
+        let mut out = String::new();
+        for (i, (k, v)) in pairs.iter().enumerate() {
+            if i > 0 {
+                out.push('&');
+            }
+            enc(k, &mut out);
+            out.push('=');
+            enc(v, &mut out);
+        }
+        out
+    }
+
+    /// Ruby `Hash#inspect` of a generated-JSON
+    /// value (the debug `post_json:` rendering).
+    fn ruby_inspect_json_text(json: &str) -> String {
+        fn render(v: &aterm_json::Value) -> String {
+            if let Some(s) = v.as_str() {
+                let mut out = String::from("\"");
+                let mut chars = s.chars().peekable();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => out.push_str("\\\""),
+                        '\\' => out.push_str("\\\\"),
+                        '\n' => out.push_str("\\n"),
+                        '\r' => out.push_str("\\r"),
+                        '\t' => out.push_str("\\t"),
+                        '#' if matches!(chars.peek(), Some('{' | '@' | '$')) => out.push_str("\\#"),
+                        c => out.push(c),
+                    }
+                }
+                out.push('"');
+                return out;
+            }
+            if v.is_null() {
+                return "nil".to_string();
+            }
+            if let Some(b) = v.as_bool() {
+                return b.to_string();
+            }
+            if let Some(i) = v.as_i64() {
+                return i.to_string();
+            }
+            if let Some(f) = v.as_f64() {
+                return if f.fract() == 0.0 && f.is_finite() {
+                    format!("{f:.1}")
+                } else {
+                    f.to_string()
+                };
+            }
+            if let Some(arr) = v.as_array() {
+                let items: Vec<String> = arr.iter().map(render).collect();
+                return format!("[{}]", items.join(", "));
+            }
+            if let Some(obj) = v.as_object() {
+                let items: Vec<String> = obj
+                    .iter()
+                    .map(|(k, val)| {
+                        let symbol = !k.is_empty()
+                            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            && !k.chars().next().unwrap().is_ascii_digit();
+                        if symbol {
+                            format!("{k}: {}", render(val))
+                        } else {
+                            format!("\"{k}\": {}", render(val))
+                        }
+                    })
+                    .collect();
+                return format!("{{{}}}", items.join(", "));
+            }
+            String::new()
+        }
+        aterm_json::from_slice::<aterm_json::Value>(json.as_bytes())
+            .map(|v| render(&v))
+            .unwrap_or_else(|_| json.to_string())
+    }
+
+    /// A POST body for a livecheck fetch.
+    enum PostData<'a> {
+        Form(&'a [(String, String)]),
+        Json(&'a str),
+        /// `post_json: {}` — a bodyless POST.
+        Empty,
+    }
+
+    fn rp_post<'a>(rp: &'a RunPlan) -> Option<PostData<'a>> {
+        if let Some(form) = &rp.post_form {
+            Some(PostData::Form(form))
+        } else if let Some(json) = &rp.post_json {
+            Some(if json == "{}" {
+                PostData::Empty
+            } else {
+                PostData::Json(json)
+            })
+        } else {
+            None
+        }
+    }
+
+    fn page_fetch(
+        url: &str,
+        spec_ua: Option<&str>,
+        post: Option<&PostData<'_>>,
+        headers: &[String],
+        compressed: bool,
+    ) -> Result<(String, String), Vec<String>> {
         // A spec-chosen agent is the only attempt (no
         // fallback, no warning — probed).
         if let Some(ua) = spec_ua {
-            return page_get_once(url, ua);
+            return page_fetch_once(url, ua, post, headers, compressed);
         }
-        match page_get_once(url, &brew_user_agent()) {
+        match page_fetch_once(url, &brew_user_agent(), post, headers, compressed) {
             Ok(ok) => Ok(ok),
             Err(msgs) => {
                 if msgs.iter().any(|m| m.starts_with("curl:")) {
                     // The oracle warns only when the fallback
                     // actually served the page.
-                    page_get_once(url, &browser_user_agent()).inspect(|_| {
-                        warn_ua_fallback_once();
-                    })
+                    page_fetch_once(url, &browser_user_agent(), post, headers, compressed).inspect(
+                        |_| {
+                            warn_ua_fallback_once();
+                        },
+                    )
                 } else {
                     Err(msgs)
                 }
@@ -21660,26 +22746,71 @@ mod livecheck {
         }
     }
 
-    fn page_get_once(url: &str, ua: &str) -> Result<(String, String), Vec<String>> {
-        let args = [
+    fn page_fetch_once(
+        url: &str,
+        ua: &str,
+        post: Option<&PostData<'_>>,
+        headers: &[String],
+        compressed: bool,
+    ) -> Result<(String, String), Vec<String>> {
+        let mut args: Vec<String> = [
             "--fail-with-body",
             "--location",
             "--max-redirs",
             "10",
             "--silent",
             "--show-error",
-            "--compressed",
             "--connect-timeout",
             "10",
             "--max-time",
             "15",
             "--user-agent",
             ua,
-            "--write-out",
-            "\n<<ABREW_FINAL_URL>>%{url_effective}",
-            "--",
-            url,
-        ];
+        ]
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+        if compressed {
+            args.push("--compressed".to_string());
+        }
+        // The oracle's POST args (`post_args`): form
+        // as `--data <www-form>`, json as `--json
+        // <generated>`, both with an explicit
+        // Content-Length header; an empty json hash
+        // still forces the POST with no body.
+        match post {
+            Some(PostData::Form(pairs)) => {
+                let data = www_form_encode(pairs);
+                args.push("--request".to_string());
+                args.push("POST".to_string());
+                args.push("--header".to_string());
+                args.push(format!("Content-Length: {}", data.len()));
+                args.push("--data".to_string());
+                args.push(data);
+            }
+            Some(PostData::Json(body)) => {
+                args.push("--request".to_string());
+                args.push("POST".to_string());
+                args.push("--header".to_string());
+                args.push(format!("Content-Length: {}", body.len()));
+                args.push("--json".to_string());
+                args.push((*body).to_string());
+            }
+            Some(PostData::Empty) => {
+                args.push("--request".to_string());
+                args.push("POST".to_string());
+            }
+            None => {}
+        }
+        for header in headers {
+            args.push("--header".to_string());
+            args.push(header.clone());
+        }
+        args.push("--write-out".to_string());
+        args.push("\n<<ABREW_FINAL_URL>>%{url_effective}".to_string());
+        args.push("--".to_string());
+        args.push(url.to_string());
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
         match fetch::run_capture("curl", &args) {
             Ok(out) if out.status.success() => {
                 let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -21708,8 +22839,15 @@ mod livecheck {
         }
     }
 
-    fn page_versions(url: &str, re: &LcRegex, ua: Option<&str>) -> Found {
-        match page_get(url, ua) {
+    fn page_versions(
+        url: &str,
+        re: &LcRegex,
+        ua: Option<&str>,
+        post: Option<&PostData<'_>>,
+        headers: &[String],
+        compressed: bool,
+    ) -> Found {
+        match page_fetch(url, ua, post, headers, compressed) {
             Ok((content, fin)) => Found::Versions(scan_versions(re, &content), Some(fin)),
             Err(msgs) => Found::Messages(msgs),
         }
@@ -21724,9 +22862,12 @@ mod livecheck {
         re: &LcRegex,
         ua: Option<&str>,
         block: Option<&super::super::formula::PageBlock>,
+        post: Option<&PostData<'_>>,
+        headers: &[String],
+        compressed: bool,
     ) -> Found {
         let Some(block) = block else {
-            return page_versions(url, re, ua);
+            return page_versions(url, re, ua, post, headers, compressed);
         };
         if let super::super::formula::PageShape::DirWalk(walk) = &block.shape {
             return dirwalk_versions(url, re, ua, walk);
@@ -21744,8 +22885,96 @@ mod livecheck {
             }
             _ => None,
         };
-        match page_get(url, ua) {
+        let hop_re = match &block.shape {
+            super::super::formula::PageShape::HopScan(hop) => match &hop.hop_re {
+                Some((pat, flags)) => match lc_regex(pat, flags) {
+                    Ok(re) => Some(re),
+                    Err(_) => return Found::Versions(Vec::new(), None),
+                },
+                None => None,
+            },
+            _ => None,
+        };
+        match page_fetch(url, ua, post, headers, compressed) {
             Ok((content, fin)) => {
+                // Hop-scan: pick a value from page one,
+                // fetch the page it names, and scan that
+                // instead. A missing/blank hop page is
+                // the block's `next` (no versions).
+                let content = if let super::super::formula::PageShape::HopScan(hop) = &block.shape {
+                    use super::super::formula::{HopPick, HopTarget};
+                    let hre = hop_re.as_ref().unwrap_or(re);
+                    let scan_all = |text: &str| -> Vec<String> {
+                        hre.whole
+                            .find_iter(text)
+                            .filter_map(|m| extract_group(hre, m.as_str()))
+                            .collect()
+                    };
+                    let value = match hop.pick {
+                        HopPick::First => search_group1(hre, &content),
+                        HopPick::ScanLast => scan_all(&content).pop(),
+                        HopPick::ScanMax => scan_all(&content)
+                            .into_iter()
+                            .max_by(|a, b| lc_cmp(false, a, b)),
+                    };
+                    let Some(value) = value.filter(|v| !v.trim().is_empty()) else {
+                        return Found::Versions(Vec::new(), Some(fin));
+                    };
+                    let target = match &hop.target {
+                        HopTarget::JoinLiteral(base) => uri_join(base, &value),
+                        HopTarget::JoinSelf => uri_join(url, &value),
+                        HopTarget::Template(pre, post) => format!("{pre}{value}{post}"),
+                    };
+                    let c2 = match page_get(&target, ua) {
+                        Ok((c2, _)) if !c2.trim().is_empty() => c2,
+                        _ => return Found::Versions(Vec::new(), Some(fin)),
+                    };
+                    // `.flatten&.last`: the final
+                    // capture verbatim (the scan
+                    // loop's dedupe would move it).
+                    if hop.last_only {
+                        let last = re
+                            .whole
+                            .find_iter(&c2)
+                            .filter_map(|m| extract_group(re, m.as_str()))
+                            .last();
+                        return Found::Versions(last.into_iter().collect(), Some(fin));
+                    }
+                    c2
+                } else {
+                    content
+                };
+                // First-capture date: no match is the
+                // block's `next` (no versions); an
+                // unparsable capture is the oracle's
+                // `Date::Error`.
+                // Single-match template: `page.match`
+                // groups over the whole content
+                // (index 0 is the whole match).
+                if let super::super::formula::PageShape::MatchTemplate(parts) = &block.shape {
+                    return match search_groups(re, &content) {
+                        Some(groups) => {
+                            Found::Versions(vec![page_render_parts(parts, &groups)], Some(fin))
+                        }
+                        None => Found::Versions(Vec::new(), Some(fin)),
+                    };
+                }
+                if let super::super::formula::PageShape::FirstDate(dashed) = &block.shape {
+                    return match search_group1(re, &content) {
+                        Some(cap) => match date_ymd(&cap) {
+                            Some(basic) => Found::Versions(
+                                vec![if *dashed && basic.len() == 8 {
+                                    format!("{}-{}-{}", &basic[..4], &basic[4..6], &basic[6..])
+                                } else {
+                                    basic
+                                }],
+                                Some(fin),
+                            ),
+                            None => Found::Raised("invalid date".to_string()),
+                        },
+                        None => Found::Versions(Vec::new(), Some(fin)),
+                    };
+                }
                 let mut out: Vec<String> = Vec::new();
                 for m in re.whole.find_iter(&content) {
                     // Multi-capture shapes take the whole
@@ -21769,6 +22998,23 @@ mod livecheck {
                                 (Some(g0), None) => Some(g0),
                                 _ => None,
                             }
+                        }
+                        super::super::formula::PageShape::ScanCsvOptTr(from, to) => {
+                            let groups = extract_groups(re, m.as_str());
+                            match (
+                                groups.first().cloned().flatten(),
+                                groups.get(1).cloned().flatten(),
+                            ) {
+                                (Some(g0), Some(g1)) => {
+                                    Some(format!("{},{}", ruby_tr(&g0, from, to), g1))
+                                }
+                                (Some(g0), None) => Some(ruby_tr(&g0, from, to)),
+                                _ => None,
+                            }
+                        }
+                        super::super::formula::PageShape::ScanTemplate(parts) => {
+                            let groups = extract_groups(re, m.as_str());
+                            Some(page_render_parts(parts, &groups))
                         }
                         _ => None,
                     };
@@ -21795,18 +23041,37 @@ mod livecheck {
         }
     }
 
-    /// Ruby `String#sub` with a backreference
-    /// template: the first match span replaced by
-    /// the template with `\1`..`\9` = captures,
-    /// `\0` = the whole match, `\\` = a backslash.
-    fn sub_backref_apply(v: &str, tmpl: &str, sub_re: Option<&LcRegex>) -> String {
-        let Some(re) = sub_re else {
-            return v.to_string();
-        };
-        let Some(m) = re.whole.find(v) else {
-            return v.to_string();
-        };
-        let groups = extract_groups(re, m.as_str());
+    /// Render page template parts against one
+    /// match's groups (missing captures interpolate
+    /// empty, as Ruby nil does).
+    fn page_render_parts(
+        parts: &[super::super::formula::PagePart],
+        groups: &[Option<String>],
+    ) -> String {
+        use super::super::formula::PagePart;
+        let mut out = String::new();
+        for part in parts {
+            match part {
+                PagePart::Lit(s) => out.push_str(s),
+                PagePart::Cap(n) => {
+                    if let Some(Some(g)) = groups.get(*n) {
+                        out.push_str(g);
+                    }
+                }
+                PagePart::CapTr(n, from, to) => {
+                    if let Some(Some(g)) = groups.get(*n) {
+                        out.push_str(&ruby_tr(g, from, to));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Render a Ruby replacement template against one
+    /// match: captures, the whole match and a literal
+    /// backslash via backslash-digit/backslash forms.
+    fn render_backref_template(tmpl: &str, whole: &str, groups: &[Option<String>]) -> String {
         let mut rendered = String::new();
         let bytes = tmpl.as_bytes();
         let mut i = 0;
@@ -21814,7 +23079,7 @@ mod livecheck {
             if bytes[i] == b'\\' && i + 1 < bytes.len() {
                 match bytes[i + 1] {
                     b'\\' => rendered.push('\\'),
-                    b'0' => rendered.push_str(m.as_str()),
+                    b'0' => rendered.push_str(whole),
                     d @ b'1'..=b'9' => {
                         if let Some(g) = groups.get((d - b'1') as usize).cloned().flatten() {
                             rendered.push_str(&g);
@@ -21830,11 +23095,64 @@ mod livecheck {
                 i += ch_len;
             }
         }
+        rendered
+    }
+
+    /// Ruby `String#sub` with a backreference
+    /// template: the first match span replaced by
+    /// the rendered template.
+    fn sub_backref_apply(v: &str, tmpl: &str, sub_re: Option<&LcRegex>) -> String {
+        let Some(re) = sub_re else {
+            return v.to_string();
+        };
+        let Some(m) = re.whole.find(v) else {
+            return v.to_string();
+        };
+        let groups = extract_groups(re, m.as_str());
+        let rendered = render_backref_template(tmpl, m.as_str(), &groups);
         let mut out = String::with_capacity(v.len());
         out.push_str(&v[..m.start()]);
         out.push_str(&rendered);
         out.push_str(&v[m.end()..]);
         out
+    }
+
+    /// Ruby `String#gsub` with a regex and a
+    /// backreference template: every match span
+    /// replaced by the rendered template.
+    fn gsub_backref_apply(v: &str, tmpl: &str, re: &LcRegex) -> String {
+        let mut out = String::with_capacity(v.len());
+        let mut last = 0usize;
+        for m in re.whole.find_iter(v) {
+            out.push_str(&v[last..m.start()]);
+            out.push_str(&render_backref_template(
+                tmpl,
+                m.as_str(),
+                &extract_groups(re, m.as_str()),
+            ));
+            last = m.end();
+        }
+        out.push_str(&v[last..]);
+        out
+    }
+
+    /// A reduced `:git` block's transform over one
+    /// tag's regex capture.
+    fn git_op_apply(
+        op: &super::super::formula::GitOp,
+        cap: &str,
+        gsub_re: Option<&LcRegex>,
+    ) -> String {
+        use super::super::formula::GitOp;
+        match op {
+            GitOp::Identity => cap.to_string(),
+            GitOp::Tr(from, to) => ruby_tr(cap, from, to),
+            GitOp::GsubLit(from, to) => cap.replace(from.as_str(), to),
+            GitOp::GsubRe(_, _, tmpl) => match gsub_re {
+                Some(re) => gsub_backref_apply(cap, tmpl, re),
+                None => cap.to_string(),
+            },
+        }
     }
 
     /// Ruby `URI.join` for the tap's relative forms:
@@ -21994,6 +23312,9 @@ mod livecheck {
                 }))
             }
             PageShape::ScanRejectEq(lit) => Ok((v != lit.as_str()).then(|| v.to_string())),
+            PageShape::ScanSelectLt(bound) => {
+                Ok((lc_cmp(false, v, bound) == std::cmp::Ordering::Less).then(|| v.to_string()))
+            }
             PageShape::ScanSubBackref(_, _, tmpl) => Ok(Some(sub_backref_apply(v, tmpl, sub_re))),
             PageShape::ScanTrSubBackref(from, to, _, _, tmpl) => {
                 Ok(Some(sub_backref_apply(&ruby_tr(v, from, to), tmpl, sub_re)))
@@ -22017,19 +23338,26 @@ mod livecheck {
             }
             // Multi-capture shapes are applied in the
             // scan loop, never per single capture.
-            PageShape::ScanJoin(_) | PageShape::ScanCsvOpt | PageShape::DirWalk(_) => {
-                Ok(Some(v.to_string()))
-            }
+            PageShape::ScanJoin(_)
+            | PageShape::ScanCsvOpt
+            | PageShape::ScanCsvOptTr(..)
+            | PageShape::ScanTemplate(_)
+            | PageShape::MatchTemplate(_)
+            | PageShape::DirWalk(_)
+            | PageShape::HopScan(_)
+            | PageShape::FirstDate(_) => Ok(Some(v.to_string())),
         }
     }
 
     /// Ruby `Date.parse(s).strftime("%Y%m%d")` for the
-    /// month-name forms the tap regexes capture
-    /// (`09Mar2016`, `March 9, 2016`): tokens split on
-    /// separators and letter/digit boundaries; one
-    /// month name (3+ letter prefix), one 4-digit
-    /// year, one 1-2 digit day, calendar-validated.
-    /// Anything else is the oracle's `Date::Error`.
+    /// forms the tap regexes capture: month-name
+    /// (`09Mar2016`, `March 9, 2016`) and all-numeric
+    /// (`2016-03-09`, `9-3-2016` day-first, `97/11/13`
+    /// two-digit-year-first with the 69 pivot,
+    /// `20160309`/`970313` compact). Tokens split on
+    /// separators and letter/digit boundaries;
+    /// calendar-validated. Anything else is the
+    /// oracle's `Date::Error`.
     fn date_ymd(s: &str) -> Option<String> {
         let mut toks: Vec<String> = Vec::new();
         let mut cur = String::new();
@@ -22066,25 +23394,68 @@ mod livecheck {
             "december",
         ];
         let (mut month, mut day, mut year) = (None, None, None);
-        for t in &toks {
-            if t.bytes().all(|b| b.is_ascii_alphabetic()) {
-                let lt = t.to_ascii_lowercase();
-                let m = MONTHS
-                    .iter()
-                    .position(|full| lt.len() >= 3 && full.starts_with(&lt))?;
-                if month.replace(m as u32 + 1).is_some() {
+        // All-numeric forms (oracle-pinned): a 4-digit
+        // token is the year (first: Y/M/D; last: D/M/Y);
+        // three short tokens are two-digit-year first
+        // (pivot 69: 00-68 -> 2000s, 69-99 -> 1900s);
+        // one token is compact YYYYMMDD or YYMMDD.
+        if toks.iter().all(|t| t.bytes().all(|b| b.is_ascii_digit())) {
+            let num = |t: &String| t.parse::<u32>().ok();
+            let short_year = |yy: u32| if yy <= 68 { 2000 + yy } else { 1900 + yy };
+            let parts: Option<(u32, u32, u32)> = match toks.len() {
+                1 => {
+                    let t = &toks[0];
+                    match t.len() {
+                        8 => Some((
+                            num(&t[..4].to_string())?,
+                            num(&t[4..6].to_string())?,
+                            num(&t[6..].to_string())?,
+                        )),
+                        6 => Some((
+                            short_year(num(&t[..2].to_string())?),
+                            num(&t[2..4].to_string())?,
+                            num(&t[4..].to_string())?,
+                        )),
+                        _ => None,
+                    }
+                }
+                3 if toks[0].len() == 4 && toks[1].len() <= 2 && toks[2].len() <= 2 => {
+                    Some((num(&toks[0])?, num(&toks[1])?, num(&toks[2])?))
+                }
+                3 if toks[2].len() == 4 && toks[0].len() <= 2 && toks[1].len() <= 2 => {
+                    Some((num(&toks[2])?, num(&toks[1])?, num(&toks[0])?))
+                }
+                3 if toks.iter().all(|t| t.len() <= 2) => {
+                    Some((short_year(num(&toks[0])?), num(&toks[1])?, num(&toks[2])?))
+                }
+                _ => None,
+            };
+            let (y, m, d) = parts?;
+            year = Some(y);
+            month = Some(m);
+            day = Some(d);
+        }
+        if year.is_none() {
+            for t in &toks {
+                if t.bytes().all(|b| b.is_ascii_alphabetic()) {
+                    let lt = t.to_ascii_lowercase();
+                    let m = MONTHS
+                        .iter()
+                        .position(|full| lt.len() >= 3 && full.starts_with(&lt))?;
+                    if month.replace(m as u32 + 1).is_some() {
+                        return None;
+                    }
+                } else if t.len() == 4 {
+                    if year.replace(t.parse::<u32>().ok()?).is_some() {
+                        return None;
+                    }
+                } else if t.len() <= 2 {
+                    if day.replace(t.parse::<u32>().ok()?).is_some() {
+                        return None;
+                    }
+                } else {
                     return None;
                 }
-            } else if t.len() == 4 {
-                if year.replace(t.parse::<u32>().ok()?).is_some() {
-                    return None;
-                }
-            } else if t.len() <= 2 {
-                if day.replace(t.parse::<u32>().ok()?).is_some() {
-                    return None;
-                }
-            } else {
-                return None;
             }
         }
         let (y, m, d) = (year?, month?, day?);
@@ -22219,7 +23590,510 @@ mod livecheck {
             JsonCond::DowncaseIncludes(name, lit) => field(name)
                 .and_then(|v| v.as_str())
                 .is_some_and(|s| s.to_lowercase().contains(lit.as_str())),
+            JsonCond::Includes(name, lit) => field(name)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains(lit.as_str())),
+            JsonCond::MatchLit(name, lit) => field(name)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains(lit.as_str())),
+            JsonCond::NoneMatch(name, inner) => {
+                let Some(re) = &rp.re else {
+                    return true;
+                };
+                !matches!(field(name).and_then(|v| v.as_array()), Some(items) if items
+                .iter()
+                .any(|el| {
+                    el.get(inner.as_str())
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| re.whole.find(s).is_some())
+                }))
+            }
         }
+    }
+
+    /// The document-order keys of the JSON object at
+    /// `path` in raw `content` (the parsed `Value` map
+    /// sorts keys; Ruby hashes keep document order).
+    /// A small token walker: strings (with escapes),
+    /// containers, scalars. `None` on any shape
+    /// surprise — callers fall back to map order.
+    fn json_object_key_order(
+        content: &str,
+        path: &[super::super::formula::JsonKey],
+    ) -> Option<Vec<String>> {
+        use super::super::formula::JsonKey;
+        let bytes = content.as_bytes();
+        fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            i
+        }
+        fn scan_string(bytes: &[u8], mut i: usize) -> Option<(String, usize)> {
+            if bytes.get(i) != Some(&b'"') {
+                return None;
+            }
+            i += 1;
+            let mut out = String::new();
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'"' => return Some((out, i + 1)),
+                    b'\\' => {
+                        i += 1;
+                        match *bytes.get(i)? {
+                            b'"' => out.push('"'),
+                            b'\\' => out.push('\\'),
+                            b'/' => out.push('/'),
+                            b'b' => out.push('\u{8}'),
+                            b'f' => out.push('\u{c}'),
+                            b'n' => out.push('\n'),
+                            b'r' => out.push('\r'),
+                            b't' => out.push('\t'),
+                            b'u' => {
+                                let hex = std::str::from_utf8(bytes.get(i + 1..i + 5)?).ok()?;
+                                let cp = u32::from_str_radix(hex, 16).ok()?;
+                                out.push(char::from_u32(cp)?);
+                                i += 4;
+                            }
+                            _ => return None,
+                        }
+                        i += 1;
+                    }
+                    _ => {
+                        let ch_len = content_char_len(bytes, i)?;
+                        out.push_str(std::str::from_utf8(&bytes[i..i + ch_len]).ok()?);
+                        i += ch_len;
+                    }
+                }
+            }
+            None
+        }
+        fn content_char_len(bytes: &[u8], i: usize) -> Option<usize> {
+            let b = *bytes.get(i)?;
+            Some(match b {
+                0x00..=0x7F => 1,
+                0xC0..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                0xF0..=0xF7 => 4,
+                _ => return None,
+            })
+        }
+        fn skip_value(bytes: &[u8], mut i: usize) -> Option<usize> {
+            i = skip_ws(bytes, i);
+            match *bytes.get(i)? {
+                b'"' => scan_string(bytes, i).map(|(_, next)| next),
+                b'{' | b'[' => {
+                    let mut depth = 0usize;
+                    while i < bytes.len() {
+                        match bytes[i] {
+                            b'"' => {
+                                i = scan_string(bytes, i)?.1;
+                                continue;
+                            }
+                            b'{' | b'[' => depth += 1,
+                            b'}' | b']' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    return Some(i + 1);
+                                }
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    None
+                }
+                _ => {
+                    while i < bytes.len()
+                        && !matches!(bytes[i], b',' | b'}' | b']')
+                        && !bytes[i].is_ascii_whitespace()
+                    {
+                        i += 1;
+                    }
+                    Some(i)
+                }
+            }
+        }
+        // Object member keys at `i` (which points at
+        // `{`), optionally descending into `want`'s
+        // value. Returns (keys, value offset of want).
+        fn object_members(
+            bytes: &[u8],
+            mut i: usize,
+            want: Option<&str>,
+        ) -> Option<(Vec<String>, Option<usize>)> {
+            if bytes.get(i) != Some(&b'{') {
+                return None;
+            }
+            i += 1;
+            let mut keys = Vec::new();
+            let mut found = None;
+            loop {
+                i = skip_ws(bytes, i);
+                if bytes.get(i) == Some(&b'}') {
+                    return Some((keys, found));
+                }
+                let (key, next) = scan_string(bytes, i)?;
+                i = skip_ws(bytes, next);
+                if bytes.get(i) != Some(&b':') {
+                    return None;
+                }
+                i = skip_ws(bytes, i + 1);
+                if want == Some(key.as_str()) {
+                    found = Some(i);
+                }
+                keys.push(key);
+                i = skip_value(bytes, i)?;
+                i = skip_ws(bytes, i);
+                match bytes.get(i) {
+                    Some(b',') => i += 1,
+                    Some(b'}') => return Some((keys, found)),
+                    _ => return None,
+                }
+            }
+        }
+        let mut pos = skip_ws(bytes, 0);
+        for (depth, key) in path.iter().enumerate() {
+            match key {
+                JsonKey::Key(name) => {
+                    let (keys, next) = object_members(bytes, pos, Some(name))?;
+                    if depth + 1 == path.len() {
+                        // `name` is the last step: we need
+                        // the keys of its value, not this
+                        // object's.
+                        let value_pos = next?;
+                        let (inner, _) = object_members(bytes, skip_ws(bytes, value_pos), None)?;
+                        return Some(inner);
+                    }
+                    let _ = keys;
+                    pos = skip_ws(bytes, next?);
+                }
+                JsonKey::Idx(idx) => {
+                    if bytes.get(pos) != Some(&b'[') {
+                        return None;
+                    }
+                    let mut i = pos + 1;
+                    for _ in 0..*idx {
+                        i = skip_value(bytes, i)?;
+                        i = skip_ws(bytes, i);
+                        if bytes.get(i) != Some(&b',') {
+                            return None;
+                        }
+                        i += 1;
+                    }
+                    pos = skip_ws(bytes, i);
+                }
+            }
+        }
+        // Empty path: the root object's keys.
+        let (keys, _) = object_members(bytes, pos, None)?;
+        Some(keys)
+    }
+
+    /// Walk a dig path from a JSON base value.
+    fn json_dig_path<'a>(
+        mut v: &'a aterm_json::Value,
+        path: &[super::super::formula::JsonKey],
+    ) -> Option<&'a aterm_json::Value> {
+        use super::super::formula::JsonKey;
+        for k in path {
+            v = match k {
+                JsonKey::Key(name) => v.get(name)?,
+                JsonKey::Idx(i) => v.as_array()?.get(*i)?,
+            };
+        }
+        Some(v)
+    }
+
+    /// Ruby interpolation of a JSON scalar (`to_s`):
+    /// containers have no version text here.
+    fn json_interp(v: &aterm_json::Value) -> Option<String> {
+        if let Some(s) = v.as_str() {
+            return Some(s.to_string());
+        }
+        if v.is_null() {
+            return Some(String::new());
+        }
+        if let Some(b) = v.as_bool() {
+            return Some(b.to_string());
+        }
+        if let Some(i) = v.as_i64() {
+            return Some(i.to_string());
+        }
+        if let Some(f) = v.as_f64() {
+            return Some(if f.fract() == 0.0 && f.is_finite() {
+                format!("{f:.1}")
+            } else {
+                f.to_string()
+            });
+        }
+        None
+    }
+
+    /// A scalar as a block return candidate: the
+    /// oracle raises its type error on non-string
+    /// scalars without a `to_s` tail.
+    fn json_scalar_ret(v: &aterm_json::Value) -> Result<Option<String>, Found> {
+        match v.as_str() {
+            Some(s) => Ok(Some(s.to_string())),
+            None => {
+                if v.is_null() || v.is_array() || v.is_object() {
+                    Ok(None)
+                } else {
+                    Err(Found::Raised(
+                        "Return value of a strategy block must be a string or array of strings."
+                            .to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn json_apply_tail(s: &str, tail: &super::super::formula::JsonTail) -> String {
+        use super::super::formula::JsonTail;
+        match tail {
+            JsonTail::None | JsonTail::ToS => s.to_string(),
+            JsonTail::Tr(from, to) => ruby_tr(s, from, to),
+            JsonTail::Sub(from, to) => s.replacen(from.as_str(), to, 1),
+            JsonTail::DeletePrefix(p) => s
+                .strip_prefix(p.as_str())
+                .map_or_else(|| s.to_string(), str::to_string),
+            JsonTail::DeleteSuffix(p) => s
+                .strip_suffix(p.as_str())
+                .map_or_else(|| s.to_string(), str::to_string),
+            JsonTail::DeleteChars(cs) => s.chars().filter(|c| !cs.contains(*c)).collect(),
+        }
+    }
+
+    /// One base value through a reduced json
+    /// template body.
+    fn json_template_one(
+        tmpl: &super::super::formula::JsonTemplate,
+        base: &aterm_json::Value,
+        rp: &RunPlan,
+        lit_res: &[Option<LcRegex>],
+    ) -> Result<Option<String>, Found> {
+        use super::super::formula::{JsonLocal, JsonPart, JsonRender, JsonTail, JsonValue};
+        if tmpl
+            .guards
+            .iter()
+            .any(|g| eval_json_cond(&g.cond, base, rp) != g.unless)
+        {
+            return Ok(None);
+        }
+        // Locals as raw values (interpolation
+        // stringifies on render).
+        let mut locals: Vec<Option<aterm_json::Value>> = Vec::new();
+        for (i, local) in tmpl.locals.iter().enumerate() {
+            let value = match local {
+                JsonLocal::Dig(path) => json_dig_path(base, path).cloned(),
+                JsonLocal::DigSplit(path, sep, idx) => json_dig_path(base, path)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.split(sep.as_str()).nth(*idx))
+                    .map(|s| aterm_json::Value::String(s.to_string())),
+                JsonLocal::DigCapture(path) => {
+                    let Some(s) = json_dig_path(base, path).and_then(|v| v.as_str()) else {
+                        locals.push(None);
+                        continue;
+                    };
+                    let Some(re) = &rp.re else {
+                        return Err(Found::Raised(
+                            "no implicit conversion from nil to integer".to_string(),
+                        ));
+                    };
+                    search_group1(re, s).map(aterm_json::Value::String)
+                }
+                JsonLocal::DigTail(path, tail) => json_dig_path(base, path)
+                    .and_then(|v| v.as_str())
+                    .map(|v| aterm_json::Value::String(json_apply_tail(v, tail))),
+                JsonLocal::DigSubRe(path, _pat, _flags, tmpl) => json_dig_path(base, path)
+                    .and_then(|v| v.as_str())
+                    .and_then(|text| {
+                        let lit = lit_res.get(i).and_then(Option::as_ref)?;
+                        let m = lit.whole.find(text)?;
+                        Some(aterm_json::Value::String(format!(
+                            "{}{}{}",
+                            &text[..m.start()],
+                            render_backref_template(
+                                tmpl,
+                                m.as_str(),
+                                &extract_groups(lit, m.as_str())
+                            ),
+                            &text[m.end()..]
+                        )))
+                    }),
+                JsonLocal::DigOr(paths) => paths
+                    .iter()
+                    .find_map(|p| json_dig_path(base, p).filter(|v| !v.is_null()))
+                    .cloned(),
+                JsonLocal::DigCaptureLit(path, ..) => {
+                    let s = json_dig_path(base, path).and_then(|v| v.as_str());
+                    match (s, lit_res.get(i).and_then(Option::as_ref)) {
+                        (Some(s), Some(re)) => search_group1(re, s).map(aterm_json::Value::String),
+                        _ => None,
+                    }
+                }
+            };
+            locals.push(value);
+        }
+        let blank = |v: &Option<aterm_json::Value>| match v {
+            None => true,
+            Some(v) => v.is_null() || v.as_str().is_some_and(|s| s.trim().is_empty()),
+        };
+        if tmpl.require.iter().any(|i| blank(&locals[*i])) {
+            return Ok(None);
+        }
+        if let Some(i) = tmpl.local_match_guard {
+            let Some(re) = &rp.re else {
+                return Ok(None);
+            };
+            let matched = locals[i]
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| re.whole.is_match(s));
+            if !matched {
+                return Ok(None);
+            }
+        }
+        let groups: Option<Vec<Option<String>>> = match &tmpl.match_src {
+            Some(path) => {
+                let Some(re) = &rp.re else {
+                    return Err(Found::Raised(
+                        "no implicit conversion from nil to integer".to_string(),
+                    ));
+                };
+                match json_dig_path(base, path).and_then(|v| v.as_str()) {
+                    Some(s) => match search_groups(re, s) {
+                        Some(g) => Some(g),
+                        None => return Ok(None),
+                    },
+                    None => return Ok(None),
+                }
+            }
+            None => None,
+        };
+        let cap = |n: usize| -> String {
+            groups
+                .as_ref()
+                .and_then(|g| g.get(n))
+                .cloned()
+                .flatten()
+                .unwrap_or_default()
+        };
+        match &tmpl.render {
+            JsonRender::Template(parts) => {
+                let mut out = String::new();
+                for part in parts {
+                    match part {
+                        JsonPart::Lit(s) => out.push_str(s),
+                        JsonPart::Cap(n) => out.push_str(&cap(*n)),
+                        JsonPart::Local(i) => {
+                            if let Some(Some(v)) = locals.get(*i)
+                                && let Some(s) = json_interp(v)
+                            {
+                                out.push_str(&s);
+                            }
+                        }
+                        JsonPart::Field(k) => {
+                            if let Some(v) = base.get(k)
+                                && let Some(s) = json_interp(v)
+                            {
+                                out.push_str(&s);
+                            }
+                        }
+                    }
+                }
+                Ok(Some(out))
+            }
+            JsonRender::Value(value, tail) => {
+                let raw: Option<aterm_json::Value> = match value {
+                    JsonValue::LocalCapture(i) => {
+                        let text = locals
+                            .get(*i)
+                            .cloned()
+                            .flatten()
+                            .and_then(|v| v.as_str().map(str::to_string));
+                        match (text, &rp.re) {
+                            (Some(t), Some(re)) => {
+                                search_group1(re, &t).map(aterm_json::Value::String)
+                            }
+                            _ => None,
+                        }
+                    }
+                    JsonValue::Local(i) => locals.get(*i).cloned().flatten(),
+                    JsonValue::Cap(n) => {
+                        let s = cap(*n);
+                        let present = groups
+                            .as_ref()
+                            .and_then(|g| g.get(*n))
+                            .is_some_and(Option::is_some);
+                        present.then_some(aterm_json::Value::String(s))
+                    }
+                    JsonValue::Field(k) => base.get(k).cloned(),
+                };
+                let Some(raw) = raw else {
+                    return Ok(None);
+                };
+                let s = if *tail == JsonTail::ToS {
+                    match json_interp(&raw) {
+                        Some(s) => s,
+                        None => return Ok(None),
+                    }
+                } else {
+                    match json_scalar_ret(&raw)? {
+                        Some(s) => s,
+                        None => return Ok(None),
+                    }
+                };
+                Ok(Some(match tail {
+                    JsonTail::None | JsonTail::ToS => s,
+                    JsonTail::Tr(from, to) => ruby_tr(&s, from, to),
+                    JsonTail::Sub(from, to) => s.replacen(from.as_str(), to, 1),
+                    JsonTail::DeletePrefix(p) => {
+                        s.strip_prefix(p.as_str()).map_or(s.clone(), str::to_string)
+                    }
+                    JsonTail::DeleteSuffix(p) => {
+                        s.strip_suffix(p.as_str()).map_or(s.clone(), str::to_string)
+                    }
+                    JsonTail::DeleteChars(cs) => s.chars().filter(|c| !cs.contains(*c)).collect(),
+                }))
+            }
+        }
+    }
+
+    /// All versions of a reduced json template body.
+    fn json_template_versions(
+        tmpl: &super::super::formula::JsonTemplate,
+        root: &aterm_json::Value,
+        rp: &RunPlan,
+    ) -> Result<Vec<String>, Found> {
+        use super::super::formula::JsonLocal;
+        // Literal local regexes were compile-checked
+        // at plan time; rebuild them.
+        let lit_res: Vec<Option<LcRegex>> =
+            tmpl.locals
+                .iter()
+                .map(|l| match l {
+                    JsonLocal::DigCaptureLit(_, pat, flags)
+                    | JsonLocal::DigSubRe(_, pat, flags, _) => lc_regex(pat, flags).ok(),
+                    _ => None,
+                })
+                .collect();
+        let mut out = Vec::new();
+        if tmpl.map {
+            if let Some(items) = json_dig_path(root, &tmpl.path).and_then(|v| v.as_array()) {
+                for item in items {
+                    if let Some(v) = json_template_one(tmpl, item, rp, &lit_res)? {
+                        out.push(v);
+                    }
+                }
+            }
+        } else if let Some(base) = json_dig_path(root, &tmpl.path)
+            && let Some(v) = json_template_one(tmpl, base, rp, &lit_res)?
+        {
+            out.push(v);
+        }
+        Ok(out)
     }
 
     fn json_versions(rp: &RunPlan) -> Found {
@@ -22227,12 +24101,47 @@ mod livecheck {
         let Some(block) = &rp.json else {
             return Found::Versions(Vec::new(), None);
         };
-        let (content, fin) = match page_get(&rp.url, rp.ua.as_deref()) {
+        let (content, fin) = match page_fetch(
+            &rp.url,
+            rp.ua.as_deref(),
+            rp_post(rp).as_ref(),
+            &rp.headers,
+            !rp.uncompressed,
+        ) {
             Ok(ok) => ok,
             Err(msgs) => return Found::Messages(msgs),
         };
         let Ok(root) = aterm_json::from_slice::<aterm_json::Value>(content.as_bytes()) else {
             return Found::Raised("Content could not be parsed as JSON.".to_string());
+        };
+        // Literal projection regexes were
+        // compile-checked at plan time; rebuild them.
+        let shape_guard = match &block.shape {
+            JsonShape::MapGuarded(_, guard) => Some(guard),
+            JsonShape::ValuesMap(_, _, guard) => Some(guard),
+            _ => None,
+        };
+        let lit_re = match shape_guard {
+            Some(guard) => match &guard.capture {
+                super::super::formula::MapCapture::Literal(pat, flags) => {
+                    match lc_regex(pat, flags) {
+                        Ok(re) => Some(re),
+                        Err(_) => return Found::Versions(Vec::new(), Some(fin)),
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let sub_re = match shape_guard {
+            Some(guard) => match &guard.sub {
+                Some((pat, flags, _)) => match lc_regex(pat, flags) {
+                    Ok(re) => Some(re),
+                    Err(_) => return Found::Versions(Vec::new(), Some(fin)),
+                },
+                None => None,
+            },
+            _ => None,
         };
         fn dig<'a>(
             mut v: &'a aterm_json::Value,
@@ -22273,6 +24182,52 @@ mod livecheck {
                 )),
             }
         };
+        // One guarded-map item: guards, projection,
+        // capture, then the `tr`/`sub` chain. `None`
+        // is the block's `next`/nil (compacted away).
+        fn apply_json_guard(
+            guard: &super::super::formula::MapGuard,
+            item: &aterm_json::Value,
+            rp: &RunPlan,
+            regex_capture: &impl Fn(&str) -> Result<Option<String>, Found>,
+            lit_re: Option<&LcRegex>,
+            sub_re: Option<&LcRegex>,
+        ) -> Result<Option<String>, Found> {
+            if guard
+                .guards
+                .iter()
+                .any(|g| eval_json_cond(&g.cond, item, rp) != g.unless)
+            {
+                return Ok(None);
+            }
+            let v = match &guard.item_key {
+                Some(k) => item.get(k.as_str()),
+                None => Some(item),
+            };
+            let Some(v) = v else {
+                return Ok(None);
+            };
+            let Some(s) = scalar(v)? else {
+                return Ok(None);
+            };
+            let proj = match &guard.capture {
+                super::super::formula::MapCapture::None => Some(s),
+                super::super::formula::MapCapture::BlockRegex => regex_capture(&s)?,
+                super::super::formula::MapCapture::Literal(..) => {
+                    lit_re.and_then(|re| search_group1(re, &s))
+                }
+            };
+            Ok(proj.map(|v| {
+                let v = match &guard.tr {
+                    Some((from, to)) => ruby_tr(&v, from, to),
+                    None => v,
+                };
+                match &guard.sub {
+                    Some((_, _, tmpl)) => sub_backref_apply(&v, tmpl, sub_re),
+                    None => v,
+                }
+            }))
+        }
         let versions: Result<Vec<String>, Found> = (|| {
             let mut out: Vec<String> = Vec::new();
             match &block.shape {
@@ -22333,25 +24288,47 @@ mod livecheck {
                 JsonShape::MapGuarded(path, guard) => {
                     if let Some(items) = dig(&root, path).and_then(|v| v.as_array()) {
                         for item in items {
-                            if guard
-                                .guards
-                                .iter()
-                                .any(|g| eval_json_cond(&g.cond, item, rp) != g.unless)
-                            {
-                                continue;
+                            if let Some(v) = apply_json_guard(
+                                guard,
+                                item,
+                                rp,
+                                &regex_capture,
+                                lit_re.as_ref(),
+                                sub_re.as_ref(),
+                            )? {
+                                out.push(v);
                             }
-                            let v = match &guard.item_key {
-                                Some(k) => item.get(k.as_str()),
-                                None => Some(item),
+                        }
+                    }
+                }
+                JsonShape::Template(tmpl) => {
+                    out.extend(json_template_versions(tmpl, &root, rp)?);
+                }
+                JsonShape::ValuesMap(path, inner_key, guard) => {
+                    if let Some(obj) = dig(&root, path).and_then(|v| v.as_object()) {
+                        // Ruby hashes iterate in document
+                        // order; the parsed map sorts keys.
+                        let order = json_object_key_order(&content, path);
+                        let groups: Vec<&aterm_json::Value> = match &order {
+                            Some(keys) => keys.iter().filter_map(|k| obj.get(k)).collect(),
+                            None => obj.values().collect(),
+                        };
+                        for group in groups {
+                            let Some(items) = group.get(inner_key).and_then(|v| v.as_array())
+                            else {
+                                continue;
                             };
-                            let Some(v) = v else { continue };
-                            let Some(s) = scalar(v)? else { continue };
-                            if guard.regex {
-                                if let Some(cap) = regex_capture(&s)? {
-                                    out.push(cap);
+                            for item in items {
+                                if let Some(v) = apply_json_guard(
+                                    guard,
+                                    item,
+                                    rp,
+                                    &regex_capture,
+                                    lit_re.as_ref(),
+                                    sub_re.as_ref(),
+                                )? {
+                                    out.push(v);
                                 }
-                            } else {
-                                out.push(s);
                             }
                         }
                     }
@@ -22503,6 +24480,417 @@ mod livecheck {
     /// The `:xml` strategy for the data-reduced block
     /// shapes: element texts at the path, optionally with
     /// the regex's first capture applied.
+    /// One element of the mini XML DOM for `:xml`
+    /// template shapes (document order = index).
+    struct XmlNode {
+        name: String,
+        attrs: Vec<(String, String)>,
+        text: String,
+        children: Vec<usize>,
+        parent: usize,
+    }
+
+    fn xml_entity_decode(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        while let Some(i) = rest.find('&') {
+            out.push_str(&rest[..i]);
+            let tail = &rest[i + 1..];
+            let Some(end) = tail.find(';') else {
+                out.push('&');
+                rest = tail;
+                continue;
+            };
+            let ent = &tail[..end];
+            let decoded: Option<String> = match ent {
+                "amp" => Some("&".into()),
+                "lt" => Some("<".into()),
+                "gt" => Some(">".into()),
+                "quot" => Some("\"".into()),
+                "apos" => Some("'".into()),
+                _ => ent
+                    .strip_prefix("#x")
+                    .and_then(|h| u32::from_str_radix(h, 16).ok())
+                    .or_else(|| ent.strip_prefix('#')?.parse().ok())
+                    .and_then(char::from_u32)
+                    .map(|c| c.to_string()),
+            };
+            match decoded {
+                Some(d) => out.push_str(&d),
+                None => {
+                    out.push('&');
+                    out.push_str(ent);
+                    out.push(';');
+                }
+            }
+            rest = &tail[end + 1..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    fn xml_dom_parse(xml: &str) -> Result<Vec<XmlNode>, String> {
+        let mut nodes: Vec<XmlNode> = vec![XmlNode {
+            name: String::new(),
+            attrs: Vec::new(),
+            text: String::new(),
+            children: Vec::new(),
+            parent: 0,
+        }];
+        let mut stack: Vec<usize> = vec![0];
+        let bytes = xml.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == b'<' {
+                let rest = &xml[i..];
+                if let Some(r) = rest.strip_prefix("<!--") {
+                    i += 4 + r.find("-->").ok_or("unterminated comment")? + 3;
+                    continue;
+                }
+                if let Some(r) = rest.strip_prefix("<![CDATA[") {
+                    let end = r.find("]]>").ok_or("unterminated CDATA")?;
+                    if let Some(top) = stack.last()
+                        && nodes[*top].text.is_empty()
+                    {
+                        nodes[*top].text = r[..end].to_string();
+                    }
+                    i += 9 + end + 3;
+                    continue;
+                }
+                if rest.starts_with("<?") || rest.starts_with("<!") {
+                    let end = rest.find('>').ok_or("unterminated tag")?;
+                    i += end + 1;
+                    continue;
+                }
+                let end = rest.find('>').ok_or("unterminated tag")?;
+                let inner = &rest[1..end];
+                i += end + 1;
+                if let Some(name) = inner.strip_prefix('/') {
+                    let name = name.trim();
+                    let Some(top) = stack.pop() else {
+                        return Err(format!("unexpected end tag '{name}'"));
+                    };
+                    if nodes[top].name != name {
+                        return Err(format!(
+                            "Missing end tag for '{}' (got '{name}')",
+                            nodes[top].name
+                        ));
+                    }
+                } else {
+                    let self_closing = inner.trim_end().ends_with('/');
+                    let body = inner.trim_end().trim_end_matches('/');
+                    let mut parts = body.splitn(2, [' ', '\t', '\n']);
+                    let name = parts.next().unwrap_or_default().trim().to_string();
+                    let mut attrs = Vec::new();
+                    if let Some(attr_src) = parts.next() {
+                        let mut rest = attr_src.trim();
+                        while !rest.is_empty() {
+                            let Some(eq) = rest.find('=') else { break };
+                            let aname = rest[..eq].trim().to_string();
+                            let after = rest[eq + 1..].trim_start();
+                            let Some(q) = after.chars().next() else { break };
+                            if q != '"' && q != '\'' {
+                                break;
+                            }
+                            let val_src = &after[q.len_utf8()..];
+                            let Some(vend) = val_src.find(q) else { break };
+                            attrs.push((aname, xml_entity_decode(&val_src[..vend])));
+                            rest = val_src[vend + q.len_utf8()..].trim_start();
+                        }
+                    }
+                    let parent = *stack.last().unwrap_or(&0);
+                    nodes.push(XmlNode {
+                        name,
+                        attrs,
+                        text: String::new(),
+                        children: Vec::new(),
+                        parent,
+                    });
+                    let idx = nodes.len() - 1;
+                    nodes[parent].children.push(idx);
+                    if !self_closing {
+                        stack.push(idx);
+                    }
+                }
+            } else {
+                let next = xml[i..].find('<').map_or(bytes.len(), |p| i + p);
+                if let Some(top) = stack.last()
+                    && nodes[*top].text.is_empty()
+                    && next > i
+                {
+                    nodes[*top].text = xml_entity_decode(&xml[i..next]);
+                }
+                i = next;
+            }
+        }
+        if stack.len() > 1 {
+            return Err(format!("Missing end tag for '{}'", nodes[stack[1]].name));
+        }
+        Ok(nodes)
+    }
+
+    fn xml_local_name(name: &str) -> &str {
+        name.rsplit(':').next().unwrap_or(name)
+    }
+
+    fn xml_step_matches(
+        nodes: &[XmlNode],
+        idx: usize,
+        step: &super::super::formula::XmlStep,
+    ) -> bool {
+        use super::super::formula::XmlPred;
+        let node = &nodes[idx];
+        let tag_ok = if step.tag.contains(':') {
+            node.name == step.tag
+        } else {
+            xml_local_name(&node.name) == step.tag
+        };
+        if !tag_ok {
+            return false;
+        }
+        match &step.pred {
+            None => true,
+            Some(XmlPred::TextEq(v)) => &node.text == v,
+            Some(XmlPred::ChildTextEq(child, v)) => node.children.iter().any(|c| {
+                let cn = &nodes[*c];
+                (if child.contains(':') {
+                    &cn.name == child
+                } else {
+                    xml_local_name(&cn.name) == child.as_str()
+                }) && &cn.text == v
+            }),
+            Some(XmlPred::AttrEq(attr, v)) => node.attrs.iter().any(|(a, val)| {
+                (if attr.contains(':') {
+                    a == attr
+                } else {
+                    xml_local_name(a) == attr.as_str()
+                }) && val == v
+            }),
+            Some(XmlPred::AttrAll(terms)) => terms.iter().all(|(attr, want)| {
+                let got = node.attrs.iter().find_map(|(a, val)| {
+                    (if attr.contains(':') {
+                        a == attr
+                    } else {
+                        xml_local_name(a) == attr.as_str()
+                    })
+                    .then_some(val.as_str())
+                });
+                match want {
+                    Some(v) => got == Some(v.as_str()),
+                    None => got.is_none(),
+                }
+            }),
+        }
+    }
+
+    fn xml_query_all(nodes: &[XmlNode], path: &super::super::formula::XmlPathQ) -> Vec<usize> {
+        if path.steps.is_empty() {
+            return Vec::new();
+        }
+        let mut current: Vec<usize> = if path.absolute {
+            nodes[0]
+                .children
+                .iter()
+                .copied()
+                .filter(|i| xml_step_matches(nodes, *i, &path.steps[0]))
+                .collect()
+        } else {
+            (1..nodes.len())
+                .filter(|i| xml_step_matches(nodes, *i, &path.steps[0]))
+                .collect()
+        };
+        for step in &path.steps[1..] {
+            let mut next = Vec::new();
+            for i in current {
+                for c in &nodes[i].children {
+                    if xml_step_matches(nodes, *c, step) {
+                        next.push(*c);
+                    }
+                }
+            }
+            current = next;
+        }
+        current
+    }
+
+    fn xml_next_element(nodes: &[XmlNode], idx: usize) -> Option<usize> {
+        let parent = nodes[idx].parent;
+        let siblings = &nodes[parent].children;
+        let pos = siblings.iter().position(|s| *s == idx)?;
+        siblings.get(pos + 1).copied()
+    }
+
+    fn xml_attr_value<'a>(nodes: &'a [XmlNode], idx: usize, attr: &str) -> Option<&'a str> {
+        nodes[idx].attrs.iter().find_map(|(a, v)| {
+            (if attr.contains(':') {
+                a == attr
+            } else {
+                xml_local_name(a) == attr
+            })
+            .then_some(v.as_str())
+        })
+    }
+
+    fn xml_render_parts(
+        parts: &[super::super::formula::XmlPart],
+        locals: &[Option<String>],
+        groups: Option<&[Option<String>]>,
+    ) -> String {
+        use super::super::formula::XmlPart;
+        let mut out = String::new();
+        for part in parts {
+            match part {
+                XmlPart::Lit(s) => out.push_str(s),
+                XmlPart::Local(i) => {
+                    if let Some(Some(v)) = locals.get(*i) {
+                        out.push_str(v);
+                    }
+                }
+                XmlPart::LocalStrip(i) => {
+                    if let Some(Some(v)) = locals.get(*i) {
+                        out.push_str(v.trim());
+                    }
+                }
+                XmlPart::Cap(n) => {
+                    if let Some(Some(g)) = groups.and_then(|g| g.get(*n)) {
+                        out.push_str(g);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn xml_template_versions(
+        tmpl: &super::super::formula::XmlTemplate,
+        content: &str,
+        rp: &RunPlan,
+    ) -> Result<Vec<String>, String> {
+        use super::super::formula::{XmlProj, XmlRender};
+        let nodes = xml_dom_parse(content)?;
+        let text_of = |idx: usize, next: bool| -> Option<String> {
+            let idx = if next {
+                xml_next_element(&nodes, idx)?
+            } else {
+                idx
+            };
+            Some(nodes[idx].text.clone())
+        };
+        let mut out: Vec<String> = Vec::new();
+        if let Some(map) = &tmpl.map {
+            for item in xml_query_all(&nodes, &map.path) {
+                if !map.locals.is_empty() {
+                    use super::super::formula::XmlItemLocal;
+                    let values: Vec<Option<String>> = map
+                        .locals
+                        .iter()
+                        .map(|local| match local {
+                            XmlItemLocal::Attr(attr) => {
+                                xml_attr_value(&nodes, item, attr).map(str::to_string)
+                            }
+                            XmlItemLocal::Text => Some(nodes[item].text.clone()),
+                            XmlItemLocal::TextCapture => rp
+                                .re
+                                .as_ref()
+                                .and_then(|re| search_group1(re, &nodes[item].text)),
+                        })
+                        .collect();
+                    let blank = |v: &Option<String>| v.as_ref().is_none_or(|s| s.trim().is_empty());
+                    if tmpl.require.iter().any(|i| blank(&values[*i])) {
+                        continue;
+                    }
+                    if let XmlRender::Template(parts) = &tmpl.render {
+                        out.push(xml_render_parts(parts, &values, None));
+                    }
+                    continue;
+                }
+                let proj: Option<String> = match &map.proj {
+                    XmlProj::Text => Some(nodes[item].text.trim().to_string()),
+                    XmlProj::NextText => text_of(item, true).map(|t| t.trim().to_string()),
+                    XmlProj::Attr(attr) => xml_attr_value(&nodes, item, attr).map(str::to_string),
+                    XmlProj::AttrCapture(attr) => {
+                        let Some(v) = xml_attr_value(&nodes, item, attr) else {
+                            continue;
+                        };
+                        match &rp.re {
+                            Some(re) => search_group1(re, v),
+                            None => None,
+                        }
+                    }
+                    XmlProj::TextMatch(next) => {
+                        let Some(text) = text_of(item, *next) else {
+                            continue;
+                        };
+                        let Some(re) = &rp.re else { continue };
+                        let Some(groups) = search_groups(re, text.trim()) else {
+                            continue;
+                        };
+                        Some(match &tmpl.render {
+                            XmlRender::CapValue(n) => match groups.get(*n).cloned().flatten() {
+                                Some(v) => v,
+                                None => continue,
+                            },
+                            XmlRender::Template(parts) => {
+                                xml_render_parts(parts, &[], Some(&groups))
+                            }
+                            _ => continue,
+                        })
+                    }
+                };
+                let Some(proj) = proj else { continue };
+                if map.grep {
+                    let keep = rp.re.as_ref().is_some_and(|re| re.whole.is_match(&proj));
+                    if !keep {
+                        continue;
+                    }
+                }
+                out.push(proj);
+            }
+            return Ok(out);
+        }
+        let locals: Vec<Option<String>> = tmpl
+            .locals
+            .iter()
+            .map(|local| {
+                xml_query_all(&nodes, &local.path)
+                    .first()
+                    .and_then(|idx| text_of(*idx, local.next))
+            })
+            .collect();
+        let blank = |v: &Option<String>| v.as_ref().is_none_or(|s| s.trim().is_empty());
+        if tmpl.require.iter().any(|i| blank(&locals[*i])) {
+            return Ok(out);
+        }
+        let groups: Option<Vec<Option<String>>> = match tmpl.match_local {
+            Some(i) => {
+                let (Some(re), Some(v)) = (&rp.re, locals[i].as_deref()) else {
+                    return Ok(out);
+                };
+                match search_groups(re, v) {
+                    Some(g) => Some(g),
+                    None => return Ok(out),
+                }
+            }
+            None => None,
+        };
+        let version = match &tmpl.render {
+            XmlRender::Template(parts) => Some(xml_render_parts(parts, &locals, groups.as_deref())),
+            XmlRender::LocalValue(i, strip) => locals[*i].as_ref().map(|v| {
+                if *strip {
+                    v.trim().to_string()
+                } else {
+                    v.clone()
+                }
+            }),
+            XmlRender::CapValue(n) => groups.as_ref().and_then(|g| g.get(*n).cloned().flatten()),
+            XmlRender::Projection => None,
+        };
+        if let Some(v) = version {
+            out.push(v);
+        }
+        Ok(out)
+    }
+
     fn xml_versions(rp: &RunPlan) -> Found {
         use super::super::formula::XmlShape;
         let Some(block) = &rp.xml else {
@@ -22513,13 +24901,26 @@ mod livecheck {
                 "Two arguments found in `strategy` block but no regex provided.".to_string(),
             );
         }
-        let (content, fin) = match page_get(&rp.url, rp.ua.as_deref()) {
+        let (content, fin) = match page_fetch(
+            &rp.url,
+            rp.ua.as_deref(),
+            rp_post(rp).as_ref(),
+            &rp.headers,
+            !rp.uncompressed,
+        ) {
             Ok(ok) => ok,
             Err(msgs) => return Found::Messages(msgs),
         };
+        if let XmlShape::Template(tmpl) = &block.shape {
+            return match xml_template_versions(tmpl, &content, rp) {
+                Ok(vs) => Found::Versions(vs, Some(fin)),
+                Err(msg) => Found::Raised(msg),
+            };
+        }
         let (path, is_regex) = match &block.shape {
             XmlShape::Texts(p) => (p, false),
             XmlShape::TextsRegex(p) => (p, true),
+            XmlShape::Template(_) => unreachable!(),
         };
         let texts = match xml_element_texts(&content, path) {
             Ok(t) => t,
@@ -22883,13 +25284,19 @@ mod livecheck {
     }
 
     fn yaml_versions_with(rp: &RunPlan, block: &super::super::formula::YamlBlock) -> Found {
-        use super::super::formula::{JsonKey, YamlShape};
+        use super::super::formula::{JsonKey, YamlPart, YamlRender, YamlShape, YamlTail};
         if block.has_regex && rp.re.is_none() {
             return Found::Raised(
                 "Two arguments found in `strategy` block but no regex provided.".to_string(),
             );
         }
-        let (content, fin) = match page_get(&rp.url, rp.ua.as_deref()) {
+        let (content, fin) = match page_fetch(
+            &rp.url,
+            rp.ua.as_deref(),
+            rp_post(rp).as_ref(),
+            &rp.headers,
+            !rp.uncompressed,
+        ) {
             Ok(ok) => ok,
             Err(msgs) => return Found::Messages(msgs),
         };
@@ -22897,15 +25304,104 @@ mod livecheck {
             Ok(root) => root,
             Err(_) => return Found::Raised("Content could not be parsed as YAML.".to_string()),
         };
+        // Match-and-render shapes (electron-builder).
+        if let YamlShape::FilesMap { key, render } | YamlShape::RootMatch { key, render } =
+            &block.shape
+        {
+            let Some(re) = &rp.re else {
+                return Found::Raised(
+                    "Two arguments found in `strategy` block but no regex provided.".to_string(),
+                );
+            };
+            // A scalar as the block sees it: strings as
+            // themselves, other scalars via Ruby `to_s`
+            // (their raw spelling for these appcasts).
+            let scalar_str = |node: &YNode| -> Option<String> {
+                match node {
+                    YNode::Scalar(s, _) => Some(s.clone()),
+                    _ => None,
+                }
+            };
+            fn map_get<'x>(node: &'x YNode, k: &str) -> Option<&'x YNode> {
+                match node {
+                    YNode::Map(entries) => entries.iter().find(|(ek, _)| ek == k).map(|(_, v)| v),
+                    _ => None,
+                }
+            }
+            let render_parts = |parts: &[YamlPart], groups: &[Option<String>]| -> Option<String> {
+                let mut out = String::new();
+                for part in parts {
+                    match part {
+                        YamlPart::Cap(n) => {
+                            if let Some(Some(g)) = groups.get(*n) {
+                                out.push_str(g);
+                            }
+                        }
+                        YamlPart::Lit(l) => out.push_str(l),
+                        YamlPart::Root(field) => {
+                            let v = map_get(&root, field).and_then(scalar_str)?;
+                            out.push_str(&v);
+                        }
+                    }
+                }
+                if out.is_empty() { None } else { Some(out) }
+            };
+            let render_one = |text: &str| -> Option<String> {
+                let groups = search_groups(re, text)?;
+                match render {
+                    YamlRender::Template(parts) => render_parts(parts, &groups),
+                    YamlRender::PresentElse { cap, then, els } => {
+                        let present = groups
+                            .get(*cap)
+                            .is_some_and(|g| g.as_deref().is_some_and(|s| !s.is_empty()));
+                        if present {
+                            render_parts(then, &groups)
+                        } else {
+                            render_parts(els, &groups)
+                        }
+                    }
+                }
+            };
+            let mut versions: Vec<String> = Vec::new();
+            let mut push = |v: Option<String>| {
+                if let Some(v) = v
+                    && !versions.contains(&v)
+                {
+                    versions.push(v);
+                }
+            };
+            match &block.shape {
+                YamlShape::FilesMap { .. } => {
+                    if let Some(YNode::Seq(items)) = map_get(&root, "files") {
+                        for item in items {
+                            if let Some(text) = map_get(item, key).and_then(scalar_str) {
+                                push(render_one(&text));
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(text) = map_get(&root, key).and_then(scalar_str) {
+                        push(render_one(&text));
+                    }
+                }
+            }
+            return Found::Versions(versions, Some(fin));
+        }
         enum YApply<'a> {
             Plain,
             Regex,
             SplitFirst(&'a str),
+            Tail(&'a YamlTail),
         }
         let (path, apply) = match &block.shape {
             YamlShape::Dig(p) => (p, YApply::Plain),
             YamlShape::DigRegex(p) => (p, YApply::Regex),
             YamlShape::DigSplitFirst(p, sep) => (p, YApply::SplitFirst(sep)),
+            YamlShape::DigTail(p, t) => (p, YApply::Tail(t)),
+            YamlShape::FilesMap { .. } | YamlShape::RootMatch { .. } => {
+                return Found::Versions(Vec::new(), Some(fin));
+            }
         };
         let is_regex = matches!(apply, YApply::Regex);
         let mut cur = &root;
@@ -22968,6 +25464,25 @@ mod livecheck {
             };
             return Found::Versions(out, Some(fin));
         }
+        if let YApply::Tail(tail) = apply {
+            let out = match tail {
+                YamlTail::DeleteSuffix(sfx) => {
+                    text.strip_suffix(sfx.as_str()).unwrap_or(&text).to_string()
+                }
+                YamlTail::DeletePrefix(pfx) => {
+                    text.strip_prefix(pfx.as_str()).unwrap_or(&text).to_string()
+                }
+                YamlTail::SubLit(a, b) => text.replacen(a.as_str(), b, 1),
+                YamlTail::SubRe(pat, flags, b) => match lc_regex(pat, flags) {
+                    Ok(lre) => match lre.whole.find(&text) {
+                        Some(m) => format!("{}{}{}", &text[..m.start()], b, &text[m.end()..]),
+                        None => text.clone(),
+                    },
+                    Err(_) => return Found::Versions(Vec::new(), Some(fin)),
+                },
+            };
+            return Found::Versions(vec![out], Some(fin));
+        }
         if !is_regex {
             return Found::Versions(vec![text], Some(fin));
         }
@@ -22987,18 +25502,61 @@ mod livecheck {
     }
 
     impl PlistItem {
-        /// The no-block version: `[short, bundle]` present
-        /// parts, deduplicated, comma-joined.
+        /// The no-block version: brew's
+        /// `BundleVersion#nice_version` over
+        /// (short, bundle).
         fn version(&self) -> Option<String> {
-            let mut parts: Vec<&str> = Vec::new();
-            for part in [self.short.as_deref(), self.bundle.as_deref()]
-                .into_iter()
-                .flatten()
-            {
-                if !parts.contains(&part) {
-                    parts.push(part);
+            // `BundleVersion#initialize` strips a trailing
+            // `(version)` from the short version.
+            let short_owned;
+            let short = match (self.short.as_deref(), self.bundle.as_deref()) {
+                (Some(s), Some(b)) if !b.is_empty() => {
+                    let suffix = format!("({b})");
+                    match s.strip_suffix(&suffix) {
+                        Some(head) => {
+                            short_owned = head.trim_end().to_string();
+                            Some(short_owned.as_str()).filter(|v| !v.is_empty())
+                        }
+                        None => Some(s),
+                    }
                 }
-            }
+                (s, _) => s,
+            };
+            let bundle = self.bundle.as_deref();
+            let dotted = |v: &str, multi: bool| {
+                let segs: Vec<&str> = v.split('.').collect();
+                (if multi {
+                    segs.len() >= 2
+                } else {
+                    !segs.is_empty()
+                }) && segs
+                    .iter()
+                    .all(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+            };
+            let parts: Vec<&str> = match (short, bundle) {
+                (Some(s), Some(b)) if s == b => vec![s],
+                (Some(s), Some(b)) => {
+                    if dotted(b, true) && b.starts_with(&format!("{s}.")) {
+                        vec![b]
+                    } else if dotted(s, true) && s.starts_with(&format!("{b}.")) {
+                        vec![s]
+                    } else if dotted(s, false)
+                        && !b.is_empty()
+                        && b.chars().all(|c| c.is_ascii_digit())
+                    {
+                        if s.starts_with(&format!("{b}.")) || s.ends_with(&format!(".{b}")) {
+                            vec![s]
+                        } else {
+                            vec![s, b]
+                        }
+                    } else {
+                        vec![s, b]
+                    }
+                }
+                (Some(s), None) => vec![s],
+                (None, Some(b)) => vec![b],
+                (None, None) => Vec::new(),
+            };
             (!parts.is_empty()).then(|| parts.join(","))
         }
     }
@@ -23011,9 +25569,12 @@ mod livecheck {
         }
     }
 
-    /// The `:extract_plist` strategy for zip containers:
-    /// download, extract, and read the declared apps'
-    /// `Info.plist` versions (XML or binary plists).
+    /// The `:extract_plist` strategy for zip and dmg
+    /// containers: download, extract, and read the
+    /// declared apps' `Info.plist` versions (XML or
+    /// binary plists). A dmg is mounted read-only via
+    /// the install path's helper (macOS only; the
+    /// plan has already delegated it elsewhere).
     fn plist_versions(rp: &RunPlan) -> Found {
         use super::super::formula::PlistProp;
         if let Some(block) = &rp.plist
@@ -23034,7 +25595,18 @@ mod livecheck {
             return Found::Versions(Vec::new(), None);
         }
         let scratch = ScratchDir(dir.clone());
-        let archive = dir.join("download.zip");
+        let is_dmg = rp
+            .url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(&rp.url)
+            .to_ascii_lowercase()
+            .ends_with(".dmg");
+        let archive = dir.join(if is_dmg {
+            "download.dmg"
+        } else {
+            "download.zip"
+        });
         if let Err(e) = fetch::curl_to_file(&rp.url, &archive, &[]) {
             let msg = e.trim().to_string();
             return Found::Messages(vec![if msg.is_empty() {
@@ -23044,15 +25616,19 @@ mod livecheck {
             }]);
         }
         let root = dir.join("extracted");
-        if crate::extract::extract_zip_tree(
-            &archive,
-            &root,
-            crate::install::UNSIGNED_SIZE_CAP,
-            crate::install::MAX_ENTRIES,
-            crate::extract::ExtractOptions::default(),
-        )
-        .is_err()
-        {
+        let extracted = if is_dmg {
+            fetch::extract_dmg(&archive, &root).is_ok()
+        } else {
+            crate::extract::extract_zip_tree(
+                &archive,
+                &root,
+                crate::install::UNSIGNED_SIZE_CAP,
+                crate::install::MAX_ENTRIES,
+                crate::extract::ExtractOptions::default(),
+            )
+            .is_ok()
+        };
+        if !extracted {
             return Found::Versions(Vec::new(), None);
         }
         let mut items: Vec<PlistItem> = Vec::new();
@@ -23126,9 +25702,13 @@ mod livecheck {
     }
 
     /// The first `<name>/Contents/Info.plist` under
-    /// `root` (directories walked in name order).
+    /// `root` (directories walked in name order). The
+    /// bundle name matches case-insensitively (the
+    /// oracle resolves it on a case-insensitive
+    /// filesystem), an exact-case hit preferred.
     fn find_app_plist(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
         let mut pending = vec![root.to_path_buf()];
+        let mut folded_hit: Option<std::path::PathBuf> = None;
         while let Some(dir) = pending.pop() {
             let mut entries: Vec<_> = std::fs::read_dir(&dir)
                 .ok()?
@@ -23140,16 +25720,22 @@ mod livecheck {
                 if !entry.file_type().ok()?.is_dir() {
                     continue;
                 }
-                if entry.file_name().to_str() == Some(name) {
-                    let plist = path.join("Contents").join("Info.plist");
-                    if plist.is_file() {
-                        return Some(plist);
+                if let Some(fname) = entry.file_name().to_str() {
+                    let exact = fname == name;
+                    if exact || fname.eq_ignore_ascii_case(name) {
+                        let plist = path.join("Contents").join("Info.plist");
+                        if plist.is_file() {
+                            if exact {
+                                return Some(plist);
+                            }
+                            folded_hit.get_or_insert(plist);
+                        }
                     }
                 }
                 pending.push(path);
             }
         }
-        None
+        folded_hit
     }
 
     /// A plist document's top-level string fields, from
@@ -23169,6 +25755,13 @@ mod livecheck {
         let mut rest = &text[start + "<dict>".len()..];
         let mut out: Vec<(String, String)> = Vec::new();
         loop {
+            // The dict end must be checked before looking
+            // for another key: the self-closing-value arm
+            // below `continue`s past a loop-end check.
+            let trimmed = rest.trim_start();
+            if trimmed.starts_with("</dict>") {
+                break;
+            }
             let key_open = rest.find("<key>")?;
             let after_open = &rest[key_open + "<key>".len()..];
             // The closing </dict> at depth zero ends the walk;
@@ -23352,7 +25945,22 @@ mod livecheck {
     /// `git ls-remote --tags` with brew's 20s timeout (the
     /// worker thread is detached on timeout; process exit
     /// does not wait for it).
-    fn git_versions(url: &str, re: &LcRegex) -> Found {
+    fn git_versions(
+        url: &str,
+        re: &LcRegex,
+        block: Option<&super::super::formula::GitBlock>,
+    ) -> Found {
+        // A `gsub` block's regex was compile-checked at
+        // plan time; rebuild it for the tag scan.
+        let gsub_re = match block.map(|b| &b.op) {
+            Some(super::super::formula::GitOp::GsubRe(pat, flags, _)) => {
+                match lc_regex(pat, flags) {
+                    Ok(re) => Some(re),
+                    Err(_) => return Found::Versions(Vec::new(), None),
+                }
+            }
+            _ => None,
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         let url_owned = url.to_string();
         std::thread::spawn(move || {
@@ -23392,10 +26000,17 @@ mod livecheck {
                 continue;
             };
             let tag = tag.strip_suffix("^{}").unwrap_or(tag);
-            if let Some(v) = search_group1(re, tag)
-                && !versions.contains(&v)
-            {
-                versions.push(v);
+            if block.is_some_and(|b| b.skip_tags.iter().any(|s| s == tag)) {
+                continue;
+            }
+            if let Some(cap) = search_group1(re, tag) {
+                let v = match block {
+                    Some(b) => git_op_apply(&b.op, &cap, gsub_re.as_ref()),
+                    None => cap,
+                };
+                if !versions.contains(&v) {
+                    versions.push(v);
+                }
             }
         }
         Found::Versions(versions, None)
@@ -23415,8 +26030,14 @@ mod livecheck {
         }
     }
 
-    fn github_latest_versions(url: &str, re: &LcRegex) -> Found {
-        github_latest_versions_with(url, re, |slug| github_client()?.releases(slug).latest())
+    fn github_latest_versions(
+        url: &str,
+        re: &LcRegex,
+        block: Option<&super::super::formula::LatestBlock>,
+    ) -> Found {
+        github_latest_versions_with(url, re, block, |slug| {
+            github_client()?.releases(slug).latest()
+        })
     }
 
     fn bind_latest_routing(
@@ -23432,6 +26053,7 @@ mod livecheck {
     fn github_latest_versions_with(
         url: &str,
         re: &LcRegex,
+        block: Option<&super::super::formula::LatestBlock>,
         read: impl FnOnce(&agh::Slug) -> agh::Result<agh::model::ReleaseObject>,
     ) -> Found {
         let Some((user, repo)) = github_repo(url) else {
@@ -23443,17 +26065,224 @@ mod livecheck {
         };
         match read(&slug) {
             Ok(release) => {
-                let mut versions = Vec::new();
-                if !release.draft
-                    && !release.prerelease
-                    && let Some(v) = search_group1(re, &release.tag_name)
-                {
-                    versions.push(v);
-                }
+                let versions = match block {
+                    // With a block the oracle applies no
+                    // draft/prerelease filter of its own.
+                    Some(block) => latest_block_versions(&release, re, block),
+                    None => {
+                        let mut versions = Vec::new();
+                        if !release.draft
+                            && !release.prerelease
+                            && let Some(v) = search_group1(re, &release.tag_name)
+                        {
+                            versions.push(v);
+                        }
+                        versions
+                    }
+                };
                 Found::Versions(versions, None)
             }
             Err(error) => Found::Raised(github_api_error(&error)),
         }
+    }
+
+    /// A reduced `:github_latest` block over the
+    /// latest release: captures from one field (or
+    /// each asset name), `tr` applied, deduplicated
+    /// in order (the oracle's block-return compact).
+    fn latest_block_versions(
+        release: &agh::model::ReleaseObject,
+        re: &LcRegex,
+        block: &super::super::formula::LatestBlock,
+    ) -> Vec<String> {
+        use super::super::formula::{
+            LatestOp, LatestPart, LatestPreOp, LatestRender, LatestSource,
+        };
+        let mut out: Vec<String> = Vec::new();
+        let push = |v: String, out: &mut Vec<String>| {
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        };
+        let field_of = |src: LatestSource| -> Option<&str> {
+            match src {
+                LatestSource::TagName => Some(&release.tag_name),
+                LatestSource::Name => release.name.as_deref(),
+                LatestSource::Body => release.body.as_deref(),
+                LatestSource::PublishedAt => release.published_at.as_deref(),
+                _ => None,
+            }
+        };
+        // Two-field equality render.
+        if matches!(block.render, LatestRender::TwoEq) {
+            let (Some(a_text), Some(b_src)) = (field_of(block.source), block.two_b) else {
+                return out;
+            };
+            let (Some(a), Some(b)) = (
+                search_group1(re, a_text),
+                field_of(b_src).and_then(|t| search_group1(re, t)),
+            ) else {
+                return out;
+            };
+            if a.is_empty() || b.is_empty() {
+                return out;
+            }
+            push(if a == b { b } else { format!("{a},{b}") }, &mut out);
+            return out;
+        }
+        // The pre-capture local (blank yields nothing).
+        let local: Option<String> = match &block.pre_capture {
+            Some(pre) => {
+                let text = field_of(pre.source);
+                let mut value: Option<String> = if pre.capture {
+                    let pre_re = match &pre.lit {
+                        Some((pat, flags)) => match lc_regex(pat, flags) {
+                            Ok(r) => Some(r),
+                            Err(_) => return out,
+                        },
+                        None => None,
+                    };
+                    text.and_then(|t| search_group1(pre_re.as_ref().unwrap_or(re), t))
+                } else {
+                    text.map(str::to_string)
+                };
+                if let Some(v) = &mut value {
+                    for op in &pre.ops {
+                        match op {
+                            LatestPreOp::Tr(from, to) => *v = ruby_tr(v, from, to),
+                            LatestPreOp::DeletePrefix(pfx) => {
+                                if let Some(stripped) = v.strip_prefix(pfx.as_str()) {
+                                    *v = stripped.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+                match value {
+                    Some(v) if !v.is_empty() => Some(v),
+                    _ => return out,
+                }
+            }
+            None => None,
+        };
+        // The texts the match/capture reads.
+        let texts: Vec<&str> = match block.source {
+            LatestSource::AssetName => release.assets.iter().map(|a| a.name.as_str()).collect(),
+            LatestSource::AssetDownloadUrl => release
+                .assets
+                .iter()
+                .map(|a| a.browser_download_url.as_str())
+                .collect(),
+            src => field_of(src).into_iter().collect(),
+        };
+        let render_parts = |parts: &[LatestPart], groups: &[Option<String>]| -> Option<String> {
+            let mut s = String::new();
+            for part in parts {
+                match part {
+                    LatestPart::Cap(n) => {
+                        if let Some(Some(g)) = groups.get(*n) {
+                            s.push_str(g);
+                        }
+                    }
+                    LatestPart::Lit(l) => s.push_str(l),
+                    LatestPart::Local => {
+                        if let Some(l) = &local {
+                            s.push_str(l);
+                        }
+                    }
+                }
+            }
+            if s.is_empty() { None } else { Some(s) }
+        };
+        let op_val = |op: &LatestOp, groups: &[Option<String>]| -> Option<String> {
+            match op {
+                LatestOp::Cap(n) => groups.get(*n).cloned().flatten(),
+                LatestOp::Local => local.clone(),
+            }
+        };
+        let push_rendered = |v: Option<String>, out: &mut Vec<String>| {
+            if let Some(v) = v {
+                let v = match &block.tr {
+                    Some((from, to)) => ruby_tr(&v, from, to),
+                    None => v,
+                };
+                push(v, out);
+            }
+        };
+        match &block.render {
+            LatestRender::Capture => {
+                for text in &texts {
+                    if block.scan {
+                        for m in re.whole.find_iter(text) {
+                            push_rendered(extract_group(re, m.as_str()), &mut out);
+                        }
+                    } else {
+                        push_rendered(search_group1(re, text), &mut out);
+                    }
+                }
+            }
+            LatestRender::Template(parts) => {
+                for text in &texts {
+                    if let Some(groups) = search_groups(re, text) {
+                        push_rendered(render_parts(parts, &groups), &mut out);
+                    }
+                }
+            }
+            LatestRender::EqElse { a, b, then, els } => {
+                for text in &texts {
+                    if let Some(groups) = search_groups(re, text) {
+                        let parts = if op_val(a, &groups) == op_val(b, &groups) {
+                            then
+                        } else {
+                            els
+                        };
+                        push_rendered(render_parts(parts, &groups), &mut out);
+                    }
+                }
+            }
+            LatestRender::PresentElse { cap, then, els } => {
+                for text in &texts {
+                    if let Some(groups) = search_groups(re, text) {
+                        let present = groups
+                            .get(*cap)
+                            .is_some_and(|g| g.as_deref().is_some_and(|s| !s.is_empty()));
+                        let parts = if present { then } else { els };
+                        push_rendered(render_parts(parts, &groups), &mut out);
+                    }
+                }
+            }
+            LatestRender::TruthyElse { cap, then, els } => {
+                for text in &texts {
+                    if let Some(groups) = search_groups(re, text) {
+                        let truthy = groups.get(*cap).is_some_and(Option::is_some);
+                        let parts = if truthy { then } else { els };
+                        push_rendered(render_parts(parts, &groups), &mut out);
+                    }
+                }
+            }
+            LatestRender::ScanTemplate(parts) => {
+                for text in &texts {
+                    for m in re.whole.find_iter(text) {
+                        let groups = extract_groups(re, m.as_str());
+                        push_rendered(render_parts(parts, &groups), &mut out);
+                    }
+                }
+            }
+            LatestRender::ScanPresentElse { cap, then, els } => {
+                for text in &texts {
+                    for m in re.whole.find_iter(text) {
+                        let groups = extract_groups(re, m.as_str());
+                        let present = groups
+                            .get(*cap)
+                            .is_some_and(|g| g.as_deref().is_some_and(|s| !s.is_empty()));
+                        let parts = if present { then } else { els };
+                        push_rendered(render_parts(parts, &groups), &mut out);
+                    }
+                }
+            }
+            LatestRender::TwoEq => {}
+        }
+        out
     }
 
     fn github_releases_versions(
@@ -23490,7 +26319,7 @@ mod livecheck {
         // The oracle's no-block path is the block
         // shape with both guards and a plain tag
         // capture, so one loop serves both.
-        use super::super::formula::{GhRelSource, GhRelThen};
+        use super::super::formula::{GhRelOp, GhRelPart, GhRelSource, GhRelThen};
         let default_block;
         let block = match block {
             Some(b) => b,
@@ -23498,26 +26327,86 @@ mod livecheck {
                 default_block = super::super::formula::GhRelBlock {
                     skip_draft: true,
                     skip_prerelease: true,
+                    require_prerelease: false,
+                    tag_ne: None,
+                    tag_prefix: None,
+                    asset_any: None,
                     name_skip: None,
+                    pre_capture: None,
                     source: GhRelSource::TagName,
                     then: GhRelThen::Identity,
+                    fallback_tag: None,
                 };
                 &default_block
             }
         };
-        let name_re = match &block.name_skip {
+        let lit_re = |l: &Option<(String, String)>| -> Option<Option<LcRegex>> {
+            match l {
+                Some((pat, flags)) => lc_regex(pat, flags).ok().map(Some),
+                None => Some(None),
+            }
+        };
+        let (Some(name_re), Some(fallback_re)) =
+            (lit_re(&block.name_skip), lit_re(&block.fallback_tag))
+        else {
+            return Found::Versions(Vec::new(), None);
+        };
+        let any_re: Option<LcRegex> = match &block.asset_any {
+            Some(super::super::formula::GhRelAny::NameMatch(pat, flags)) => {
+                match lc_regex(pat, flags) {
+                    Ok(r) => Some(r),
+                    Err(_) => return Found::Versions(Vec::new(), None),
+                }
+            }
+            _ => None,
+        };
+        let pre_lit = block.pre_capture.as_ref().and_then(|c| c.lit.as_ref());
+        let pre_owned: Option<LcRegex> = match pre_lit {
             Some((pat, flags)) => match lc_regex(pat, flags) {
-                Ok(re) => Some(re),
+                Ok(r) => Some(r),
                 Err(_) => return Found::Versions(Vec::new(), None),
             },
             None => None,
         };
+        // Literal regexes read by tag-capture parts.
+        let mut tag_res: std::collections::HashMap<(&str, &str), LcRegex> =
+            std::collections::HashMap::new();
+        {
+            let mut part_sets: Vec<&[GhRelPart]> = Vec::new();
+            match &block.then {
+                GhRelThen::Template(parts) => part_sets.push(parts),
+                GhRelThen::EqElse { then, els, .. } | GhRelThen::TruthyElse { then, els, .. } => {
+                    part_sets.push(then);
+                    part_sets.push(els);
+                }
+                _ => {}
+            }
+            for parts in part_sets {
+                for part in parts {
+                    if let GhRelPart::TagCapture(pat, flags) = part
+                        && !tag_res.contains_key(&(&pat[..], &flags[..]))
+                    {
+                        match lc_regex(pat, flags) {
+                            Ok(r) => {
+                                tag_res.insert((pat, flags), r);
+                            }
+                            Err(_) => return Found::Versions(Vec::new(), None),
+                        }
+                    }
+                }
+            }
+        }
         match read(&slug) {
             Ok(releases) => {
                 let mut versions: Vec<String> = Vec::new();
                 for release in &releases {
                     if (block.skip_draft && release.draft)
                         || (block.skip_prerelease && release.prerelease)
+                        || (block.require_prerelease && !release.prerelease)
+                        || block
+                            .tag_ne
+                            .as_deref()
+                            .is_some_and(|lit| release.tag_name != lit)
                     {
                         continue;
                     }
@@ -23529,31 +26418,148 @@ mod livecheck {
                     {
                         continue;
                     }
+                    if let Some(pfx) = &block.tag_prefix
+                        && !release.tag_name.starts_with(pfx.as_str())
+                    {
+                        continue;
+                    }
+                    if let Some(any) = &block.asset_any {
+                        use super::super::formula::GhRelAny;
+                        let ok = match any {
+                            GhRelAny::NameMatch(..) => any_re.as_ref().is_some_and(|r| {
+                                release
+                                    .assets
+                                    .iter()
+                                    .any(|a| r.whole.find(&a.name).is_some())
+                            }),
+                            GhRelAny::NameEndsWith(sfx) => release
+                                .assets
+                                .iter()
+                                .any(|a| a.name.ends_with(sfx.as_str())),
+                        };
+                        if !ok {
+                            continue;
+                        }
+                    }
+                    // The release-level pre-capture local
+                    // (its blank guard skips the release).
+                    let local: Option<String> = match &block.pre_capture {
+                        Some(pc) => {
+                            let text = match pc.field.as_str() {
+                                "name" => release.name.as_deref(),
+                                _ => Some(release.tag_name.as_str()),
+                            };
+                            let pre = pre_owned.as_ref().unwrap_or(re);
+                            match text.and_then(|t| search_group1(pre, t)) {
+                                Some(v) if !v.is_empty() => Some(v),
+                                _ => continue,
+                            }
+                        }
+                        None => None,
+                    };
+                    let render =
+                        |parts: &[GhRelPart], groups: &[Option<String>]| -> Option<String> {
+                            let mut out = String::new();
+                            for part in parts {
+                                match part {
+                                    GhRelPart::Cap(n) => {
+                                        if let Some(Some(g)) = groups.get(*n) {
+                                            out.push_str(g);
+                                        }
+                                    }
+                                    GhRelPart::Lit(l) => out.push_str(l),
+                                    GhRelPart::Local => {
+                                        if let Some(l) = &local {
+                                            out.push_str(l);
+                                        }
+                                    }
+                                    GhRelPart::Tag => out.push_str(&release.tag_name),
+                                    GhRelPart::TagTr(from, to) => {
+                                        out.push_str(&ruby_tr(&release.tag_name, from, to));
+                                    }
+                                    GhRelPart::TagCapture(pat, flags) => {
+                                        if let Some(r) = tag_res.get(&(&pat[..], &flags[..]))
+                                            && let Some(g) = search_group1(r, &release.tag_name)
+                                        {
+                                            out.push_str(&g);
+                                        }
+                                    }
+                                }
+                            }
+                            if out.is_empty() { None } else { Some(out) }
+                        };
+                    let op_val = |op: &GhRelOp, groups: &[Option<String>]| -> Option<String> {
+                        match op {
+                            GhRelOp::Cap(n) => groups.get(*n).cloned().flatten(),
+                            GhRelOp::Local => local.clone(),
+                            GhRelOp::Tag => Some(release.tag_name.clone()),
+                        }
+                    };
                     let texts: Vec<&str> = match block.source {
                         GhRelSource::TagName => vec![release.tag_name.as_str()],
+                        GhRelSource::Name => release.name.as_deref().into_iter().collect(),
                         GhRelSource::AssetDownloadUrl => release
                             .assets
                             .iter()
                             .map(|a| a.browser_download_url.as_str())
                             .collect(),
-                    };
-                    for text in texts {
-                        let Some(cap) = search_group1(re, text) else {
-                            continue;
-                        };
-                        let v = match &block.then {
-                            GhRelThen::Identity => cap,
-                            GhRelThen::Tr(from, to) => ruby_tr(&cap, from, to),
-                            GhRelThen::NonZeroPatch => {
-                                if !version_patch_nonzero(&cap) {
-                                    continue;
-                                }
-                                cap
-                            }
-                        };
-                        if !versions.contains(&v) {
-                            versions.push(v);
+                        GhRelSource::AssetName => {
+                            release.assets.iter().map(|a| a.name.as_str()).collect()
                         }
+                        GhRelSource::PreCaptureOnly => vec![""],
+                    };
+                    let mut found_here = 0usize;
+                    for text in texts {
+                        let v: Option<String> = match &block.then {
+                            GhRelThen::Identity | GhRelThen::Tr(..) | GhRelThen::NonZeroPatch => {
+                                search_group1(re, text).and_then(|cap| match &block.then {
+                                    GhRelThen::Identity => Some(cap),
+                                    GhRelThen::Tr(from, to) => Some(ruby_tr(&cap, from, to)),
+                                    _ => {
+                                        if version_patch_nonzero(&cap) {
+                                            Some(cap)
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                })
+                            }
+                            GhRelThen::Template(parts) => {
+                                if block.source == GhRelSource::PreCaptureOnly {
+                                    render(parts, &[])
+                                } else {
+                                    search_groups(re, text)
+                                        .and_then(|groups| render(parts, &groups))
+                                }
+                            }
+                            GhRelThen::EqElse { a, b, then, els } => search_groups(re, text)
+                                .and_then(|groups| {
+                                    if op_val(a, &groups) == op_val(b, &groups) {
+                                        render(then, &groups)
+                                    } else {
+                                        render(els, &groups)
+                                    }
+                                }),
+                            GhRelThen::TruthyElse { cap, then, els } => search_groups(re, text)
+                                .and_then(|groups| {
+                                    let truthy = groups.get(*cap).is_some_and(Option::is_some);
+                                    render(if truthy { then } else { els }, &groups)
+                                }),
+                        };
+                        if let Some(v) = v {
+                            found_here += 1;
+                            if !versions.contains(&v) {
+                                versions.push(v);
+                            }
+                        }
+                    }
+                    // `.presence ||` fallback to the tag.
+                    if found_here == 0
+                        && let Some(fre) = &fallback_re
+                        && let Some(v) = search_group1(fre, &release.tag_name)
+                        && !versions.contains(&v)
+                    {
+                        versions.push(v);
                     }
                 }
                 Found::Versions(versions, None)
@@ -23591,8 +26597,67 @@ mod livecheck {
     /// wins), run the regex over each wanted header —
     /// or, without one, detect the version from the
     /// header value (`Version.parse`).
-    fn header_versions(url: &str, re: Option<&LcRegex>, ua: Option<&str>) -> Found {
-        let merged = page_headers(url, ua);
+    fn header_versions(
+        url: &str,
+        re: Option<&LcRegex>,
+        ua: Option<&str>,
+        block: Option<&super::super::formula::HeaderBlock>,
+        post: Option<&PostData<'_>>,
+        headers: &[String],
+    ) -> Found {
+        use super::super::formula::HeaderShape;
+        let merged = page_headers(url, ua, post, headers);
+        if let Some(block) = block {
+            let value = merged.get(&block.header);
+            let mut versions: Vec<String> = Vec::new();
+            match (&block.shape, value) {
+                (HeaderShape::Bare, Some(v)) => versions.push(v.clone()),
+                (HeaderShape::Template(parts), Some(v)) => {
+                    if let Some(re) = re
+                        && let Some(groups) = search_groups(re, v)
+                    {
+                        versions.push(page_render_parts(parts, &groups));
+                    }
+                }
+                (HeaderShape::CsvOpt, Some(v)) => {
+                    if let Some(re) = re
+                        && let Some(groups) = search_groups(re, v)
+                    {
+                        let g1 = groups.get(1).cloned().flatten();
+                        let g2 = groups.get(2).cloned().flatten();
+                        match (g1, g2) {
+                            (Some(a), Some(b)) => versions.push(format!("{a},{b}")),
+                            (Some(a), None) => versions.push(a),
+                            _ => {}
+                        }
+                    }
+                }
+                (HeaderShape::ScanTemplate(parts), Some(v)) => {
+                    if let Some(re) = re {
+                        for m in re.whole.find_iter(v) {
+                            let groups = extract_groups(re, m.as_str());
+                            let rendered = page_render_parts(parts, &groups);
+                            if !versions.contains(&rendered) {
+                                versions.push(rendered);
+                            }
+                        }
+                    }
+                }
+                (HeaderShape::ScanFlatten(parts), Some(v)) => {
+                    if let Some(re) = re {
+                        let mut flat: Vec<Option<String>> = Vec::new();
+                        for m in re.whole.find_iter(v) {
+                            flat.extend(extract_groups(re, m.as_str()));
+                        }
+                        if !flat.is_empty() {
+                            versions.push(page_render_parts(parts, &flat));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return Found::Versions(versions, None);
+        }
         let mut versions: Vec<String> = Vec::new();
         for name in ["content-disposition", "location"] {
             if let Some(value) = merged.get(name)
@@ -23613,61 +26678,458 @@ mod livecheck {
     fn page_headers(
         url: &str,
         spec_ua: Option<&str>,
+        post: Option<&PostData<'_>>,
+        headers: &[String],
     ) -> std::collections::BTreeMap<String, String> {
         let ua = spec_ua.map(str::to_string).unwrap_or_else(brew_user_agent);
+        let mut last_merged = std::collections::BTreeMap::new();
         for extra in [&[][..], &["--request", "GET"][..]] {
-            let mut args: Vec<&str> = vec![
-                "--fail",
-                "--location",
-                "--silent",
-                "--show-error",
-                "--head",
-                "--max-redirs",
-                "10",
-                "--connect-timeout",
-                "10",
-                "--max-time",
-                "15",
-                "--user-agent",
-                &ua,
+            let mut args: Vec<String> = vec![
+                "--fail".into(),
+                "--location".into(),
+                "--silent".into(),
+                "--show-error".into(),
+                "--max-redirs".into(),
+                "10".into(),
+                "--connect-timeout".into(),
+                "10".into(),
+                "--max-time".into(),
+                "15".into(),
+                "--user-agent".into(),
+                ua.clone(),
             ];
-            args.extend_from_slice(extra);
-            args.extend(["--", url]);
+            match post {
+                // A POST fetch dumps headers instead
+                // of a HEAD request.
+                Some(PostData::Form(pairs)) => {
+                    let data = www_form_encode(pairs);
+                    args.extend([
+                        "--request".into(),
+                        "POST".into(),
+                        "--header".into(),
+                        format!("Content-Length: {}", data.len()),
+                        "--data".into(),
+                        data,
+                        "--dump-header".into(),
+                        "-".into(),
+                        "--output".into(),
+                        "/dev/null".into(),
+                    ]);
+                }
+                Some(PostData::Json(body)) => {
+                    args.extend([
+                        "--request".into(),
+                        "POST".into(),
+                        "--header".into(),
+                        format!("Content-Length: {}", body.len()),
+                        "--json".into(),
+                        (*body).to_string(),
+                        "--dump-header".into(),
+                        "-".into(),
+                        "--output".into(),
+                        "/dev/null".into(),
+                    ]);
+                }
+                Some(PostData::Empty) => {
+                    args.extend([
+                        "--request".into(),
+                        "POST".into(),
+                        "--dump-header".into(),
+                        "-".into(),
+                        "--output".into(),
+                        "/dev/null".into(),
+                    ]);
+                }
+                None => args.push("--head".into()),
+            }
+            for header in headers {
+                args.push("--header".into());
+                args.push(header.clone());
+            }
+            if post.is_none() {
+                args.extend(extra.iter().map(|e| e.to_string()));
+            }
+            args.extend(["--".into(), url.to_string()]);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
             let Ok(out) = fetch::run_capture("curl", &args) else {
                 continue;
             };
             let text = String::from_utf8_lossy(&out.stdout);
             let merged = merge_response_headers(&text);
-            if !merged.is_empty() {
+            // The HEAD attempt short-circuits only when
+            // a redirect target already arrived and the
+            // chain did not end in a 4xx (some CDNs
+            // answer HEAD with 400s but resolve GET);
+            // the GET retry's headers are used
+            // regardless.
+            let last_status = text
+                .lines()
+                .rev()
+                .find_map(|l| {
+                    l.strip_prefix("HTTP/")
+                        .and_then(|r| r.split_whitespace().nth(1))
+                        .and_then(|c| c.parse::<u32>().ok())
+                })
+                .unwrap_or(0);
+            if (merged.contains_key("location") || merged.contains_key("content-disposition"))
+                && !(400..500).contains(&last_status)
+            {
                 return merged;
             }
+            last_merged = merged;
         }
-        std::collections::BTreeMap::new()
+        last_merged
     }
 
     fn merge_response_headers(text: &str) -> std::collections::BTreeMap<String, String> {
+        // The oracle merges every response's headers
+        // (`reduce(&:merge)` — last value wins); the
+        // no-block path reads only location /
+        // content-disposition from the result.
         let mut merged = std::collections::BTreeMap::new();
         for line in text.lines() {
             let Some((name, value)) = line.split_once(':') else {
                 continue;
             };
             let name = name.trim().to_lowercase();
-            if name == "location" || name == "content-disposition" {
-                merged.insert(name, value.trim().to_string());
+            if name.is_empty() || name.contains(' ') {
+                continue;
             }
+            merged.insert(name, value.trim().to_string());
         }
         merged
     }
 
-    /// Brew `Sparkle` without a strategy block: newest
-    /// appcast item's bundle version (nice form).
-    fn sparkle_versions(url: &str, ua: Option<&str>) -> Found {
-        match page_get(url, ua) {
+    /// Brew `Sparkle`: newest appcast item's bundle
+    /// version (nice form), or a reduced strategy
+    /// block evaluated over the filtered items.
+    fn sparkle_versions(
+        url: &str,
+        ua: Option<&str>,
+        post: Option<&PostData<'_>>,
+        headers: &[String],
+        compressed: bool,
+        block: Option<&super::super::formula::SparkleBlock>,
+        re: Option<&LcRegex>,
+    ) -> Found {
+        match page_fetch(url, ua, post, headers, compressed) {
             Ok((content, fin)) => {
-                Found::Versions(sparkle_newest(&content).into_iter().collect(), Some(fin))
+                let versions = match block {
+                    Some(block) => sparkle_block_versions(&content, block, re),
+                    None => sparkle_newest(&content).into_iter().collect(),
+                };
+                Found::Versions(versions, Some(fin))
             }
             Err(msgs) => Found::Messages(msgs),
         }
+    }
+
+    fn sparkle_field(item: &SparkleItem, field: super::super::formula::SpField) -> Option<String> {
+        use super::super::formula::SpField;
+        match field {
+            SpField::Short => item.short.clone(),
+            SpField::Full => item.version.clone(),
+            SpField::Nice => bundle_nice(item.short.as_deref(), item.version.as_deref()),
+            SpField::Title => item.title.clone(),
+            SpField::Url => item.url.clone(),
+        }
+    }
+
+    /// Ruby `String#tr` (the shared port in this
+    /// module).
+    fn sparkle_tr(s: &str, from: &str, to: &str) -> String {
+        ruby_tr(s, from, to)
+    }
+
+    /// One item through a reduced sparkle block:
+    /// zero or more version strings.
+    fn sparkle_eval(
+        item: &SparkleItem,
+        block: &super::super::formula::SparkleBlock,
+        re: Option<&LcRegex>,
+    ) -> Vec<String> {
+        use super::super::formula::SpExpr;
+        for field in &block.present {
+            if sparkle_field(item, *field).is_none_or(|v| v.trim().is_empty()) {
+                return Vec::new();
+            }
+        }
+        if let Some(field) = block.match_guard {
+            let Some(re) = re else { return Vec::new() };
+            let matched = sparkle_field(item, field).is_some_and(|v| re.whole.is_match(&v));
+            if !matched {
+                return Vec::new();
+            }
+        }
+        let one = |v: Option<String>| v.into_iter().collect::<Vec<String>>();
+        match &block.expr {
+            SpExpr::Field(f) => one(sparkle_field(item, *f)),
+            SpExpr::FieldSplitFirst(f) => one(sparkle_field(item, *f)
+                .and_then(|v| v.split_whitespace().next().map(str::to_string))),
+            SpExpr::FieldTr(f, a, b) => one(sparkle_field(item, *f).map(|v| sparkle_tr(&v, a, b))),
+            SpExpr::FieldCharsJoin(f, sep) => one(sparkle_field(item, *f).map(|v| {
+                v.chars()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join(sep)
+            })),
+            SpExpr::FieldDeletePrefix(f, p) => one(sparkle_field(item, *f)
+                .map(|v| v.strip_prefix(p.as_str()).map_or(v.clone(), str::to_string))),
+            SpExpr::FieldDeleteSuffix(f, p) => one(sparkle_field(item, *f)
+                .map(|v| v.strip_suffix(p.as_str()).map_or(v.clone(), str::to_string))),
+            SpExpr::FieldIndex(f, n) => {
+                let (Some(re), Some(v)) = (re, sparkle_field(item, *f)) else {
+                    return Vec::new();
+                };
+                one(search_groups(re, &v).and_then(|g| g.get(*n).cloned().flatten()))
+            }
+            SpExpr::CapturesJoin(f) => {
+                let (Some(re), Some(v)) = (re, sparkle_field(item, *f)) else {
+                    return Vec::new();
+                };
+                let Some(groups) = search_groups(re, &v) else {
+                    return Vec::new();
+                };
+                vec![
+                    groups[1..]
+                        .iter()
+                        .map(|g| g.as_deref().unwrap_or_default())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ]
+            }
+            SpExpr::Template { from, local, parts } => {
+                let groups = match (from, re) {
+                    (Some(f), Some(re)) => match sparkle_field(item, *f) {
+                        Some(v) => match search_groups(re, &v) {
+                            Some(g) => Some(g),
+                            None => return Vec::new(),
+                        },
+                        None => return Vec::new(),
+                    },
+                    (Some(_), None) => return Vec::new(),
+                    (None, _) => None,
+                };
+                let local_val = match (local, re) {
+                    (Some((f, n)), Some(re)) => match sparkle_field(item, *f) {
+                        Some(v) => {
+                            match search_groups(re, &v).and_then(|g| g.get(*n).cloned().flatten()) {
+                                Some(v) => Some(v),
+                                None => return Vec::new(),
+                            }
+                        }
+                        None => return Vec::new(),
+                    },
+                    (Some(_), None) => return Vec::new(),
+                    (None, _) => None,
+                };
+                one(sparkle_render(
+                    item,
+                    parts,
+                    groups.as_deref(),
+                    local_val.as_deref(),
+                    re,
+                ))
+            }
+            SpExpr::EqElse {
+                from,
+                local,
+                a,
+                b,
+                then,
+                els,
+            } => {
+                use super::super::formula::SpOp;
+                let (Some(re), Some(f)) = (re, from) else {
+                    return Vec::new();
+                };
+                let Some(v) = sparkle_field(item, *f) else {
+                    return Vec::new();
+                };
+                let Some(groups) = search_groups(re, &v) else {
+                    return Vec::new();
+                };
+                let local_val = match local {
+                    Some((lf, n)) => match sparkle_field(item, *lf) {
+                        Some(lv) => {
+                            match search_groups(re, &lv).and_then(|g| g.get(*n).cloned().flatten())
+                            {
+                                Some(v) => Some(v),
+                                None => return Vec::new(),
+                            }
+                        }
+                        None => return Vec::new(),
+                    },
+                    None => None,
+                };
+                let op_val = |op: &SpOp| -> Option<String> {
+                    match op {
+                        SpOp::Cap(n) => groups.get(*n).cloned().flatten(),
+                        SpOp::Field(f) => sparkle_field(item, *f),
+                    }
+                };
+                let parts = if op_val(a) == op_val(b) { then } else { els };
+                one(sparkle_render(
+                    item,
+                    parts,
+                    Some(&groups),
+                    local_val.as_deref(),
+                    Some(re),
+                ))
+            }
+            SpExpr::CapElse {
+                from,
+                cap,
+                invert,
+                then,
+                els,
+            } => {
+                let (Some(re), Some(f)) = (re, from) else {
+                    return Vec::new();
+                };
+                let Some(v) = sparkle_field(item, *f) else {
+                    return Vec::new();
+                };
+                let Some(groups) = search_groups(re, &v) else {
+                    return Vec::new();
+                };
+                let truthy = groups.get(*cap).is_some_and(Option::is_some);
+                let parts = if truthy != *invert { then } else { els };
+                one(sparkle_render(item, parts, Some(&groups), None, Some(re)))
+            }
+            SpExpr::BlankElse { from, blank, parts } => {
+                let groups = match (from, re) {
+                    (Some(f), Some(re)) => {
+                        sparkle_field(item, *f).and_then(|v| search_groups(re, &v))
+                    }
+                    _ => None,
+                };
+                match groups {
+                    Some(g) => one(sparkle_render(item, parts, Some(&g), None, re)),
+                    None => one(sparkle_render(item, blank, None, None, re)),
+                }
+            }
+            SpExpr::Scan { from, parts } => {
+                let (Some(re), Some(v)) = (re, sparkle_field(item, *from)) else {
+                    return Vec::new();
+                };
+                let mut out = Vec::new();
+                for m in re.whole.find_iter(&v) {
+                    // Scan arrays index captures from 0
+                    // (`match[0]` is the first capture).
+                    let groups = extract_groups(re, m.as_str());
+                    if let Some(s) = sparkle_render(item, parts, Some(&groups), None, Some(re)) {
+                        out.push(s);
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// Render one sparkle interpolation template.
+    /// A missing field/capture interpolates empty
+    /// (Ruby nil), as brew's blocks rely on for
+    /// optional CSV components.
+    fn sparkle_render(
+        item: &SparkleItem,
+        parts: &[super::super::formula::SpPart],
+        groups: Option<&[Option<String>]>,
+        local: Option<&str>,
+        re: Option<&LcRegex>,
+    ) -> Option<String> {
+        use super::super::formula::SpPart;
+        let cap = |n: usize| -> String {
+            groups
+                .and_then(|g| g.get(n))
+                .cloned()
+                .flatten()
+                .unwrap_or_default()
+        };
+        let mut out = String::new();
+        for part in parts {
+            match part {
+                SpPart::Lit(s) => out.push_str(s),
+                SpPart::Field(f) => {
+                    if let Some(v) = sparkle_field(item, *f) {
+                        out.push_str(&v);
+                    }
+                }
+                SpPart::Cap(n) => out.push_str(&cap(*n)),
+                SpPart::CapTr(n, a, b) => out.push_str(&sparkle_tr(&cap(*n), a, b)),
+                SpPart::CapOr(n, fb) => {
+                    let v = cap(*n);
+                    out.push_str(if v.is_empty() { fb } else { &v });
+                }
+                SpPart::Local => out.push_str(local.unwrap_or_default()),
+                SpPart::FieldSplit(f, sep, last) => {
+                    if let Some(v) = sparkle_field(item, *f) {
+                        let seg = if *last {
+                            v.rsplit(sep.as_str()).next()
+                        } else {
+                            v.split(sep.as_str()).next()
+                        };
+                        out.push_str(seg.unwrap_or_default());
+                    }
+                }
+                SpPart::FieldIndex(f, n) => {
+                    if let (Some(re), Some(v)) = (re, sparkle_field(item, *f))
+                        && let Some(g) = search_groups(re, &v)
+                        && let Some(Some(s)) = g.get(*n)
+                    {
+                        out.push_str(s);
+                    }
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// A reduced sparkle block over an appcast: the
+    /// oracle's filtered, newest-first items through
+    /// the channel gate, compacted and deduplicated
+    /// (`handle_block_return`).
+    fn sparkle_block_versions(
+        content: &str,
+        block: &super::super::formula::SparkleBlock,
+        re: Option<&LcRegex>,
+    ) -> Vec<String> {
+        use super::super::formula::SpChannel;
+        let items = sparkle_sorted_items(content);
+        let gated = |it: &SparkleItem| {
+            (match &block.channel {
+                None => true,
+                Some(SpChannel::Nil) => it.channel.is_none(),
+                Some(SpChannel::Eq(x)) => it.channel.as_deref() == Some(x.as_str()),
+                Some(SpChannel::Ne(x)) => it.channel.as_deref() != Some(x.as_str()),
+                Some(SpChannel::EqOrNil(x)) => {
+                    it.channel.is_none() || it.channel.as_deref() == Some(x.as_str())
+                }
+            }) && (!block.find
+                || block
+                    .match_guard
+                    .is_none_or(|field| match (re, sparkle_field(it, field)) {
+                        (Some(re), Some(text)) => re.whole.is_match(&text),
+                        _ => false,
+                    }))
+        };
+        let mut out: Vec<String> = Vec::new();
+        if block.all {
+            for item in items.iter().filter(|it| gated(it)) {
+                for v in sparkle_eval(item, block, re) {
+                    if !out.contains(&v) {
+                        out.push(v);
+                    }
+                }
+            }
+        } else if let Some(item) = items.iter().rev().find(|it| gated(it)) {
+            for v in sparkle_eval(item, block, re) {
+                if !out.contains(&v) {
+                    out.push(v);
+                }
+            }
+        }
+        out
     }
 
     struct SparkleItem {
@@ -23676,10 +27138,22 @@ mod livecheck {
         version: Option<String>,
         os: Option<String>,
         min_sys: Option<String>,
+        title: Option<String>,
+        url: Option<String>,
+        channel: Option<String>,
         any_field: bool,
     }
 
     fn sparkle_newest(content: &str) -> Option<String> {
+        let items = sparkle_sorted_items(content);
+        let item = items.last()?;
+        bundle_nice(item.short.as_deref(), item.version.as_deref())
+    }
+
+    /// Filtered appcast items, oldest first (the
+    /// oracle sorts newest first; consumers here
+    /// read from the end).
+    fn sparkle_sorted_items(content: &str) -> Vec<SparkleItem> {
         let mut items: Vec<SparkleItem> = sparkle_items(content)
             .into_iter()
             .filter(|it| {
@@ -23706,8 +27180,7 @@ mod livecheck {
             })
             .collect();
         items.sort_by(|a, b| a.pub_date.cmp(&b.pub_date).then_with(|| bundle_cmp(a, b)));
-        let item = items.last()?;
-        bundle_nice(item.short.as_deref(), item.version.as_deref())
+        items
     }
 
     fn bundle_cmp(a: &SparkleItem, b: &SparkleItem) -> Ordering {
@@ -23801,7 +27274,9 @@ mod livecheck {
             }
             let body = &rest[gt + 1..];
             let close = format!("</{tag}>");
-            let end = body.find(&close)?;
+            let Some(end) = body.find(&close) else {
+                continue;
+            };
             let text = xml_unescape(&body[..end]);
             return (!text.is_empty()).then_some(text);
         }
@@ -23936,8 +27411,23 @@ mod livecheck {
     }
 
     fn sparkle_items(content: &str) -> Vec<SparkleItem> {
+        // XML comments can mention `<item` (generator
+        // notes); they are not elements.
+        let mut cleaned = String::new();
+        let mut scan = content;
+        while let Some(open) = scan.find("<!--") {
+            cleaned.push_str(&scan[..open]);
+            match scan[open + 4..].find("-->") {
+                Some(close) => scan = &scan[open + 4 + close + 3..],
+                None => {
+                    scan = "";
+                    break;
+                }
+            }
+        }
+        cleaned.push_str(scan);
         let mut items = Vec::new();
-        let mut rest = content;
+        let mut rest = cleaned.as_str();
         while let Some(start) = rest.find("<item") {
             let after = &rest[start..];
             let Some(end) = after.find("</item>") else {
@@ -24002,6 +27492,9 @@ mod livecheck {
             items.push(SparkleItem {
                 pub_date,
                 any_field: any_field || short.is_some() || version.is_some(),
+                url: xml_enclosure_attr(item, "url").or_else(|| xml_elem_text(item, "link")),
+                channel: xml_elem_text(item, "channel"),
+                title,
                 short,
                 version,
                 os,

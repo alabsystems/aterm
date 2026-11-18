@@ -215,7 +215,9 @@ fn sigkill_cargo_drains_compiler_before_recovering_exactly_its_gnu_tokens() {
 
 fn driver_command(root: &Path) -> Command {
     let exe = std::env::current_exe().unwrap();
+    let sdk = crate::build_inputs::AppleSdk::capture().unwrap();
     let env = ReleaseEnv {
+        sdk: &sdk,
         path: "/usr/bin:/bin".into(),
         home: root.as_os_str(),
         tmp: root,
@@ -224,7 +226,7 @@ fn driver_command(root: &Path) -> Command {
         short_commit: "0123456789ab",
         commit: "0123456789abcdef0123456789abcdef01234567",
         target_dir: root.join("target"),
-        rustup_home: None,
+        stock: None,
         index_hint: None,
         units: None,
     };

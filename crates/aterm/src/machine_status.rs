@@ -990,7 +990,7 @@ fn owed_area(owed: &Result<OwedClone, String>, token: bool) -> Area {
             "`aterm init` clones them, or owes the clone to the vault's sync until the token lands",
         ),
         Ok(OwedClone::Off(why) | OwedClone::Held(why)) => Area::off(NAME, why.clone()),
-        Ok(OwedClone::Waiting(why)) => Area::working(
+        Ok(OwedClone::Waiting(why) | OwedClone::Inputs(why)) => Area::working(
             NAME,
             why.clone(),
             "the vault's sync clones them by itself once it can",

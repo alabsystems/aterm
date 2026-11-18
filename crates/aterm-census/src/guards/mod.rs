@@ -40,6 +40,7 @@ mod no_reach_read;
 mod release_notes;
 mod rules;
 mod seam_caller;
+mod traced_reads;
 pub(crate) mod unmounted_test;
 
 /// One violation: where, which rule, and what the rule saw there.
@@ -102,6 +103,7 @@ pub const GUARDS: &[Rule] = &[
     no_reach_read::NO_REACH_READ,
     unmounted_test::UNMOUNTED_TEST,
     inline_test_module::INLINE_TEST_MODULE,
+    traced_reads::TRACED_READS,
 ];
 
 /// The guards' outcome over one tree.

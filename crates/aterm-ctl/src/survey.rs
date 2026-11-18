@@ -2545,6 +2545,29 @@ pub(crate) fn sid_not_found(replies: &[HostReply], sid: &str, fleet: bool) -> St
     }
 }
 
+/// Survey replies, each `(label, reply)` with its `OK <n>` line and the lines after it, as
+/// `survey --json` prints them: fleet peers' where `remote` (no peer proven by a node), else this
+/// Mac's own windows'. A dev seam, so a reader of that form (aterm-gui's fleet sightings) is
+/// tested on what this build's own parser and JSON writer make of a reply.
+#[cfg(any(test, debug_assertions))]
+pub fn survey_json_of_replies(remote: bool, replies: &[(&str, &str)]) -> String {
+    let hosts: Vec<HostReply> = replies
+        .iter()
+        .map(|(label, reply)| {
+            let lines: Vec<String> = reply.lines().map(str::to_owned).collect();
+            HostReply {
+                label: (*label).to_owned(),
+                remote,
+                unproven: false,
+                node: None,
+                answer: parse_reply(&lines),
+                reason: None,
+            }
+        })
+        .collect();
+    render_json(&hosts)
+}
+
 /// Render replies as a single-line JSON array (`--json`).
 pub(crate) fn render_json(replies: &[HostReply]) -> String {
     // Each record as an object.

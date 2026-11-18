@@ -15,7 +15,7 @@ use aterm_vitals::jobs::JobsView;
 use aterm_vitals::left::LeftView;
 
 use super::{Msg, NameReply, Request, TabReads};
-use crate::vitals_jobs::JobsPass;
+use crate::vitals_jobs::{JobsPass, ProcessFacts};
 use crate::vitals_left::LeftPass;
 
 /// Work the machine reader must service after draining any control message.
@@ -99,8 +99,7 @@ impl Evidence {
 
 pub(super) struct Input {
     pub(super) reads: TabReads,
-    pub(super) sweep: Option<Vec<ProcessReading>>,
-    pub(super) complete: bool,
+    facts: ProcessFacts,
     pub(super) req: Request,
     pub(super) unix_ms: u64,
     pub(super) thrashing: bool,
@@ -112,8 +111,7 @@ pub(super) struct Input {
 impl Input {
     pub(super) fn new(
         reads: TabReads,
-        sweep: Option<Vec<ProcessReading>>,
-        complete: bool,
+        facts: ProcessFacts,
         req: &Request,
         unix_ms: u64,
         thrashing: bool,
@@ -121,12 +119,15 @@ impl Input {
         let evidence = Arc::new(Evidence::new(
             req,
             &reads,
-            if complete { sweep.as_deref() } else { None },
+            if facts.complete() {
+                facts.sweep()
+            } else {
+                None
+            },
         ));
         Self {
             reads,
-            sweep,
-            complete,
+            facts,
             req: req.clone(),
             unix_ms,
             thrashing,
@@ -167,15 +168,15 @@ impl Core {
         let jobs = super::jobs_step(
             &mut self.jobs,
             &input.reads,
-            input.sweep.as_deref(),
+            &input.facts,
             &input.req,
             input.thrashing,
         );
         let age = super::jobs_age_ms(jobs.as_deref(), input.reads.now_ms());
         let left = self.left.tick(
             input.unix_ms,
-            input.sweep.as_deref(),
-            input.complete,
+            input.facts.sweep(),
+            input.facts.complete(),
             &input.req,
             jobs.as_deref(),
             age,

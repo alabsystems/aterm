@@ -4,6 +4,9 @@
 use super::*;
 use crate::ledger::{GitCli, GitRunner, object_git};
 
+#[path = "tag_residency_tests.rs"]
+mod tag_residency;
+
 #[test]
 fn publisher_controls_share_one_complete_advertisement() {
     use agh::git::{PUBLISHER_FENCE_REF as FENCE, RELEASE_LEASE_REF as LEASE};
@@ -281,6 +284,51 @@ fn commit(repo: &Path, text: &str) -> String {
     git(repo, &["add", "line.toml"]);
     git(repo, &["commit", "-q", "-m", "fixture"]);
     git(repo, &["rev-parse", "HEAD"])
+}
+
+#[test]
+fn windows_request_replacement_uses_native_custom_ref_leases() {
+    use crate::buildplan::windows_pull::{Origin, RemoteOrigin, write_request};
+    use aterm_winship::pull::REQUEST_REF;
+
+    let root = aterm_tempfile::tempdir().unwrap();
+    let bare = repo(root.path(), "remote.git", true);
+    let source = repo(root.path(), "source", false);
+    git(&source, &["config", "user.name", "fixture"]);
+    git(
+        &source,
+        &["config", "user.email", "fixture@example.invalid"],
+    );
+    let release = commit(&source, "release source\n");
+    git(
+        &source,
+        &[
+            "config",
+            "remote.origin.url",
+            "https://github.com/fixture/app.git",
+        ],
+    );
+    let remote = claim_fixture(&source, &bare);
+    let origin = RemoteOrigin(&remote);
+    let runner = GitCli::new(&source);
+    let first = write_request(&origin, &runner, "0.206.0", 1, &release, 1_794_700_800).unwrap();
+    assert_eq!(origin.get(REQUEST_REF).unwrap(), Some(first.clone()));
+    let children_before = remote.client.fx().children_run().len();
+    let second = write_request(&origin, &runner, "0.206.0", 2, &release, 1_794_700_801).unwrap();
+    assert_ne!(first, second);
+    assert_eq!(origin.get(REQUEST_REF).unwrap(), Some(second.clone()));
+    // Each request remains a sibling with exactly C as parent. Replacement must delete
+    // the previous request under its exact lease, then create the new one from absence.
+    for request in [&first, &second] {
+        assert_eq!(
+            git(&bare, &["rev-list", "--parents", "-n", "1", request]),
+            format!("{request} {release}")
+        );
+    }
+    assert_new_native_children_are_progress_bound(&remote, children_before);
+    // A stale reservation cannot withdraw the new request through the adapter.
+    assert!(!origin.delete(REQUEST_REF, &first).unwrap());
+    assert_eq!(origin.get(REQUEST_REF).unwrap(), Some(second));
 }
 
 /// The name and peeled commit alone cannot bind an annotated historical tag:
@@ -1018,20 +1066,24 @@ fn a_complete_tag_catalog_needs_no_main_and_tag_commits_refuse_noncommits() {
     assert_eq!(catalog.get("refs/tags/v1"), Some(&token));
     assert_eq!(catalog.get("refs/tags/v1^{}"), Some(&commit));
     assert_eq!(catalog.get("refs/tags/alias^{}"), Some(&commit));
-    // Residency alone grants no reuse: another Remote has no completed-import custody.
+    // A new Remote recomputes raw residency without inheriting the catalog's proof.
     let uncached = Remote::new(remote.client.clone(), remote.slug.clone(), &target).unwrap();
     let first = effects.children_run().len();
-    let imported_at = std::time::Instant::now();
     assert_eq!(uncached.tag_commit("v1").unwrap(), Some(commit.clone()));
     let children = effects.children_run();
     let imports = children[first..]
         .iter()
         .filter(|child| child.args.iter().any(|arg| arg == "fetch"))
         .count();
-    assert_eq!(imports, 1, "an uncached exact tag read must import");
-    eprintln!(
-        "uncached-exact-tag: {imports} fetch, {:?} elapsed",
-        imported_at.elapsed(),
+    assert_eq!(
+        imports, 0,
+        "a fresh raw-closure proof avoids a repeated import"
+    );
+    assert!(
+        children[first..]
+            .iter()
+            .any(|child| child.args.iter().any(|arg| arg == "--batch")),
+        "the new native call independently hashes the raw tag chain"
     );
     // The handoff policy asks for the predecessor again after catalog gates imported it.
     // NEGATIVE CONTROL: an unconditional fetch here repeats the completed import.

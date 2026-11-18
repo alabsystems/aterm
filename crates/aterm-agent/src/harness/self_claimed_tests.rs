@@ -1359,3 +1359,36 @@ fn structural_resume_validation_and_relaunch_lines_reject_malformed_or_line_brea
         assert!(witnesses.record(4242, "start").is_err());
     }
 }
+
+/// The step the renewal hand-back takes where the tab could not be read as the shell's
+/// ([`unsnapped_step`], which aterm-gui's host and the renewal's pty test share): a read that can
+/// fail for now (the roster, the shell, its terminal and arguments, the whole-table read behind
+/// `terminal` on a loaded Mac) waits; only a tab the relaunch can never name is refused.
+///
+/// NEGATIVE CONTROL, observed 2026-11-17: with `"terminal"` added to the refused arm, this fails
+/// at the `terminal` row (`refused:terminal` against `wait:terminal`): the answer the pty test
+/// took as its end on m72 on 2026-11-13.
+#[test]
+fn a_snapshot_read_that_can_fail_for_now_waits_and_only_an_unnameable_tab_is_refused() {
+    for why in [
+        "no-socket",
+        "roster",
+        "no-foreground",
+        "tab-ambiguous",
+        "no-shell",
+        "shell-unread",
+        "layout-unread",
+        "terminal",
+        "terminal-unread",
+        "argv-unreadable",
+    ] {
+        assert_eq!(unsnapped_step(why), format!("wait:{why}"));
+    }
+    for why in [
+        "no-tab",
+        "tab-identity-conflict",
+        crate::harness::relaunch::ARGV_WITHHELD,
+    ] {
+        assert_eq!(unsnapped_step(why), format!("refused:{why}"));
+    }
+}

@@ -97,7 +97,7 @@ pub(crate) fn transition(state: &State, action: &str) -> State {
         history.last_attempt.clone(),
         history.shared_preparations.clone(),
     );
-    let guard = Arc::new(std::sync::Mutex::new(history));
+    let guard = history.shared();
     // Reverse discovery order makes deterministic tie-breaking observable.
     let ordered = ordered_shared_candidates(vec![b, a], &guard);
     let first = match ordered[0].row.label.as_str() {
@@ -160,7 +160,7 @@ pub(crate) fn progress_transition(state: &State, _: &str) -> State {
             );
         }
     }
-    let guard = Arc::new(std::sync::Mutex::new(history));
+    let guard = history.shared();
     let ordered = ordered_shared_candidates(vec![b, a], &guard);
     let grant = ordered[0].authority.prepare(&ordered[0].row).unwrap();
     let selected = if grant.source == grant_a.source { 1 } else { 2 };
@@ -211,7 +211,7 @@ fn busy_preparation_admission_does_not_record_a_new_decision() {
     history
         .shared_preparations
         .insert(key.clone(), (grant.source, [99; 32]));
-    let guard = Arc::new(std::sync::Mutex::new(history));
+    let guard = history.shared();
     let held = AutoRenewPermit::claim_with_mailbox(&guard, "other", start, false, None).unwrap();
     assert!(AutoRenewPermit::claim_preparation(&guard, &key, start, &grant).is_none());
     {
@@ -247,7 +247,7 @@ fn foreign_source_history_is_unseen_without_resetting_it() {
         history.last_attempt.clone(),
         history.shared_preparations.clone(),
     );
-    let guard = Arc::new(std::sync::Mutex::new(history));
+    let guard = history.shared();
     let ordered = ordered_shared_candidates(vec![b, a], &guard);
     assert_eq!(ordered[0].row.label, "candidate-1");
     let after = guard.lock().unwrap();

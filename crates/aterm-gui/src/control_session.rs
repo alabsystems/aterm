@@ -178,7 +178,7 @@ pub(crate) fn sessions_lines(
                     meta.supervisor_proven(now),
                     meta.claim_proven(now),
                 ),
-                crate::harness_claim::wire_versions(meta.live_scoped(now)),
+                crate::harness_claim::wire_versions(&meta, now),
                 meta.supervisor_authority(now).wire_fields(),
             )
         };
@@ -4587,9 +4587,10 @@ pub(crate) fn cmd_meta_supervisor(
 /// The kernel's proof of a claim being made: `holder`'s process, under the image rule of the
 /// contract the claim names (`None`: a claim without `contract=`), as
 /// [`crate::control::prove_claim_for`] reads it in production; a seed id's contract 3 claim is
-/// proven by the rule contract 3 always had, whatever row the registry composed for the id.
+/// proven by the rule contract 3 always had, whatever row the registry composed for the id. The
+/// proof carries the version of the build it admitted ([`crate::harness_claim::ClaimProof`]).
 pub(crate) type ProveClaim<'a> =
-    dyn Fn(&str, Option<u32>) -> Option<crate::self_claim::Proven> + 'a;
+    dyn Fn(&str, Option<u32>) -> Option<crate::harness_claim::ClaimProof> + 'a;
 
 /// The kernel's look at a contract 4 claim's child for its just-proven claimant
 /// ([`crate::harness_claim::keep_child`] with the session's foreground group and the live
@@ -4693,7 +4694,11 @@ pub(crate) fn cmd_meta_supervisor_serving(
         }
         aterm_agent::harness::contract::Words::Scoped(claim) => {
             let contract = claim.contract;
-            let Some(proven) = prove(holder, Some(contract)) else {
+            let Some(crate::harness_claim::ClaimProof {
+                proven,
+                version: admitted,
+            }) = prove(holder, Some(contract))
+            else {
                 aterm_log::info!(
                     "harness @{}: {}'s contract {contract} claim is unproven (the kernel's peer, \
                      the foreground group or the image rule); nothing is claimed",
@@ -4730,8 +4735,8 @@ pub(crate) fn cmd_meta_supervisor_serving(
                 claim,
                 child: child.map(|(_, kept)| kept),
             };
-            let claimed = crate::session_timeline::publish_claim_supervisor_scoped(
-                ctx, holder, conn, scoped, now, by,
+            let claimed = crate::session_timeline::publish_claim_supervisor_admitted(
+                ctx, holder, conn, scoped, admitted, now, by,
             );
             if claimed.as_ref().is_ok_and(|c| c.published_ref().changed) {
                 aterm_log::info!(
@@ -4763,7 +4768,7 @@ pub(crate) fn cmd_meta_supervisor_serving(
     let proven = if ttl_ms.is_some() {
         None
     } else {
-        prove(holder, None)
+        prove(holder, None).map(|proof| proof.proven)
     };
     let proof = proven.clone();
     let claimed = crate::session_timeline::publish_claim_supervisor_as(

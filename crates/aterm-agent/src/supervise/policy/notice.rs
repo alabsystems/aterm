@@ -392,7 +392,7 @@ pub const WHY_USE_UNMADE: &str = "it could not restart this Claude Code";
 /// Every clause [`LIMIT_USE`]'s `{why}` is filled with.
 pub const USE_WHYS: &[&str] = &[WHY_USE_EARLIER, WHY_USE_PIN, WHY_USE_RESET, WHY_USE_UNMADE];
 
-/// A multi-day usage limit on a roster row's login that aterm does not move the tab off by itself, and another row `{label}` is ready to run now: the owner's `accounts use` makes that row the one every session follows, this tab included.
+/// A multi-day usage limit on a roster row's login that aterm does not move the tab off by itself, and another row is ready to run now: the owner's `accounts use` makes that row the one every session follows, this tab included. Its `{label}` is the word that names the ready row's account (`super::turn_end::Ready::word`: its slug, else its key), which `accounts use` takes; never a roster label, which names nothing. A ready row with no address has no word, and is told as [`LIMIT_ROSTER`].
 pub const LIMIT_USE: NoticeText = NoticeText {
     id: "limit-use",
     code: "lw",
@@ -543,7 +543,7 @@ pub const LIMIT_ROSTER: NoticeText = NoticeText {
     title: "Claude usage limit reached",
     happened: "Claude Code hit this account's usage limit, and no other listed account can take over.",
     did: "aterm keeps this tab on its own account, so no other account replaces its login.",
-    todo: "Run aterm harness accounts add <label>",
+    todo: "Run aterm harness accounts add <account>",
     todo_as: None,
     expect: LIMIT_NEXT_ANY,
     expect_reset: Some(LIMIT_NEXT_RESET),

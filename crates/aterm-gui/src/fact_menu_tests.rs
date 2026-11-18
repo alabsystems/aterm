@@ -1696,6 +1696,70 @@ fn account_menu_shows_the_week_and_rotation_accounts() {
 /// that choosing it signs it in; the row itself says only its condition), and a walled row says
 /// `out`, never a percentage (glass design §2.1: never an inferred 100%). Negative control: a
 /// limited row or a footer's wall said with a percentage fails the walled row.
+/// A MODEL'S OWN WEEKLY WALL IS NAMED BESIDE THE WEEK OF A ROW THAT RUNS (FL-206): Fable's wall
+/// walls Fable's sessions alone, so the row says what it says of its week, can be chosen, and
+/// names `· Fable week out` beside it, as `accounts list` names it; an account's own wall says
+/// `out` alone. NEGATIVE CONTROL: with no model wall the row says its week alone.
+#[test]
+fn a_rows_model_wall_is_named_beside_its_week() {
+    use aterm_agent::harness::accounts;
+    const NOW: i64 = 1_790_000_000;
+    let roster = accounts::Roster {
+        rows: vec![accounts::Row {
+            label: "work".into(),
+            class: accounts::Class::Preferred,
+            dir: None,
+            email: Some("work@example.test".into()),
+            ..accounts::Row::default()
+        }],
+    };
+    let enrolled = ["work"].into_iter().map(str::to_string).collect();
+    let rows = |state: &accounts::State| {
+        account_menu_rows_from(
+            &roster,
+            state,
+            &enrolled,
+            None,
+            true,
+            None,
+            None,
+            SessionWeek::default(),
+            NOW,
+        )
+    };
+    let plain = rows(&accounts::State::default());
+    assert!(
+        !plain[0].trail.contains("Fable"),
+        "NEGATIVE CONTROL: {plain:?}"
+    );
+    let mut walled = accounts::State::default();
+    let fable = "seven_day_overage_included";
+    let _ = accounts::note_wall(
+        &mut walled,
+        "work",
+        fable,
+        Some(NOW + 86_400),
+        NOW - 60,
+        NOW,
+    );
+    let named = rows(&walled);
+    assert_eq!(
+        named[0].trail,
+        format!("{} \u{b7} Fable week out", plain[0].trail)
+    );
+    assert!(named[0].spoken.contains(", Fable week out"), "{named:?}");
+    assert!(named[0].enabled);
+    let _ = accounts::note_wall(
+        &mut walled,
+        "work",
+        "seven_day",
+        Some(NOW + 86_400),
+        NOW - 60,
+        NOW,
+    );
+    assert_eq!(rows(&walled)[0].trail, "out", "an account's own wall");
+}
+
 #[test]
 fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
     use aterm_agent::harness::accounts;
@@ -2080,7 +2144,7 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
     );
     assert!(
         menu.join(" ")
-            .contains("note Add one: aterm harness accounts add --cli note kimi <label>"),
+            .contains("note Add one: aterm harness accounts add --cli note kimi <account>"),
         "{menu:?}"
     );
     assert!(

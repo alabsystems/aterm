@@ -89,7 +89,7 @@ impl AccountsHost for DiagnosticHost {
 struct Fixture {
     bed: Bed,
     host: Arc<DiagnosticHost>,
-    guard: Arc<Mutex<AutoRenewGuard>>,
+    guard: Arc<Watched<AutoRenewGuard>>,
     lines: Arc<Mutex<Vec<String>>>,
 }
 
@@ -103,7 +103,7 @@ impl Fixture {
         Self {
             bed,
             host,
-            guard: Arc::new(Mutex::new(AutoRenewGuard::default())),
+            guard: AutoRenewGuard::default().shared(),
             lines: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -115,8 +115,8 @@ impl Fixture {
             scope: None,
             fetch: &|_, _| panic!("no source fetch"),
             spawn_renewal: spawn,
-            sync_cooldown: &Mutex::new(None),
-            rediscovery: &Mutex::new(Rediscovery::default()),
+            sync_cooldown: &Watched::new("accounts_sync/sync_cooldown", None),
+            rediscovery: &Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
             renew_guard: &self.guard,
             find_browser: &|_| false,
             vault_sync: |_, _scope| crate::harness::sign_in_ladder::Vault::NotMember,
@@ -136,7 +136,7 @@ impl Fixture {
         upkeep(
             &self.bed.home,
             &self.bed.state,
-            (&self.bed.roster, NOW, UpkeepStep::Renew),
+            (&self.bed.roster, trace::Now::at(NOW), UpkeepStep::Renew),
             &fx,
         );
     }

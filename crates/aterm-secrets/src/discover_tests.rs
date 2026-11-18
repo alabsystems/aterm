@@ -4,29 +4,29 @@
 use super::*;
 use crate::envelope;
 
-/// While the LAN broker is unavailable a standing browse asks again every [`BROKER_PAUSE`],
-/// however long it has waited, and the first browse that then ends waits [`RESTART_FIRST`];
-/// a browse that ran and ended backs off doubling, up to [`RESTART_LONGEST`], and from the
-/// start again once one ran that long. Negative control: the broker's absence on the
-/// doubled backoff waits 5, 10, 20, 40 and 60 s.
+/// A standing browse that found no broker waits for one with no timer of its own, however long
+/// it has waited, and the first browse that then ends waits [`RESTART_FIRST`]; a browse that ran
+/// and ended backs off doubling, up to [`RESTART_LONGEST`], and from the start again once one ran
+/// that long. NEGATIVE CONTROL: the broker's absence on a pause of its own (the 2 s cadence
+/// before) fails the first assertion; on the doubled backoff, it waits 5, 10, 20, 40 and 60 s.
 #[test]
-fn a_standing_browse_waits_for_the_broker_on_a_short_cadence() {
+fn a_standing_browse_backs_off_and_waits_for_its_broker_with_no_timer() {
     let mut pause = RESTART_FIRST;
     for _ in 0..8 {
         let (wait, next) = restart_pause(Started::NoBroker, pause);
-        assert_eq!(wait, BROKER_PAUSE);
+        assert_eq!(wait, None);
         pause = next;
     }
     let quick = Started::Ran(Duration::from_secs(1));
     let mut waits = Vec::new();
     for _ in 0..6 {
         let (wait, next) = restart_pause(quick, pause);
-        waits.push(wait.as_secs());
+        waits.push(wait.map(|wait| wait.as_secs()));
         pause = next;
     }
-    assert_eq!(waits, [5, 10, 20, 40, 60, 60]);
+    assert_eq!(waits, [5, 10, 20, 40, 60, 60].map(Some));
     let (wait, _) = restart_pause(Started::Ran(RESTART_LONGEST), pause);
-    assert_eq!(wait, RESTART_FIRST);
+    assert_eq!(wait, Some(RESTART_FIRST));
 }
 
 /// A browse's add of `name` of `service` on `interface`, as the broker streams it.
@@ -244,6 +244,7 @@ fn the_vault_watch_of_a_lab_service_hears_that_service_alone() {
     );
     let lab_watch = Watch {
         watched: Arc::new(watched),
+        closing: None,
     };
     for w in [&watch, &lab_watch] {
         hears(w, &added(crate::server::SERVICE_TYPE, 4, "alab-secrets"));
@@ -972,5 +973,547 @@ fn default_urls_do_not_starve_discovered_servers_at_the_final_candidate_limit() 
             }
             assert_eq!(queried, expected, "servers={count}, watch={use_watch}");
         }
+    }
+}
+
+/// The standing browse's own thread ([`browse_standing`]), run against a stand-in LAN broker in
+/// a scratch folder (`aterm_uds::lan::seam_here`): no test reaches the person's broker or the LAN.
+/// Each test drops its watch in one of the thread's waits and sees the thread end within the
+/// hang detector.
+#[cfg(target_os = "macos")]
+mod standing {
+    use super::*;
+    use aterm_spec::wait::MUST_HAPPEN;
+    use aterm_uds::lan::wire::{self, Frame, Reader, Request};
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
+
+    /// What the stand-in does with one connection it accepts.
+    #[derive(Clone, Debug)]
+    enum Answer {
+        /// Refuses this process before its hello, and closes.
+        Refuse,
+        /// Says it could not judge this process, and closes.
+        Unchecked,
+        /// Says its hello, tells a request it is then sent, streams `events` and holds the
+        /// request open until the client ends it (`hold`), or closes.
+        Hello { events: Vec<Event>, hold: bool },
+        /// As `Hello` that holds its request, but streams `events` only once its test sends on
+        /// `go` (within the hang detector).
+        Later {
+            events: Vec<Event>,
+            go: Arc<Mutex<mpsc::Receiver<()>>>,
+        },
+    }
+
+    /// What the stand-in tells its test.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Told {
+        /// A request came.
+        Asked(Request),
+        /// A client ended a request held open.
+        Ended,
+    }
+
+    /// A stand-in broker and what it tells.
+    struct StandIn {
+        told: mpsc::Receiver<Told>,
+        accepted: Arc<AtomicUsize>,
+    }
+
+    impl StandIn {
+        /// The connections it accepted so far.
+        fn accepted(&self) -> usize {
+            self.accepted.load(Ordering::SeqCst)
+        }
+
+        /// The browse request it was sent next.
+        fn browsed(&self) -> bool {
+            matches!(
+                self.told.recv_timeout(MUST_HAPPEN),
+                Ok(Told::Asked(Request::Browse { .. }))
+            )
+        }
+    }
+
+    /// A stand-in broker at `socket`, answering the connections it accepts in turn as `answers`
+    /// say, on a thread of its own. Its socket is bound beside the socket's folder and moved into
+    /// it whole, so a browse that waits on that folder hears one change, of a socket that
+    /// already listens.
+    fn serve(socket: &Path, answers: Vec<Answer>) -> StandIn {
+        let bound = socket.parent().unwrap().with_file_name("bound.sock");
+        let listener = aterm_uds::CtlListener::bind(&bound).unwrap();
+        std::fs::rename(&bound, socket).unwrap();
+        let (tell, told) = mpsc::channel();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            for answer in answers {
+                let Ok((stream, _)) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Until(Instant::now() + MUST_HAPPEN),
+                    aterm_uds::AcceptedMode::Blocking,
+                ) else {
+                    return;
+                };
+                counted.fetch_add(1, Ordering::SeqCst);
+                answered(&stream, answer, &tell);
+            }
+        });
+        StandIn { told, accepted }
+    }
+
+    /// Answer one connection as `answer` says.
+    fn answered(stream: &aterm_uds::CtlStream, answer: Answer, tell: &mpsc::Sender<Told>) {
+        let (events, hold, go) = match answer {
+            Answer::Refuse => {
+                let words = "a stand-in that refuses".to_owned();
+                let _ = wire::send(stream, &Frame::Refused { words });
+                return;
+            }
+            Answer::Unchecked => {
+                let words = "a stand-in that could not check".to_owned();
+                let _ = wire::send(stream, &Frame::Unchecked { words });
+                return;
+            }
+            Answer::Hello { events, hold } => (events, hold, None),
+            Answer::Later { events, go } => (events, true, Some(go)),
+        };
+        let hello = Frame::Hello {
+            protocol: aterm_uds::lan::PROTOCOL,
+            build: "stand-in".to_owned(),
+        };
+        let mut reader = Reader::new(0);
+        let deadline = Some(Instant::now() + MUST_HAPPEN);
+        if wire::send(stream, &hello).is_err()
+            || !matches!(
+                reader.frame(stream, deadline),
+                Ok(Some(Frame::Hello { .. }))
+            )
+        {
+            return;
+        }
+        // A hello alone (an arrival's) is closed by its client.
+        let Ok(Some(Frame::Request(request))) = reader.frame(stream, deadline) else {
+            return;
+        };
+        let _ = tell.send(Told::Asked(request));
+        if let Some(go) = go {
+            let go = go.lock().unwrap_or_else(PoisonError::into_inner);
+            if go.recv_timeout(MUST_HAPPEN).is_err() {
+                return;
+            }
+        }
+        for event in events {
+            if wire::send(stream, &Frame::Event(event)).is_err() {
+                return;
+            }
+        }
+        if hold && matches!(reader.frame(stream, None), Ok(None)) {
+            let _ = tell.send(Told::Ended);
+        }
+    }
+
+    /// A scratch folder for a broker's socket (under this test binary's short root, so the path
+    /// fits `sun_path`), the socket's path in it, and the LAN seam that points a thread's client
+    /// at that socket.
+    fn scratch() -> (aterm_tempfile::TempDir, PathBuf, aterm_uds::lan::Seam) {
+        let short = aterm_uds::test_binary::short_root().expect("a test binary's short root");
+        let root = aterm_tempfile::Builder::new().tempdir_in(short).unwrap();
+        let folder = root.path().join("broker");
+        std::fs::create_dir(&folder).unwrap();
+        let socket = folder.join("b.sock");
+        let seam = aterm_uds::lan::Seam {
+            socket: Some(socket.clone()),
+            ..aterm_uds::lan::Seam::default()
+        };
+        (root, socket, seam)
+    }
+
+    /// A socket at `socket` that nothing listens on, as a broker that went leaves its own: bound
+    /// beside the folder, its listener dropped, and moved in whole.
+    fn left_behind(socket: &Path) {
+        let bound = socket.parent().unwrap().with_file_name("bound.sock");
+        drop(aterm_uds::CtlListener::bind(&bound).unwrap());
+        std::fs::rename(&bound, socket).unwrap();
+    }
+
+    /// A restart backoff longer than the hang detector: a test whose browse waited it out would
+    /// fail that detector.
+    const LONG: Duration = Duration::from_secs(600);
+
+    /// A vault watch whose standing browse runs against the broker `seam` names, its first
+    /// restart backoff `restart_first`, and what says its thread ended.
+    fn browsing_after(
+        bell: &Arc<Bell>,
+        seam: aterm_uds::lan::Seam,
+        restart_first: Duration,
+    ) -> (Watch, mpsc::Receiver<()>) {
+        let (ended, end) = mpsc::channel();
+        let watch = Watch::browsing(
+            crate::server::SERVICE_TYPE,
+            bell,
+            &[],
+            restart_first,
+            move |browse| {
+                aterm_uds::lan::seam_here(seam, browse);
+                let _ = ended.send(());
+            },
+        );
+        (watch, end)
+    }
+
+    /// [`browsing_after`] with the production backoff.
+    fn browsing(bell: &Arc<Bell>, seam: aterm_uds::lan::Seam) -> (Watch, mpsc::Receiver<()>) {
+        browsing_after(bell, seam, RESTART_FIRST)
+    }
+
+    /// The waits `watch`'s standing browse made, once `enough` says they are (asked at each new
+    /// one), within the hang detector.
+    fn waits_once(watch: &Watch, enough: impl Fn(&[Waited]) -> bool) -> Vec<Waited> {
+        let deadline = Instant::now() + MUST_HAPPEN;
+        let mut waits = watch
+            .watched
+            .waits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while !enough(&waits) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "the browse's waits stayed {:?}", *waits);
+            waits = watch
+                .watched
+                .waited
+                .wait_timeout(waits, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        waits.clone()
+    }
+
+    /// Drop `watch` and see its thread end within the hang detector.
+    fn ends(watch: Watch, end: &mpsc::Receiver<()>) {
+        drop(watch);
+        end.recv_timeout(MUST_HAPPEN)
+            .expect("the browse's thread ends with its watch");
+    }
+
+    /// A hello alone, closed by its client: an arrival's.
+    const ARRIVAL: Answer = Answer::Hello {
+        events: Vec::new(),
+        hold: false,
+    };
+
+    /// A running standing browse waits for each frame with no timeout handed to poll(2), beside
+    /// its watch's pipe, and hands each event to the watch, which rings its bell; dropping the
+    /// watch while it waits ends the thread at once and, with it, the broker request. The
+    /// broker's arrival is asked its hello before the browse, and the broker sends its event
+    /// only once the browse waits for it, so the browse waits once before it and once after.
+    ///
+    /// NEGATIVE CONTROLS: a frame wait handed a deadline (`Some(Duration::from_secs(1))` for
+    /// `None` in `Standing::hear`, the 1 s poll of before) is noted `Waited(Frames, Some(1 s))`
+    /// and fails the first assertion on the waits; one without the pipe beside it
+    /// (`events.next()` for the wait and `next_beside`) notes no wait, and a watch that keeps its
+    /// pipe's write end once dropped (`mem::forget` in `Drop`) never ends the thread: the hang
+    /// detector fails each.
+    #[test]
+    fn a_standing_browse_waits_for_frames_with_no_deadline() {
+        let (_root, socket, seam) = scratch();
+        let (go, gone) = mpsc::channel();
+        let browse = Answer::Later {
+            events: vec![added(crate::server::SERVICE_TYPE, 4, "m3")],
+            go: Arc::new(Mutex::new(gone)),
+        };
+        let broker = serve(&socket, vec![ARRIVAL, browse]);
+        let bell = Arc::new(Bell::default());
+        let (watch, end) = browsing(&bell, seam);
+        assert!(broker.browsed());
+        assert_eq!(
+            waits_once(&watch, |waits| !waits.is_empty()),
+            [Waited(Why::Frames, None)],
+            "a wait for the first frame, with no timeout"
+        );
+        go.send(()).unwrap();
+        assert_eq!(bell.nap(MUST_HAPPEN), Wake::Browse, "a server heard");
+        assert_eq!(watch.heard(), ["m3"]);
+        assert_eq!(
+            waits_once(&watch, |waits| waits.len() == 2),
+            [Waited(Why::Frames, None); 2],
+            "and one for the next, with no timeout"
+        );
+        ends(watch, &end);
+        assert_eq!(
+            broker.told.recv_timeout(MUST_HAPPEN),
+            Ok(Told::Ended),
+            "the request ended with the watch"
+        );
+    }
+
+    /// A standing browse that found no broker waits, with no timeout handed to poll(2), for one
+    /// to arrive at its socket, and browses as soon as one answers its checked hello.
+    ///
+    /// NEGATIVE CONTROLS: a broker wait handed a timeout of its own where the folder is watched
+    /// (`Some(retry.min(BROKER_PAUSE))` for `(retry != Duration::MAX).then_some(retry)` in
+    /// `Standing::wait_for_broker`, a 2 s timer again) is noted `Waited(Broker, Some(2 s))` and
+    /// fails the first assertion; so is the broker's absence waited on `BROKER_PAUSE` alone
+    /// (`Ok(false) => None`).
+    #[test]
+    fn a_broker_that_arrives_is_browsed_without_a_pause() {
+        let (_root, socket, seam) = scratch();
+        let bell = Arc::new(Bell::default());
+        let (watch, end) = browsing(&bell, seam);
+        assert_eq!(
+            waits_once(&watch, |waits| !waits.is_empty()),
+            [Waited(Why::Broker, None)],
+            "no broker: a wait for one, with no timeout"
+        );
+        let browse = Answer::Hello {
+            events: Vec::new(),
+            hold: true,
+        };
+        let broker = serve(&socket, vec![ARRIVAL, browse]);
+        assert!(broker.browsed());
+        assert_eq!(
+            waits_once(&watch, |waits| waits.len() == 2),
+            [Waited(Why::Broker, None), Waited(Why::Frames, None)]
+        );
+        assert_eq!(broker.accepted(), 2, "its hello, then the browse");
+        ends(watch, &end);
+    }
+
+    /// A broker there that refuses this process is asked its hello once, and the browse once,
+    /// and nothing more until its socket is made again: the browse waits with no timeout, and
+    /// dropping the watch ends that wait at once.
+    ///
+    /// NEGATIVE CONTROL: a wait that browses again whenever the broker's arrival says nothing new
+    /// (`Ok(false) => return false` in `Standing::wait_for_broker`) asks the refusing broker
+    /// without end and never waits, and the hang detector fails the first assertion.
+    #[test]
+    fn a_refusing_broker_is_asked_nothing_more_until_its_socket_changes() {
+        let (_root, socket, seam) = scratch();
+        let broker = serve(&socket, vec![Answer::Refuse; 64]);
+        let bell = Arc::new(Bell::default());
+        let (watch, end) = browsing(&bell, seam);
+        assert_eq!(
+            waits_once(&watch, |waits| !waits.is_empty()),
+            [Waited(Why::Broker, None)]
+        );
+        assert_eq!(broker.accepted(), 2, "the arrival's hello, then the browse");
+        ends(watch, &end);
+        assert_eq!(broker.accepted(), 2, "nothing more");
+    }
+
+    /// A broker whose hello did not judge this process (its code check did not finish) is asked
+    /// again on the arrivals' own backoff (the first a second off), and browsed once it answers:
+    /// its hello did not judge, its browse refused, its next hello answered. Each wait for the
+    /// broker before then has the rest of that second as its timeout; where the browse's own
+    /// exchange outlasted the second (a loaded Mac), the hello is asked again before any wait.
+    ///
+    /// NEGATIVE CONTROL: a wait with no timeout whatever that backoff says (`retry =
+    /// Duration::MAX`) never asks again, and the hang detector fails it.
+    #[test]
+    fn a_broker_that_did_not_judge_this_process_is_asked_again_on_its_backoff() {
+        let (_root, socket, seam) = scratch();
+        let answers = vec![
+            Answer::Unchecked,
+            Answer::Refuse,
+            ARRIVAL,
+            Answer::Hello {
+                events: Vec::new(),
+                hold: true,
+            },
+        ];
+        let broker = serve(&socket, answers);
+        let bell = Arc::new(Bell::default());
+        let (watch, end) = browsing(&bell, seam);
+        assert!(broker.browsed());
+        let waits = waits_once(&watch, |waits| {
+            waits.last() == Some(&Waited(Why::Frames, None))
+        });
+        let (browsed, before) = waits.split_last().expect("a wait");
+        assert_eq!(*browsed, Waited(Why::Frames, None));
+        assert!(
+            before.iter().all(|waited| matches!(
+                waited,
+                Waited(Why::Broker, Some(retry)) if *retry <= Duration::from_secs(1)
+            )),
+            "{waits:?}"
+        );
+        assert_eq!(broker.accepted(), 4);
+        ends(watch, &end);
+    }
+
+    /// A browse its broker could not answer (it did not judge this process) waits out the
+    /// restart backoff, beside the broker's arrivals: a broker whose socket is made again
+    /// meanwhile is browsed at once, though the backoff is longer than the hang detector.
+    ///
+    /// NEGATIVE CONTROL: a backoff waited beside the pipe alone (`others` left empty and no
+    /// `arrivals.poll()` in `Standing::restart_after`) browses the new broker only once the 600 s
+    /// pass, and the hang detector fails it.
+    #[test]
+    fn a_broker_made_again_during_a_restart_backoff_is_browsed_at_once() {
+        let (_root, socket, seam) = scratch();
+        serve(&socket, vec![ARRIVAL, Answer::Unchecked]);
+        let bell = Arc::new(Bell::default());
+        let (watch, end) = browsing_after(&bell, seam, LONG);
+        assert_eq!(
+            waits_once(&watch, |waits| !waits.is_empty()),
+            [Waited(Why::Restart, Some(LONG))],
+            "the browse it could not answer: the backoff"
+        );
+        let browse = Answer::Hello {
+            events: Vec::new(),
+            hold: true,
+        };
+        let again = serve(&socket, vec![ARRIVAL, browse]);
+        assert!(again.browsed(), "the broker made again, browsed");
+        assert_eq!(
+            waits_once(&watch, |waits| waits.len() == 2),
+            [Waited(Why::Restart, Some(LONG)), Waited(Why::Frames, None)]
+        );
+        ends(watch, &end);
+    }
+
+    /// A socket nothing listens on (a broker that went leaves its socket behind) waits for the
+    /// broker's next generation, not out the restart backoff, and that generation is browsed as
+    /// soon as it answers: its hello is asked again on the arrivals' own backoff (1 s doubling
+    /// to 30 s) while the socket stays, and at once when the socket is made again.
+    ///
+    /// NEGATIVE CONTROL: a refusing socket taken for a broker that could not answer (step 3's
+    /// `broker_settled`: `NotInstalled | NotRunning` with the socket there not waiting for a
+    /// broker) waits out the 600 s backoff, noted `Waited(Restart, ..)`, and fails the first
+    /// assertion.
+    #[test]
+    fn a_socket_nothing_listens_on_waits_for_the_next_generation() {
+        let (_root, socket, seam) = scratch();
+        left_behind(&socket);
+        let bell = Arc::new(Bell::default());
+        let (watch, end) = browsing_after(&bell, seam, LONG);
+        let waits = waits_once(&watch, |waits| !waits.is_empty());
+        assert!(
+            matches!(waits[0], Waited(Why::Broker, Some(retry)) if retry <= Duration::from_secs(30)),
+            "{waits:?}"
+        );
+        let browse = Answer::Hello {
+            events: Vec::new(),
+            hold: true,
+        };
+        let broker = serve(&socket, vec![ARRIVAL, browse]);
+        assert!(broker.browsed(), "the broker made again, browsed");
+        ends(watch, &end);
+    }
+
+    /// A direct path whose allowance is read from the file `record` names (allowed once it says
+    /// `allow`), and whose server answers a browse as the stand-in broker does, telling `told`.
+    struct AllowedWhenWritten {
+        record: std::sync::OnceLock<PathBuf>,
+        told: Mutex<Option<mpsc::Sender<Told>>>,
+    }
+
+    impl aterm_uds::lan::direct::Direct for AllowedWhenWritten {
+        fn allowed(&self) -> Result<String, String> {
+            let record = self.record.get().ok_or("no record")?;
+            match std::fs::read_to_string(record) {
+                Ok(said) if said.trim() == "allow" => Ok("the record's Allow".to_owned()),
+                _ => Err("no Allow in the record".to_owned()),
+            }
+        }
+
+        fn record(&self) -> Option<PathBuf> {
+            self.record.get().cloned()
+        }
+
+        fn serve(&self, stream: aterm_uds::CtlStream) {
+            let tell = self
+                .told
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(tell) = tell {
+                let browse = Answer::Hello {
+                    events: Vec::new(),
+                    hold: true,
+                };
+                answered(&stream, browse, &tell);
+            }
+        }
+    }
+
+    /// With no broker, an Allow macOS records for this process while its browse waits is heard
+    /// through the record's file, and the browse asked again goes through the direct path it
+    /// opened. The Allow is written once the wait was asked again after the watch's first look,
+    /// in a folder apart from the socket's, so only the record's own events can bring the browse.
+    ///
+    /// NEGATIVE CONTROL: a broker wait that does not watch the record
+    /// (`lan::direct::record().filter(|_| false)?` in `Allowance::watch`) waits on for a broker,
+    /// and the hang detector fails the first assertion (only one wait is ever noted).
+    #[test]
+    fn an_allowance_given_while_no_broker_answers_is_browsed_through_the_direct_path() {
+        static DIRECT: AllowedWhenWritten = AllowedWhenWritten {
+            record: std::sync::OnceLock::new(),
+            told: Mutex::new(None),
+        };
+        let (root, _socket, seam) = scratch();
+        let prefs = root.path().join("prefs");
+        std::fs::create_dir(&prefs).unwrap();
+        let record = prefs.join("networkextension.plist");
+        std::fs::write(&record, "ask\n").unwrap();
+        DIRECT.record.set(record.clone()).unwrap();
+        let (tell, told) = mpsc::channel();
+        *DIRECT.told.lock().unwrap_or_else(PoisonError::into_inner) = Some(tell);
+        let bell = Arc::new(Bell::default());
+        let (ended, end) = mpsc::channel();
+        let watch = Watch::browsing(
+            crate::server::SERVICE_TYPE,
+            &bell,
+            &[],
+            RESTART_FIRST,
+            move |browse| {
+                aterm_uds::lan::direct::seam_here(&DIRECT, || {
+                    aterm_uds::lan::seam_here(seam, browse);
+                });
+                let _ = ended.send(());
+            },
+        );
+        let waits = waits_once(&watch, |waits| waits.len() >= 2);
+        assert!(
+            waits
+                .iter()
+                .all(|waited| *waited == Waited(Why::Broker, None)),
+            "no broker and no Allow: a wait with no timeout, the browse asked again at the \
+             watch's first look, and a wait again: {waits:?}"
+        );
+        // As macOS writes its record: a new file renamed over the old.
+        let written = prefs.join("written.plist");
+        std::fs::write(&written, "allow\n").unwrap();
+        std::fs::rename(&written, &record).unwrap();
+        assert!(
+            matches!(
+                told.recv_timeout(MUST_HAPPEN),
+                Ok(Told::Asked(Request::Browse { .. }))
+            ),
+            "the Allow heard, the browse goes through the direct path"
+        );
+        ends(watch, &end);
+    }
+
+    /// A browse its broker ended starts again after the backoff, waited out beside the watch's
+    /// pipe, so dropping the watch ends that wait at once, though the backoff is longer than the
+    /// hang detector.
+    ///
+    /// NEGATIVE CONTROL: a backoff slept out (`{ std::thread::sleep(within); false }` for the wait
+    /// in `Standing::restart_after`) ends the thread only once the 600 s pass, and the hang
+    /// detector fails it.
+    #[test]
+    fn a_dropped_watch_ends_its_thread_during_a_restart_pause() {
+        let (_root, socket, seam) = scratch();
+        let broker = serve(&socket, vec![ARRIVAL, ARRIVAL]);
+        let bell = Arc::new(Bell::default());
+        let (watch, end) = browsing_after(&bell, seam, LONG);
+        assert!(broker.browsed());
+        assert_eq!(
+            waits_once(&watch, |waits| waits.len() == 2),
+            [Waited(Why::Frames, None), Waited(Why::Restart, Some(LONG))]
+        );
+        ends(watch, &end);
     }
 }

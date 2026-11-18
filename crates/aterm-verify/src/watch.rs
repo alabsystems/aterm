@@ -1277,7 +1277,7 @@ struct Sample {
 /// has a desk session.
 const ROWS: [(&str, &[&str]); 8] = [
     ("inputs", &["ship", "inputs"]),
-    ("stable-x86_64", &["ship", "check", "--compat"]),
+    ("stock-x86_64", &["ship", "check", "--compat"]),
     ("tree", &["verify", "release", "--tree"]),
     ("cells", &["verify", "cells"]),
     ("appkit", &["verify", "appkit"]),

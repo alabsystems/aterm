@@ -29,9 +29,11 @@ pub(in crate::harness) const EMAIL: &str = "person@example.com";
 /// The lab key every test account is keyed by.
 pub(in crate::harness) const KEY: &str = "ac-fedcba9876543210";
 
-/// The roster: `work` (an email), `lent` (an email, held by m7), `bare` (no email).
+/// The roster: `work` (an email), `m7-2` (an email, held by m7; its label no word of its
+/// address, so a line that printed it is told apart from one that printed the address), `bare`
+/// (no email).
 const ROSTER: &str = "[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\nemail = \
-                      \"person@example.com\"\n\n[[account]]\nlabel = \"lent\"\nclass = \
+                      \"person@example.com\"\n\n[[account]]\nlabel = \"m7-2\"\nclass = \
                       \"dedicated\"\ndir = \"/logins/lent\"\nemail = \"lent@example.com\"\n\
                       held_by = \"m7\"\n\n[[account]]\nlabel = \"bare\"\nclass = \
                       \"dedicated\"\ndir = \"/logins/bare\"\n";
@@ -42,6 +44,53 @@ pub(in crate::harness) fn keyer(_realm: &str, _email: &str) -> Option<String> {
 
 pub(in crate::harness) fn key() -> Key {
     Key::parse(KEY).expect("a key")
+}
+
+/// How a message names the test account (`EMAIL`'s) with no lab: its name ([`Named::shown`]).
+pub(in crate::harness) const SHOWN: &str = "claude person@example.com";
+
+/// The word `word` (a slug or a key), as a step names an account by it.
+pub(in crate::harness) fn word_of(word: &str) -> Word {
+    Named {
+        pk: word.to_owned(),
+        row: None,
+        names: aterm_file::AccountNames::default(),
+    }
+    .word()
+}
+
+/// The resolver's key of the test account (`EMAIL`'s): the word its steps name it by with no lab,
+/// whatever keyer the journal has, and one the verb takes.
+pub(in crate::harness) fn person_pk() -> String {
+    account_names::names_of_login(Cli::Claude, None, EMAIL, None)
+        .expect("a key")
+        .0
+}
+
+/// The step that names the test account (`EMAIL`'s) with no lab, as a line quotes it.
+pub(in crate::harness) fn work_step() -> String {
+    format!("`aterm harness accounts token {}`", person_pk())
+}
+
+/// Whether `label` is a word of `text`: a run of the label grammar's bytes, as SF-07H's exit
+/// test reads a printed label (`account_names`' tests).
+pub(in crate::harness) fn says_label(text: &str, label: &str) -> bool {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+        .map(|word| word.trim_end_matches('.'))
+        .any(|word| word == label)
+}
+
+/// The test account `work` as the verb resolves it with no lab: its row's label, name and word.
+pub(super) fn work_account() -> Account {
+    Account {
+        email: EMAIL.to_owned(),
+        label: Some("work".to_owned()),
+        shown: SHOWN.to_owned(),
+        word: word_of(&person_pk()),
+        account_id: Some("c-0123456789ab".to_owned()),
+        key: key(),
+        holder: None,
+    }
 }
 
 /// A scratch world for the verb: its state, config (the roster beside it) and home.
@@ -116,7 +165,7 @@ pub(in crate::harness) enum Answer {
 /// each read after the first answers (`None`: the same: what the vault holds once a capture ran),
 /// the standing it answers once a write was asked (`None`: that one, or, where `lands`, one of the
 /// token written, made from `found`'s), and the writes, standing reads and removals it was asked
-/// for.
+/// for, and the key of each account a standing read or a removal was asked of (`asked`).
 #[derive(Clone)]
 pub(in crate::harness) struct FakeVault {
     route: WriteRoute,
@@ -130,6 +179,7 @@ pub(in crate::harness) struct FakeVault {
     writes: Rc<RefCell<Vec<Meta>>>,
     reads: Rc<Cell<u32>>,
     removes: Rc<Cell<u32>>,
+    pub(in crate::harness) asked: Rc<RefCell<Vec<String>>>,
 }
 
 impl FakeVault {
@@ -146,6 +196,7 @@ impl FakeVault {
             writes: Rc::default(),
             reads: Rc::default(),
             removes: Rc::default(),
+            asked: Rc::default(),
         }
     }
 }
@@ -154,7 +205,8 @@ impl TokenVault for FakeVault {
     fn route(&self, _by: Instant) -> Result<WriteRoute, String> {
         Ok(self.route)
     }
-    fn standing(&self, _key: &Key, _by: Instant) -> Result<Lookup<Standing>, String> {
+    fn standing(&self, key: &Key, _by: Instant) -> Result<Lookup<Standing>, String> {
+        self.asked.borrow_mut().push(key.as_str().to_owned());
         let first = self.reads.get() == 0;
         self.reads.set(self.reads.get() + 1);
         let written = self.writes.borrow().last().cloned();
@@ -199,7 +251,8 @@ impl TokenVault for FakeVault {
         self.writes.borrow_mut().push(meta.clone());
         Ok(self.written.clone().unwrap_or(MemberWritten::Posted))
     }
-    fn remove(&self, _key: &Key, _by: Instant) -> Result<MemberUnset, String> {
+    fn remove(&self, key: &Key, _by: Instant) -> Result<MemberUnset, String> {
+        self.asked.borrow_mut().push(key.as_str().to_owned());
         self.removes.set(self.removes.get() + 1);
         Ok(MemberUnset::Posted)
     }
@@ -417,6 +470,8 @@ pub(in crate::harness) struct Host {
     pub(in crate::harness) asked_program: Cell<bool>,
     person: Option<TestPerson>,
     pub(in crate::harness) logins: Vec<SessionLogin>,
+    /// This aterm's survey rows ([`AccountsHost::local_survey`]): none unless a test gives some.
+    pub(in crate::harness) survey: Option<Vec<String>>,
     write_wait: Option<Duration>,
     /// Whether another Mac's fleet drive typed into this run's session
     /// ([`AccountsHost::driven_over_the_fleet`]).
@@ -435,6 +490,7 @@ impl Host {
             asked_program: Cell::new(false),
             person: None,
             logins: Vec::new(),
+            survey: None,
             write_wait: None,
             fleet: false,
         }
@@ -518,6 +574,9 @@ impl AccountsHost for Host {
     }
     fn session_logins(&self, _env: &Env) -> Vec<SessionLogin> {
         self.logins.clone()
+    }
+    fn local_survey(&self, _env: &Env) -> Option<Vec<String>> {
+        self.survey.clone()
     }
     fn driven_over_the_fleet(&self) -> bool {
         self.fleet
@@ -646,25 +705,49 @@ fn the_verb_parses_its_flags() {
         let words: Vec<String> = line.split(' ').map(str::to_owned).collect();
         crate::harness::cli::parse(&words).map(|(cmd, _)| cmd)
     };
-    for (line, mode) in [
-        ("accounts token work", TokenMode::Make),
-        ("accounts token work --replace", TokenMode::Replace),
-        ("accounts token a@b.example --remove", TokenMode::Remove),
+    for (line, mode, named) in [
+        (
+            "accounts token claude-ada-x",
+            TokenMode::Make,
+            "claude-ada-x",
+        ),
+        (
+            "accounts token ac-0123456789abcdef --replace",
+            TokenMode::Replace,
+            "ac-0123456789abcdef",
+        ),
+        (
+            "accounts token claude a@b.example --remove",
+            TokenMode::Remove,
+            "claude a@b.example",
+        ),
+        ("accounts token a@b.example", TokenMode::Make, "a@b.example"),
     ] {
-        let Ok(Cmd::Accounts(AccountsCmd::Token { mode: parsed, .. })) = parse(line) else {
+        let Ok(Cmd::Accounts(AccountsCmd::Token { mode: parsed, name })) = parse(line) else {
             panic!("{line} does not parse as the verb");
         };
-        assert_eq!(parsed, mode, "{line}");
+        assert_eq!((parsed, name.as_str()), (mode, named), "{line}");
     }
     for refused in [
-        "accounts token work --replace --remove",
+        "accounts token claude-ada-x --replace --remove",
         "accounts token",
         "accounts token a b",
+        "accounts token claude a@b.example claude-ada-x",
         "accounts --replace",
-        "accounts token work --cli codex",
+        "accounts token claude-ada-x --cli codex",
     ] {
         assert!(parse(refused).is_err(), "{refused} parses");
     }
+    // Two accounts named: the refusal counts the words and repeats none, since a word may be an
+    // address and the refusal reaches captured stderr.
+    let Err(why) = parse("accounts token claude a@b.example claude-ada-x") else {
+        unreachable!("refused above");
+    };
+    assert!(why.contains("not 2 words"), "{why}");
+    assert!(
+        !why.contains("a@b.example") && !why.contains("claude-ada-x"),
+        "{why}"
+    );
 }
 
 /// EACH REFUSAL COMES BEFORE ANY SPAWN: no terminal, a Mac not seated, a route
@@ -791,7 +874,7 @@ fn every_refusal_comes_before_any_spawn() {
         let VaultOf::Fake(vault) = case.host.vault.clone().unwrap() else {
             unreachable!()
         };
-        let ran = token_run(&scratch, &case.host, "work", TokenMode::Make);
+        let ran = token_run(&scratch, &case.host, EMAIL, TokenMode::Make);
         assert!(!ran.ok, "{}: {}", case.name, ran.out);
         assert!(ran.err.contains(case.says), "{}: {}", case.name, ran.err);
         assert!(
@@ -804,56 +887,148 @@ fn every_refusal_comes_before_any_spawn() {
     assert!(scratch.table().rows.is_empty());
 }
 
-/// An email no session here is logged into and no row names is refused, and so is a row with no
-/// email, both before any spawn.
+/// AN ACCOUNT THE VERB CANNOT NAME IS REFUSED, before any spawn: an address no session here is
+/// on and no row holds, a roster label (`work`'s, whose row has an address, and `bare`'s, whose
+/// has none), and a word that names nothing; and an account only the lab names, which no session
+/// here is on and no row here holds.
 #[test]
 fn an_account_the_verb_cannot_name_is_refused() {
     let scratch = Scratch::new("unnamed");
     let host = Host::new(VaultOf::Fake(FakeVault::new(Answer::Absent)));
-    let ran = token_run(&scratch, &host, "nobody@example.com", TokenMode::Make);
+    for word in ["nobody@example.com", "work", "bare", "missing"] {
+        let ran = token_run(&scratch, &host, word, TokenMode::Make);
+        assert!(!ran.ok, "{word}: {}", ran.out);
+        assert!(
+            ran.err.contains(&format!("no account is named `{word}`")),
+            "{word}: {}",
+            ran.err
+        );
+    }
+    let mut lab = crate::harness::alab_roster::Lab::default();
+    lab.names.insert(
+        "ac-0123456789abcdef".to_owned(),
+        aterm_file::AccountNames {
+            realm: "claude".to_owned(),
+            slug: "claude-ada-x".to_owned(),
+            name: Some("claude ada@x.example".to_owned()),
+            email: Some("ada@x.example".to_owned()),
+            login: None,
+            live: true,
+        },
+    );
+    let ran = crate::harness::alab_roster::with_lab(lab, || {
+        token_run(&scratch, &host, "claude-ada-x", TokenMode::Make)
+    });
     assert!(
-        ran.err.contains("no session on this Mac is logged into"),
+        ran.err.contains(
+            "no session on this Mac is on ac-0123456789abcdef (claude-ada-x), and no roster row \
+             here holds it"
+        ),
         "{}",
         ran.err
     );
-    let ran = token_run(&scratch, &host, "bare", TokenMode::Make);
-    assert!(ran.err.contains("bare names no email"), "{}", ran.err);
-    let ran = token_run(&scratch, &host, "missing", TokenMode::Make);
-    assert!(
-        ran.err.contains("no Claude Code row is labelled missing"),
-        "{}",
-        ran.err
+    assert!(!ran.err.contains("ada@x.example"), "{}", ran.err);
+    // An account of another pool only: the verb is Claude Code's alone, so no `--cli` takes it.
+    let mut lab = crate::harness::alab_roster::Lab::default();
+    lab.names.insert(
+        "ac-00000000000000e5".to_owned(),
+        aterm_file::AccountNames {
+            realm: "codex".to_owned(),
+            slug: "oai-eve-v".to_owned(),
+            name: Some("oai eve@v.example".to_owned()),
+            email: Some("eve@v.example".to_owned()),
+            login: None,
+            live: true,
+        },
     );
+    for word in ["oai-eve-v", "oai:eve@v.example"] {
+        let ran = crate::harness::alab_roster::with_lab(lab.clone(), || {
+            token_run(&scratch, &host, word, TokenMode::Make)
+        });
+        assert!(
+            ran.err.contains(&format!(
+                "`{word}` is an OpenAI account: a token is made only for a Claude Code account"
+            )),
+            "{word}: {}",
+            ran.err
+        );
+        assert!(!ran.err.contains("--cli"), "{word}: {}", ran.err);
+    }
     assert!(!host.asked_program.get());
 }
 
-/// A HELD_BY ROW IS ACCEPTED when named on the verb, and the outcome names the Mac that holds it;
-/// `--replace` passes an active token.
+/// A HELD_BY ROW IS ACCEPTED when named on the verb, and the outcome names the Mac that holds it
+/// and the account by its word (its key with no lab, its slug under one), never by the row's
+/// label; `--replace` passes an active token.
+/// NEGATIVE CONTROL (2026-11-16, by hand, then restored): with `held_note` naming the row by its
+/// label, `the token serves m7-2 on m7` fails.
 #[test]
 fn a_held_row_is_accepted_and_the_outcome_names_its_holder() {
     let scratch = Scratch::new("held");
     let world = World::new("success", false);
-    let fake = FakeVault::new(active());
-    let host = Host::minting(VaultOf::Fake(fake.clone()), &world);
-    let ran = token_run(&scratch, &host, "lent", TokenMode::Replace);
-    assert!(ran.ok, "{} {}", ran.out, ran.err);
-    assert!(
-        ran.out
-            .contains("the token serves lent on m7, the Mac that holds it"),
-        "{}",
-        ran.out
+    let (pk, _) =
+        account_names::names_of_login(Cli::Claude, None, "lent@example.com", None).expect("a key");
+    let mut lab = crate::harness::alab_roster::Lab::default();
+    lab.names.insert(
+        pk.clone(),
+        aterm_file::AccountNames {
+            realm: "claude".to_owned(),
+            slug: "claude-lent-example".to_owned(),
+            name: Some("claude lent@example.com".to_owned()),
+            email: Some("lent@example.com".to_owned()),
+            login: None,
+            live: true,
+        },
     );
-    let writes = fake.writes.borrow();
-    assert_eq!(writes.len(), 1);
-    assert_eq!(writes[0].email, "lent@example.com");
-    assert_eq!(writes[0].minted_on, "m22");
+    for (under, word) in [(None, pk.as_str()), (Some(&lab), "claude-lent-example")] {
+        let fake = FakeVault::new(active());
+        let host = Host::minting(VaultOf::Fake(fake.clone()), &world);
+        let run = || {
+            token_run(
+                &scratch,
+                &host,
+                "claude lent@example.com",
+                TokenMode::Replace,
+            )
+        };
+        let ran = match under {
+            Some(lab) => crate::harness::alab_roster::with_lab(lab.clone(), run),
+            None => run(),
+        };
+        assert!(ran.ok, "{word}: {} {}", ran.out, ran.err);
+        assert!(
+            ran.out.contains(&format!(
+                "the token serves {word} on m7, the Mac that holds it"
+            )),
+            "{}",
+            ran.out
+        );
+        assert!(
+            ran.out
+                .contains("stored a Claude Code token for claude lent@example.com"),
+            "{}",
+            ran.out
+        );
+        for text in [&ran.out, &ran.err] {
+            assert!(!says_label(text, "m7-2"), "the row's label: {text}");
+        }
+        let writes = fake.writes.borrow();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].email, "lent@example.com");
+        assert_eq!(writes[0].minted_on, "m22");
+    }
     let _ = notes();
 }
 
-/// A ROW-LESS EMAIL A SESSION HERE IS LOGGED INTO IS ACCEPTED, and its row records the account id
-/// the session's login record names.
+/// A ROW-LESS EMAIL A SESSION HERE IS LOGGED INTO IS ACCEPTED AS SPELLED, and its row records the
+/// account id the session's login record names. The address is matched exactly, as every
+/// account word is (`aterm_file::resolve`: no folded case): `Solo@Example.com` names no account,
+/// where the verb before SF-07H folded its case. A decision, not an accident: the resolver is
+/// the one rule every account verb and `aterm file` share, and the refusal lists nothing.
+/// NEGATIVE CONTROL (2026-11-16, by hand, then restored): with the verb folding the word's case
+/// before it resolves it, the folded spelling makes the token.
 #[test]
-fn a_row_less_email_a_session_here_is_on_is_accepted() {
+fn a_row_less_email_a_session_here_is_on_is_accepted_exactly_as_spelled() {
     let scratch = Scratch::new("rowless");
     let world = World::new("success", false);
     let fake = FakeVault::new(Answer::Absent);
@@ -865,7 +1040,17 @@ fn a_row_less_email_a_session_here_is_on_is_accepted() {
         }],
         ..Host::minting(VaultOf::Fake(fake.clone()), &world)
     };
-    let ran = token_run(&scratch, &host, "Solo@Example.com", TokenMode::Make);
+    let folded = token_run(&scratch, &host, "Solo@Example.com", TokenMode::Make);
+    assert!(!folded.ok, "{}", folded.out);
+    assert!(
+        folded
+            .err
+            .contains("no account is named `Solo@Example.com`"),
+        "{}",
+        folded.err
+    );
+    assert!(!host.asked_program.get(), "a folded case ran the verb");
+    let ran = token_run(&scratch, &host, "solo@example.com", TokenMode::Make);
     assert!(ran.ok, "{} {}", ran.out, ran.err);
     assert_eq!(fake.writes.borrow()[0].account_id, "c-0123456789ab");
     let row = scratch.table().rows.remove(KEY).expect("the row");
@@ -882,7 +1067,7 @@ fn a_token_under_a_day_stores_nothing() {
     let fake = FakeVault::new(Answer::Absent);
     let host = Host::minting(VaultOf::Fake(fake.clone()), &world);
     let _ = notes();
-    let ran = token_run(&scratch, &host, "work", TokenMode::Make);
+    let ran = token_run(&scratch, &host, EMAIL, TokenMode::Make);
     assert!(!ran.ok);
     assert!(
         ran.err
@@ -912,16 +1097,20 @@ fn a_minted_token_is_in_the_vault_and_its_row_holds_every_field() {
         ..Host::minting(VaultOf::Real(lab.paths.clone()), &world)
     };
     let _ = notes();
-    let ran = token_run(&scratch, &host, "work", TokenMode::Make);
+    let ran = token_run(&scratch, &host, EMAIL, TokenMode::Make);
     assert!(ran.ok, "{} {}", ran.out, ran.err);
     assert!(
         ran.out.contains(
-            "stored a Claude Code token for person@example.com in the vault, valid for 1 year"
+            "stored a Claude Code token for claude person@example.com in the vault, valid for 1 \
+             year"
         ),
         "{}",
         ran.out
     );
     assert!(lab.holds_the_token(), "the vault returns the token");
+    for text in [&ran.out, &ran.err] {
+        assert!(!says_label(text, "work"), "the row's label: {text}");
+    }
 
     let row = scratch.table().rows.remove(KEY).expect("the row");
     assert_eq!(row.key, KEY);
@@ -955,7 +1144,7 @@ fn a_minted_token_is_in_the_vault_and_its_row_holds_every_field() {
     );
     assert!(!format!("{noted:?}").contains(&token[..16]));
 
-    let again = token_run(&scratch, &host, "work", TokenMode::Make);
+    let again = token_run(&scratch, &host, EMAIL, TokenMode::Make);
     assert!(
         again
             .err
@@ -995,13 +1184,17 @@ fn a_sign_in_makes_the_accounts_token_only_where_none_is_in_use() {
     let (code, said) = after(&scratch, &host);
     assert_eq!(code, Some(format!("{:?}", ExitCode::SUCCESS)), "{said}");
     assert!(
-        said.contains("work: it has no year-long token in use here"),
+        said.contains(&format!(
+            "{SHOWN}: it has no year-long token in use here, so this run makes one, as {} does",
+            work_step()
+        )),
         "{said}"
     );
     assert!(
-        said.contains("stored a Claude Code token for person@example.com"),
+        said.contains("stored a Claude Code token for claude person@example.com"),
         "{said}"
     );
+    assert!(!says_label(&said, "work"), "the row's label: {said}");
     assert!(lab.holds_the_token());
 
     // The token made is in use here: the next sign-in makes none and says nothing.
@@ -1168,7 +1361,7 @@ fn a_sign_ins_own_run_never_replaces_a_token_the_vault_holds() {
     };
     let fake = FakeVault::new(Answer::Found(held));
     let host = Host::new(VaultOf::Fake(fake.clone()));
-    let bare = token_run(&scratch, &host, "work", TokenMode::Make);
+    let bare = token_run(&scratch, &host, EMAIL, TokenMode::Make);
     assert!(
         !bare.ok
             && bare
@@ -1182,7 +1375,7 @@ fn a_sign_ins_own_run_never_replaces_a_token_the_vault_holds() {
         !host.asked_program.get(),
         "the bare run went past its refusal"
     );
-    let replaced = token_run(&scratch, &host, "work", TokenMode::Replace);
+    let replaced = token_run(&scratch, &host, EMAIL, TokenMode::Replace);
     assert!(
         replaced
             .err
@@ -1232,7 +1425,9 @@ fn a_bare_run_is_refused_for_a_token_other_macs_may_use() {
 /// A SIGN-IN MADE OUTSIDE THE SIGN-IN WINDOW IS OFFERED THE STEP, AND NOTHING RUNS: no browser
 /// session is known to be the account's, so its run makes no token. Where the account's token
 /// is due the step is said once, with nothing spawned and nothing in the vault; where the bare
-/// verb would refuse without news (no desk for the window, a token in use) nothing is said.
+/// verb would refuse without news (no desk for the window, a token in use) nothing is said. The
+/// step's line shows the account's name to a person at this Mac's terminal and its word to a run
+/// nobody is there for, and never the row's label.
 #[test]
 fn a_sign_in_outside_the_window_is_offered_the_token_step_and_makes_none() {
     let offer = |scratch: &Scratch, host: &Host| {
@@ -1257,12 +1452,31 @@ fn a_sign_in_outside_the_window_is_offered_the_token_step_and_makes_none() {
     let said = offer(&scratch, &host);
     assert_eq!(said.lines().count(), 1, "{said}");
     assert!(
-        said.starts_with("work: it has no year-long token in use here")
-            && said.contains("`aterm harness accounts token work`"),
+        said.starts_with(&format!("{SHOWN}: it has no year-long token in use here"))
+            && said.contains(&work_step()),
         "{said}"
     );
+    assert!(!says_label(&said, "work"), "the row's label: {said}");
     assert!(!host.asked_program.get(), "the offer spawned Claude Code");
     assert!(!lab.holds_the_token(), "the offer made a token");
+    // Nobody at this Mac's terminal (an agent's renewal): the line names the account by its word,
+    // never its address, since a log or the fleet's relay of the run's output may keep it.
+    let unattended = Host {
+        tty: false,
+        ..Host::minting(VaultOf::Real(lab.paths.clone()), &world)
+    };
+    let said = offer(&scratch, &unattended);
+    assert!(
+        said.starts_with(&format!(
+            "{}: it has no year-long token in use here",
+            person_pk()
+        )) && said.contains(&work_step()),
+        "{said}"
+    );
+    assert!(
+        !said.contains(EMAIL),
+        "nobody there, yet the address: {said}"
+    );
 
     let absent = || VaultOf::Fake(FakeVault::new(Answer::Absent));
     for (what, host) in [
@@ -1327,7 +1541,7 @@ fn token_required_standing_waits_for_its_native_vault_writer() {
             run(
                 &scratch.env(),
                 &host,
-                "work",
+                EMAIL,
                 TokenMode::Make,
                 &mut out,
                 &mut err,
@@ -1402,11 +1616,12 @@ fn token_preflight_waits_for_its_native_vault_writer() {
         let _ = notes();
         let mut out = Vec::new();
         let mut err = Vec::new();
+        let pk = person_pk();
         let code = journal::with_keyer(keyer, || {
             run_with_clock(
                 &scratch.env(),
                 &host,
-                "work",
+                Of::Word(&pk),
                 TokenMode::Make,
                 (Via::Desk, None),
                 &mut out,
@@ -1479,7 +1694,7 @@ fn a_write_a_pass_holds_off_lands_waiting_and_the_next_pass_stores_it() {
     let claim = aterm_secrets::client::test_hold_pass_claim(&lab.paths)
         .expect("the claim")
         .expect("no pass holds it");
-    let ran = token_run(&scratch, &host, "work", TokenMode::Make);
+    let ran = token_run(&scratch, &host, EMAIL, TokenMode::Make);
     assert!(ran.ok, "{} {}", ran.out, ran.err);
     assert!(ran.out.starts_with("not yet in vault: "), "{}", ran.out);
     assert!(
@@ -1503,7 +1718,7 @@ fn a_write_a_pass_holds_off_lands_waiting_and_the_next_pass_stores_it() {
     assert!(claude_token::waiting_here(&lab.paths, &key()).expect("waiting"));
     assert!(!lab.holds_the_token(), "nothing is in the vault yet");
 
-    let again = token_run(&scratch, &host, "work", TokenMode::Make);
+    let again = token_run(&scratch, &host, EMAIL, TokenMode::Make);
     assert!(
         again.err.contains("made here is not yet in vault"),
         "{}",
@@ -1564,7 +1779,7 @@ fn a_replace_whose_write_waits_keeps_the_vaults_tokens_row() {
     let claim = aterm_secrets::client::test_hold_pass_claim(&lab.paths)
         .expect("the claim")
         .expect("no pass holds it");
-    let ran = token_run(&scratch, &host, "work", TokenMode::Replace);
+    let ran = token_run(&scratch, &host, EMAIL, TokenMode::Replace);
     assert!(ran.ok, "{} {}", ran.out, ran.err);
     assert!(ran.out.starts_with("not yet in vault: "), "{}", ran.out);
     let found = held();
@@ -1640,7 +1855,7 @@ fn a_replace_whose_write_lands_keeps_the_row_of_the_token_it_replaced() {
     .expect("the vault's token's row");
     let world = World::new("success", false);
     let host = Host::minting(VaultOf::Real(lab.paths.clone()), &world);
-    let ran = token_run(&scratch, &host, "work", TokenMode::Replace);
+    let ran = token_run(&scratch, &host, EMAIL, TokenMode::Replace);
     assert!(ran.ok, "{} {}", ran.out, ran.err);
     assert!(
         ran.out.starts_with("stored a Claude Code token"),
@@ -1713,13 +1928,7 @@ fn the_kept_row_follows_the_vault_once_the_write_returns() {
     let mut first = (*older).clone();
     let first_at = older_at + 600;
     first.meta.as_mut().expect("a meta").minted_at = first_at;
-    let account = Account {
-        email: EMAIL.to_owned(),
-        label: Some("work".to_owned()),
-        account_id: Some("c-0123456789ab".to_owned()),
-        key: key(),
-        holder: None,
-    };
+    let account = work_account();
     let waits = || InVault::Waiting(waits_words(WaitFor::LockDeadline).to_owned());
     let second_run = |tag: &str, fake: FakeVault| {
         let scratch = Scratch::new(tag);
@@ -1753,7 +1962,7 @@ fn the_kept_row_follows_the_vault_once_the_write_returns() {
         .expect("its verdict");
         let world = World::new("success", false);
         let host = Host::minting(VaultOf::Fake(fake.clone()), &world);
-        let ran = token_run(&scratch, &host, "work", TokenMode::Replace);
+        let ran = token_run(&scratch, &host, EMAIL, TokenMode::Replace);
         assert!(ran.ok, "{} {}", ran.out, ran.err);
         assert_eq!(fake.writes.borrow().len(), 1);
         let _ = notes();
@@ -1830,7 +2039,7 @@ fn ctrl_c_during_the_wait_lands_the_write_waiting() {
     let claim = aterm_secrets::client::test_hold_pass_claim(&lab.paths)
         .expect("the claim")
         .expect("no pass holds it");
-    let ran = token_run(&scratch, &host, "work", TokenMode::Make);
+    let ran = token_run(&scratch, &host, EMAIL, TokenMode::Make);
     assert!(ran.ok, "{} {}", ran.out, ran.err);
     assert!(ran.out.starts_with("not yet in vault: "), "{}", ran.out);
     assert!(claude_token::waiting_here(&lab.paths, &key()).expect("waiting"));
@@ -1849,7 +2058,7 @@ fn remove_deletes_both_names_and_updates_the_row() {
     let lab = Lab::new();
     let world = World::new("success", false);
     let host = Host::minting(VaultOf::Real(lab.paths.clone()), &world);
-    let ran = token_run(&scratch, &host, "work", TokenMode::Make);
+    let ran = token_run(&scratch, &host, EMAIL, TokenMode::Make);
     assert!(ran.ok, "{} {}", ran.out, ran.err);
     assert!(lab.holds_the_token());
     let _ = notes();
@@ -1862,9 +2071,9 @@ fn remove_deletes_both_names_and_updates_the_row() {
     let removed = token_run(&scratch, &host, EMAIL, TokenMode::Remove);
     assert!(removed.ok, "{} {}", removed.out, removed.err);
     assert!(
-        removed
-            .out
-            .starts_with("removed the Claude Code token for person@example.com from the vault"),
+        removed.out.starts_with(
+            "removed the Claude Code token for claude person@example.com from the vault"
+        ),
         "{}",
         removed.out
     );
@@ -1990,7 +2199,7 @@ fn every_offered_step_passes_the_preflight() {
             "{name}"
         );
         let step = state
-            .offer("work", false)
+            .offer(&word_of(&person_pk()), false)
             .unwrap_or_else(|| panic!("{name} offers"));
         let line = step.to_string();
         let words: Vec<String> = line.split(' ').skip(2).map(str::to_owned).collect();
@@ -2015,7 +2224,7 @@ fn every_offered_step_passes_the_preflight() {
             "{name}: {err}"
         );
         assert!(
-            state.offer("work", true).is_none(),
+            state.offer(&word_of(&person_pk()), true).is_none(),
             "{name}: offered while pending"
         );
     }
@@ -2043,7 +2252,7 @@ fn every_offered_step_passes_the_preflight() {
             None,
             NOW,
         );
-        assert_eq!(state.offer("work", false), None, "{name}");
+        assert_eq!(state.offer(&word_of(&person_pk()), false), None, "{name}");
     }
 }
 
@@ -2401,13 +2610,7 @@ fn an_earlier_builds_row_of_the_vaults_token_takes_its_kept_check() {
         panic!("a standing");
     };
     let meta = token.meta.clone().expect("a meta");
-    let account = Account {
-        email: EMAIL.to_owned(),
-        label: Some("work".to_owned()),
-        account_id: Some("c-0123456789ab".to_owned()),
-        key: key(),
-        holder: None,
-    };
+    let account = work_account();
     let earlier = |minted_at: u64| {
         format!(
             r#"{{"schema":1,"rows":[{{"key":"{KEY}","email":"{EMAIL}","label":"work","entry":"{entry}","minted_at":{minted_at},"vault":"in-vault","verification":{{"basis_at":null,"basis":null,"first_reading":null,"verdict":null}}}}],"offers":[],"posts":[]}}"#,
@@ -2503,16 +2706,18 @@ fn a_second_tab_on_the_account_is_refused() {
         .expect("the lock opens")
         .expect("no tab holds it");
     let host = Host::new(VaultOf::Fake(FakeVault::new(Answer::Absent)));
-    let ran = token_run(&scratch, &host, "work", TokenMode::Make);
+    let ran = token_run(&scratch, &host, EMAIL, TokenMode::Make);
     assert!(
-        ran.err
-            .contains("a token for work is being made in another tab"),
+        ran.err.contains(&format!(
+            "a token for {} is being made in another tab",
+            person_pk()
+        )),
         "{}",
         ran.err
     );
     assert!(!host.asked_program.get());
     drop(held);
-    let ran = token_run(&scratch, &host, "work", TokenMode::Make);
+    let ran = token_run(&scratch, &host, EMAIL, TokenMode::Make);
     assert!(host.asked_program.get(), "{}", ran.err);
 }
 
@@ -2677,14 +2882,18 @@ fn the_reports_row_and_its_vault_tokens_section_agree_on_each_login() {
             .unwrap_or_default()
             .to_owned()
     };
+    // Each row's line, by the account the report names it by.
+    let row_line = |label: &str| {
+        let name = format!("claude {label}@example.com ");
+        rows.lines()
+            .find(|line| line.starts_with(&name))
+            .unwrap_or_else(|| panic!("{label}'s row: {out}"))
+    };
     let said = |label: &str| {
-        let row = rows
-            .lines()
-            .find(|line| line.split_whitespace().next() == Some(label))
-            .unwrap_or_else(|| panic!("{label}'s row: {out}"));
+        let row = row_line(label);
         let token = tokens
             .lines()
-            .find(|line| line.starts_with(&format!("  {label} (")))
+            .find(|line| line.starts_with(&format!("  claude {label}@example.com: ")))
             .unwrap_or_else(|| panic!("{label}'s vault tokens line: {out}"));
         (
             row.to_owned(),
@@ -2699,10 +2908,7 @@ fn the_reports_row_and_its_vault_tokens_section_agree_on_each_login() {
     assert_eq!(in_tokens, in_row, "ended: {out}");
     // A login never made here: the row says it is not enrolled and signed out, and the vault
     // tokens line that this Mac holds no login of it; neither says a signed-in word.
-    let row = rows
-        .lines()
-        .find(|line| line.split_whitespace().next() == Some("unmade"))
-        .unwrap_or_else(|| panic!("unmade's row: {out}"));
+    let row = row_line("unmade");
     assert!(row.contains("not-enrolled"), "{row}");
     assert_eq!(
         word_after(row, "login: "),
@@ -2711,7 +2917,7 @@ fn the_reports_row_and_its_vault_tokens_section_agree_on_each_login() {
     );
     let token = tokens
         .lines()
-        .find(|line| line.starts_with("  unmade ("))
+        .find(|line| line.starts_with("  claude unmade@example.com: "))
         .unwrap_or_else(|| panic!("unmade's vault tokens line: {out}"));
     assert!(token.contains("; no login here"), "unmade: {out}");
     let (row, in_row, in_tokens) = said("made");
@@ -2719,10 +2925,7 @@ fn the_reports_row_and_its_vault_tokens_section_agree_on_each_login() {
     assert_eq!(in_tokens, "ok", "NEGATIVE CONTROL: {out}");
     // A signed-out login whose row runs on its vault token here is on its token in the row, and
     // the vault tokens line says no signed-out word of it either.
-    let row = rows
-        .lines()
-        .find(|line| line.split_whitespace().next() == Some("token"))
-        .unwrap_or_else(|| panic!("token's row: {out}"));
+    let row = row_line("token");
     assert_eq!(
         word_after(row, "login: "),
         accounts::LoginHere::ON_TOKEN,
@@ -2731,7 +2934,7 @@ fn the_reports_row_and_its_vault_tokens_section_agree_on_each_login() {
     assert!(!row.contains("signed-out"), "{row}");
     let token = tokens
         .lines()
-        .find(|line| line.starts_with("  token ("))
+        .find(|line| line.starts_with("  claude token@example.com: "))
         .unwrap_or_else(|| panic!("token's vault tokens line: {out}"));
     assert!(
         !token.contains(accounts::LoginHere::SIGNED_OUT) && !token.contains("no login here"),
@@ -2805,12 +3008,15 @@ fn a_row_on_its_vault_token_asks_a_person_for_no_renewal_in_the_report() {
             .as_array()
             .and_then(|rows| {
                 rows.iter()
-                    .find(|row| row["label"] == aterm_json::Value::from("token"))
+                    .find(|row| row["name"] == aterm_json::Value::from("claude token@example.com"))
                     .cloned()
             })
             .unwrap_or_else(|| panic!("token's row: {out}"))
     };
-    let step = "sign-in needed: Run aterm harness accounts renew token in a terminal on this Mac";
+    let step = &format!(
+        "sign-in needed: Run aterm harness accounts renew {} in a terminal on this Mac",
+        crate::harness::account_names::tests::row_name(Cli::Claude, &roster_path, "token").word
+    );
 
     // CONTROL: signed out with no reading, the task's step stands.
     let text = report(false);
@@ -3097,7 +3303,7 @@ fn a_token_step_a_check_stopped_leaves_one_record_and_waits_for_an_event_not_a_c
         let code = journal::with_keyer(keyer, || {
             run_accounts(
                 &AccountsCmd::Token {
-                    name: "work".to_owned(),
+                    name: EMAIL.to_owned(),
                     mode: TokenMode::Make,
                 },
                 &env,
@@ -3175,13 +3381,14 @@ fn signed_in_again(store: &accounts::Store) {
     store.save_logins(&logins).expect("the login");
 }
 
-/// `accounts token work` as `aterm harness` routes it on `host`, under the test keyer.
+/// `accounts token person@example.com` as `aterm harness` routes it on `host`, under the test
+/// keyer.
 fn step_run(env: &Env, host: &StepHost, mode: TokenMode) -> Ran {
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = journal::with_keyer(keyer, || {
         run_accounts(
             &AccountsCmd::Token {
-                name: "work".to_owned(),
+                name: EMAIL.to_owned(),
                 mode,
             },
             env,
@@ -3203,9 +3410,13 @@ fn step_run(env: &Env, host: &StepHost, mode: TokenMode) -> Ran {
 /// (`ATERM_OPEN_URL_UNATTENDED`), so the consent page's human check ends that capture at once;
 /// once a login made for the row has ended the account's check, the step's own record of the
 /// check still holds the next such sign-in, whose step is offered with nothing run, and an
-/// agent's run of the verb, which is told the person's step. CONTROL: a person's own sign-in in
-/// the window, at a terminal of theirs, makes the token whatever the record says, in a window not
-/// told nobody is there, and the token made clears the record.
+/// agent's run of the verb, which is told the person's step. A line of a sign-in nobody started
+/// names the account by its word (its key, with no lab), never its address or its row's label.
+/// CONTROL: a person's own sign-in in the window, at a terminal of theirs, makes the token
+/// whatever the record says, in a window not told nobody is there, its lines naming the account
+/// by its name, and the token made clears the record.
+/// NEGATIVE CONTROL (2026-11-16, by hand, then restored): with `Account::named_for` showing the
+/// name to every run, the window's intro line names `claude person@example.com`.
 /// NEGATIVE CONTROL: with `after_sign_in` mapping every window sign-in to the person's route
 /// (`SignedIn::Window => Via::Desk`, the merge's form), `` the window was not told nobody is
 /// there ``; with it reading the check's record only after a headless sign-in, `` a sign-in
@@ -3246,9 +3457,22 @@ fn who_is_there_decides_how_the_tokens_page_runs_not_where_the_sign_in_ran() {
             .any(|line| line == "ATERM_OPEN_URL_UNATTENDED=1")
     };
 
-    // The upkeep's sign-in in the window: its token's page meets the human check.
+    // The upkeep's sign-in in the window: its token's page meets the human check. Nobody is
+    // there to read its lines, so they name the account by its word, never its address.
     let (code, said) = after(&host);
     assert_eq!(code, Some(false), "{said}");
+    let intro = said.lines().next().unwrap_or_default();
+    assert!(
+        intro.starts_with(&format!(
+            "{}: it has no year-long token in use here, so this run makes one",
+            person_pk()
+        )),
+        "{said}"
+    );
+    assert!(
+        !intro.contains(EMAIL),
+        "nobody there, yet the address: {said}"
+    );
     assert_eq!(world.runs(), 1);
     assert!(told_nobody(), "the window was not told nobody is there");
     assert_eq!(
@@ -3266,9 +3490,21 @@ fn who_is_there_decides_how_the_tokens_page_runs_not_where_the_sign_in_ran() {
         "a sign-in nobody started was not offered the step: {said}"
     );
     assert!(
-        said.contains("`aterm harness accounts token work` run by a person at this Mac"),
+        said.contains(&format!("{} run by a person at this Mac", work_step())),
         "{said}"
     );
+    assert!(
+        said.starts_with(&format!(
+            "{}: its token's consent page carried a check",
+            person_pk()
+        )),
+        "{said}"
+    );
+    assert!(
+        !said.contains(EMAIL),
+        "nobody there, yet the address: {said}"
+    );
+    assert!(!says_label(&said, "work"), "the row's label: {said}");
     assert_eq!(
         world.runs(),
         1,
@@ -3285,11 +3521,15 @@ fn who_is_there_decides_how_the_tokens_page_runs_not_where_the_sign_in_ran() {
     );
 
     // CONTROL: a person's own sign-in in the window makes it, in a window not told nobody is
-    // there, and the token made clears the record.
+    // there, and the token made clears the record; its lines show the account's name.
     host.person.set(true);
     let (code, said) = after(&host);
     host.person.set(false);
     assert_eq!(code, Some(true), "{said}");
+    assert!(
+        said.starts_with(&format!("{SHOWN}: it has no year-long token in use here")),
+        "{said}"
+    );
     assert_eq!(world.runs(), 2);
     assert!(!told_nobody(), "a person's window was told nobody is there");
     assert!(token_steps::read(&store).unwrap().is_empty());
@@ -3455,7 +3695,7 @@ fn a_check_the_accounts_records_could_not_take_is_handed_to_the_caller() {
         let mut err = Vec::new();
         let handed = {
             let _held = busy.then(|| store.acquire().expect("the test holds accounts.lock"));
-            checked.hold_after(&store, KEY, NOW, &mut err)
+            checked.hold_after(&store, (KEY, "claude-work-x"), NOW, &mut err)
         };
         let err = String::from_utf8_lossy(&err).into_owned();
         if busy {
@@ -3626,7 +3866,7 @@ fn an_upkeep_run_opens_no_page_where_a_stop_held_the_step_after_it_looked() {
             let code = run_with_clock(
                 &env,
                 &host,
-                "work",
+                Of::Row("work"),
                 finding.gap.mode(),
                 (finding.via, Some(finding)),
                 &mut out,
@@ -3880,7 +4120,7 @@ fn a_headless_login_makes_its_token_on_the_same_profile() {
     // CONTROL: with no proven profile the step is offered, and nothing runs.
     let (code, out, err) = after();
     assert_eq!(code, None, "{out}{err}");
-    assert!(out.contains("`aterm harness accounts token work`"), "{out}");
+    assert!(out.contains(&work_step()), "{out}");
     assert_eq!(world.runs(), 0);
 
     // The profile the headless sign-in proved.
@@ -3934,10 +4174,7 @@ fn a_headless_login_makes_its_token_on_the_same_profile() {
             out.contains("carried a check the last time"),
             "{what}: {out}"
         );
-        assert!(
-            out.contains("`aterm harness accounts token work`"),
-            "{what}: {out}"
-        );
+        assert!(out.contains(&work_step()), "{what}: {out}");
     };
     signed_in_again();
     held("Cloudflare");
@@ -4030,7 +4267,7 @@ fn a_headless_login_makes_its_token_on_the_same_profile() {
     let (code, out, err) = after();
     assert_eq!(code, success, "{out}{err}");
     assert!(
-        out.contains("stored a Claude Code token for person@example.com"),
+        out.contains("stored a Claude Code token for claude person@example.com"),
         "{out}"
     );
     assert_eq!(world.runs(), 5);
@@ -4090,7 +4327,7 @@ fn a_captures_own_hang_holds_no_step() {
     let make = || {
         journal::with_keyer(keyer, || {
             let (mut out, mut err) = (Vec::new(), Vec::new());
-            let code = run(&env, &host, "work", TokenMode::Make, &mut out, &mut err);
+            let code = run(&env, &host, EMAIL, TokenMode::Make, &mut out, &mut err);
             Ran {
                 ok: format!("{code:?}") == format!("{:?}", ExitCode::SUCCESS),
                 out: String::from_utf8_lossy(&out).into_owned(),
@@ -4215,6 +4452,36 @@ fn a_code_pages_step_is_let_through_once_the_vault_delivers_the_accounts_mailbox
     let human = Stopped::new(MetWord::WindowHumanCheck, NOW, "2.1.318", "").expect("a record");
     token_steps::put(&store, KEY, Some(&human)).expect("the record");
     assert!(!due(), "a mailbox let a human check's step through");
+}
+
+/// THE UPKEEP'S TOKENS-HERE READING TAKES THE READING RAW TO SETTLE A SPLIT PAIR ONLY WHERE ITS
+/// LISTING HOLDS ONE ([`rows_on_token_settled`]): a listing that holds none, here a vault that is
+/// not there, settles nothing, so no settle poisons the window's accounts keeper's trace by the
+/// clock, and the keeper's tokens-here duty over a vault that is not there can be kept. A listed
+/// standing of a row the reading judges is judged at the reading raw all the same, split or not
+/// ([`rows_on_token_of`], whose law is `served`'s
+/// `the_tokens_here_reading_takes_the_reading_raw_only_to_judge_a_listed_standing`).
+///
+/// NEGATIVE CONTROL (2026-11-16, at the merge of the keeper with main's split settle):
+/// `rows_on_token_settled` without its `holds_split(&listed) &&` failed "no split pair: the
+/// reading is not taken raw", the trace poisoned for `a raw read of now`. Restored, the file
+/// touched.
+#[cfg(unix)]
+#[test]
+fn a_tokens_here_reading_takes_no_reading_raw_to_settle_where_no_pair_is_split() {
+    use aterm_uds::trace::{self, Now, Unkept};
+    let dir = aterm_tempfile::tempdir().expect("a scratch folder");
+    let paths = Paths::for_home(dir.path());
+    let store = Store::at(&dir.path().join("state"));
+    let (read, traced) = trace::scope(|| {
+        rows_on_token_settled(&paths, &store, &Roster::default(), Now::at(1_800_000_000))
+    });
+    assert_eq!(read, None, "no vault: no reading");
+    assert!(
+        !matches!(traced.unkept(), Some(Unkept::Poison(_))),
+        "no split pair: the reading is not taken raw: {:?}",
+        traced.unkept()
+    );
 }
 
 #[path = "accounts_renew_token_tests.rs"]

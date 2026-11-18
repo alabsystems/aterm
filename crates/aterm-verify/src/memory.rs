@@ -9,8 +9,12 @@
 //! its live groups held together at any read, and never less than the largest lifetime peak the
 //! kernel kept for one of their members. No sampler of its own, and no sleep.
 //!
-//! A stage that passed keeps its peak (0 when it started no child: [`Meter::held`]) in [`Records`],
-//! one file in this user's aterm state directory ([`Book::live`]). A record is keyed by the stage,
+//! A stage that passed keeps its peak (0 when it started no child: [`Meter::held`]) in the
+//! versioned aggregate [`Records`] file in this user's aterm state directory ([`Book::live`]).
+//! Meter-derived shaping units have a separate bounded file, so their churn cannot evict a
+//! measured stage. [`ShapingHistory`] composes the two read-only for estimates and unit floors;
+//! it never supplies the stronger successful-wrapper admission-unit book.
+//! A record is keyed by the stage,
 //! the checkout it ran in (each checkout builds into a cache of its own, and a warm cache compiles
 //! less than a cold one), the run's sorted crate selection for a stage that reads it (the test
 //! compile and run, the lint, and the cells a selection pulled; every other stage
@@ -62,9 +66,11 @@ use crate::plan::{Lane, StageId, StageSpec};
 use crate::scope::Scope;
 
 /// The record's peaks, schema and size, and the record itself, lifted into `aterm_capacity`'s
-/// book so a plain build reads verify's records as its analogue
-/// ([`aterm_capacity::book::chain`]): what verify keeps and reads is unchanged.
+/// book so a plain build reads verify's stage measurements and conservative shaping floors as
+/// its analogue ([`aterm_capacity::book::chain`]). The independently retained domains preserve
+/// their original measurement keys and light-run guards.
 pub use aterm_capacity::book::{KEPT, Learned, Peak, ROWS_KEPT, Records, Row, SCHEMA, Wider};
+pub use aterm_capacity::book::{ShapingHistory, ShapingSource};
 
 /// What a record is kept for ([`StageKey::of_run`]): a stage, the checkout it ran in, the run's
 /// crate selection, sorted, where the stage reads it, and what else of the run changes its work.
@@ -1100,7 +1106,7 @@ fn and_list(items: &[String]) -> String {
 /// cells, which keep no unit's peak, and for a test compile none of whose crates kept a unit
 /// (one is kept only at [`UNIT_FLOOR`] or more).
 #[must_use]
-pub fn wider_elsewhere(records: &Records, key: &Key) -> Option<Wider> {
+pub fn wider_elsewhere(records: &dyn ShapingSource, key: &Key) -> Option<Wider> {
     records.wider_elsewhere(key, records.unit_floor(key))
 }
 
@@ -1200,7 +1206,7 @@ impl CoverSearch<'_> {
 /// parts). A part may share crates with another: the sum still bounds their union. `None` where
 /// a crate of the selection is in no narrower record: nothing bounds what its units take.
 #[must_use]
-pub fn composed(records: &Records, key: &Key) -> Option<Cover> {
+pub fn composed(records: &dyn ShapingSource, key: &Key) -> Option<Cover> {
     let crates = key.crates.as_deref()?;
     if crates.len() < 2 || crates.len() > 128 {
         return None;
@@ -1316,7 +1322,7 @@ pub fn composed(records: &Records, key: &Key) -> Option<Cover> {
 /// which no estimate raises.
 #[must_use]
 pub fn need(
-    records: &Records,
+    records: &dyn ShapingSource,
     plain: &Records,
     spec: &StageSpec,
     key: &Key,
@@ -1383,7 +1389,7 @@ pub fn need(
 /// particular, a pooled peak must never lower an unpooled run's claim.
 #[must_use]
 pub(crate) fn need_for_jobs(
-    records: &Records,
+    records: &dyn ShapingSource,
     plain: &Records,
     spec: &StageSpec,
     key: &Key,
@@ -1400,7 +1406,7 @@ pub(crate) fn need_for_jobs(
 /// row says its claim was sized at.
 #[must_use]
 pub(crate) fn need_keyed(
-    records: &Records,
+    records: &dyn ShapingSource,
     plain: &Records,
     spec: &StageSpec,
     key: &Key,
@@ -1414,12 +1420,13 @@ pub(crate) fn need_keyed(
     (need(records, plain, spec, key, physical), keyed)
 }
 
-/// THE RUN'S MEMORY BOOK: where its stages' peaks are kept, and the machine they are claimed on,
-/// read once as the run begins.
+/// THE RUN'S MEMORY HISTORY: independent aggregate and shaping-unit retention, and the machine
+/// they are claimed on, read once as the run begins. Wrapper-proven unit admission remains a
+/// different book, reached only by [`crate::compile_width`].
 #[derive(Debug)]
 pub struct Book {
-    /// The record's file; `None` keeps nothing (no state directory), and every stage claims as
-    /// though none were kept.
+    /// The versioned aggregate file. Its weaker shaping sibling is derived beside it; `None`
+    /// keeps neither domain (no state directory), and stages claim as though none were kept.
     pub path: Option<PathBuf>,
     /// The plain builds' record, read and never written ([`plain_like`]); `None` reads none.
     pub plain: Option<PathBuf>,
@@ -1433,15 +1440,14 @@ pub struct Book {
     /// which the test-compile shaper must make every call fit. This is only a planning ceiling;
     /// every call still takes normal live admission before it starts.
     shape_budget: Option<u64>,
-    /// Held while a stage reads, adds to and writes the file: the run's stages end on threads of
-    /// their own.
+    /// Serializes this run's writes. Each domain's file lock also serializes other processes.
     lock: Mutex<()>,
 }
 
 impl Book {
-    /// The live book: the record in this user's aterm state directory
-    /// (`aterm_types::dirs::account_state_dir`, [`RECORD`]), the plain builds' beside it
-    /// ([`PLAIN_RECORD`]), and the machine read now.
+    /// Live aggregate and shaping histories in this user's aterm state directory
+    /// (`aterm_types::dirs::account_state_dir`, [`RECORD`]), the read-only plain-build analogue
+    /// beside them ([`PLAIN_RECORD`]), and the machine read now.
     #[must_use]
     pub fn live() -> Book {
         use aterm_capacity::Machine as _;
@@ -1506,10 +1512,23 @@ impl Book {
         self.shape_budget.unwrap_or_else(|| self.budget())
     }
 
-    /// The peaks kept now.
+    /// Aggregate stage and planner-refusal rows only, independently of weaker shaping units.
     #[must_use]
     pub fn records(&self) -> Records {
-        self.path.as_deref().map(Records::load).unwrap_or_default()
+        self.path
+            .as_deref()
+            .map(aterm_capacity::book::stage_records)
+            .unwrap_or_default()
+    }
+
+    /// Aggregate estimates and weaker unit floors, composed only for shaping. This view cannot
+    /// be handed to the separate successful-wrapper compiler-unit admission reader.
+    #[must_use]
+    pub fn shaping_records(&self) -> ShapingHistory {
+        self.path
+            .as_deref()
+            .map(ShapingHistory::load)
+            .unwrap_or_default()
     }
 
     /// The plain builds' peaks kept now ([`Book::plain`]).
@@ -1534,7 +1553,7 @@ impl Book {
         jobs: Option<u32>,
     ) -> (StageNeed, Option<u32>) {
         need_keyed(
-            &self.records(),
+            &self.shaping_records(),
             &self.plain_records(),
             spec,
             key,
@@ -1543,7 +1562,8 @@ impl Book {
         )
     }
 
-    /// Keep each named unit's peak in `peaks`, read in a run in `checkout`, under its unit's key
+    /// Keep each named unit's peak in the separate weaker shaping book, read in a run in
+    /// `checkout`, under its unit's key
     /// ([`crate::shape::unit_key`]), unless it was light beside the heaviest that key kept in two
     /// weeks ([`Records::keep_unless_light`]). The caller raises every identified light compiler
     /// to [`UNIT_FLOOR`], so the shaper can require complete history rather than silently omit an
@@ -1564,7 +1584,7 @@ impl Book {
         let mut kept = Vec::new();
         for (name, peak) in peaks {
             let key = crate::shape::unit_key(checkout, name);
-            if Records::keep_unless_light(path, key, *peak, at_ms)? {
+            if aterm_capacity::book::keep_shaping_unit(path, key, *peak, at_ms)? {
                 kept.push((name.clone(), *peak));
             }
         }
@@ -1585,7 +1605,14 @@ impl Book {
             return Ok(());
         };
         let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
-        Records::keep(path, key.clone(), 0, aterm_time::unix_millis().unwrap_or(0))
+        aterm_capacity::book::keep_stage(
+            path,
+            key.clone(),
+            0,
+            aterm_time::unix_millis().unwrap_or(0),
+            false,
+        )
+        .map(|_| ())
     }
 
     /// Keep `peak`, measured for `spec`, under `key` ([`Records::push`]); nothing for a stage
@@ -1617,13 +1644,17 @@ impl Book {
         let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
         let at_ms = aterm_time::unix_millis().unwrap_or(0);
         if compiles(spec.id) {
-            return Records::keep_unless_light(path, key.clone(), peak, at_ms)
+            return aterm_capacity::book::keep_stage(path, key.clone(), peak, at_ms, true)
                 .map(|kept| if kept { Kept::Kept } else { Kept::Light });
         }
-        Records::keep(path, key.clone(), peak, at_ms).map(|()| Kept::Kept)
+        aterm_capacity::book::keep_stage(path, key.clone(), peak, at_ms, false).map(|_| Kept::Kept)
     }
 }
 
 #[cfg(test)]
 #[path = "memory_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "memory_retention_tests.rs"]
+mod retention_tests;

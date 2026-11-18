@@ -5831,12 +5831,12 @@ fn the_members_asking_rings_as_what_its_worker_reads_moves() {
 }
 
 /// A SUBSCRIBER'S PROJECTION HANDS EACH RUNNER THE NOTE OF WHY IT STARTS: the runner command
-/// built inside its start carries [`crate::converge::START_NOTE_ENV`] and nothing else, set to
-/// the start's note as the projection's own update made it. The first start says `start` and
+/// built inside its start carries [`crate::converge::START_NOTE_ENV`] set to the start's note
+/// as the projection's own update made it. The first start says `start` and
 /// `recheck`; an input look that asked for a repair with the index moved says `input-repair`,
 /// `m=index`, `n=1`; that runner failed, and the retry 5 s later says `retry-failed`.
 /// NEGATIVE CONTROL: a projection that starts its runner under an empty note
-/// (`noting(&StartNote::default(), …)`) builds commands that carry no variable: the first
+/// (`noting(&StartNote::default(), …)`) builds commands that carry no start note: the first
 /// start's is `[]` where `[("ATERM_CONVERGE_START", Some("c=start+recheck"))]` is wanted.
 #[cfg(unix)]
 #[test]
@@ -5872,6 +5872,7 @@ fn a_projection_hands_each_runner_the_note_of_why_it_starts() {
         let command = crate::converge::runner_requested(exe, crate::converge::SUBSCRIBER, request);
         let envs: Vec<(String, Option<String>)> = command
             .get_envs()
+            .filter(|(key, _)| *key == crate::converge::START_NOTE_ENV)
             .map(|(key, value)| {
                 (
                     key.to_string_lossy().into_owned(),

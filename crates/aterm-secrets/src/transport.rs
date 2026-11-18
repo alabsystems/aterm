@@ -440,7 +440,9 @@ fn client(timeout: Duration) -> Client {
 /// judges; without a broker the connect fails with the broker's words
 /// ([`aterm_uds::lan::LanError::into_io`]), never a lookup here. Any other name, and every name
 /// off Unix, goes to aterm-http's own connector, whose connect sends a local-network address
-/// through the broker ([`aterm_uds::connect_tcp`]).
+/// through the broker ([`aterm_uds::connect_tcp`]). Every request is its own connection
+/// (aterm-http sends `Connection: close` and keeps none), so where the thread works for a
+/// subscriber's pass each connect is one of its requests ([`crate::pass_counts`]).
 #[derive(Clone, Copy, Debug, Default)]
 struct LanConnector;
 
@@ -452,7 +454,10 @@ impl aterm_http::Connect for LanConnector {
         deadline: aterm_http::Deadline,
     ) -> std::io::Result<std::net::TcpStream> {
         #[cfg(unix)]
+        crate::pass_counts::add(crate::pass_counts::Count::Requests);
+        #[cfg(unix)]
         if aterm_uds::lan::is_local_name(host) {
+            crate::pass_counts::add(crate::pass_counts::Count::LocalDials);
             let within = deadline.remaining_or_timeout()?;
             let (stream, _) = aterm_uds::lan::connect(
                 &aterm_uds::lan::Target::Host(host.to_owned()),
@@ -523,6 +528,12 @@ pub const OBSERVER_HEADER: &str = "X-Aterm-Observer";
 /// Header asking a `>= 0.146` server's `?after=<seq>` GET to answer `204` at once instead of
 /// holding a long-poll when `held.seq <= seq` (`DESIGN-fluid-swarm` §4.1 F6).
 pub const NO_WAIT_HEADER: &str = "X-Aterm-No-Wait";
+
+/// Header a `/records` GET sends (`"1"`) when its reader takes a served frame after the records
+/// (`membership_log::served`): a server whose store is rooted at a final checkpoint sends its
+/// roots and stubs only to such a GET, and every other reader is sent records alone. No client of
+/// this build sends it (tracker FL-148c).
+pub const RECORDS_SERVED_HEADER: &str = "X-Aterm-Records-Served";
 
 /// Header on a `>= 0.146` server's `/records` GET reply (`"1"`) when the caller's `?have=` frontier
 /// names a record the server's own log does not hold, so the caller posts its records back.
@@ -983,6 +994,37 @@ pub(crate) fn get_within_as(
         get_request(&client(total), url, None, connect, subscriber, false, false),
         url,
         None,
+        subscriber,
+        limit,
+    )
+}
+
+/// [`get_within_as`], asking only for a vault newer than `after` (`?after=<after>`) and that the
+/// server not wait ([`NO_WAIT_HEADER`]): a server that holds `after` or older answers `204` at
+/// once with no body, so only a newer vault's bytes are read. A subscriber's gated pass probes
+/// its peers so (`crate::client`'s `probe_peers_for_sync`), naming itself as the whole read
+/// does.
+#[cfg(any(unix, windows))]
+pub(crate) fn get_after_within_as(
+    url: &str,
+    after: u64,
+    total: Duration,
+    connect: Option<Duration>,
+    subscriber: Option<&str>,
+    limit: usize,
+) -> crate::Result<Pulled> {
+    pulled(
+        get_request(
+            &client(total),
+            url,
+            Some(after),
+            connect,
+            subscriber,
+            true,
+            false,
+        ),
+        url,
+        Some(after),
         subscriber,
         limit,
     )

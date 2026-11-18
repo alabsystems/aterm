@@ -2328,29 +2328,65 @@ fn a_registered_target_cargo_made_again_after_it_went_is_adopted_anew() {
 }
 
 #[test]
-fn a_record_of_this_very_folder_that_adoption_did_not_write_is_neither_finished_nor_replaced() {
-    for case in ["owners-unknown", "no-owner"] {
+fn unknown_owners_survive_resuming_creation_and_adoption() {
+    for point in [
+        Point::Intent,
+        Point::Publishing,
+        Point::Renamed,
+        Point::Adopted,
+    ] {
         let world = World::new();
-        cargo_laid(&world.target);
-        let fault = stop_at(Point::Adopted);
-        assert!(world.admit().is_err());
-        drop(fault);
-        let mut changed = read(&world.record()).unwrap();
-        match case {
-            "owners-unknown" => changed.owners_unknown = true,
-            "no-owner" => changed.owners.clear(),
-            _ => unreachable!(),
+        if point == Point::Adopted {
+            cargo_laid(&world.target);
         }
-        write(&world.record(), &changed).unwrap();
-        let recorded = std::fs::read(world.record()).unwrap();
-        assert!(!world.admit().unwrap(), "{case}: not adopted");
-        assert!(!world.target.join(MARKER).exists(), "{case}");
-        assert_eq!(
-            std::fs::read(world.record()).unwrap(),
-            recorded,
-            "{case}: the record stands"
+        let fault = stop_at(point);
+        assert!(world.admit().is_err(), "{point:?}: interrupted");
+        drop(fault);
+        super::super::suppress_configured(&world.home).unwrap();
+        let before = read(&world.record()).unwrap();
+        assert!(before.owners_unknown);
+        assert!(world.admit().unwrap(), "{point:?}: valid custody resumes");
+        let after = read(&world.record()).unwrap();
+        assert!(
+            after.owners_unknown,
+            "{point:?}: uncertainty survives recovery"
         );
+        assert!(after.creating.is_none());
+        assert_eq!(after.identity, before.identity);
+        assert_eq!(after.nonce, before.nonce);
+        assert!(super::super::same(&world.home, &after));
+        if point == Point::Adopted {
+            assert_eq!(
+                std::fs::read(world.target.join("debug/deps/libprobe.rlib")).unwrap(),
+                b"reusable output"
+            );
+        }
+        std::fs::remove_dir_all(&world.owner).unwrap();
+        assert!(super::super::plan(&world.home, std::time::SystemTime::now()).is_empty());
+        assert!(
+            super::super::retire(&world.home, &world.target, &mut |_, _| panic!(
+                "unknown owners forbid retirement"
+            ))
+            .is_err()
+        );
+        assert!(world.target.exists());
     }
+}
+
+#[test]
+fn an_adoption_without_any_recorded_owner_is_neither_finished_nor_replaced() {
+    let world = World::new();
+    cargo_laid(&world.target);
+    let fault = stop_at(Point::Adopted);
+    assert!(world.admit().is_err());
+    drop(fault);
+    let mut changed = read(&world.record()).unwrap();
+    changed.owners.clear();
+    write(&world.record(), &changed).unwrap();
+    let recorded = std::fs::read(world.record()).unwrap();
+    assert!(!world.admit().unwrap());
+    assert!(!world.target.join(MARKER).exists());
+    assert_eq!(std::fs::read(world.record()).unwrap(), recorded);
 }
 
 #[test]

@@ -43,7 +43,7 @@ fn publication_case_with_unread_policy(cli: Cli, case: i64, unread: u8) -> [bool
     if case != 18 {
         assert_ne!(before.get("account").unwrap().last_success_generation, 0);
     }
-    let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     super::recovery_policy_tests::hold_retry(&guard, &store, cli, "local", "account");
     super::recovery_policy_tests::hold_retry(&guard, &store, cli, "foreign", "another");
     {
@@ -195,8 +195,8 @@ fn publication_case_with_unread_policy(cli: Cli, case: i64, unread: u8) -> [bool
             use std::os::unix::fs::PermissionsExt as _;
             fs::set_permissions(config_beside(&path), fs::Permissions::from_mode(0o664)).unwrap();
         }
-        let cooldown = std::sync::Mutex::new(None);
-        let rediscovery = std::sync::Mutex::new(Rediscovery::default());
+        let cooldown = Watched::new("accounts_sync/sync_cooldown", None);
+        let rediscovery = Watched::new("accounts_sync/rediscovery", Rediscovery::default());
         let fx = UpkeepEffects {
             scope: None,
             fetch: &|_, _| panic!("disabled upkeep fetched a source"),
@@ -224,7 +224,7 @@ fn publication_case_with_unread_policy(cli: Cli, case: i64, unread: u8) -> [bool
             let result = upkeep(
                 &root.path().join("home"),
                 &root.path().join("state"),
-                (&path, NOW + 2, UpkeepStep::Renew),
+                (&path, trace::Now::at(NOW + 2), UpkeepStep::Renew),
                 &fx,
             );
             assert_eq!(result == Upkept::Off, matches!(case, 20 | 21));
@@ -436,7 +436,7 @@ fn vendor_completion_clears_only_the_successful_accounts_captured_retry() {
             )
             .unwrap();
             let observed = store.load_logins(NOW).unwrap().0;
-            let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+            let guard = AutoRenewGuard::default().shared();
             super::recovery_policy_tests::hold_retry(
                 &guard,
                 &store,

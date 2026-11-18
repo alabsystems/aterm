@@ -549,7 +549,7 @@ fn run_one(h: &Host<'_>, prepared: &PreparedReview, ask: &Ask<'_>) -> (Answer, O
         };
         answer.why = Some(format!("{words}; nothing was run"));
         answer.fix = match &default {
-            DefaultRow::Serves(label) => Some(unread_fix(Some(label))),
+            DefaultRow::Serves(_, word) => word.as_ref().map(|word| unread_fix(Some(word))),
             DefaultRow::Unlisted => Some(unread_fix(None)),
             DefaultRow::SignedOut { .. } => Some(default_sign_in()),
             DefaultRow::Moved(_) | DefaultRow::Walled { .. } | DefaultRow::Other { .. } => None,

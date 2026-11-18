@@ -27,7 +27,7 @@ pub const USAGE: &str = "usage:
   aterm secrets need pass                          run this Mac's pass over credentials/requests/1 now (and the custodian's, on the vault's admin Mac)
   aterm secrets need give <want|id> [--file <path>]
                                                    offer a value from a file or piped stdin; an admin publishes it now
-                                                   (never claude-token:, whose one producer is aterm harness accounts token <label|email>)
+                                                   (never claude-token:, whose one producer is aterm harness accounts token <account>)
 ";
 
 fn say(text: &str) -> ExitCode {

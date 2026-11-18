@@ -26,6 +26,12 @@
 //!   ([`super::provider_read::ProbeEvent`]), as a `probe` of the account read with why it is in
 //!   use; the executable fills that door with it. Claude Code's ledger `probe` claim row is not
 //!   noted, since the door's report of the typed panel is the read itself.
+//! - [`login_rows`]: what one CLI's accounts store says of each login this Mac holds, in the
+//!   shared file `ai/logins`'s words ([`LoginRow`]), which the executable hands the flusher as
+//!   this Mac's `login` rows. A blocked sign-in is still noted as `sign-in-failed` with why
+//!   `blocked` (an `error` with why `blocked` where the login it would have renewed still
+//!   works), and one no route could start with why `no-route`: the forms builds before the
+//!   shared files read, which drop the newer `sign-in-blocked` and `no-route` kinds.
 //!
 //! A note holds no ledger free text: every word in it is one of this module's constants, so no
 //! address, URL, code or reason line can reach the journal.
@@ -266,7 +272,8 @@ pub const WHYS: &[&str] = &[
     "failed",
     "blocked",
     // A sign-in that failed, or answered another account, on an account whose login here still
-    // works: an `error` for the log, never the account's sign-in word ([`observe`]).
+    // works: an `error` for the log, never the account's sign-in word ([`observe`]); one that
+    // was blocked says `blocked` above.
     "sign-in-failed",
     "wrong-account",
     // What stopped a token step (`TokenEvent::Stopped`, `token_steps::Stopped::why`), beside
@@ -984,6 +991,216 @@ pub fn account_key_with(
     Key::new(&keyer(&lease.pool, &lease.email)?)
 }
 
+/// One login this Mac holds of an account, in the words of the shared file `ai/logins`
+/// (docs/DESIGN-shared-files-2026-11-11.md §10 file 3): what one CLI's accounts store says of it
+/// ([`login_rows`]). Every field is a word of a fixed list, a count, a Unix second, the account's
+/// lab key or a word of [`PLANS`], so it can carry no address, path, link, mail code, token or
+/// cookie: the `aterm` executable checks each word again into the journal's own types
+/// (`aterm_db::alab::journal::mine::Login`) and the flusher writes it as this Mac's `login` row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoginRow {
+    pub account: Key,
+    /// The CLI's word ([`Cli::id`]).
+    pub cli: &'static str,
+    /// `managed` where the login lives in a directory aterm manages, else `default`.
+    pub place: &'static str,
+    /// `signed-in`, `signed-out`, `ended` or `wrong-account`, by the store's word
+    /// ([`login_rows`]).
+    pub state: &'static str,
+    /// `status`, `page` or `unchecked`.
+    pub proof: &'static str,
+    /// Where this Mac reads the login: `profile`, `auth-file`, `cli-log` or `vault-token`.
+    pub src: &'static str,
+    /// The supervised sessions on it.
+    pub tabs: u64,
+    /// Why this Mac holds it, as the caller's `held` says.
+    pub held: &'static str,
+    /// Since when the state has held: when the journal was last told its word (0 where nothing
+    /// says).
+    pub since: u64,
+    pub served_at: Option<u64>,
+    pub ends_by: Option<u64>,
+    pub ended_at: Option<u64>,
+    /// How its last sign-in ended: `none`, `signed-in`, `failed`, `blocked` or `no-route`.
+    pub attempt: &'static str,
+    pub attempt_at: Option<u64>,
+    /// `vault` for a sign-in that found the account's vault token in use here; no other route
+    /// is said, since the routes an attempt tried are free text.
+    pub attempt_route: Option<&'static str>,
+    /// The plan its renewal's check answered, where it is one of [`PLANS`].
+    pub plan: Option<&'static str>,
+}
+
+/// The login rows of `cli`'s accounts as `records` (one consistent read of its roster,
+/// `state.json` and `logins.json`, `Store::peek_account_records`, which reads no credential,
+/// with the upkeep's reading of the rows on their vault token in `records.state.tokens_here`)
+/// state them at `now`: one per account, keyed by the claims email's key through `keyer`, else
+/// the key the state learned (a row with neither is left out, never stated under its label).
+///
+/// - **State** is the store's word ([`super::accounts::Account::auth_on_record`]), the one
+///   [`observe`] tells the journal: a Claude Code row the upkeep's reading has on its vault token
+///   here ([`super::accounts::on_token_here`], what the launch and `accounts status` take) is
+///   signed in on the token; a login whose word is signed in is `signed-in`, a renewal since
+///   that answered another account being only how its last attempt ended (`failed`); a signed
+///   out one is `wrong-account` where a renewal since its last one answered another account,
+///   `ended` where an end was seen since then, else `signed-out`; with no word on record, only a
+///   renewal that answered another account is stated (`wrong-account`), and any other row is
+///   left out.
+/// - **Since** is when that word was last told the journal (`State::told`, which moves only when
+///   the word does or a renewal restates it), else the renewal for a signed-in login, else when
+///   the word was learned; a token's since the sign-in that found it in use, a wrong account's
+///   and an end's their own time.
+/// - **Two rows of one account** are one login, as [`settle`] ranks them: the one signed in
+///   speaks for it, then the one signed out, the first in roster order among equals; its tabs are
+///   every session on any of them.
+///
+/// `held` says why this Mac holds each account. Nothing of a directory, a retained login, the
+/// proved address or directory, the routes a sign-in tried, a bot check's page or a token is
+/// read into a row.
+#[must_use]
+pub fn login_rows(
+    cli: Cli,
+    records: &super::accounts::AccountRecords,
+    keyer: &dyn Fn(&str, &str) -> Option<String>,
+    held: &dyn Fn(&Key) -> &'static str,
+    now: i64,
+) -> Vec<LoginRow> {
+    use super::accounts::{AttemptOutcome, Proof};
+    let opt = |t: Option<i64>| t.and_then(secs);
+    let state = &records.state;
+    // Each keyed row's login, with its rank among the rows of one account.
+    let mut out: Vec<(u8, LoginRow)> = Vec::new();
+    let mut tabs: BTreeMap<Key, u64> = BTreeMap::new();
+    for row in &records.roster.rows {
+        let account = state.accounts.get(&row.label);
+        let Some(key) = account_key_with(cli, row, keyer)
+            .or_else(|| account.and_then(|a| a.pk.as_deref()).and_then(Key::new))
+        else {
+            continue;
+        };
+        *tabs.entry(key).or_default() += state
+            .sessions
+            .values()
+            .filter(|session| session.account == row.label)
+            .count() as u64;
+        let binding = records.logins.get(&row.label);
+        let tokened =
+            cli == Cli::Claude && super::accounts::on_token_here(row, state, now).is_some();
+        let ended_at = super::accounts::login_ended_at(row, &records.logins, state);
+        let renewed = binding.and_then(|b| b.renewed_at).unwrap_or(0);
+        let wrong = binding.and_then(|b| b.wrong_at).filter(|at| *at > renewed);
+        let attempt = binding.and_then(|b| b.sign_in_attempt.as_ref());
+        let auth = account.map_or(Auth::Unseen, super::accounts::Account::auth_on_record);
+        let told = state
+            .told
+            .get(key.as_str())
+            .and_then(|told| Some((told.word, i64::try_from(told.t).ok()?)));
+        let told_as = |word: SignWord| told.filter(|(w, _)| *w == word).map(|(_, t)| t);
+        let learned = account.and_then(|a| a.auth_at);
+        let (rank, state_word, since) = if tokened {
+            // Since the sign-in that found its token in use, where one did.
+            let found = attempt
+                .filter(|a| a.outcome == AttemptOutcome::OnToken)
+                .map(|a| a.since);
+            (2, "signed-in", found.or(told_as(SignWord::In)).or(learned))
+        } else {
+            match auth {
+                Auth::Ok => (
+                    2,
+                    "signed-in",
+                    told_as(SignWord::In)
+                        .or(binding.and_then(|b| b.renewed_at))
+                        .or(learned),
+                ),
+                Auth::SignedOut => match (wrong, ended_at.filter(|at| *at > renewed)) {
+                    (Some(at), _) => (1, "wrong-account", Some(at)),
+                    (None, Some(at)) => (1, "ended", Some(at)),
+                    (None, None) => (1, "signed-out", told_as(SignWord::Out).or(learned)),
+                },
+                Auth::Unseen => match wrong {
+                    Some(at) => (0, "wrong-account", Some(at)),
+                    None => continue,
+                },
+            }
+        };
+        let proof = match binding.and_then(|b| b.proved_by) {
+            Some(Proof::Status) => "status",
+            Some(Proof::Page) => "page",
+            Some(Proof::Unchecked) => "unchecked",
+            // A Claude Code renewal's proof is its status check, never written.
+            None if cli == Cli::Claude && renewed > 0 => "status",
+            None => "unchecked",
+        };
+        let src = match cli {
+            _ if tokened => "vault-token",
+            Cli::Claude => "profile",
+            Cli::Codex | Cli::Grok | Cli::Kimi => "auth-file",
+            Cli::Agy => "cli-log",
+        };
+        // How its last sign-in ended: the attempt on record, or a renewal since its last one that
+        // answered another account, whichever is newer.
+        let tried = attempt.map(|a| {
+            (
+                match a.outcome {
+                    AttemptOutcome::NoRoute => "no-route",
+                    AttemptOutcome::Failed => "failed",
+                    AttemptOutcome::Blocked => "blocked",
+                    AttemptOutcome::SignedIn | AttemptOutcome::OnToken => "signed-in",
+                },
+                a.tried_at.max(a.since),
+                (a.outcome == AttemptOutcome::OnToken).then_some("vault"),
+            )
+        });
+        let (attempt_word, attempt_at, attempt_route) = match (tried, wrong) {
+            (Some((_, at, _)), Some(wrong_at)) if wrong_at >= at => {
+                ("failed", Some(wrong_at), None)
+            }
+            (None, Some(wrong_at)) => ("failed", Some(wrong_at), None),
+            (Some((word, at, route)), _) => (word, Some(at), route),
+            (None, None) => ("none", None, None),
+        };
+        let login = LoginRow {
+            account: key,
+            cli: cli.id(),
+            place: if binding.is_some_and(|b| b.dir.is_some()) || row.dir.is_some() {
+                "managed"
+            } else {
+                "default"
+            },
+            state: state_word,
+            proof,
+            src,
+            tabs: 0,
+            held: held(&key),
+            since: opt(since).unwrap_or(0),
+            served_at: opt(super::accounts::login_served_at(
+                row,
+                &records.logins,
+                state,
+            )),
+            ends_by: opt(super::accounts::login_forecast(row, &records.logins, state)),
+            ended_at: opt(ended_at),
+            attempt: attempt_word,
+            attempt_at: opt(attempt_at),
+            attempt_route,
+            plan: binding
+                .and_then(|b| b.subscription.as_deref())
+                .and_then(plan_word),
+        };
+        match out.iter_mut().find(|(_, known)| known.account == key) {
+            Some(slot) if rank > slot.0 => *slot = (rank, login),
+            Some(_) => {}
+            None => out.push((rank, login)),
+        }
+    }
+    out.into_iter()
+        .map(|(_, login)| LoginRow {
+            tabs: tabs.get(&login.account).copied().unwrap_or(0),
+            ..login
+        })
+        .collect()
+}
+
 /// Send each note to the installed sink, once its transaction is durable.
 pub fn publish(notes: &[Note]) {
     for each in notes {
@@ -1189,7 +1406,9 @@ fn stamp(natural: u64, said: Option<Told>, word: SignWord) -> u64 {
 ///   transaction less exactly and are left out.
 /// - A row whose word the store does not hold states none: a login wall the store refused as
 ///   older than the word it holds, and a failed or wrong sign-in of an account whose login here
-///   still works, which is kept for the log as an `error` saying which.
+///   still works, which is kept for the log as an `error` saying which (`blocked` for one a bot
+///   check or a person's step stopped, which is sharp, else `sign-in-failed` or
+///   `wrong-account`).
 /// - Where the journal still holds another word than the store (no row stated it: a served
 ///   turn, a usage read, a displacement's other account; or a build before [`Told`] said
 ///   otherwise), the store's word is told from the state: `signed-in` or `signed-out` from the
@@ -1239,6 +1458,10 @@ fn settle(
                 said = Some(Told { word, t });
             } else if !holds(word) {
                 let why = match word {
+                    // A blocked one keeps its word, which the fleet hears at once
+                    // (`aterm_db::alab::journal::Event::sharp`): its row says it until the
+                    // bot check is past, and no peer starts a browser sign-in into it.
+                    SignWord::Failed if note.why == Some("blocked") => "blocked",
                     SignWord::Failed => "sign-in-failed",
                     SignWord::Wrong => "wrong-account",
                     _ => continue,

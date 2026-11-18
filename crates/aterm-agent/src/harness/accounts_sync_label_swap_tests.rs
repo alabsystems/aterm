@@ -105,6 +105,7 @@ fn m3() -> Desk {
                     account: "m3-2".into(),
                     at: NOW,
                     held: None,
+                    owner: None,
                 },
             );
             accounts::note_served_login(logins, "m3-2", NOW - 50);
@@ -1193,8 +1194,8 @@ fn a_swap_back_while_the_default_switches_points_no_row_at_another_accounts_logi
 /// directory, and Ann signs in there. When the default login is Ann's again that directory is
 /// named by no row, and when it is Bea's once more Ann's row finds her login there rather than
 /// a new one. While it is named by no row, `accounts add` of its name is refused with nothing
-/// written, and `accounts add m3.1` (a label beside it) gets `logins/m3.1`, leaving Ann's login
-/// as it was.
+/// written (it names no account), and `accounts add` of a new account gets a directory under
+/// that account's reserved slug, leaving Ann's login as it was.
 #[test]
 fn a_new_directory_is_named_apart_from_every_label_and_found_again_by_its_account() {
     let desk = Desk::new("m3");
@@ -1230,14 +1231,15 @@ fn a_new_directory_is_named_apart_from_every_label_and_found_again_by_its_accoun
 
     let name = fresh.file_name().unwrap().to_str().unwrap().to_owned();
     let before = records(&desk);
-    let (code, _, why) = super::resync_tests::add(&desk, &name, Some(EVE));
+    let (code, _, why) = super::resync_tests::add(&desk, &name);
     assert_ne!(code, ExitCode::SUCCESS, "`accounts add {name}` adopted it");
     assert_eq!(records(&desk), before, "{why}");
-    let (code, _, why) = super::resync_tests::add(&desk, "m3.1", Some(EVE));
+    let (code, _, why) = super::resync_tests::add(&desk, &format!("claude {EVE}"));
     assert_eq!(code, ExitCode::SUCCESS, "{why}");
+    let eve = super::super::account_names::tests::added_label(Cli::Claude, EVE);
     assert_eq!(
-        dir_of(&desk, "m3.1"),
-        Some(text(&store.logins_dir().join("m3.1")))
+        dir_of(&desk, &eve),
+        Some(text(&store.logins_dir().join(&eve)))
     );
     assert_eq!(
         fs::read_to_string(fresh.join(".claude.json")).unwrap(),
@@ -1251,7 +1253,7 @@ fn a_new_directory_is_named_apart_from_every_label_and_found_again_by_its_accoun
 const BEA_ALIAS: &str = "bea+m3@example.test";
 
 /// Gives the roster's row `label` the provider identity `email` (`identity_email`), as `accounts
-/// add --identity-email` records an alias's account.
+/// add <account> --email <alias>` records an alias's account.
 fn set_identity(desk: &Desk, label: &str, email: &str) {
     let mut roster = desk.rows();
     let row = roster

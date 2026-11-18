@@ -702,5 +702,19 @@ fn the_pin_judgments_verify_makes_first_hold_the_checkout_and_the_motion_with_re
         "{why}"
     );
     at(&c);
+    assert_eq!(judged(), Ok(Some(c.clone())));
+
+    // NEGATIVE CONTROL: the submodule's folder without its own repository, where git inside it
+    // answers for the superproject, is no checkout of the pin; with its repository back it is.
+    let aside = aterm_tempfile::tempdir().unwrap();
+    let own = root.join(SUBMODULE).join(".git");
+    std::fs::rename(&own, aside.path().join("git")).unwrap();
+    let why = judged().expect_err("git inside it answers for the superproject");
+    assert!(
+        why.contains("not an initialised submodule checkout")
+            && why.contains("answers for the repository at"),
+        "{why}"
+    );
+    std::fs::rename(aside.path().join("git"), &own).unwrap();
     assert_eq!(judged(), Ok(Some(c)));
 }

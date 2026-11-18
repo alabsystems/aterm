@@ -15,11 +15,12 @@
 //!   profile in the scratch HOME) and records so.
 //! - **S2**: a lost login no row names: aterm types `/login` once, presses nothing in its method
 //!   picker, and tells the owner (the `login-choose` notice).
-//! - **S3**: `aterm harness accounts add lab-b` names that login while the picker stands: aterm
-//!   backs out of its own picker with one fenced Esc, no method picked, before the host's own
-//!   look at the roster could have told it of the row (the add's wake brought the news), the
-//!   tab then waits on the row's sign-in, and the login exception's `CLEARED` line names the
-//!   back-out.
+//! - **S3**: `aterm harness accounts add claude nobody-b@example.test` names that login (its row
+//!   labelled with the account's reserved slug, [`LABEL_B`]) while the picker stands: aterm
+//!   backs out of its own picker with one fenced Esc, no method picked, after the host's news of
+//!   the add's wake marker (the add's own wake brought the news; a row written by hand brings
+//!   none), the tab then waits on the row's sign-in, and the login exception's `CLEARED` line
+//!   names the back-out.
 //! - **S3b**: a person's own `/login` in the same tab: no key reaches its picker for longer than
 //!   the grace the supervisor keeps after a person's keys, and nothing approves it.
 //!
@@ -58,9 +59,11 @@ use crate::{Fail, Res, stop};
 
 /// The roster row S1's login is (`lab-a`), listed before any tab runs.
 pub const LABEL_A: &str = "lab-a";
-/// The row S3 adds for S2's login (`lab-b`), by `aterm harness accounts add`.
-pub const LABEL_B: &str = "lab-b";
-/// The email of [`LABEL_B`]'s row.
+/// The row S3 adds for S2's login, by `aterm harness accounts add claude <EMAIL_B>`: the
+/// account's reserved slug (`aterm_db::typed::keys::reserved_slug`), the label `add` gives its
+/// row, which `claude_login_proof_tests` holds to that function.
+pub const LABEL_B: &str = "claude-15e8a439470c1cf1";
+/// The address of [`LABEL_B`]'s account.
 const EMAIL_B: &str = "nobody-b@example.test";
 /// What S1 types: any prompt, which meets the dead login.
 const PROMPT_A: &str = "Write one sentence about lighthouses, then stop.";
@@ -70,20 +73,13 @@ const PROMPT_B: &str = "Write one sentence about harbours, then stop.";
 pub(crate) const HANG: Duration = Duration::from_secs(60);
 /// The longest any one wait runs however much moves (Claude Code's spinner moves forever).
 const WAIT_CAP: Duration = Duration::from_secs(300);
-/// How often the host looks at the roster's bytes by itself (aterm-gui's `WAKE_FALLBACK`, the
-/// activation thread's wait): the looks come this far apart from the activation wake's arming
-/// ([`WAKE_ARMED`]), and one that finds the roster changed logs [`ROSTER_LOOK`].
-const HOST_LOOK_EVERY: Duration = Duration::from_secs(60);
-/// S3's add lands at most this long after one of the host's looks at the roster ([`add_wait`]),
-/// so the next look is `HOST_LOOK_EVERY - S3_ADD_AFTER_LOOK` or more after it: a back-out the
-/// add's wake brought comes before that look, one the look brought after it.
-const S3_ADD_AFTER_LOOK: Duration = Duration::from_secs(15);
-/// How far past a look of the host's an add that waited for it lands.
-const LOOK_SETTLE: Duration = Duration::from_secs(2);
-/// aterm.log's line for the activation thread's start, its first look at the roster.
-pub const WAKE_ARMED: &str = "harness: the activation wake is armed";
-/// aterm.log's line for a look of the host's at the roster that found its bytes changed.
-pub const ROSTER_LOOK: &str = "harness: the accounts' roster changed: news of the accounts";
+/// aterm.log's line for a look of the host's accounts' keeper at the accounts store's wake
+/// marker that found it replaced: the news `aterm harness accounts add` brings as it writes
+/// (aterm-gui's `harness_host::News`). The keeper looks as its file watch hears the marker; a
+/// row written into the roster by hand replaces no marker, and its look logs the roster's line
+/// alone (`harness: the accounts' roster changed: news of the accounts`).
+pub const MARKER_LOOK: &str =
+    "harness: the accounts store's wake marker moved: news of the accounts";
 /// What S3b watches past the supervisor's grace ([`s3b_grace`]).
 const S3B_MARGIN: Duration = Duration::from_secs(15);
 /// The word the process watcher's control carries ([`Watcher`]).
@@ -266,11 +262,11 @@ pub fn log_times(aterm_log: &str, needle: &str) -> Vec<i64> {
         .collect()
 }
 
-/// The host's looks at the roster that found its bytes changed ([`ROSTER_LOOK`]), ms since the
-/// epoch.
+/// The host's looks at the accounts store's wake marker that found it replaced
+/// ([`MARKER_LOOK`]), ms since the epoch.
 #[must_use]
-pub fn looks_of(aterm_log: &str) -> Vec<i64> {
-    log_times(aterm_log, ROSTER_LOOK)
+pub fn wakes_of(aterm_log: &str) -> Vec<i64> {
+    log_times(aterm_log, MARKER_LOOK)
 }
 
 /// A JSON time as ms since the epoch: an integer of ms, or seconds with a fraction.
@@ -506,15 +502,16 @@ pub fn judge_s2(journal: &[Said], acts: &[Act], messages: &[Message], to: i64) -
 
 /// S3: the row `label` added for tab B's login at `from`; `next` S3b's start. Between them one
 /// input, an Esc fenced on the person, and one approved [`RULE_LOGIN_BACK_OUT`] decision; that
-/// Esc before the host's first look at the roster at or after `from` (`looks`, [`looks_of`]),
-/// so the add's own wake brought the news, not the host's look; after the Esc, before `next`,
+/// Esc at or after the host's first news of the add's wake marker at or after `from` (`wakes`,
+/// [`wakes_of`]), so the news the add's own wake brought brought the back-out (a row written by
+/// hand brings no such news); after the Esc, before `next`,
 /// the login exception `CLEARED` naming the back-out ([`LOGIN_BACKED_OUT`]), the
 /// [`LOGIN_CHOOSE`] message withdrawn and a `WAITING` record naming `label`; no `/login` typed
 /// again; and the accounts' ledger books `label`'s no-route sign-in.
 #[must_use]
 pub fn judge_s3(
     (journal, decisions, acts): (&[Said], &[Decided], &[Act]),
-    (ledger, messages, looks): (&[Booked], &[Message], &[i64]),
+    (ledger, messages, wakes): (&[Booked], &[Message], &[i64]),
     label: &str,
     (from, next): (i64, i64),
 ) -> Judged {
@@ -538,18 +535,17 @@ pub fn judge_s3(
             "{approved} approved {RULE_LOGIN_BACK_OUT} rows (want one)"
         ));
     }
-    let look = looks.iter().copied().filter(|&t| t >= from).min();
+    let wake = wakes.iter().copied().filter(|&t| t >= from).min();
     let secs = |ms: i64| ms as f64 / 1000.0;
-    match (esc, look) {
-        (Some(e), Some(l)) if l <= e.t_ms => missing.push(format!(
-            "the Esc came {:.1} s after the host's own look at the roster ({:.1} s after the add): \
-             the add's wake did not bring the news",
-            secs(e.t_ms - l),
-            secs(l - from)
+    match (esc, wake) {
+        (Some(e), Some(w)) if e.t_ms < w => missing.push(format!(
+            "the Esc came {:.1} s before the host's news of the add's wake marker: the add's wake \
+             did not bring it",
+            secs(w - e.t_ms)
         )),
         (Some(_), None) => missing.push(format!(
-            "no look of the host's at the roster after the add (aterm.log's `{ROSTER_LOOK}`), \
-             so the add's wake is not told from it"
+            "no news of the add's wake marker in aterm.log after the add (`{MARKER_LOOK}`), so \
+             the add's own wake did not bring the back-out"
         )),
         _ => {}
     }
@@ -588,11 +584,11 @@ pub fn judge_s3(
     Judged::of(
         &missing,
         format!(
-            "Esc {:.1} s after the add, {:.1} s before the host's own look at the roster; \
+            "Esc {:.1} s after the add, {:.1} s after the host's news of its wake marker; \
              {RULE_LOGIN_BACK_OUT} approved, the notice withdrawn; `{}`; `{}`",
             esc.map_or(0.0, |a| secs(a.t_ms - from)),
-            match (esc, look) {
-                (Some(e), Some(l)) => secs(l - e.t_ms),
+            match (esc, wake) {
+                (Some(e), Some(w)) => secs(e.t_ms - w),
                 _ => 0.0,
             },
             clip(cleared.map_or("", |s| s.line.as_str()), 60),
@@ -797,24 +793,6 @@ pub fn s3b_grace(cfg: &SupervisorConfig) -> Duration {
     Duration::from_secs(u64::from(cfg.human_grace_s)) + TurnEndTiming::default().take_within
 }
 
-/// How long S3's add waits, at `now`, to land at most [`S3_ADD_AFTER_LOOK`] after one of the
-/// host's looks at the roster: those come every [`HOST_LOOK_EVERY`] from the latest one aterm.log
-/// shows (the activation wake's arming, [`WAKE_ARMED`], or a look that logged [`ROSTER_LOOK`]),
-/// and a wait lands [`LOOK_SETTLE`] past the next. `None`: at once, the last look near enough,
-/// or none logged.
-#[must_use]
-pub fn add_wait(aterm_log: &str, now: i64) -> Option<Duration> {
-    let last = log_times(aterm_log, WAKE_ARMED)
-        .into_iter()
-        .chain(looks_of(aterm_log))
-        .max()?;
-    let every = i64::try_from(HOST_LOOK_EVERY.as_millis()).unwrap_or(i64::MAX);
-    let near = i64::try_from(S3_ADD_AFTER_LOOK.as_millis()).unwrap_or(0);
-    let phase = (now - last).rem_euclid(every);
-    (phase > near)
-        .then(|| Duration::from_millis(u64::try_from(every - phase).unwrap_or(0)) + LOOK_SETTLE)
-}
-
 // ---------------------------------------------------------------------------------------------
 // The process watcher.
 
@@ -927,7 +905,7 @@ struct World {
     harness: PathBuf,
     /// S1's login directory: the scratch HOME's `.claude`, `lab-a`'s row's.
     login_a: PathBuf,
-    /// S2's: the accounts store's own directory for `lab-b`, which no row names until S3.
+    /// S2's: the accounts store's own directory for [`LABEL_B`], which no row names until S3.
     login_b: PathBuf,
 }
 
@@ -936,7 +914,7 @@ impl World {
         let harness = run.state().join("harness").join("claude-harness");
         let login_b = Store::at(&harness)
             .login_dir(LABEL_B)
-            .ok_or_else(|| Fail::die("lab-b names no login directory"))?;
+            .ok_or_else(|| Fail::die("LABEL_B names no login directory"))?;
         Ok(World {
             roster: run.w.join("cfg/aterm/accounts.toml"),
             config: run.w.join("cfg/aterm/aterm.toml"),
@@ -1132,7 +1110,7 @@ pub(crate) fn first_prompt(
 
 /// The live negative control's S3 ([`scenarios`]' `by_hand`): [`LABEL_B`]'s row, as `accounts
 /// add` would list it, written into the roster by the lab itself, so no wake marker tells the
-/// host of it and only the host's own look at the roster can.
+/// host of it and only the host's look at the roster, as its file watch hears it, does.
 fn row_by_hand(world: &World) -> Result<(), Fail> {
     let row = Row {
         label: LABEL_B.to_string(),
@@ -1305,21 +1283,6 @@ fn scenarios(
             .find(|d| d.t_ms >= from && d.rule == RULE_LOGIN_BACK_OUT && d.decision == "approved")
             .map(|d| d.t_ms)
     };
-    let log = scratch_text(&aterm_log(run));
-    if let Some(wait) = add_wait(&log, now_ms()) {
-        println!(
-            "  (S3) the host looks at the roster every {} s by itself: the add waits {:.0} s, to land \
-             just past its next look, so a back-out the add's wake brings is told from one that look brings",
-            HOST_LOOK_EVERY.as_secs(),
-            wait.as_secs_f64()
-        );
-        stop::sleep(wait)?;
-    } else if log_times(&log, WAKE_ARMED).is_empty() {
-        println!(
-            "  (S3) aterm.log names no arming of the activation wake (`{WAKE_ARMED}`): the add is \
-             not placed after a look of the host's"
-        );
-    }
     let mark = now_ms();
     m.s3 = Some(mark);
     if by_hand {
@@ -1332,13 +1295,13 @@ fn scenarios(
         let state = world.harness.to_string_lossy().into_owned();
         let config = world.config.to_string_lossy().into_owned();
         let r = door.harness(&[
-            "accounts", "add", LABEL_B, "--email", EMAIL_B, "--state", &state, "--config", &config,
+            "accounts", "add", "claude", EMAIL_B, "--state", &state, "--config", &config,
         ])?;
         m.added = format!("{}{}", r.stdout, r.stderr)
             .trim()
             .replace('\n', " | ");
         println!(
-            "  (S3) `aterm harness accounts add {LABEL_B}` took {:.1} s",
+            "  (S3) `aterm harness accounts add claude {EMAIL_B}` took {:.1} s",
             (now_ms() - mark) as f64 / 1000.0
         );
         if r.code != 0 {
@@ -1371,7 +1334,7 @@ fn scenarios(
             return Ok(());
         }
     }
-    let waiting = hang_wait(run, &door, &b, "tab B's WAITING naming lab-b", || {
+    let waiting = hang_wait(run, &door, &b, "tab B's WAITING naming its row", || {
         read_journal(run, &b)
             .iter()
             .any(|s| s.t_ms >= mark && s.line.starts_with("WAITING ") && names(&s.line, LABEL_B))
@@ -1565,7 +1528,7 @@ fn judge_run(ev: &Evidence, ran: &Ran<'_>) -> Vec<(&'static str, Judged)> {
     };
     let ledger = ledger_of(&ev.ledger);
     let messages = messages_of(&ev.messages);
-    let looks = looks_of(&ev.aterm_log);
+    let wakes = wakes_of(&ev.aterm_log);
     let blocked = marks
         .blocked
         .clone()
@@ -1605,7 +1568,7 @@ fn judge_run(ev: &Evidence, ran: &Ran<'_>) -> Vec<(&'static str, Judged)> {
         match marks.s3 {
             Some(from) => judge_s3(
                 (&jb, &db, &ab),
-                (&ledger, &messages, &looks),
+                (&ledger, &messages, &wakes),
                 LABEL_B,
                 (from, marks.s3b.unwrap_or(i64::MAX)),
             ),

@@ -22,6 +22,171 @@ const PEER_PROBED: &str = "ATERM_VERIFY_PROBE_HANG_PEER_PROBED";
 const ARMED: &str = "ATERM_VERIFY_PROBE_HANG_ARMED";
 const CANCEL: &str = "ATERM_VERIFY_DISPATCH_CANCEL_WORLD";
 const CANCEL_KIND: &str = "ATERM_VERIFY_DISPATCH_CANCEL_KIND";
+const QUEUED: &str = "ATERM_VERIFY_QUEUED_CEILING_WORLD";
+const QUEUED_CEILING: Duration = Duration::from_secs(10);
+
+/// The actual dispatcher, isolated from other tests' groups and halt state. Its sole CPU
+/// credit belongs to the parent until that parent observes dispatch and a queued decision.
+#[test]
+fn standin_queued_work_ceiling() {
+    let Some(world) = std::env::var_os(QUEUED).map(PathBuf::from) else {
+        return;
+    };
+    crate::exec::group::kill_on_interrupt();
+    let mut bins = Vec::new();
+    for name in ["first", "second"] {
+        let executable = world.join(name);
+        let marker = world.join(format!("{name}-ran"));
+        crate::standin_body(&executable, "printf x >> \"$MARKER\"");
+        let mut bin = binary(
+            &format!("-p fixture --test {name}"),
+            &executable,
+            &[("MARKER", &marker)],
+        );
+        bin.harness = false;
+        bins.push(bin);
+    }
+    let scratch = world.join("scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    let ctx = Ctx::new(
+        world.clone(),
+        Scope::workspace(),
+        EnvSnapshot::default(),
+        scratch,
+    )
+    .with_pool(Some(
+        aterm_capacity::Jobserver::inherited().unwrap().unwrap(),
+    ))
+    .with_child_ceiling(Some(QUEUED_CEILING))
+    .with_events(Some(
+        crate::event_log::EventLog::open(&world.join("events")).unwrap(),
+    ));
+    let mut report = crate::ladder::Report::new("test");
+    super::run_planned(
+        &ctx,
+        &mut report,
+        "test",
+        RunPlan::fixture(bins, 1),
+        crate::checks::Check::Test,
+    );
+    std::fs::write(world.join("report"), report.render()).unwrap();
+    std::fs::write(world.join("done"), "done\n").unwrap();
+}
+
+/// A queued batch can outlive one child's work budget. The FIFO holds both actual children
+/// before execution; returning its original credit must still run each exactly once. The
+/// asserted hold is the condition under test, not a completion latency budget. Existing
+/// cancellation/first-red and genuine zero-ceiling controls below remain independent.
+#[test]
+fn queued_binaries_keep_their_own_work_ceiling() {
+    let dir = scratch();
+    let pool = aterm_capacity::Jobserver::new(&dir.path().join("jobs"), 1).unwrap();
+    let held = pool
+        .try_acquire()
+        .unwrap()
+        .expect("the original FIFO credit");
+    let events = dir.path().join("events");
+    let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "testrun::probe_hang_tests::standin_queued_work_ceiling",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(QUEUED, dir.path())
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(std::fs::File::create(dir.path().join("stderr")).unwrap());
+    pool.hand_to(&mut command);
+    let mut child = Standin(command.spawn().unwrap());
+    let observed = until_within(
+        MUST_HAPPEN,
+        "actual dispatch with a queued FIFO decision",
+        || {
+            let text = std::fs::read_to_string(&events).ok()?;
+            let mut dispatch = false;
+            for line in text
+                .lines()
+                .filter_map(|line| line.strip_prefix("verify-event: "))
+            {
+                let Ok(row) = aterm_json::from_str::<aterm_json::Value>(line) else {
+                    continue;
+                };
+                if row["event"].as_str() == Some("test-phase-started")
+                    && row["phase"].as_str() == Some("dispatch")
+                    && crate::test_progress::supported_start(line)
+                {
+                    dispatch = true;
+                }
+                // This closed initial queue interval is emitted only after a worker has made
+                // its first admission decision, strictly after the old batch clock began.
+                // Phase START alone would race with that clock on a heavily loaded machine.
+                if dispatch
+                    && row["event"].as_str() == Some("test-dispatch-wait")
+                    && matches!(
+                        row["test"].as_str(),
+                        Some("-p fixture --test first" | "-p fixture --test second")
+                    )
+                    && row["source"].as_str() == Some("dispatcher")
+                {
+                    return Some(text);
+                }
+            }
+            None
+        },
+    );
+    let queued_at = std::time::Instant::now();
+    until_within(
+        MUST_HAPPEN,
+        "held FIFO outlives a child's work ceiling",
+        || (queued_at.elapsed() > QUEUED_CEILING).then_some(()),
+    );
+    for name in ["first", "second"] {
+        assert!(
+            !dir.path().join(format!("{name}-ran")).exists(),
+            "the held credit prevents any execution: {observed}"
+        );
+    }
+    drop(held);
+    let status = until_within(
+        MUST_HAPPEN,
+        "both queued binaries' positive completion",
+        || child.0.try_wait().unwrap(),
+    );
+    let report = std::fs::read_to_string(dir.path().join("report")).unwrap_or_default();
+    let stderr = std::fs::read_to_string(dir.path().join("stderr")).unwrap_or_default();
+    let events = std::fs::read_to_string(events).unwrap_or_default();
+    let all = format!("{status}\n{report}\n{stderr}\n{events}");
+    assert!(
+        status.success() && dir.path().join("done").exists(),
+        "{all}"
+    );
+    assert!(
+        !report.contains("FAIL") && !report.contains(crate::findings::CEILING_KILL),
+        "{all}"
+    );
+    for name in ["first", "second"] {
+        assert_eq!(
+            std::fs::read(dir.path().join(format!("{name}-ran"))).unwrap(),
+            b"x",
+            "{all}"
+        );
+    }
+    let outcomes: Vec<_> = events
+        .lines()
+        .filter_map(|line| line.strip_prefix("verify-event: "))
+        .map(|line| aterm_json::from_str::<aterm_json::Value>(line).unwrap())
+        .filter(|row| row["event"].as_str() == Some("test-binary-finished"))
+        .collect();
+    assert_eq!(outcomes.len(), 2, "{all}");
+    assert!(
+        outcomes.iter().all(
+            |row| row["outcome"].as_str() == Some("ok") && row["exit_code"].as_i64() == Some(0)
+        ),
+        "{all}"
+    );
+}
 
 /// A private process so the actual interrupt handler can end its active stage group without
 /// touching another test's children. The queued binary shares the single dispatch slot.

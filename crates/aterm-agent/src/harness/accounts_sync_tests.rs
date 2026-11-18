@@ -1292,7 +1292,7 @@ fn renewal_admission_outlives_unstarted_work_resources() {
     struct HeldWork {
         _signin: accounts::SigninTurn,
         store: accounts::Store,
-        guard: Arc<Mutex<AutoRenewGuard>>,
+        guard: Arc<Watched<AutoRenewGuard>>,
         observed: Arc<Mutex<Option<(bool, bool)>>>,
     }
 
@@ -1307,7 +1307,7 @@ fn renewal_admission_outlives_unstarted_work_resources() {
     for mode in ["run", "refuse", "discard", "panic"] {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let store = accounts::Store::at(tmp.path());
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         let observed = Arc::new(Mutex::new(None));
         let held = HeldWork {
             _signin: store.signin_now().unwrap().unwrap(),
@@ -1362,10 +1362,10 @@ fn renewal_admission_outlives_unstarted_work_resources() {
 
 #[test]
 fn a_refused_renewal_worker_releases_admission_without_running_it() {
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
 
-    let state = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let state = AutoRenewGuard::default().shared();
     let now = Instant::now();
     let ran = Arc::new(AtomicBool::new(false));
     let called = Arc::clone(&ran);
@@ -1432,8 +1432,7 @@ fn a_refused_renewal_worker_releases_admission_without_running_it() {
 #[test]
 fn a_background_renewal_that_stopped_for_a_person_is_left_alone_for_its_backoff() {
     use super::super::cli::Renewal;
-    use std::sync::{Arc, Mutex};
-    let state = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let state = AutoRenewGuard::default().shared();
     let now = Instant::now();
     let after_cooldown = now + Duration::from_secs(901);
     drop(AutoRenewPermit::claim(&state, "grok:grok-1", now, false).expect("admitted"));
@@ -1464,8 +1463,7 @@ fn a_background_renewal_that_stopped_for_a_person_is_left_alone_for_its_backoff(
 #[test]
 fn a_background_renewal_that_met_a_bot_check_holds_its_row_with_no_clock() {
     use super::super::cli::Renewal;
-    use std::sync::{Arc, Mutex};
-    let state = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let state = AutoRenewGuard::default().shared();
     let store = accounts::Store::at(Path::new("/synthetic/bot-check"));
     let now = Instant::now();
     let key = "kimi:kimi-1";
@@ -1914,9 +1912,9 @@ struct Witness {
     spawned: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     fetch: Box<Fetch<'static>>,
     spawn: Box<SpawnRenewal<'static>>,
-    cooldown: std::sync::Mutex<Option<Instant>>,
-    rediscovery: std::sync::Mutex<Rediscovery>,
-    guard: std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    cooldown: Watched<Option<Instant>>,
+    rediscovery: Watched<Rediscovery>,
+    guard: std::sync::Arc<Watched<AutoRenewGuard>>,
     /// Whether a headless browser is installed: none unless a test says so.
     browser: Box<dyn Fn(&Path) -> bool + Sync>,
     /// The vault's sync: this machine is in none unless a test says so.
@@ -1955,9 +1953,9 @@ impl Witness {
             }),
             fetched,
             spawned,
-            cooldown: std::sync::Mutex::new(None),
-            rediscovery: std::sync::Mutex::new(Rediscovery::default()),
-            guard: std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default())),
+            cooldown: Watched::new("accounts_sync/sync_cooldown", None),
+            rediscovery: Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
+            guard: AutoRenewGuard::default().shared(),
             browser: Box::new(|_: &Path| false),
             vault_sync: |_: &Path, _scope| super::super::sign_in_ladder::Vault::NotMember,
             logged: std::sync::Arc::default(),
@@ -2020,7 +2018,7 @@ fn an_unconfigured_upkeep_fetches_nothing_and_starts_nothing() {
         upkeep(
             &w.home,
             &w.state,
-            (&w.roster(), UPKEEP_NOW, UpkeepStep::Both),
+            (&w.roster(), trace::Now::at(UPKEEP_NOW), UpkeepStep::Both),
             &wit.fx(),
         )
     };
@@ -2181,7 +2179,7 @@ fn a_fleet_file_no_one_here_named_a_source_for_opts_nothing_in() {
         upkeep(
             &w.home,
             &w.state,
-            (&w.roster(), UPKEEP_NOW, UpkeepStep::Both),
+            (&w.roster(), trace::Now::at(UPKEEP_NOW), UpkeepStep::Both),
             &wit.fx(),
         )
     };
@@ -2297,7 +2295,7 @@ fn an_explicit_source_opts_in_a_bounded_local_fleet() {
         upkeep(
             &w.home,
             &w.state,
-            (&w.roster(), UPKEEP_NOW, UpkeepStep::Both),
+            (&w.roster(), trace::Now::at(UPKEEP_NOW), UpkeepStep::Both),
             &wit.fx(),
         ),
         Upkept::Configured {
@@ -2366,7 +2364,7 @@ fn a_signed_out_login_a_session_runs_on_is_renewed_by_default_and_a_machine_with
         upkeep(
             &w.home,
             &w.state,
-            (&w.roster(), now, UpkeepStep::Both),
+            (&w.roster(), trace::Now::at(now), UpkeepStep::Both),
             &wit.fx()
         ),
         Upkept::Configured {
@@ -2437,14 +2435,24 @@ fn a_signed_out_login_a_session_runs_on_is_renewed_by_default_and_a_machine_with
     let lines = no_route_lines();
     assert_eq!(lines.len(), tried.len(), "one log line per try: {lines:?}");
     for (label, _) in &tried {
+        // The log names the row by its account's key.
+        let logged =
+            crate::harness::account_names::tests::row_name(Cli::Claude, &w.roster(), label).logged;
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains(&format!("account {label}:")) && l.contains("mailbox(")),
+                .any(|l| l.contains(&format!("account {logged}:")) && l.contains("mailbox(")),
             "{label}: {lines:?}"
         );
     }
-    let upkept = |step| upkeep(&w.home, &w.state, (&w.roster(), now, step), &wit.fx());
+    let upkept = |step| {
+        upkeep(
+            &w.home,
+            &w.state,
+            (&w.roster(), trace::Now::at(now), step),
+            &wit.fx(),
+        )
+    };
     upkept(UpkeepStep::Renew);
     assert_eq!(
         sign_ins(),
@@ -2919,7 +2927,7 @@ fn upkeep_converges_from_secrets_mailbox_and_proactively_renews_due_or_signed_ou
         upkeep(
             &w.home,
             &w.state,
-            (&w.roster(), UPKEEP_NOW, UpkeepStep::Sync),
+            (&w.roster(), trace::Now::at(UPKEEP_NOW), UpkeepStep::Sync),
             &wit.fx()
         ),
         Upkept::Configured {
@@ -2966,7 +2974,11 @@ fn upkeep_converges_from_secrets_mailbox_and_proactively_renews_due_or_signed_ou
         upkeep(
             &w.home,
             &w.state,
-            (&w.roster(), UPKEEP_NOW + 1, UpkeepStep::Sync),
+            (
+                &w.roster(),
+                trace::Now::at(UPKEEP_NOW + 1),
+                UpkeepStep::Sync
+            ),
             &wit.fx()
         ),
         Upkept::Configured {
@@ -3344,7 +3356,7 @@ fn recovery_refuses_unproven_or_stale_checkpoints_without_changing_accounts() {
         let state = store.load(UPKEEP_NOW).unwrap().0;
         let logins = store.load_logins(UPKEEP_NOW).unwrap().0;
         let ledger = store.tail(10).unwrap();
-        let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         assert!(
             !recover_interrupted_staging_renewals(&store, &roster, &guard, UPKEEP_NOW),
             "{case}"
@@ -3435,7 +3447,7 @@ fn recovery_prefers_the_latest_checked_account_across_prefixes_and_numeric_ties(
             .unwrap();
             assert!(!store.state_file().exists());
         }
-        let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         assert!(recover_interrupted_staging_renewals(
             &store, &roster, &guard, UPKEEP_NOW
         ));
@@ -3491,7 +3503,7 @@ fn claude_alias_completion_and_recovery_require_the_canonical_identity() {
                     &store.load_logins(UPKEEP_NOW).unwrap().0,
                 )
                 .unwrap();
-                let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+                let guard = AutoRenewGuard::default().shared();
                 recover_interrupted_staging_renewals(&store, &roster, &guard, UPKEEP_NOW)
             } else {
                 let status = super::super::align::Captured {
@@ -3636,7 +3648,7 @@ fn recover_interrupted_staging_renewals_adopts_completed_login_and_preserves_oth
     )
     .unwrap();
 
-    let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     assert!(
         recover_interrupted_staging_renewals(&store, &roster, &guard, UPKEEP_NOW),
         "completed staging login for m27-2 must be recovered"
@@ -3768,7 +3780,7 @@ fn held_account_selections_resume_the_latest_request_without_automatic_source_op
             .collect(),
     };
     fs::write(w.roster(), format_roster_toml(&roster).unwrap()).unwrap();
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     type Work = Box<dyn FnOnce() + Send>;
     let queued: Arc<Mutex<Vec<Work>>> = Arc::new(Mutex::new(Vec::new()));
     let into_queue = Arc::clone(&queued);
@@ -3779,14 +3791,14 @@ fn held_account_selections_resume_the_latest_request_without_automatic_source_op
     let fetch = |_: &Env, _: &str| -> Result<String, String> {
         panic!("an explicit saved request must not fetch an automatic source")
     };
-    let cooldown = Mutex::new(None);
+    let cooldown = Watched::new("accounts_sync/sync_cooldown", None);
     let lifetime = crate::harness::account_work::Lifetime::default();
     let mut fx = UpkeepEffects {
         scope: lifetime.enter(),
         fetch: &fetch,
         spawn_renewal: &spawn,
         sync_cooldown: &cooldown,
-        rediscovery: &Mutex::new(Rediscovery::default()),
+        rediscovery: &Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
         renew_guard: &guard,
         find_browser: &|_: &Path| false,
         vault_sync: |_: &Path, _scope| super::super::sign_in_ladder::Vault::NotMember,
@@ -3863,7 +3875,7 @@ fn held_account_selections_resume_the_latest_request_without_automatic_source_op
         upkeep(
             &w.home,
             &w.state,
-            (&w.roster(), UPKEEP_NOW, UpkeepStep::Renew),
+            (&w.roster(), trace::Now::at(UPKEEP_NOW), UpkeepStep::Renew),
             &fx
         ),
         Upkept::Unconfigured {
@@ -4023,7 +4035,7 @@ fn a_saved_choice_nobody_waits_on_opens_no_window() {
         }],
     };
     fs::write(w.roster(), format_roster_toml(&roster).unwrap()).unwrap();
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     type Work = Box<dyn FnOnce() + Send>;
     let queued: Arc<Mutex<Vec<Work>>> = Arc::new(Mutex::new(Vec::new()));
     let into_queue = Arc::clone(&queued);
@@ -4086,7 +4098,7 @@ fn a_vendor_sign_in_holding_the_lock_keeps_a_claude_pin_request_pending() {
             .collect(),
     };
     fs::write(w.roster(), format_roster_toml(&roster).unwrap()).unwrap();
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     type Work = Box<dyn FnOnce() + Send>;
     let queued: Arc<Mutex<Vec<Work>>> = Arc::new(Mutex::new(Vec::new()));
     let into_queue = Arc::clone(&queued);
@@ -4186,7 +4198,7 @@ fn recovering_another_login_keeps_a_pending_pin_until_its_account_is_eligible() 
         &store.load_logins(UPKEEP_NOW).unwrap().0,
     )
     .unwrap();
-    let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     assert!(recover_interrupted_staging_renewals(
         &store, &roster, &guard, UPKEEP_NOW
     ));
@@ -4374,12 +4386,22 @@ fn sync_use_and_renew_due_honor_bound_staging_logins_and_recover_checkpoints() {
         String::from_utf8_lossy(&err)
     );
     let sync_json: Value = aterm_json::from_str(&String::from_utf8_lossy(&out)).expect("sync json");
+    // The receipt keys each row by its account, never by its label.
+    let m27_key = crate::harness::account_names::names_of_login(
+        Cli::Claude,
+        None,
+        "sol-m27@example.test",
+        None,
+    )
+    .expect("m27's account")
+    .0;
     let m27_entry = sync_json["machine_accounts"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|v| v["label"].as_str() == Some("m27"))
+        .find(|v| v["ac"].as_str() == Some(m27_key.as_str()))
         .expect("m27 row in sync output");
+    assert!(m27_entry.get("label").is_none(), "{sync_json}");
     assert_eq!(m27_entry["enrolled"].as_bool(), Some(true));
     assert_eq!(m27_entry["condition"].as_str(), Some("usable"));
     let recovered = store
@@ -4405,19 +4427,20 @@ fn sync_use_and_renew_due_honor_bound_staging_logins_and_recover_checkpoints() {
         .as_array()
         .unwrap()
         .iter()
-        .filter_map(Value::as_str)
+        .filter_map(|row| row["ac"].as_str())
         .collect();
     assert!(
-        !needs_renew.contains(&"m27"),
+        !needs_renew.contains(&m27_key.as_str()),
         "recovered and bound staging login m27 must not be in needs_renew: {needs_renew:?}"
     );
 
-    // `accounts use m27` succeeds even though `logins/m27` is empty and the login is in `m27+1`.
+    // `accounts use` of m27's account succeeds even though `logins/m27` is empty and the login
+    // is in `m27+1`.
     out.clear();
     err.clear();
     let use_code = super::super::cli::run_accounts(
         &super::super::cli::AccountsCmd::Use {
-            label: "m27".to_owned(),
+            account: use_word(&env, "m27"),
         },
         &env,
         &super::super::cli::LiveAccounts::default(),
@@ -4469,7 +4492,7 @@ fn sync_use_and_renew_due_honor_bound_staging_logins_and_recover_checkpoints() {
     err.clear();
     let renew_code = super::super::cli::run_accounts(
         &super::super::cli::AccountsCmd::Renew {
-            labels: Vec::new(),
+            accounts: Vec::new(),
             due: true,
             on: None,
         },
@@ -4931,7 +4954,7 @@ fn staging_completion_failures_stop_fallback_and_keep_verified_logins() {
                         Cli::Claude,
                         &store,
                         &roster_path,
-                        &std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default())),
+                        &AutoRenewGuard::default().shared(),
                         UPKEEP_NOW,
                         &[],
                         || {},
@@ -5369,7 +5392,7 @@ totp = "JBSWY3DPEHPK3PXP"
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code_unconfigured = super::super::cli::run_accounts(
         &super::super::cli::AccountsCmd::Renew {
-            labels: vec!["m27-2".to_owned()],
+            accounts: vec!["sun.m27.2@example.test".to_owned()],
             due: false,
             on: None,
         },
@@ -5388,7 +5411,10 @@ totp = "JBSWY3DPEHPK3PXP"
         "non-terminal renew of m27-2 (which has no mailbox password) must not run renew_flow"
     );
     assert!(
-        String::from_utf8_lossy(&out).contains("due here: m27-2"),
+        String::from_utf8_lossy(&out).contains(&format!(
+            "due here: {}",
+            crate::harness::account_names::tests::row_name(Cli::Claude, &w.roster(), "m27-2").shown
+        )),
         "stdout: {}",
         String::from_utf8_lossy(&out)
     );
@@ -5397,7 +5423,7 @@ totp = "JBSWY3DPEHPK3PXP"
     err.clear();
     let code_due = super::super::cli::run_accounts(
         &super::super::cli::AccountsCmd::Renew {
-            labels: Vec::new(),
+            accounts: Vec::new(),
             due: true,
             on: None,
         },
@@ -5460,7 +5486,7 @@ totp = "JBSWY3DPEHPK3PXP"
     err.clear();
     let code_wrong_profile = super::super::cli::run_accounts(
         &super::super::cli::AccountsCmd::Renew {
-            labels: vec!["m27-2".to_owned()],
+            accounts: vec!["sun.m27.2@example.test".to_owned()],
             due: false,
             on: None,
         },
@@ -5625,7 +5651,7 @@ totp = "JBSWY3DPEHPK3PXP"
     err.clear();
     let use_code = super::super::cli::run_accounts(
         &super::super::cli::AccountsCmd::Use {
-            label: "m27-3".to_owned(),
+            account: use_word(&env_use, "m27-3"),
         },
         &env_use,
         &non_tty_host,
@@ -5695,7 +5721,7 @@ totp = "JBSWY3DPEHPK3PXP"
 /// NO SWEEP (`DESIGN-alab-one-mesh-2026-11-05.md` §4.15 rule 4): a session's walled, low or
 /// warned account signs in none of the rows that could take it (no session here runs on them
 /// or ran on them within a week: the rotation takes a ready row, and a person's `accounts
-/// login <label>` the rest), and a due
+/// login <account>` the rest), and a due
 /// login is renewed only once a session on this Mac ran on it within the week, whatever the
 /// pressure on it. CONTROL: the same records with that use renew the due login.
 #[test]
@@ -5948,6 +5974,7 @@ fn a_kept_reading_hides_no_row_a_session_waits_on_while_the_vault_is_unread() {
     state.tokens_here = Some(accounts::TokensHere {
         read_at: now - 600,
         ends: [("m2-2".to_owned(), now + 86_400)].into(),
+        vouched: false,
     });
     assert_eq!(
         accounts::login_here(&roster.rows[0], &state, true, now),
@@ -6583,7 +6610,7 @@ fn a_sign_in_takes_an_unverified_window_minted_vault_token_another_mac_minted_be
         home: &Path,
         store: &accounts::Store,
         roster: &Roster,
-        now: i64,
+        now: aterm_uds::trace::Now,
     ) -> Option<BTreeMap<String, u64>> {
         let at = u64::try_from(NOW).unwrap();
         let minted = |by: MintedBy, verified: bool| Standing {
@@ -6675,8 +6702,9 @@ fn a_sign_in_takes_an_unverified_window_minted_vault_token_another_mac_minted_be
         Some(&(NOW + i64::try_from(YEAR).unwrap()))
     );
     let said = format!(
-        "account w3: automatic sign-in on-token: vault: its year token is in use here until \
-         {until}; no browser opened; profile(ready) mailbox(none configured) vault(applied seq 52)"
+        "account {}: automatic sign-in on-token: vault: its year token is in use here until \
+         {until}; no browser opened; profile(ready) mailbox(none configured) vault(applied seq 52)",
+        crate::harness::account_names::tests::row_name(Cli::Claude, &desk.roster(), "w3").logged
     );
     let logged = bench.logged();
     assert!(
@@ -7785,7 +7813,7 @@ fn mailbox_need_pass(w: &World) -> (Vec<String>, Vec<String>) {
         upkeep(
             &w.home,
             &w.state,
-            (&w.roster(), UPKEEP_NOW, UpkeepStep::Renew),
+            (&w.roster(), trace::Now::at(UPKEEP_NOW), UpkeepStep::Renew),
             &fx
         ),
         UNCONFIGURED,
@@ -7930,7 +7958,7 @@ fn app_scope_cancellation_during_fetch_does_not_publish_the_fetched_roster() {
             upkeep(
                 &w.home,
                 &w.state,
-                (&w.roster(), UPKEEP_NOW, UpkeepStep::Sync),
+                (&w.roster(), trace::Now::at(UPKEEP_NOW), UpkeepStep::Sync),
                 fx,
             )
         });
@@ -7951,7 +7979,7 @@ fn app_scope_cancellation_during_fetch_does_not_publish_the_fetched_roster() {
                 upkeep(
                     &w.home,
                     &w.state,
-                    (&w.roster(), UPKEEP_NOW, UpkeepStep::Sync),
+                    (&w.roster(), trace::Now::at(UPKEEP_NOW), UpkeepStep::Sync),
                     fx,
                 )
             });
@@ -7968,4 +7996,119 @@ fn app_scope_cancellation_during_fetch_does_not_publish_the_fetched_roster() {
             assert_eq!(wit.rediscovery.lock().unwrap().failed, prior_failure);
         }
     }
+}
+
+/// THE DASHBOARD'S USE FORM PINS THE ROW'S ACCOUNT BY ITS KEY: a row with an address offers a form
+/// that posts `/use?account=<its key>`, which the serve's `POST /use` runs as `accounts use`, and
+/// that row is pinned; a row with no address offers none. A roster label posted as `account=`
+/// names nothing and pins nothing, and the form the dashboard posted before (`label=`) is no
+/// action. CONTROL: `auto=1` ends the pin.
+#[test]
+fn the_dashboards_use_form_posts_the_accounts_key_and_pins_its_row() {
+    let w = World::new();
+    w.write_config("");
+    let env = w.env(UPKEEP_NOW);
+    let store = env.accounts_store();
+    let work = store.login_dir("work-2").expect("a label");
+    fs::create_dir_all(&work).unwrap();
+    fs::write(work.join(".claude.json"), "{}").unwrap();
+    let rows = [
+        accounts::Row {
+            label: "work-2".into(),
+            email: Some("work@x.example".into()),
+            dir: work.to_str().map(str::to_owned),
+            ..accounts::Row::default()
+        },
+        accounts::Row {
+            label: "plain".into(),
+            ..accounts::Row::default()
+        },
+    ];
+    fs::write(
+        w.roster(),
+        accounts::append_rows_for(Cli::Claude, "", &rows).unwrap(),
+    )
+    .unwrap();
+    let report = super::super::cli::ReportedAccounts {
+        roster: accounts::Roster::load(&w.roster()).unwrap(),
+        names: crate::harness::account_names::Listing::default(),
+        state: accounts::State::default(),
+        enrolled: ["work-2".to_owned()].into(),
+        own: None,
+    };
+    let html = dashboard_rows_html(Some(&report), UPKEEP_NOW);
+    let (pk, _) = crate::harness::account_names::names_of_row(Cli::Claude, &rows[0], None)
+        .expect("an address");
+    assert!(
+        html.contains(&format!("action=\"/use?account={pk}\"")),
+        "{html}"
+    );
+    assert_eq!(
+        html.matches("action=\"/use?").count(),
+        1,
+        "the row with no address offers no pin: {html}"
+    );
+    // Each row's sign-in names it by the word the verb takes: the addressed row by its key (no
+    // lab slugs it here), which `renew` resolves back to that row, and the row with no address
+    // by its label, in the `login` such a row takes. No step types the label of a row with an
+    // address, which `renew` refuses.
+    // NEGATIVE CONTROL: with the dashboard's step typing `row.label` again, this fails on
+    // `aterm harness accounts renew work-2` (2026-11-16, by hand, then restored).
+    assert!(
+        html.contains(&format!("<code>aterm harness accounts renew {pk}</code>")),
+        "{html}"
+    );
+    assert!(
+        html.contains("<code>aterm harness accounts login plain</code>"),
+        "{html}"
+    );
+    assert!(!html.contains("accounts renew work-2"), "{html}");
+    let roster = accounts::Roster::load(&w.roster()).unwrap();
+    let candidates = crate::harness::account_names::Candidates {
+        roster: &roster.rows,
+        ..crate::harness::account_names::Candidates::default()
+    };
+    let reached = crate::harness::account_names::row_named(Cli::Claude, &pk, &candidates, "");
+    assert_eq!(reached.map(|row| row.label.as_str()), Ok("work-2"));
+    let post = |query: &str| {
+        let cmd = use_action(&parse_query(query)).expect("a use action");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = super::super::cli::run_accounts(
+            &cmd,
+            &env,
+            &super::super::cli::LiveAccounts::default(),
+            &mut out,
+            &mut err,
+        );
+        (code, String::from_utf8_lossy(&err).into_owned())
+    };
+    let pinned = || {
+        let (state, _) = store.load(UPKEEP_NOW).expect("the records");
+        state.active.filter(|_| state.pinned)
+    };
+    let (code, err) = post(&format!("account={pk}"));
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert_eq!(pinned().as_deref(), Some("work-2"));
+    let (code, err) = post("auto=1");
+    assert_eq!(code, ExitCode::SUCCESS, "CONTROL: {err}");
+    assert_eq!(pinned(), None, "CONTROL");
+    let (code, err) = post("account=work-2");
+    assert_eq!(code, ExitCode::from(1));
+    assert!(
+        err.contains(&aterm_file::no_account("work-2")),
+        "a label names nothing: {err}"
+    );
+    assert_eq!(pinned(), None);
+    assert!(use_action(&parse_query("label=work-2")).is_none());
+}
+
+/// The word `accounts use` takes for the Claude Code roster row labelled `label` in `env`'s
+/// roster: its account's key, as no lab names it here.
+fn use_word(env: &super::super::cli::Env, label: &str) -> String {
+    let path = env.accounts_roster().expect("a roster path");
+    let roster = accounts::Roster::load_for(Cli::Claude, &path).expect("the roster");
+    let row = roster.row(label).expect("the row");
+    crate::harness::account_names::word_of_row(Cli::Claude, row, &roster.rows, None)
+        .expect("a row with an address")
+        .to_string()
 }

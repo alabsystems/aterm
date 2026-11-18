@@ -1908,27 +1908,6 @@ pub struct AppliedMember {
     pub tree_root: String,
 }
 
-/// What a [`rollback`] did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RollbackReport {
-    /// The program rolled back.
-    pub program: String,
-    /// The build it was active on before.
-    pub from_build: u64,
-    /// The gate-valid build it is now active on (strictly below `from_build`).
-    pub to_build: u64,
-    /// The `index_build` of the signed index this rollback trusted (advance the floor to it).
-    pub index_build: u64,
-    /// The `roster_seq` that authorized it (advance the durable roster floor to it).
-    pub roster_seq: u64,
-    /// The program's coherence group, if it is in one (a per-program rollback splits it).
-    pub coherence_group: Option<String>,
-    /// The local pins that keep it on `to_build` through the next update.
-    pub held_by: Vec<String>,
-    /// A member of its group whose current build is revoked (yanked or below the floor).
-    pub revoked_member: Option<(String, u64)>,
-}
-
 /// Update every program the channel pins, group by group.
 #[allow(
     clippy::too_many_arguments,
@@ -3530,127 +3509,6 @@ pub fn last_resolve() -> Option<ResolveProvenance> {
     LAST_RESOLVE.with(|slot| slot.borrow().clone())
 }
 
-/// Roll `program` back to the highest retained build strictly below its active build that
-/// still passes the floor/yank gate, re-pointing its shims and `current` via
-/// [`rollback_member`] (links only; no retained tree is touched).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "rollback needs the fetcher, layout, pinned root key, channel + program \
-              selectors, the exclusions the update pass reads, and the floor + clock the \
-              freshness/floor gates read — the same irreducible set the install/apply entry \
-              points take"
-)]
-pub fn rollback(
-    fetcher: &dyn Fetcher,
-    layout: &Layout,
-    anchor: &Anchor,
-    channel: &str,
-    program: &str,
-    excluded: &[String],
-    floor: BuildFloor,
-    now_unix: i64,
-) -> Result<RollbackReport, FlowError> {
-    rollback_returning_index(
-        fetcher, layout, anchor, channel, program, excluded, floor, now_unix,
-    )
-    .map(|(report, _)| report)
-}
-
-/// [`rollback`] returning the verified [`TrustedIndex`] alongside the [`RollbackReport`].
-#[allow(
-    clippy::too_many_arguments,
-    reason = "rollback_returning_index takes the same irreducible inputs as rollback"
-)]
-pub fn rollback_returning_index(
-    fetcher: &dyn Fetcher,
-    layout: &Layout,
-    anchor: &Anchor,
-    channel: &str,
-    program: &str,
-    excluded: &[String],
-    floor: BuildFloor,
-    now_unix: i64,
-) -> Result<(RollbackReport, TrustedIndex), FlowError> {
-    let current = crate::ops::active_build_of(layout, program).ok_or_else(|| {
-        FlowError::Rollback(format!(
-            "{program} is not installed \u{2014} nothing to roll back (aterm pkg list shows what is)"
-        ))
-    })?;
-    let pins =
-        crate::pin::pinned_set(layout).map_err(|error| FlowError::Rollback(error.to_string()))?;
-    let index = verify_select_fresh(fetcher, layout, anchor, floor, now_unix)?;
-    let coherence_group = index
-        .program(program)
-        .ok_or_else(|| FlowError::NotReachable(program.to_string(), index_roster(&index)))?
-        .coherence_group
-        .clone();
-    let ch = index
-        .channels
-        .iter()
-        .find(|c| c.name == channel)
-        .ok_or_else(|| FlowError::NoChannel(channel.to_string()))?;
-    let lower: Vec<u64> = crate::ops::list_installed_for(layout, program)
-        .into_iter()
-        .filter(|&b| b < current)
-        .collect();
-    let target = lower
-        .iter()
-        .rev()
-        .copied()
-        .find(|&b| rollback_lands_on(layout, Some(ch), program, b))
-        .ok_or_else(|| {
-            FlowError::Rollback(match lower.last() {
-                None => {
-                    format!("no older {program} build is kept \u{2014} {program} {current} stays")
-                }
-                Some(&b) if !crate::gate::current_build_ok(ch, program, Some(b)) => {
-                    format!("{program} {b} is revoked \u{2014} {program} {current} stays")
-                }
-                Some(&b) => format!(
-                    "{program} {b} has nothing in bin/ to run \u{2014} {program} {current} stays"
-                ),
-            })
-        })?;
-    let staged = Staged {
-        build: current,
-        build_dir: layout.build_dir(program, current),
-        exposes: crate::ops::active_tools(layout, program, current),
-        prior_build: Some(target),
-        was_live: true,
-        was_held: true,
-        reloc: None,
-        tree_root: String::new(),
-        aliases: Aliases::for_program(program, index.program(program)),
-    };
-    if let Err(e) = rollback_member(layout, program, &staged) {
-        eprintln!("atpkg: {program}: its rollback could not put everything back: {e}");
-    }
-    let active = crate::ops::active_builds(layout);
-    let members = pin_gate_members(layout, &index, ch, program, &active, excluded);
-    let revoked_member = members.iter().find_map(|m| {
-        let build = active.get(m).copied()?;
-        (!crate::gate::current_build_ok(ch, m, Some(build))).then(|| (m.clone(), build))
-    });
-    let held_by = if revoked_member.is_some() {
-        Vec::new()
-    } else {
-        members.into_iter().filter(|m| pins.contains(m)).collect()
-    };
-    Ok((
-        RollbackReport {
-            program: program.to_string(),
-            from_build: current,
-            to_build: target,
-            index_build: index.index_build,
-            roster_seq: index.roster_seq(),
-            coherence_group,
-            held_by,
-            revoked_member,
-        },
-        index,
-    ))
-}
-
 /// The transactional `update <grouped-member>` path.
 #[allow(
     clippy::too_many_arguments,
@@ -4352,26 +4210,6 @@ pub(crate) fn staged_download_path(
         return Err(FlowError::VendorRefused(why));
     }
     Ok(layout.staging_dir(program).join(asset))
-}
-
-/// Whether [`rollback`] may land `program` on its retained `build`.
-pub(crate) fn rollback_lands_on(
-    layout: &Layout,
-    ch: Option<&Channel>,
-    program: &str,
-    build: u64,
-) -> bool {
-    ch.is_none_or(|ch| crate::gate::current_build_ok(ch, program, Some(build)))
-        && build_can_be_rolled_onto(layout, program, build)
-}
-
-fn build_can_be_rolled_onto(layout: &Layout, program: &str, build: u64) -> bool {
-    let bin = layout.build_dir(program, build).join("bin");
-    match std::fs::read_dir(&bin) {
-        Ok(entries) => entries.flatten().next().is_some(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => true,
-    }
 }
 
 /// Put `program` back on its prior build (a fresh install: take its shims and `current` away).

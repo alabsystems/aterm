@@ -576,7 +576,12 @@ pub fn run(repo: &Path, json: bool) -> Result<(), Error> {
                     &GitCli::new(repo),
                     &journal.commit,
                     &artifact.macho_sha256,
-                    crate::build_inputs::current,
+                    || {
+                        crate::build_inputs::available_for_commit(
+                            &GitCli::new(repo),
+                            &journal.commit,
+                        )
+                    },
                 )
             })
         })

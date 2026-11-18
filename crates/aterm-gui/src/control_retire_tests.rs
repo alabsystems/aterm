@@ -157,6 +157,7 @@ fn a_cold_exec_retires_the_control_socket_and_a_failed_one_reopens_it() {
                         .write_all(aterm_types::control_verbs::CONTROL_BUSY_LINE.as_bytes());
                 }
             },
+            crate::control::turn_away_at_limit,
             &stopping,
         );
     });

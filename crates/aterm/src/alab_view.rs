@@ -26,10 +26,14 @@
 //! What no shared file carries is still read from the registry, strictly, as a sign-in's
 //! mailbox always was (§10): the mail metadata (mailboxes, where an address's codes arrive, the
 //! alias links), whose collections hold `Secret` columns (LT-04). It is read when the snapshots'
-//! records move, and again 15 seconds after a refusal; a refusal leaves the mail routes empty
-//! and never withholds the lab. Writers stay strict: a receipt decided from the served lab is saved
-//! only under the registry's admitted projection, and only where that projection makes the same
-//! lab (`NativeReceiptGuard`). Reveals read the registry as they always did.
+//! records move, and, after a refusal, again at the first ask a run's first rerun wait
+//! (`aterm_uds::trace::RERUN_FIRST`) or more later. A refusal leaves the mail routes empty and
+//! never withholds the lab; each read that serves the lab without them records a retry
+//! ([`MAIL_REFUSED`]), so no verdict of the accounts upkeep is kept from a run that read it
+//! (`aterm_agent::harness::accounts_upkeep_memo`). Writers stay strict: a receipt decided from
+//! the served lab is saved only under the registry's admitted projection, and only where that
+//! projection makes the same lab (`NativeReceiptGuard`). Reveals read the registry as they
+//! always did.
 //!
 //! Syncs, the accounts list, mail routes and first-name creation ask, never a typing path.
 //! `[alab] roster = false` in `aterm.toml` turns the source off on this Mac. A test, a debug
@@ -41,6 +45,9 @@
 //! The cached lab carries no `place` rows (`Lab::places` stays empty): no sync, pool or outlook
 //! reads them, so no process decodes the journal window for them; the exports read their own
 //! ([`placements`], from `alab_sheet`), once per run of the owner verb.
+//!
+//! Traced by the accounts keeper: what this file reads of the file system itself, it reads
+//! through `aterm_uds::trace::fs` (census `traced-reads`).
 
 #[cfg(test)]
 use aterm_agent::machine_name::RegistryNameRead;
@@ -72,7 +79,7 @@ use aterm_secrets::client::Paths;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Whether this process may hold a lab: a release build outside a build tool's tests, with no
 /// scratch state root and no CI. The lab's roster source here, [`crate::alab_mailbox`],
@@ -312,6 +319,13 @@ fn harness_lab_with_placed(
             .map(|(commons, machine)| (commons.clone(), MachineKey::from_registry(machine.clone())))
             .collect(),
         accounts,
+        names: view.names.clone(),
+        barred: view
+            .accounts
+            .values()
+            .filter(|account| !account.joinable())
+            .map(|account| account.pk.clone())
+            .collect(),
         aliases: view.aliases(),
         mailboxes,
         places: Default::default(),
@@ -391,8 +405,14 @@ fn look<S>(held: &mut Held<S>, read: Result<Option<Projected<S>>, String>) {
     }
 }
 
-/// The least time between two reads of the registry's mail metadata after one was refused.
-const RETRY_MAIL: Duration = Duration::from_secs(15);
+/// Why a lab served here lacks the registry's mail metadata: the last read of it was refused
+/// (a writer succession still pending, ATERM-KI-1109-1, among other refusals). Each read that
+/// serves such a lab records it as a retry in the trace scope armed on its thread
+/// (`aterm_uds::trace::retry`): the run that read it used a lab without its mail routes, so it is
+/// never kept, and its trace owes a rerun after the trace's backoff (`aterm_uds::trace::backoff`:
+/// 10 s, 20 s, 40 s, then 60 s for each run not kept after them). A refusal can end with no mark
+/// of the snapshots moved, so a run kept from such a read would never be shown the answer.
+const MAIL_REFUSED: &str = "the registry refused its mail metadata";
 
 /// What a read of one shared file answers from: what its status says of its snapshot (its
 /// frontier's fingerprint, its revision and the last pass's word), and the ids of this Mac's
@@ -423,7 +443,7 @@ struct Cache<S = Seen> {
     held: Mutex<Held<S>>,
     /// Keep an older in-flight read from replacing a newer projection.
     refreshing: Mutex<()>,
-    /// When the registry last refused a read of its mail metadata.
+    /// When the registry last refused a read of its mail metadata; `None` once a read answered.
     mail_refused: Mutex<Option<Instant>>,
 }
 
@@ -558,10 +578,15 @@ impl<S: CachedSource> Cache<S> {
     }
 }
 
-/// The parts of `lab` a native receipt is decided from: everything but the mail routes, which
-/// no receipt reads.
+/// The parts of `lab` a native receipt is decided from: everything but the mail routes and the
+/// accounts' names, which no receipt reads. The names (`Lab::names`) cover every realm, and a
+/// slug moves when an owner relabels any account, so comparing them would retry every receipt
+/// here while the shared files catch up with the registry, though nothing a receipt decided
+/// from changed. The first receipt that decides from an account's names (resolving an asked
+/// account through them) takes `names` out of this list.
 fn decided(lab: &Lab) -> Lab {
     Lab {
+        names: BTreeMap::new(),
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
         places: Placements::default(),
@@ -596,19 +621,33 @@ impl Cache {
         harness_lab(source.view(), &BTreeMap::new())
     }
 
-    /// Whether a read of the registry's mail metadata is due though the snapshot did not move:
-    /// [`RETRY_MAIL`] after the last one was refused.
-    fn mail_due(&self) -> bool {
+    /// Whether the last read of the registry's mail metadata was refused less than a run's first
+    /// rerun wait (`aterm_uds::trace::RERUN_FIRST`) ago. Then a lab whose snapshot did not move is
+    /// served as it is held, without them, and the registry is not read again: the asks made
+    /// within that wait (one pass's several, other threads' beside them) make no strict read, and
+    /// a rerun made when a run not kept owes it (no sooner than that wait after the run,
+    /// `aterm_uds::trace::backoff`) finds a read due. The wait is judged unrecorded: the retry each
+    /// such serve records ([`MAIL_REFUSED`]) already keeps its run from being kept and owes the
+    /// backoff's rerun, and a deadline recorded beside it would ask for a rerun before then.
+    fn mail_refused_lately(&self) -> bool {
         self.mail_refused
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_none_or(|at| at.elapsed() >= RETRY_MAIL)
+            .is_some_and(|at| {
+                !aterm_uds::trace::unrecorded(|| {
+                    aterm_uds::trace::Since::new(at)
+                        .elapsed_at_least(aterm_uds::trace::RERUN_FIRST, Instant::now())
+                })
+            })
     }
 
     /// Read the registry's mail metadata strictly, as a sign-in's mailbox has always been read
     /// (docs/DESIGN-shared-files-2026-11-11.md §10): its collections hold `Secret` columns, so
     /// no shared file carries them yet (LT-04). `None` on an installation with no Commons, and
-    /// where the registry refuses, which is noted for [`Self::mail_due`].
+    /// where the registry refuses: that is noted for [`Self::mail_refused_lately`], and recorded
+    /// as a retry ([`MAIL_REFUSED`]), so the run that read the lab without them is not kept. A
+    /// read that answers records what it looked at through the vault's readers (the registry
+    /// journal's `lstat`s, `aterm_secrets::fsx::JournalSeen::of`, among them).
     fn read_mail(&self) -> Option<ProjectionRead> {
         let read = Registry::at(self.paths.clone()).observe_installed_projection(&self.config);
         *self
@@ -618,6 +657,7 @@ impl Cache {
         match read {
             Ok(mail) => mail,
             Err(why) => {
+                aterm_uds::trace::retry(MAIL_REFUSED);
                 aterm_log::debug!("lab view: the registry's mail metadata: {why}");
                 None
             }
@@ -667,11 +707,17 @@ impl Cache {
             .projected
             .clone()
             .filter(|held| held.source.files == marks);
-        // Nothing moved: the held lab stands, unless its mail metadata is still to be read.
-        if let Some(held) = &held
-            && (held.source.mail.is_some() || !self.mail_due())
-        {
-            return Ok(Some(held.clone()));
+        // Nothing moved: the held lab stands, unless its mail metadata is still to be read. One
+        // held without it while the last read of it was refused lately is served as it is, the
+        // refusal recorded as a retry, as the refused read recorded it.
+        if let Some(held) = &held {
+            if held.source.mail.is_some() {
+                return Ok(Some(held.clone()));
+            }
+            if self.mail_refused_lately() {
+                aterm_uds::trace::retry(MAIL_REFUSED);
+                return Ok(Some(held.clone()));
+            }
         }
         let [accounts, links, machines] = files.map(|file| file.read());
         if [&accounts, &links, &machines]
@@ -863,6 +909,37 @@ impl alab_roster::Source for &'static Cache {
         );
         match result {
             Ok(Ok(())) => Ok(()),
+            Ok(Err(why)) => Err(why.words()),
+            Err(_) => Err("registry binding or secret changed or is unavailable"),
+        }
+    }
+
+    fn same_bound(
+        &self,
+        expected: &LabMailbox,
+        parts: &[Part],
+        held: &[&[u8]],
+    ) -> Result<bool, &'static str> {
+        if self.snapshot().lab().is_none() {
+            return Err("no lab registry is held here");
+        }
+        let which: Vec<_> = parts
+            .iter()
+            .map(|part| match part {
+                Part::Password => mail::Credential::Password,
+                Part::MailboxPassword => mail::Credential::MailboxPassword,
+                Part::Totp => mail::Credential::Totp,
+            })
+            .collect();
+        match mail::bound_same(
+            &Registry::at(self.paths.clone()),
+            &secret::store(&self.paths),
+            &expected.pk,
+            &which,
+            held,
+            |found| &to_lab_mailbox(found) == expected,
+        ) {
+            Ok(Ok(same)) => Ok(same),
             Ok(Err(why)) => Err(why.words()),
             Err(_) => Err("registry binding or secret changed or is unavailable"),
         }

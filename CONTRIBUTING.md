@@ -47,8 +47,10 @@ What to run before a pull request:
   A fresh clone is green once `targo --unverified verify provision` has run:
   it places the tools the checkout pins (fish, pwsh, binaryen, on a Mac bash
   5.3 built from GNU's source, the browsers, rustup itself and the one stock
-  toolchain the checkout pins, with every cell's std and clippy, and the
-  release chain's stable, writing nothing in `~/.cargo`; until it runs, a
+  toolchain the checkout pins, with every cell's std and clippy, and, where
+  the checkout carries a `trust.lock` (a public snapshot has none), the
+  release chain's stock toolchain it names, writing nothing in
+  `~/.cargo`; until it runs, a
   rustup on your
   `PATH`, Homebrew's included, is the fallback). A test that needs a tool
   this machine still lacks

@@ -23,6 +23,10 @@ pub(crate) const SD_BOTH: i32 = 2;
 
 /// `recv`/`send` after a local `shutdown` of that direction.
 pub(crate) const WSAESHUTDOWN: i32 = 10058;
+/// The connection was aborted on this side.
+pub(crate) const WSAECONNABORTED: i32 = 10053;
+/// The peer closed the connection: afunix's answer to a send once a send found the peer gone.
+pub(crate) const WSAECONNRESET: i32 = 10054;
 /// A non-blocking `recv`/`send` with no data/space right now. Expected once
 /// `WSAEventSelect` flips the socket non-blocking; the caller parks on the
 /// readiness event and retries.

@@ -187,7 +187,17 @@ pub fn swarm_member_heard_now(paths: &Paths) -> crate::Result<Option<u64>> {
         return Ok(None);
     }
     match state_look(paths, None) {
-        Some(look) => Ok(look.heard),
+        Some(look) => {
+            // It answers with `heard`, which is no part of the file's standing.
+            if aterm_uds::trace::armed() {
+                aterm_uds::trace::standing(
+                    &paths.state_file(),
+                    look.whole,
+                    super::traced_state_whole,
+                );
+            }
+            Ok(look.heard)
+        }
         None => super::steward::swarm_member_heard(paths),
     }
 }
@@ -1038,9 +1048,12 @@ impl<'m> Under<'m> {
     /// moment kept, and otherwise taken now, and kept where taking it looked at nothing afresh
     /// ([`fsx::fresh_looks`]: the file's first `lstat` the glance's, and a look kept for that
     /// stamp). For an ask whose [`Under`] stands for its look's moment ([`Self::caching_for`]).
+    /// With a trace scope armed, a look the moment kept is recorded as a fresh one is
+    /// ([`StateLook::note`]).
     fn state_look(self) -> Option<StateLook> {
         let moment = self.moment;
         if let Some(look) = moment.state.get() {
+            look.note(moment.paths);
             return Some(look);
         }
         #[cfg(any(test, debug_assertions))]
@@ -1665,8 +1678,10 @@ fn stamp_paths_in(
     files: &[PathBuf],
     glance: Option<&fsx::Glance>,
 ) -> Option<FileStamps> {
+    // Judged by its identity and access alone: with a trace scope armed, that is what is recorded
+    // of it, never its times, which each file written in it moves.
     #[cfg(unix)]
-    let directory = match fsx::lstat_in(glance, &paths.dir) {
+    let directory = match fsx::folder_in(glance, &paths.dir) {
         Ok(Some(meta)) if meta.is_dir() => Some(DirectoryStamp {
             dev: meta.dev(),
             inode: meta.ino(),
@@ -1678,7 +1693,7 @@ fn stamp_paths_in(
         Ok(None) => None,
     };
     #[cfg(windows)]
-    let directory = match fsx::lstat_in(glance, &paths.dir) {
+    let directory = match fsx::folder_in(glance, &paths.dir) {
         Ok(Some(meta)) if meta.file_type().is_dir() => Some(DirectoryStamp {
             dev: meta.st_dev,
             inode: meta.st_ino,
@@ -1713,7 +1728,9 @@ pub(crate) fn state_standing_in(
         return Ok(look.standing);
     }
     fsx::look_afresh();
-    Ok(super::state_standing_heard(paths)?.map(|(standing, _)| standing))
+    Ok(super::read_state_at(&paths.state_file())?
+        .as_ref()
+        .map(super::standing_of))
 }
 
 /// `state.toml` at `paths` as a memo stamps it ([`state_look`]), under `under` where the caller
@@ -1729,12 +1746,29 @@ fn state_look_in(paths: &Paths, under: Option<Under<'_>>) -> Option<StateLook> {
 /// What a memo stamps `state.toml` by ([`stamp_memo_inputs_in`]), and when the vault last heard
 /// this Mac, from one read of the file.
 #[derive(Clone, Copy)]
-struct StateLook {
+pub(super) struct StateLook {
     /// What it holds but `heard` and the receipts of the vault's rounds
     /// ([`state_standing`](super::state_standing)); `None` with no file.
-    standing: Option<[u8; 32]>,
+    pub(super) standing: Option<[u8; 32]>,
     /// `heard`, where it holds this Mac in its vault.
     heard: Option<u64>,
+    /// What it holds, all of it (`client::whole_of`); `None` with no file.
+    pub(super) whole: Option<[u8; 32]>,
+}
+
+impl StateLook {
+    /// Record, in a trace scope armed on this thread, that a run took this look of the vault at
+    /// `paths`' `state.toml`: its standing, the one part of it a memo's answer is taken from
+    /// (`client::read_state_at` records the same of a read).
+    fn note(self, paths: &Paths) {
+        if aterm_uds::trace::armed() {
+            aterm_uds::trace::standing(
+                &paths.state_file(),
+                self.standing,
+                super::traced_state_standing,
+            );
+        }
+    }
 }
 
 /// The last [`StateLook`] of each vault folder's `state.toml` read in this process, with the
@@ -1744,14 +1778,30 @@ struct StateLook {
 /// warm memo makes holds whatever other tests read meanwhile.
 static STATE_LOOKS: Mutex<Vec<(PathBuf, Stamp, StateLook)>> = Mutex::new(Vec::new());
 
-/// `state.toml` at `paths` as a memo stamps it ([`StateLook`]), its `lstat` `glance`'s where the
+/// `state.toml` at `paths` as a memo stamps it ([`state_look_at`]), its `lstat` `glance`'s where
+/// the caller looks through one. With a trace scope armed, what it gives is recorded as the file's
+/// standing ([`StateLook::note`]) and none of the `lstat`s it took: its answer is the standing, and
+/// a memo's whose key it is takes nothing else from the file.
+fn state_look(paths: &Paths, glance: Option<&fsx::Glance>) -> Option<StateLook> {
+    let file = paths.state_file();
+    if !aterm_uds::trace::armed() {
+        return state_look_at(&file, glance);
+    }
+    let look = aterm_uds::trace::unrecorded(|| state_look_at(&file, glance))?;
+    look.note(paths);
+    Some(look)
+}
+
+/// `state.toml` at `file` as a memo stamps it ([`StateLook`]), its `lstat` `glance`'s where the
 /// caller looks through one: what the file showing that stamp was read to, where one was, and
 /// otherwise the file read now, kept for that stamp where the file showed it after the read as
 /// well. `None` where the file cannot be stamped or read, or moved during the read (a fresh read
-/// then).
-fn state_look(paths: &Paths, glance: Option<&fsx::Glance>) -> Option<StateLook> {
-    let file = paths.state_file();
-    let stamp = |glance| match fsx::lstat_in(glance, &file) {
+/// then). A trace's replay of the file's standing asks it (`client::traced_state_standing`).
+pub(super) fn state_look_at(
+    file: &std::path::Path,
+    glance: Option<&fsx::Glance>,
+) -> Option<StateLook> {
+    let stamp = |glance| match fsx::lstat_in(glance, file) {
         Ok(meta) => Some(meta.as_ref().map(Stamp::of)),
         Err(_) => None,
     };
@@ -1759,6 +1809,7 @@ fn state_look(paths: &Paths, glance: Option<&fsx::Glance>) -> Option<StateLook> 
         return Some(StateLook {
             standing: None,
             heard: None,
+            whole: None,
         });
     };
     let looks = || {
@@ -1768,27 +1819,30 @@ fn state_look(paths: &Paths, glance: Option<&fsx::Glance>) -> Option<StateLook> 
     };
     if let Some((_, _, look)) = looks()
         .iter()
-        .find(|(at, stamp, _)| *at == file && *stamp == before)
+        .find(|(at, stamp, _)| at == file && *stamp == before)
     {
         return Some(*look);
     }
-    let (standing, heard) = match super::state_standing_heard(paths) {
-        Ok(Some((standing, heard))) => (Some(standing), heard),
+    let look = match super::parse_state_at(file) {
+        Ok(Some(state)) => StateLook {
+            standing: Some(super::standing_of(&state)),
+            heard: (state.membership == super::Stored::In).then_some(state.heard),
+            whole: Some(super::whole_of(&state)),
+        },
         Ok(None) | Err(_) => return None,
     };
     if stamp(None)? != Some(before) {
         return None;
     }
-    let look = StateLook { standing, heard };
     let mut looks = looks();
-    looks.retain(|(at, _, _)| *at != file);
+    looks.retain(|(at, _, _)| at != file);
     #[cfg(not(test))]
     if looks.len() >= MAX_FOLDERS {
         looks.remove(0);
     }
     #[cfg(test)]
     looks.retain(|(at, _, _)| at.parent().is_some_and(std::path::Path::exists));
-    looks.push((file, before, look));
+    looks.push((file.to_path_buf(), before, look));
     Some(look)
 }
 

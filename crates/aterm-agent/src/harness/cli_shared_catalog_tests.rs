@@ -42,9 +42,11 @@ fn shared_accounts_are_reported_when_no_local_roster_can_be_read() {
         report["shared_accounts"]["accounts"][0]["key"].as_str(),
         Some("shared-one")
     );
+    let shared = &report["shared_accounts"]["accounts"][0];
     assert_eq!(
-        report["shared_accounts"]["accounts"][0]["local_label"],
-        Value::Null
+        (shared.get("local"), shared.get("local_own")),
+        (Some(&Value::Null), Some(&Value::from(false))),
+        "no roster was read, so no row holds it: {shared}"
     );
     assert_eq!(
         report["shared_accounts"]["accounts"][0]["login_authority"].as_str(),

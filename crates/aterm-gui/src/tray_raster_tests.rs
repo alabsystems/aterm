@@ -4663,3 +4663,43 @@ fn a_pictogram_prim_inks_only_its_square() {
         }
     }
 }
+
+/// THE RASTER NEVER BAKES (§4.5): an image whose bake is not kept (one the setup screen's worker
+/// has not landed yet, or one dropped between a view's paint and its raster) draws nothing,
+/// keeps nothing and leaves its art unbaked; the setup screen bakes ahead on its own worker
+/// (`system_state::prebake`). NEGATIVE CONTROL: once that bake is kept, the same prim draws it.
+#[test]
+fn an_image_not_kept_draws_nothing_and_bakes_nothing() {
+    let art = crate::widget::ImageArt::Road(aterm_effects::rainbow_road::RoadArt {
+        length: 400,
+        permille: 500,
+        done: false,
+        dark: true,
+    });
+    let h = 120_u32;
+    let w = (h as f32 * art.aspect()).round() as u32;
+    let prims = [DrawPrim::Image {
+        x: 4.0,
+        y: 4.0,
+        w: w as f32,
+        h: h as f32,
+        art,
+        device: (w, h),
+        alpha: 255,
+    }];
+    let ground = [0x10, 0x12, 0x18, 0xFF];
+    let raster = |prims: &[DrawPrim]| rasterize_tray_pixels(prims, w + 8, h + 8, 1.0, ground);
+    let blank = raster(&[] as &[DrawPrim]);
+    let kept = crate::widget::images_kept_bytes();
+    assert!(!art.is_kept(w, h), "nothing baked yet");
+    assert!(raster(&prims) == blank, "an image not kept draws nothing");
+    assert_eq!(
+        crate::widget::images_kept_bytes(),
+        kept,
+        "and keeps nothing"
+    );
+    assert!(!art.is_kept(w, h), "and leaves its art unbaked");
+    art.keep(w, h, art.bake(w, h).into());
+    assert!(raster(&prims) != blank, "control: kept, it draws");
+    crate::widget::retain_images(&[]);
+}

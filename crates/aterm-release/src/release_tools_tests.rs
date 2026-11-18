@@ -5,10 +5,10 @@ use super::*;
 
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
-/// A /1 freezer cannot supply /2's built_from binding. Repair the old proof once;
+/// An older freezer cannot supply the current bindings. Repair the old proof once;
 /// a failed repair is not permission for another compile/exec cycle.
 #[test]
-fn a_v1_cutter_record_gets_one_v2_repair() {
+fn an_older_cutter_record_gets_one_current_repair() {
     let temp = aterm_tempfile::tempdir().unwrap();
     let release = temp.path().join("release");
     let source = tool_source(temp.path(), "skew-cutter", CUTTER_VERSION, 0);
@@ -18,6 +18,7 @@ fn a_v1_cutter_record_gets_one_v2_repair() {
         &source,
         &release.with_extension("events"),
         None,
+        None,
     )
     .unwrap();
     let mut legacy = aterm_toml::to_string(&cutter).unwrap();
@@ -25,7 +26,7 @@ fn a_v1_cutter_record_gets_one_v2_repair() {
         .lines()
         .filter(|line| !line.starts_with("built_from ="))
         .map(|line| {
-            if line == "schema = 2" {
+            if line == "schema = 3" {
                 "schema = 1"
             } else {
                 line
@@ -173,6 +174,36 @@ fn launch_contract_bounds_recovery_without_authenticating_the_proof() {
     }
 }
 
+#[test]
+fn a_failed_same_candidate_check_can_refreeze_only_once() {
+    let earlier = "f".repeat(40);
+    for running in [None, Some(earlier.as_str()), Some(COMMIT)] {
+        let no_marker = Recovery::failed_launch(COMMIT, running, |_| None);
+        assert_eq!(
+            no_marker,
+            if running == Some(COMMIT) {
+                Recovery::Refreeze
+            } else {
+                Recovery::Initial
+            }
+        );
+        assert_eq!(
+            Recovery::failed_launch(COMMIT, running, |name| {
+                (name == REFREEZE_ENV).then(|| COMMIT.into())
+            }),
+            Recovery::Refuse,
+            "a valid stamp cannot erase the failed candidate's consumed repair"
+        );
+        assert_eq!(
+            Recovery::failed_launch(COMMIT, running, |name| {
+                (name == REFREEZE_ENV).then(|| earlier.clone())
+            }),
+            no_marker,
+            "a prior candidate's repair does not consume this candidate's repair"
+        );
+    }
+}
+
 /// NEGATIVE CONTROL: accepting the legacy proof bypasses the re-freeze; trusting the
 /// repair hint instead of the new proof accepts the deliberately mutated image.
 #[test]
@@ -186,6 +217,7 @@ fn legacy_tool_record_needs_a_new_content_proof() {
         COMMIT,
         &old.cutter.path,
         &release.with_extension("events"),
+        None,
         None,
     )
     .unwrap();
@@ -211,6 +243,7 @@ fn a_cutter_can_be_frozen_before_the_verifier_but_every_binding_is_required() {
         &source,
         &release.with_extension("events"),
         None,
+        None,
     )
     .unwrap();
     assert!(!record_path(&release).exists());
@@ -234,7 +267,8 @@ fn a_cutter_can_be_frozen_before_the_verifier_but_every_binding_is_required() {
             COMMIT,
             &source,
             &release.with_extension("events"),
-            None
+            None,
+            None,
         )
         .is_err()
     );
@@ -257,10 +291,16 @@ fn adoption_binds_both_commits_and_rejects_changed_or_unproved_inputs() {
         COMMIT,
         &source,
         &release.with_extension("events"),
+        Some(inputs.seal.clone()),
         Some(inputs.clone()),
     )
     .unwrap();
     publish_cutter(&release, &original).unwrap();
+    for seal in [None, Some("4".repeat(64)), Some("invalid".into())] {
+        let mut mutant = original.clone();
+        mutant.seal = seal;
+        assert!(publish_cutter(&release, &mutant).is_err());
+    }
     let next = "b".repeat(40);
     let mut observation = crate::cutter_inputs::Observation {
         inputs,
@@ -336,6 +376,7 @@ fn only_a_parsed_release_preview_can_start_away_from_its_frozen_commit() {
         &candidate,
         &source,
         &temp.path().join("log"),
+        None,
         None,
     )
     .unwrap();

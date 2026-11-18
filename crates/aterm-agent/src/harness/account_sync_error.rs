@@ -19,11 +19,17 @@ pub struct SyncError {
 }
 
 impl SyncError {
+    /// A failure the same input may be retried after, for `reason`. Making one records a retry
+    /// in the trace scope armed on this thread (`aterm_uds::trace::retry`): the run that met it
+    /// did not finish its work, so it is not kept as a duty's verdict and owes a rerun, whether
+    /// its caller passes the failure on or drops it.
     #[must_use]
     pub fn retry(reason: Retry, message: impl Into<String>) -> Self {
+        let message = message.into();
+        aterm_uds::trace::retry(format!("a retryable sync failure ({reason:?}): {message}"));
         Self {
             retry: Some(reason),
-            message: message.into(),
+            message,
         }
     }
 

@@ -408,9 +408,14 @@ fn a_tab_without_state_is_still_fed_by_the_screen_reader() {
         "the applied line is kept as text"
     );
 
-    // The claim ends with its connection: the reader feeds the tab again, from what it reads.
-    drop(stream);
-    rig.ended(id);
+    // The claim is released: the reader feeds the tab again, from what it reads. (A closed
+    // connection alone keeps a contract 4 claim, and the stand-down, through the re-exec grace.)
+    assert!(crate::session_timeline::release_supervisor(
+        &rig.service.handle(ONE).ctx,
+        Some(id),
+        crate::metrics::now_us(),
+        Actor::Ctl,
+    ));
     assert_eq!(published(&rig, ONE), ("question", None, 4));
     assert_eq!(composer(&rig, ONE), "empty");
     assert!(screen(&rig, ONE, "idle", None));

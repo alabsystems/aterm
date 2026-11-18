@@ -66,6 +66,7 @@ fn secret_get_scan_export_history_and_unknown_reader() {
         cells,
         inert: Default::default(),
         owned: Default::default(),
+        logs: Default::default(),
         complete: true,
         awaiting: crate::typed::Awaiting::NONE,
         refused: vec![],

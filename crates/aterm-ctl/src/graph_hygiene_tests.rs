@@ -184,3 +184,64 @@ fn foreign_is_outside_and_tokenless_only() {
         "inside the rendezvous dir: never foreign"
     );
 }
+
+/// A graph entry for `sid` in `dir`'s graph folder naming `pid`.
+fn publish(dir: &Path, sid: &str, pid: u32) {
+    let graph = dir.join("graph");
+    std::fs::create_dir_all(&graph).unwrap();
+    std::fs::write(
+        graph.join(sid),
+        format!("sock /tmp/x/a.sock\nnonce 00\npid {pid}\n"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_session_is_served_only_by_the_live_writer_its_entry_names() {
+    let s = scratch();
+    let live = "s-00000000000000000001";
+    let ended = "s-00000000000000000002";
+    let absent = "s-00000000000000000003";
+    let nameless = "s-00000000000000000004";
+    assert_eq!(
+        session_served_in(s.path(), absent),
+        Served::Gone,
+        "no graph folder: nothing is published"
+    );
+    publish(s.path(), live, std::process::id());
+    let mut child =
+        aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new("/usr/bin/true")))
+            .spawn()
+            .unwrap();
+    let gone_pid = child.id();
+    child.wait().unwrap();
+    publish(s.path(), ended, gone_pid);
+    std::fs::write(
+        s.path().join("graph").join(nameless),
+        "sock /tmp/x/a.sock\n",
+    )
+    .unwrap();
+    assert_eq!(
+        session_served_in(s.path(), live),
+        Served::By(std::process::id())
+    );
+    assert_eq!(session_served_in(s.path(), ended), Served::Gone);
+    assert_eq!(session_served_in(s.path(), absent), Served::Gone);
+    assert_eq!(
+        session_served_in(s.path(), nameless),
+        Served::Unknown,
+        "an entry that names no pid says nothing"
+    );
+    assert_eq!(
+        session_served_in(s.path(), "ada"),
+        Served::Unknown,
+        "a word that is no session id says nothing"
+    );
+    std::fs::remove_file(s.path().join("graph").join(live)).unwrap();
+    std::fs::create_dir(s.path().join("graph").join(live)).unwrap();
+    assert_eq!(
+        session_served_in(s.path(), live),
+        Served::Unknown,
+        "an entry that cannot be read says nothing"
+    );
+}

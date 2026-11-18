@@ -1575,6 +1575,33 @@ fn a_yanked_installed_version_moves_to_the_head_or_rolls_back() {
     assert_eq!(shim_build(&l, "claude"), Some(v("2.1.282").build_id()));
 }
 
+/// RL-29: gc keeps no older build of a program the lab releases, but a vendor-direct program (an
+/// upstream binary the lab cannot fix forward) keeps the one build a signed yank lands on: after
+/// gc, yanking the live version still rolls back onto it.
+#[test]
+fn a_yanked_vendor_build_still_lands_on_its_retained_previous_build() {
+    let l = world::layout("yank-after-gc");
+    let f = Fake::default();
+    for (version, exe) in [("2.1.280", "a"), ("2.1.281", "b"), ("2.1.282", "c")] {
+        f.publish_claude(version, &native_exe(exe));
+        run(&l, &f, &Policy::default(), claude());
+    }
+    let report = crate::gc::run(&l, None);
+    assert!(
+        !l.build_dir("claude", v("2.1.280").build_id()).exists(),
+        "the build below the retained one is reclaimed: {:?}",
+        report.reclaimed
+    );
+    assert!(
+        l.build_dir("claude", v("2.1.281").build_id()).is_dir(),
+        "the build a yank lands on is kept: {:?}",
+        report.reclaimed
+    );
+    let o = run(&l, &f, &Policy::from_entries(["claude@2.1.282"]), claude());
+    assert!(matches!(o.verdict, Verdict::RolledBack { .. }), "{o:?}");
+    assert_eq!(shim_build(&l, "claude"), Some(v("2.1.281").build_id()));
+}
+
 #[test]
 fn a_yanked_version_with_nothing_admissible_is_tombstoned() {
     let l = world::layout("tombstone");

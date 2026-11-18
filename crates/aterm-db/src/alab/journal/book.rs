@@ -9,7 +9,10 @@
 //! tables and saves it.
 
 use super::{
-    event::{Event, Kind, MAX_EVENT, Pk, SIGNIN_IN, SIGNIN_UNKNOWN, SIGNIN_WORDS, Window, Word},
+    event::{
+        Event, Kind, MAX_EVENT, Pk, SIGNIN_IN, SIGNIN_UNKNOWN, SIGNIN_WORDS, Source, Window, Word,
+    },
+    mine,
     place::{Holding, Why},
     relay::{Entry, Heard, Rk},
     spool::{KEEP_S, MAX_SPOOL},
@@ -19,7 +22,10 @@ use crate::{
     Error, Result,
     catalog::ring::{JOURNAL_SHARES, Used},
     database::{Change, MAX_WRITES},
-    typed::owned::{caps, fit},
+    typed::{
+        Collection,
+        owned::{caps, fit},
+    },
 };
 use aterm_json::{Map, Value, json};
 use aterm_update_core::update_record::UpdateRecord;
@@ -97,6 +103,9 @@ pub(crate) struct Facts {
     /// Each window's standing wall: until, and when it was seen.
     pub walls: BTreeMap<Window, (Option<u64>, u64)>,
     pub plan: Option<(String, u64)>,
+    /// The newest reading, wall or cleared wall, and where it was read: a `usage` row's `read_at`
+    /// and `src` where it is newer than every reading the book keeps.
+    pub read: Option<(u64, Source)>,
     /// On a sub-account's row, the provider's `AccountKey` it is keyed by (12 hex digits).
     pub key: Option<String>,
     /// On a sub-account's row, the account it belongs to: a sub-account key is a one-way digest
@@ -105,6 +114,8 @@ pub(crate) struct Facts {
     /// The newest event about it.
     pub used: u64,
     pub stated: Option<Stated>,
+    /// What its `usage` row last said ([`mine::content`]) and when.
+    pub usage: Option<Stated>,
 }
 
 impl Facts {
@@ -141,6 +152,14 @@ impl Facts {
                 t: e.t,
                 cli: e.cli.as_str().to_owned(),
             });
+        }
+        if ((e.kind == Kind::Quota && e.pct_x10.is_some())
+            || matches!(e.kind, Kind::Wall | Kind::WallCleared))
+            && e.window.is_some()
+            && super::READING_SOURCES.contains(&e.src.word())
+            && self.read.is_none_or(|(t, _)| t <= e.t)
+        {
+            self.read = Some((e.t, e.src));
         }
         match e.kind {
             Kind::SessionStart => {
@@ -264,6 +283,108 @@ impl Facts {
         let kept = fit(&entries, cap, wrap)?;
         Ok(wrap(&entries[..kept]))
     }
+
+    /// The content of the `usage` row (docs/DESIGN-shared-files-2026-11-11.md §10 file 4) of the
+    /// account or sub-account `pk` at `now`, without its counter and the time it is stated
+    /// ([`mine::row`]): each window's latest reading (tenths of a percent, the provider's reset
+    /// in milliseconds), the standing wall that lasts longest, the plan where it is a plan word
+    /// the registry seeds ([`mine::plan_word`]), where and when the
+    /// newest reading was read, and the sessions. `None` where nothing was read of it (no
+    /// reading and no wall from a reading source), or a sub-account's row names no account.
+    pub(crate) fn usage_row(&self, pk: &Pk, now: u64) -> Option<Value> {
+        let (account, sub) = match (&self.account, &self.key) {
+            (Some(account), Some(key)) => (*account, Some(key.as_str())),
+            (None, None) if pk.as_str().starts_with("ac-") => (*pk, None),
+            _ => return None,
+        };
+        let (read_at, src) = self
+            .quota
+            .values()
+            .filter(|e| super::READING_SOURCES.contains(&e.src.word()))
+            .map(|e| (e.t, e.src))
+            .chain(self.read)
+            .max_by_key(|(t, _)| *t)?;
+        let mut row = Map::new();
+        row.insert("r".into(), Value::from(VERSION));
+        row.insert("account".into(), Value::from(account.as_str()));
+        if let Some(sub) = sub {
+            row.insert("sub".into(), Value::from(sub));
+        }
+        for (window, pct, reset) in [
+            (Window::FiveHour, "w5h", "w5h_reset"),
+            (Window::Week, "w7d", "w7d_reset"),
+            (Window::WeekModel, "w7dm", "w7dm_reset"),
+        ] {
+            let Some(e) = self.quota.get(&window) else {
+                continue;
+            };
+            if let Some(p) = e.pct_x10 {
+                row.insert(pct.into(), Value::from(u64::from(p)));
+            }
+            if let Some(r) = e.reset {
+                row.insert(reset.into(), Value::from(mine::ms(r)));
+            }
+        }
+        // The standing wall that lasts longest; one with no stated end outlasts every other.
+        let wall = self
+            .walls
+            .iter()
+            .filter(|(_, (until, _))| until.is_none_or(|u| u > now))
+            .filter_map(|(w, (until, _))| Some((wall_word(*w)?, *until)))
+            .max_by_key(|(_, until)| until.unwrap_or(u64::MAX));
+        row.insert(
+            "wall".into(),
+            Value::from(wall.map_or(mine::Wall::None, |(word, _)| word).word()),
+        );
+        if let Some(until) = wall.and_then(|(_, until)| until) {
+            row.insert("wall_until".into(), Value::from(mine::ms(until)));
+        }
+        if let Some((word, _)) = self.plan.as_ref().filter(|(word, _)| mine::plan_word(word)) {
+            row.insert("plan".into(), Value::from(word.as_str()));
+        }
+        row.insert("src".into(), Value::from(src.word()));
+        row.insert("read_at".into(), Value::from(mine::ms(read_at)));
+        row.insert(
+            "sessions_7d".into(),
+            Value::from(self.sessions_7d(now) as u64),
+        );
+        if self.last_start > 0 {
+            row.insert("last_start".into(), Value::from(mine::ms(self.last_start)));
+        }
+        if self.last_end > 0 {
+            row.insert("last_end".into(), Value::from(mine::ms(self.last_end)));
+        }
+        Some(Value::Object(row))
+    }
+}
+
+/// A usage row's wall word of a window's wall: none for the journal's own `day` and `month`
+/// windows, which `ai/usage` does not name.
+const fn wall_word(window: Window) -> Option<mine::Wall> {
+    match window {
+        Window::FiveHour => Some(mine::Wall::FiveHour),
+        Window::Week => Some(mine::Wall::Week),
+        Window::WeekModel => Some(mine::Wall::WeekModel),
+        Window::Credits => Some(mine::Wall::Credits),
+        Window::Day | Window::Month => None,
+    }
+}
+
+/// One login this Mac's harness reports ([`Book::take_logins`]): its row's content as the
+/// report says it ([`mine::Login::content`], the `place` reason applied when its row is made,
+/// [`Book::login_content`]), when the harness last reported it, and what the row last said and
+/// when.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LoginFacts {
+    pub content: Value,
+    /// When the harness last reported it, Unix seconds: its row is restated in a new week only
+    /// while that was this week or the last ([`Book::logins_due`]), so a store that stopped
+    /// reading never has its old row restated as current.
+    pub reported_at: u64,
+    /// The report of its CLI no longer names it: `content` is its row as no longer held here
+    /// ([`mine::released`]), stated once, then the book forgets it.
+    pub gone: bool,
+    pub stated: Option<Stated>,
 }
 
 /// What a `use` or `relay` row says, without its counter and week, to compare with what was
@@ -409,6 +530,8 @@ pub(crate) struct Book {
     pub accounts: BTreeMap<Pk, Facts>,
     /// What this Mac holds that no preference here names, by account ([`Self::hold`]).
     pub places: BTreeMap<Pk, Place>,
+    /// The logins the harness last reported, by account ([`Self::take_logins`]).
+    pub logins: BTreeMap<Pk, LoginFacts>,
     /// The last counter a record of this Mac's used: never reused, so an `ev` batch key is new.
     pub n: u64,
     /// The week of the last `sum` row.
@@ -455,6 +578,8 @@ pub(crate) struct Planned {
     pub sum: bool,
     pub uses: Vec<(Pk, Value)>,
     pub places: Vec<(Pk, Value)>,
+    pub logins: Vec<(Pk, Value)>,
+    pub usages: Vec<(Pk, Value)>,
     pub relays: Vec<(u8, Value)>,
     /// The `upd` row it carries.
     pub upd: Option<Value>,
@@ -583,7 +708,8 @@ impl Book {
     /// Whether a flush is due at `now` in week `period` (design §3.9): the week's first record
     /// (its `sum`, even idle); otherwise, while under the pace line, a `sum` that must say the
     /// journal was turned off or on, and with the journal on a sharp event, an update record the
-    /// last `upd` row did not say ([`Self::upd_waiting`]), 128 waiting events,
+    /// last `upd` row did not say ([`Self::upd_waiting`]), a login whose row changed urgently
+    /// ([`Self::logins_urgent`]), 128 waiting events,
     /// or six hours since the last flush with events or rows waiting. With the journal off
     /// (`off`, `[alab] journal = false`) nothing but the `sum` is ever due.
     pub(crate) fn due(
@@ -609,6 +735,7 @@ impl Book {
         }
         outbox.iter().any(Event::sharp)
             || self.upd_waiting()
+            || self.logins_urgent(now)
             || outbox.len() >= BATCH_EVENTS
             || ((owed || !outbox.is_empty()) && now >= self.flushed_at.saturating_add(ROUTINE_S))
     }
@@ -748,6 +875,146 @@ impl Book {
         due
     }
 
+    /// Take the harness's `reports` at `now` (docs/DESIGN-shared-files-2026-11-11.md §10 file 3),
+    /// one per CLI: each account's first reported login is kept with what its row last said,
+    /// reported now. Of a CLI whose store read, a login the report no longer names is released
+    /// ([`mine::released`]: stated once as no longer held here, then forgotten, as an ended
+    /// `place` row is; one never stated is forgotten at once). Of a CLI whose store did not read,
+    /// or the report names nothing of, every login stays as it was, its `reported_at` unmoved. At
+    /// most [`MAX_ACCOUNTS`] are kept: a new login past them is not taken.
+    pub(crate) fn take_logins(&mut self, reports: &mine::Reports, now: u64) {
+        let read: BTreeSet<&str> = reports
+            .iter()
+            .filter(|(_, logins)| logins.is_some())
+            .map(|(cli, _)| cli.word())
+            .collect();
+        let mut reported = BTreeSet::new();
+        for login in reports.values().flatten().flatten() {
+            if !reported.insert(login.account) {
+                continue;
+            }
+            let content = login.content();
+            let room = self.logins.len() < MAX_ACCOUNTS;
+            match self.logins.get_mut(&login.account) {
+                Some(known) => {
+                    known.content = content;
+                    known.reported_at = now;
+                    known.gone = false;
+                }
+                None if room => {
+                    self.logins.insert(
+                        login.account,
+                        LoginFacts {
+                            content,
+                            reported_at: now,
+                            gone: false,
+                            stated: None,
+                        },
+                    );
+                }
+                None => {}
+            }
+        }
+        self.logins.retain(|account, login| {
+            let of_read = login
+                .content
+                .get("cli")
+                .and_then(Value::as_str)
+                .is_some_and(|cli| read.contains(cli));
+            if reported.contains(account) || !of_read {
+                return true;
+            }
+            if login.stated.is_none() {
+                return false;
+            }
+            if !login.gone {
+                login.gone = true;
+                login.content = mine::released(&login.content, now);
+            }
+            true
+        });
+    }
+
+    /// The content of `account`'s login row: what the harness reported, saying the reason this
+    /// Mac's `place` row gives where it holds the account for one ([`Self::hold`], so `probation`
+    /// until it ran or signed in here).
+    pub(crate) fn login_content(&self, account: &Pk, login: &LoginFacts) -> Value {
+        let mut content = login.content.clone();
+        if !login.gone
+            && let Some(place) = self.places.get(account).filter(|place| !place.ended)
+            && let Some(row) = content.as_object_mut()
+        {
+            row.insert("held".into(), Value::from(mine::Held::of(place.why).word()));
+        }
+        content
+    }
+
+    /// Whether a login's row changed urgently since it was last stated ([`mine::urgent`]; one
+    /// never stated, from nothing) and the value-free guard admits it, so a record is due for it
+    /// as for a sharp event.
+    pub(crate) fn logins_urgent(&self, now: u64) -> bool {
+        self.logins.iter().any(|(account, login)| {
+            let content = self.login_content(account, login);
+            mine::urgent(
+                login.stated.as_ref().map_or(&Value::Null, |s| &s.value),
+                &content,
+            ) && mine::checked(&super::LOGIN, &mine::row(&content, 0, now)).is_ok()
+        })
+    }
+
+    /// Whether a row whose content is `content` and last said `said` is due at `now` in week
+    /// `period`, and whether that is its weekly restatement: an urgent change ([`mine::urgent`])
+    /// at once, any other change once an hour has passed since the row was last written, and a
+    /// row last stated in an earlier week (where `carries`) in the week's first record.
+    fn row_due(
+        said: Option<&Stated>,
+        content: &Value,
+        carries: bool,
+        period: u64,
+        now: u64,
+    ) -> bool {
+        let carry = carries && said.is_some_and(|s| s.period < period);
+        let eligible = said.is_none_or(|s| {
+            now >= s.at.saturating_add(USE_EVERY) || mine::urgent(&s.value, content)
+        });
+        let changed = eligible && said.is_none_or(|s| s.value != *content);
+        changed || carry
+    }
+
+    /// The `login` rows due now at counter `n` in week `period` ([`Self::row_due`]), each saying
+    /// its `place` reason ([`Self::login_content`]): a login is restated in a new week while the
+    /// harness reported it this week or the last, so a store that stopped reading lapses with its
+    /// weeks rather than being restated as current; a released one is stated once and never
+    /// restated.
+    pub(crate) fn logins_due(&self, n: u64, period: u64, now: u64) -> Vec<(Pk, Value)> {
+        self.logins
+            .iter()
+            .filter_map(|(pk, login)| {
+                let content = self.login_content(pk, login);
+                let carries = !login.gone && (login.reported_at / WEEK).saturating_add(1) >= period;
+                Self::row_due(login.stated.as_ref(), &content, carries, period, now)
+                    .then(|| (*pk, mine::row(&content, n, now)))
+            })
+            .collect()
+    }
+
+    /// The `usage` rows due now at counter `n` in week `period` ([`Self::row_due`]): one for each
+    /// account or sub-account something was read of ([`Facts::usage_row`]), restated in every new
+    /// week while its `use` row is (an account used in the last 180 days).
+    pub(crate) fn usages_due(&self, n: u64, period: u64, now: u64) -> Vec<(Pk, Value)> {
+        let mut due = Vec::new();
+        for (pk, facts) in &self.accounts {
+            let Some(content) = facts.usage_row(pk, now) else {
+                continue;
+            };
+            let carries = facts.used.saturating_add(CARRY_S) >= now;
+            if Self::row_due(facts.usage.as_ref(), &content, carries, period, now) {
+                due.push((*pk, mine::row(&content, n, now)));
+            }
+        }
+        due
+    }
+
     /// The `relay` rows due now: a duty bucket's row that changed and was last written six
     /// hours or more ago, and once a week each duty bucket's row (the weekly carry).
     pub(crate) fn relays_due(
@@ -824,10 +1091,14 @@ impl Book {
 
     /// One flush record from `outbox`, the rows due and `heard`'s relays, at counter `n` (design
     /// §4.17 "Record packing"): the `ev` batch first, then `sum`, then the `upd` row, then the
-    /// changed `use` rows, then the `place` rows, then the `relay` rows, while the record stays
-    /// within 64 changes and 60 KiB; what does not fit goes in the next flush. With the journal
-    /// off (`off`) the record holds the `sum` row alone, saying so: no event, `upd`, `use`,
-    /// `place` or `relay` row is published.
+    /// `login` and `usage` rows that changed urgently ([`mine::urgent`]), then the changed `use`
+    /// rows, then the `place` rows, then the `relay` rows, then every other `login` and `usage`
+    /// row due (a routine change, the weekly restatement), while the record stays within 64
+    /// changes and 60 KiB; what does not fit goes in the next flush, so the rows builds before
+    /// SF-08 read are never held back by the new ones. A `login` or `usage` row the value-free
+    /// guard refuses ([`mine::checked`]) is never written. With the journal off (`off`) the record holds the
+    /// `sum` row alone, saying so: no event, `upd`, `login`, `usage`, `use`, `place` or `relay`
+    /// row is published.
     ///
     /// # Errors
     /// A row cannot be built within its cap.
@@ -911,6 +1182,54 @@ impl Book {
                 planned.upd = Some(row);
             }
         }
+        // Each `login` and `usage` row due, the guard's refusals left out, and whether it changed
+        // urgently since it was last stated.
+        let said = |collection: &Collection, pk: &Pk| {
+            if collection.name == super::LOGIN.name {
+                self.logins.get(pk).and_then(|l| l.stated.as_ref())
+            } else {
+                self.accounts.get(pk).and_then(|f| f.usage.as_ref())
+            }
+        };
+        let (login, usage) = (&super::LOGIN, &super::USAGE);
+        let mut mine_due: Vec<(&Collection, Pk, Value, bool)> = Vec::new();
+        for (collection, due) in [
+            (login, self.logins_due(n, period, now)),
+            (usage, self.usages_due(n, period, now)),
+        ] {
+            for (pk, row) in due {
+                if mine::checked(collection, &row).is_err() {
+                    continue;
+                }
+                let urgent = mine::urgent(
+                    said(collection, &pk).map_or(&Value::Null, |s| &s.value),
+                    &mine::content(&row),
+                );
+                mine_due.push((collection, pk, row, urgent));
+            }
+        }
+        let offer_mine =
+            |planned: &mut Planned,
+             payload_len: &mut usize,
+             (collection, pk, row): (&Collection, Pk, Value)| {
+                let change = Change {
+                    collection: collection.name.into(),
+                    key: format!("{}.{uuid}", pk.as_str()),
+                    value: Some(row.clone()),
+                };
+                if offer(planned, payload_len, change) {
+                    if collection.name == super::LOGIN.name {
+                        planned.logins.push((pk, row));
+                    } else {
+                        planned.usages.push((pk, row));
+                    }
+                }
+            };
+        let (urgent, routine): (Vec<_>, Vec<_>) =
+            mine_due.into_iter().partition(|(_, _, _, urgent)| *urgent);
+        for (collection, pk, row, _) in urgent {
+            offer_mine(&mut planned, &mut payload_len, (collection, pk, row));
+        }
         for (pk, row) in self.uses_due(n, period, now)? {
             let change = Change {
                 collection: super::USE.name.into(),
@@ -940,6 +1259,9 @@ impl Book {
             if offer(&mut planned, &mut payload_len, change) {
                 planned.relays.push((bucket, row));
             }
+        }
+        for (collection, pk, row, _) in routine {
+            offer_mine(&mut planned, &mut payload_len, (collection, pk, row));
         }
         Ok(planned)
     }
@@ -973,6 +1295,28 @@ impl Book {
             });
             if ended {
                 self.places.remove(pk);
+            }
+        }
+        for (pk, row) in &planned.logins {
+            let gone = self.logins.get_mut(pk).is_some_and(|login| {
+                login.stated = Some(Stated {
+                    value: mine::content(row),
+                    at: now,
+                    period,
+                });
+                login.gone
+            });
+            if gone {
+                self.logins.remove(pk);
+            }
+        }
+        for (pk, row) in &planned.usages {
+            if let Some(facts) = self.accounts.get_mut(pk) {
+                facts.usage = Some(Stated {
+                    value: mine::content(row),
+                    at: now,
+                    period,
+                });
             }
         }
         if let Some(row) = &planned.upd {
@@ -1038,6 +1382,12 @@ impl Book {
                 if let Some(s) = &f.stated {
                     o.insert("stated".into(), stated(s));
                 }
+                if let Some((t, src)) = f.read {
+                    o.insert("read".into(), json!({"t": t, "src": src.word()}));
+                }
+                if let Some(s) = &f.usage {
+                    o.insert("usage".into(), stated(s));
+                }
                 (pk.as_str().to_owned(), Value::Object(o))
             })
             .collect();
@@ -1060,6 +1410,20 @@ impl Book {
                     o.insert("until".into(), Value::from(p.until));
                     o.insert("ended".into(), Value::from(p.ended));
                     if let Some(s) = &p.stated {
+                        o.insert("stated".into(), stated(s));
+                    }
+                    (pk.as_str().to_owned(), Value::Object(o))
+                })
+                .collect::<Map>(),
+            "logins": self.logins.iter()
+                .map(|(pk, login)| {
+                    let mut o = Map::new();
+                    o.insert("content".into(), login.content.clone());
+                    o.insert("reported_at".into(), Value::from(login.reported_at));
+                    if login.gone {
+                        o.insert("gone".into(), Value::Bool(true));
+                    }
+                    if let Some(s) = &login.stated {
                         o.insert("stated".into(), stated(s));
                     }
                     (pk.as_str().to_owned(), Value::Object(o))
@@ -1126,6 +1490,13 @@ impl Book {
                 key: f.get("key").and_then(Value::as_str).map(str::to_owned),
                 account: f.get("account").and_then(Value::as_str).and_then(Pk::new),
                 stated: stated(f.get("stated")),
+                read: f.get("read").and_then(|r| {
+                    Some((
+                        r.get("t")?.as_u64()?,
+                        Source::parse(r.get("src")?.as_str()?)?,
+                    ))
+                }),
+                usage: stated(f.get("usage")),
                 ..Facts::default()
             };
             facts.signin = f.get("signin").and_then(|s| {
@@ -1187,6 +1558,29 @@ impl Book {
             })();
             if let Some((pk, place)) = parsed {
                 book.places.insert(pk, place);
+            }
+        }
+        for (pk, login) in v
+            .get("logins")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+        {
+            if let (Some(pk), Some(content)) =
+                (Pk::new(pk), login.get("content").filter(|c| c.is_object()))
+            {
+                book.logins.insert(
+                    pk,
+                    LoginFacts {
+                        content: content.clone(),
+                        reported_at: login
+                            .get("reported_at")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default(),
+                        gone: login.get("gone").and_then(Value::as_bool) == Some(true),
+                        stated: stated(login.get("stated")),
+                    },
+                );
             }
         }
         for (b, s) in v

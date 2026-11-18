@@ -3246,7 +3246,7 @@ fn a_move_whose_drop_the_disk_refuses_is_not_gone_past() {
                     .len()
             };
             bridge.state.refuse_writes_of(Some(crate::state::LOGPIN));
-            let refused = bridge.forget_log_offsets(20, moved, None, None);
+            let refused = bridge.forget_log_offsets(20, bridge.bus_log, moved, None, None);
             assert_eq!(batch(&bridge), 1, "{case}: the batch is still on disk");
             if past {
                 assert!(
@@ -3261,7 +3261,7 @@ fn a_move_whose_drop_the_disk_refuses_is_not_gone_past() {
             );
             bridge.state.refuse_writes_of(None);
             bridge
-                .forget_log_offsets(20, moved, None, None)
+                .forget_log_offsets(20, bridge.bus_log, moved, None, None)
                 .expect("the next attach");
             assert_eq!(batch(&bridge), 0, "{case}: the next attach drops it");
         }

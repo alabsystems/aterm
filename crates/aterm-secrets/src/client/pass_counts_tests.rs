@@ -15,21 +15,21 @@ use std::sync::Arc;
 /// A member (`m9`) of a `team` vault at seq 2, its source a server on loopback, `peers` more
 /// servers that each hold the same seq 2, and one more that holds no vault.
 #[cfg(unix)]
-struct Lab {
+pub(super) struct Lab {
     root: aterm_tempfile::TempDir,
-    admin: Paths,
-    member: Paths,
-    source: Option<crate::server::Running>,
+    pub(super) admin: Paths,
+    pub(super) member: Paths,
+    pub(super) source: Option<crate::server::Running>,
     peers: Vec<crate::server::Running>,
     /// Every peer: those that hold the vault, the one that holds none, then each [`Lab::serve`]
     /// added.
-    found: Vec<crate::discover::DiscoveredVault>,
+    pub(super) found: Vec<crate::discover::DiscoveredVault>,
     /// The bytes the source, each holding peer and the member hold.
-    held: Vec<u8>,
+    pub(super) held: Vec<u8>,
 }
 
 #[cfg(unix)]
-fn lab(peers: usize) -> Lab {
+pub(super) fn lab(peers: usize) -> Lab {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let source = start_loopback_server(&root.path().join("source"));
     let url = format!("http://{}/v1/team", source.addr);
@@ -87,7 +87,7 @@ impl Lab {
             .push(crate::discover::DiscoveredVault { url, txt: None });
     }
 
-    fn stop(self) {
+    pub(super) fn stop(self) {
         for server in self.source.into_iter().chain(self.peers) {
             server.stop();
         }
@@ -96,7 +96,7 @@ impl Lab {
 
 /// Every count of `counts` that is not 0, by name.
 #[cfg(unix)]
-fn counted(counts: &PassCounts) -> Vec<(&'static str, u64)> {
+pub(super) fn counted(counts: &PassCounts) -> Vec<(&'static str, u64)> {
     Count::ALL
         .iter()
         .map(|what| (what.name(), counts.get(*what)))
@@ -122,7 +122,7 @@ fn pass(at: &Lab, repaired: &mut Repaired) -> (Arc<PassCounts>, SyncOutcome) {
 /// another test's vaults pushed out of the process's cache of parsed vaults is parsed and asked
 /// again, as a signature this process has not verified before is computed.
 #[cfg(unix)]
-fn sites(counts: &PassCounts) -> Vec<(&'static str, u64)> {
+pub(super) fn sites(counts: &PassCounts) -> Vec<(&'static str, u64)> {
     let kept = [
         "parses",
         "entry_verifies",
@@ -137,7 +137,7 @@ fn sites(counts: &PassCounts) -> Vec<(&'static str, u64)> {
 
 /// `base` at `advance` versions later, descending from `parent`, signed with `seed`.
 #[cfg(unix)]
-fn signed_from(base: &[u8], seed: &[u8; 32], advance: u64, parent: [u8; 32]) -> Vec<u8> {
+pub(super) fn signed_from(base: &[u8], seed: &[u8; 32], advance: u64, parent: [u8; 32]) -> Vec<u8> {
     let base = envelope::parse(base).unwrap();
     envelope::sign(
         &Unsigned {
@@ -186,10 +186,14 @@ fn entries(counts: &PassCounts) -> Vec<(&'static str, u64)> {
 /// verified whole: `verifies` and each `fresh_` site are absent, against 8 of each before the
 /// entry answered. The pass's thread passes each of the pass's phase marks once, and the mark
 /// into choosing peers once for the records fan-out and once for the probe, so the time a phase
-/// is said to have taken is the time between its own marks. A source that then holds a newer
-/// version is counted as a body, verified whole. Counted, never timed.
+/// is said to have taken is the time between its own marks. Each connection it opened is one
+/// request (aterm-http keeps none open): the source's records and its held request, and each
+/// peer's records and envelope, 10. A source that then holds a newer version is counted as a
+/// body, verified whole. Counted, never timed.
 ///
-/// Negative controls: delete `pass_counts::add_n(Count::ProbePeers, urls.len())` in
+/// Negative controls: delete `crate::pass_counts::add(crate::pass_counts::Count::Requests)` in
+/// `transport::LanConnector::connect` (`requests` is absent, wants 10); delete
+/// `pass_counts::add_n(Count::ProbePeers, urls.len())` in
 /// `probe_peers_for_sync` (`probe_peers` is absent, wants 4); run the fan-out's threads without
 /// `started.run` in `fan_out::each_at_once` (`probe_bodies` reads 1 and `probe_missing` is
 /// absent: only the loop thread's own share of the probe is counted); find no entry in
@@ -222,6 +226,7 @@ fn a_pass_counts_what_it_asked_what_each_peer_answered_and_who_verified() {
             ("memo_select_held", 1),
             ("memo_select_peer", 3),
             ("memo_admin", 1),
+            ("requests", 10),
         ];
         assert_eq!(sites(&counts), want);
         assert_eq!(threads(&counts), [("records", 4), ("probe", 3)]);
@@ -306,6 +311,7 @@ fn a_body_that_is_not_the_held_bytes_is_verified_whole_on_every_pass() {
             ("memo_select_held", 1),
             ("memo_select_peer", 3),
             ("memo_admin", 1),
+            ("requests", 12),
         ];
         assert_eq!(sites(&counts), want);
         assert!(!chain_cache::keeps(&fork));
@@ -377,6 +383,7 @@ fn a_probed_body_longer_than_the_first_read_is_counted_as_a_second_request() {
             ("memo_select_held", 1),
             ("memo_select_peer", 1),
             ("memo_admin", 1),
+            ("requests", 7),
         ];
         assert_eq!(sites(&counts), want);
     }
@@ -474,10 +481,15 @@ fn each_answer_is_counted_as_what_it_was() {
 /// The subscriber's loop says its counts in its log as its first and its second pass end: the
 /// production loop ([`subscriber_loop_until`]) over the lab, stopped after two passes, says the
 /// two lines at each, every total and the last passes', each with the passes and the source's
-/// answers. The loop's own phase marks are in them: by the end of the second pass its thread
-/// passed the mark before a pass twice, the one after a pass twice, and the one into the pause
-/// between the two once. That pause is ended by the bell (a listener's ring, rung where the loop
-/// asks whether to stop before it pauses), so nothing here waits a pause out.
+/// answers, and each ending with the time it was said (`unix_s`). The loop's own phase marks are
+/// in them: by the end of the second pass its thread passed the mark before a pass twice, the one
+/// after a pass twice, and the one into the pause between the two once. That pause is ended by
+/// the bell (a listener's ring, rung where the loop asks whether to stop before it pauses), so
+/// nothing here waits a pause out. The loop gates its passes ([`subscriber_gate`]): its first
+/// catches up, asking the source and both peers for records (3 requests), the source for the
+/// envelope (1) and both peers for a version newer than the member's (2), which the holder
+/// answers with a `204` and the other with a `404`; its second asks the source alone (2
+/// requests), unless the host's routes moved between the two, which makes it a catch-up too.
 ///
 /// Negative controls: delete the `log(&line)` of the lines in `subscriber_loop_projecting` (no
 /// line holds `pass counts`: 0 lines, wants 4); delete the `pass_counts::enter(Phase::Pause)`
@@ -527,6 +539,19 @@ fn the_loop_says_its_counts_in_its_log_as_a_due_pass_ends() {
         .filter(|line| line.contains("pass counts"))
         .collect();
     assert_eq!(said.len(), 4, "{logged:?}");
+    // Each line's counts by name, and the time it was said, which ends it.
+    let fields = |line: &str| -> std::collections::BTreeMap<String, u64> {
+        let (_, counts) = line.split_once(": ").expect("a line of counts");
+        let last = counts.rsplit(' ').next().expect("a last field");
+        assert!(last.starts_with("unix_s="), "{line}");
+        counts
+            .split(' ')
+            .map(|field| {
+                let (name, n) = field.split_once('=').expect("name=n");
+                (name.to_owned(), n.parse().expect("a count"))
+            })
+            .collect()
+    };
     assert!(
         said[0].starts_with("pass counts: passes=1 primary_204_seq=1 "),
         "{}",
@@ -538,10 +563,18 @@ fn the_loop_says_its_counts_in_its_log_as_a_due_pass_ends() {
         said[1]
     );
     for line in &said[..2] {
-        assert!(line.contains(" probe_peers=2 probe_bodies=1 "), "{line}");
-        assert!(line.contains(" before_entries=1 "), "{line}");
-        assert!(line.contains(" after_entries=1 "), "{line}");
-        assert!(!line.contains(" pause_entries="), "{line}");
+        let counted = fields(line);
+        let get = |name: &str| counted.get(name).copied();
+        assert_eq!(get("catch_ups"), Some(1), "{line}");
+        assert_eq!(get("gated_passes"), None, "{line}");
+        assert_eq!(get("requests"), Some(6), "{line}");
+        assert_eq!(get("probe_peers"), Some(2), "{line}");
+        assert_eq!(get("probe_204"), Some(1), "{line}");
+        assert_eq!(get("probe_missing"), Some(1), "{line}");
+        assert_eq!(get("probe_bodies"), None, "{line}");
+        assert_eq!(get("before_entries"), Some(1), "{line}");
+        assert_eq!(get("after_entries"), Some(1), "{line}");
+        assert_eq!(get("pause_entries"), None, "{line}");
     }
     assert!(
         said[2].starts_with("pass counts: passes=2 primary_204_seq=2 "),
@@ -554,11 +587,22 @@ fn the_loop_says_its_counts_in_its_log_as_a_due_pass_ends() {
         said[3]
     );
     for line in &said[2..] {
-        assert!(line.contains(" probe_peers=4 probe_bodies=2 "), "{line}");
-        assert!(line.contains(" before_entries=2 "), "{line}");
-        assert!(line.contains(" rest_entries=2 "), "{line}");
-        assert!(line.contains(" after_entries=2 "), "{line}");
-        assert!(line.contains(" pause_entries=1 "), "{line}");
+        let counted = fields(line);
+        let get = |name: &str| counted.get(name).copied().unwrap_or(0);
+        // The second pass asked its source alone, or caught up again where the routes moved.
+        let (catch_ups, requests, probed) = if get("gated_passes") == 1 {
+            (1, 6 + 2, 2)
+        } else {
+            (2, 6 + 6, 4)
+        };
+        assert_eq!(get("catch_ups"), catch_ups, "{line}");
+        assert_eq!(get("catch_ups") + get("gated_passes"), 2, "{line}");
+        assert_eq!(get("requests"), requests, "{line}");
+        assert_eq!(get("probe_peers"), probed, "{line}");
+        assert_eq!(get("before_entries"), 2, "{line}");
+        assert_eq!(get("rest_entries"), 2, "{line}");
+        assert_eq!(get("after_entries"), 2, "{line}");
+        assert_eq!(get("pause_entries"), 1, "{line}");
     }
     at.stop();
 }

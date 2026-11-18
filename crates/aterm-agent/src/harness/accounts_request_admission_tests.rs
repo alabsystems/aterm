@@ -89,7 +89,7 @@ impl Fixture {
 
     fn queue_claude(
         &self,
-        guard: &Arc<Mutex<AutoRenewGuard>>,
+        guard: &Arc<Watched<AutoRenewGuard>>,
         spawn: &SpawnRenewal<'_>,
         run: RunAttempt,
     ) -> RenewalDispatch {
@@ -360,7 +360,7 @@ fn unreadable_signin_lock_preserves_saved_selection_without_dispatch() {
         let lock = fixture.store.shared_dir().join(accounts::SIGNIN_LOCK_FILE);
         aterm_types::fs_restricted::ensure_private_dir(&fixture.store.shared_dir()).unwrap();
         fs::create_dir(&lock).unwrap();
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         let refuse = |_: Box<dyn FnOnce() + Send>| {
             panic!("unreadable sign-in lock cannot dispatch authentication")
         };
@@ -423,7 +423,7 @@ fn a_replaced_queued_selection_starts_no_authentication() {
 
 fn queued_selection(superseded: bool) {
     let fixture = Fixture::new(Cli::Claude);
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     type Work = Box<dyn FnOnce() + Send>;
     let queued: Arc<Mutex<Vec<Work>>> = Arc::default();
     let into = Arc::clone(&queued);
@@ -479,7 +479,7 @@ fn queued_selection(superseded: bool) {
 fn a_person_started_sign_in_a_sleep_spans_is_counted_and_its_request_retired() {
     for sleeps in [true, false] {
         let fixture = Fixture::new(Cli::Claude);
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         type Work = Box<dyn FnOnce() + Send>;
         let queued: Arc<Mutex<Vec<Work>>> = Arc::default();
         let into = Arc::clone(&queued);
@@ -541,7 +541,7 @@ fn fallback_admission_failure_keeps_the_current_request() {
             Some("work"),
         ))
         .unwrap();
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         type Work = Box<dyn FnOnce() + Send>;
         let queued: Arc<Mutex<Vec<Work>>> = Arc::default();
         let into = Arc::clone(&queued);
@@ -605,7 +605,7 @@ fn fallback_admission_failure_keeps_the_current_request() {
 fn vendor_worker_keeps_selection_when_its_second_lock_take_is_unavailable() {
     for cli in [Cli::Codex, Cli::Kimi] {
         let fixture = Fixture::new(cli);
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         type Work = Box<dyn FnOnce() + Send>;
         let queued: Arc<Mutex<Vec<Work>>> = Arc::default();
         let into = Arc::clone(&queued);
@@ -665,7 +665,7 @@ fn a_permit_holding_background_worker_yields_to_the_same_manual_head_without_a_c
     );
     {
         let fixture = Fixture::new(Cli::Codex);
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         type Work = Box<dyn FnOnce() + Send>;
         let queued: Arc<Mutex<Vec<Work>>> = Arc::default();
         let into = queued.clone();
@@ -761,7 +761,7 @@ fn a_manual_turn_survives_preflight_refusal_and_moves_only_to_the_actual_attempt
     )
     .unwrap();
     let request = fixture.store.request_next(NOW + 1).unwrap();
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let owner = ManualSelectionOwner::claim(
         &guard,
         &fixture.store,

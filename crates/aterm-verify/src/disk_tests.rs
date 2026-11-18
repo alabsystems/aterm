@@ -1757,8 +1757,9 @@ fn a_run_whose_builds_receipts_name_its_units_keeps_no_run_of_its_own() {
         let folder = leaf.join(stale::RECEIPTS);
         std::fs::create_dir_all(&folder).expect("the receipts");
         let named: Vec<String> = hashes.iter().map(|h| format!("\"{h}\"")).collect();
+        let file = folder.join("00000000000000a1.json");
         std::fs::write(
-            folder.join("00000000000000a1.json"),
+            &file,
             format!(
                 "{{\"began_ms\":{began_ms},\"members\":[\"aterm-grid\"],\
                  \"profiles\":{{\"debug\":[{}]}},\"receipt\":1,\"selection\":{{}}}}",
@@ -1766,6 +1767,15 @@ fn a_run_whose_builds_receipts_name_its_units_keeps_no_run_of_its_own() {
             ),
         )
         .expect("a receipt");
+        // Dated by the clock the run's start was read from: the file system dates a write by its
+        // own coarser one (Windows' tick of about 15.6 ms, a Linux jiffy), which puts this write,
+        // made within that step of the run's start, before it, and a receipt is read as begun no
+        // later than it was written. A real build's receipt is written long after its run began.
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+            .expect("the receipt dated");
     };
     let read = || stale::Kept::read(&leaf);
 

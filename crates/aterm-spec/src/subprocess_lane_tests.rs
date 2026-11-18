@@ -317,7 +317,9 @@ fn standalone_saturation_returns_no_lease() {
 
 /// Re-entrant admission belongs to the opened directory object, not merely its pathname.
 /// NEGATIVE CONTROL: replacing a pool directory at the same path refuses the old thread-local
-/// lease; an alias of the unchanged directory still resolves to the same pool.
+/// lease; an alias of the unchanged directory still resolves to the same pool. Windows renames
+/// no folder that holds an open file, so there the first lease's slot, which it holds open,
+/// moves out of the pool before the pool is displaced.
 #[cfg(any(unix, windows))]
 #[test]
 fn reentrant_admission_tracks_the_pool_object_across_path_replacement() {
@@ -326,6 +328,12 @@ fn reentrant_admission_tracks_the_pool_object_across_path_replacement() {
     let displaced = tmp.path().join("displaced");
     init_pool_dir(&pool, 1).expect("first pool");
     let first = acquire_with_pool(Some(&pool), Duration::from_secs(60)).expect("first pool lease");
+    #[cfg(windows)]
+    std::fs::rename(
+        slot_path(&pool, "slot", 0),
+        tmp.path().join("held-slot.lock"),
+    )
+    .expect("the held slot moves out of the first pool");
     std::fs::rename(&pool, &displaced).expect("displace first pool");
     init_pool_dir(&pool, 1).expect("replacement pool");
     let replacement = acquire_with_pool(Some(&pool), Duration::ZERO)

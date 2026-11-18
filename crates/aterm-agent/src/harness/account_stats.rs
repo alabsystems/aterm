@@ -159,6 +159,41 @@ pub struct SpendLook<'a> {
     pub complete: bool,
 }
 
+/// The `--json` document's schema ([`json`]): 3 names the home's account by its key, slug and name
+/// (`account.ac`, `slug`, `name`), where 2 named it by its roster label, which only a home with no
+/// account keeps (`account.label`).
+pub const SCHEMA: u64 = 3;
+
+/// How the view names the account of the home it is of
+/// (`docs/DESIGN-shared-files-2026-11-11.md` §10), as the caller found it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HomeName<'a> {
+    /// As the text names it: the roster row that holds the home by its account's name and slug
+    /// (`claude ada@x.example (claude-ada-x)`), a row with no address by its label marked so
+    /// (`work (no address)`); this Mac's own login by the account its login file names; else a
+    /// home no row holds by its own word (`main`, `home-<key>`, `home`), marked `(no row)` where
+    /// a row is labelled with that word.
+    pub shown: &'a str,
+    /// Its account's key and names, where it has an account: the JSON's `ac`, `slug` and `name`.
+    pub account: Option<(&'a str, &'a aterm_file::AccountNames)>,
+    /// The label its records are kept under here: the JSON's `label` where it has no account,
+    /// whose only name it is; `None` (`label: null`) for a home no row holds whose word a row is
+    /// labelled with, which names that row, not the home.
+    pub label: Option<&'a str>,
+}
+
+impl<'a> HomeName<'a> {
+    /// A home named by `label` alone, which has no account: its text and its JSON both say it.
+    #[must_use]
+    pub const fn label(label: &'a str) -> Self {
+        Self {
+            shown: label,
+            account: None,
+            label: Some(label),
+        }
+    }
+}
+
 /// Everything the view is built from, gathered by the caller.
 #[derive(Debug, Clone, Copy)]
 pub struct Look<'a> {
@@ -168,8 +203,8 @@ pub struct Look<'a> {
     pub tz_s: i64,
     /// This machine's kept id ([`super::accounts::Store::machine_id`]).
     pub machine: Option<&'a str>,
-    /// The selected home's display label.
-    pub label: &'a str,
+    /// The selected home's account, as the text and the JSON name it ([`HomeName`]).
+    pub name: HomeName<'a>,
     /// The home's profile, as the allowlist read it.
     pub profile: &'a Result<Profile, NoProfile>,
     /// What the accounts state holds of the label.
@@ -729,7 +764,7 @@ fn windows_of(
         now,
         tz_s: 0,
         machine,
-        label: "",
+        name: HomeName::default(),
         profile,
         account,
         state_unread: false,
@@ -1201,7 +1236,11 @@ pub fn text_local(look: &Look<'_>, view: &View, tz_at: &dyn Fn(i64) -> i64) -> S
             (credits, _) => format!("credits {}", credits.state().unwrap_or(DASH)),
         },
     );
-    let _ = write!(out, "{}{DOT}claude{DOT}{plan}{DOT}{credits}", look.label);
+    let _ = write!(
+        out,
+        "{}{DOT}claude{DOT}{plan}{DOT}{credits}",
+        look.name.shown
+    );
     if let Some((money, cache)) = p.and_then(|p| {
         p.usage
             .as_ref()
@@ -1449,12 +1488,12 @@ fn spend_window_json(win: &Win, figure: &spend::Figure, on_credits: bool) -> Val
     Value::Object(o)
 }
 
-/// Render the `--json` document of `look` (schema 2).
+/// Render the `--json` document of `look` ([`SCHEMA`]).
 #[must_use]
 pub fn json(look: &Look<'_>, view: &View, aterm: &str) -> String {
     let now = look.now;
     let mut doc = Map::new();
-    doc.insert("schema".to_owned(), Value::from(2u64));
+    doc.insert("schema".to_owned(), Value::from(SCHEMA));
     doc.insert("kind".to_owned(), Value::from("account-stats"));
     put_time(&mut doc, "as_of", Some(now));
     let mut missing = Vec::new();
@@ -1501,7 +1540,26 @@ pub fn json(look: &Look<'_>, view: &View, aterm: &str) -> String {
         ),
     );
     a.insert("agent".to_owned(), Value::from("claude"));
-    a.insert("label".to_owned(), Value::from(look.label));
+    let account = look.name.account;
+    a.insert(
+        "ac".to_owned(),
+        Value::from(account.map(|(pk, _)| pk.to_owned())),
+    );
+    a.insert(
+        "slug".to_owned(),
+        Value::from(
+            account
+                .map(|(_, names)| names.slug.clone())
+                .filter(|slug| !slug.is_empty()),
+        ),
+    );
+    a.insert(
+        "name".to_owned(),
+        Value::from(account.and_then(|(_, names)| names.name.clone())),
+    );
+    if account.is_none() {
+        a.insert("label".to_owned(), Value::from(look.name.label));
+    }
     a.insert(
         "missing".to_owned(),
         look.profile

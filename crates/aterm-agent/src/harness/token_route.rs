@@ -7,7 +7,7 @@
 //! Two callers share it, so a line never changes route under its plan's intent:
 //!
 //! - **the relaunch plan** (`relaunch::plan`), which types `aterm harness accounts token-run
-//!   <label> -- <build> <args…>` for a [`Decision::Token`], and the line it types today otherwise;
+//!   <key> -- <build> <args…>` for a [`Decision::Token`], and the line it types today otherwise;
 //! - **the wrapper** (`accounts_token_run`), which serves the token only where the judgment says
 //!   [`Decision::Token`] again at exec, and otherwise runs the program exactly as typed. It only
 //!   ever falls back: it never serves past what the plan decided.
@@ -30,13 +30,14 @@ use super::netwatch::Source;
 pub use crate::supervise::policy::turn_end::RouteTo;
 use std::path::{Path, PathBuf};
 
-/// The marker aterm's wrapper sets beside the descriptor: the token entry it served.
-pub const MARKER_ENV: &str = "ATERM_CLAUDE_TOKEN";
+/// The marker aterm's wrapper sets beside the descriptor: the token entry it served. No aterm
+/// tab inherits it (`aterm_types::domain::ENV_DENY_VARS`).
+pub const MARKER_ENV: &str = aterm_types::domain::ENV_CLAUDE_TOKEN;
 
 /// The variable aterm's wrapper sets beside the marker: the `minted_at` (unix seconds) of the
 /// token it served, value-free, so a reader knows which token of the entry a session runs on
 /// ([`ServedToken`]): after a `--replace`, a session still on the earlier token names that one.
-pub const MINTED_ENV: &str = "ATERM_CLAUDE_TOKEN_MINTED";
+pub const MINTED_ENV: &str = aterm_types::domain::ENV_CLAUDE_TOKEN_MINTED;
 
 /// The variable Claude Code reads a token's descriptor number from (§2.4).
 pub const DESCRIPTOR_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR";
@@ -223,21 +224,14 @@ impl Fallback {
     }
 }
 
-/// The account a launch is judged on: its row's label where a row names it, and its email.
+/// The account a launch is judged on: its row's label where a row names it (the local key the
+/// row's records are kept under), and its email.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Account {
     /// The roster row's label; `None` for an account no row names (its login record's).
     pub label: Option<String>,
     /// The row's claims email, else the login record's.
     pub email: String,
-}
-
-impl Account {
-    /// How a labelled line names it: the row's label, else the email.
-    #[must_use]
-    pub fn named(&self) -> &str {
-        self.label.as_deref().unwrap_or(&self.email)
-    }
 }
 
 /// What the judgment decided.
@@ -443,30 +437,22 @@ pub fn outside_why(
     profile_store.then(|| "the vendor's profile store holds a configuration".to_owned())
 }
 
-/// How a launch names its account: a label (or an email) the line typed, or `--auto`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Named<'a> {
-    /// A row's label, or an account's email.
-    Label(&'a str),
-    /// The row the launch's login resolves, else the account its login record names.
-    Auto,
-}
-
 /// TODAY'S JUDGMENT of a launch whose login facts are `who` (after its settings and profile
 /// store: [`ProcessLogin::with_settings`], [`ProcessLogin::with_profile_store`]), under `roster`:
-/// the account whose stored login it is on, and that account's token entry. The route must be
-/// the account's own ([`accounts::AuthRoute::for_account`]: a stored login, or the token whose
-/// marker names this account's entry) under the default home. The account is the row
-/// `row_for_login` resolves, else, with no row, the one the login record names
-/// (`login_email`); a label must name that same row, and an email that same account. `why`
-/// names what moved the launch off it, where today's judgment does.
+/// the account whose stored login it is on, and that account's token entry (its row's
+/// [`TokenEntry::of_row`], else its login's [`TokenEntry::of_email`]). The route must be the
+/// account's own ([`accounts::AuthRoute::for_account`]: a stored login, or the token whose marker
+/// names this account's entry) under the default home. The account is the row `row_for_login`
+/// resolves, else, with no row, the one the login record names (`login_email`). A wrapper line
+/// that names its account holds this account to the one its word names
+/// (`accounts_token_run`). `why` names what moved the launch off it, where today's judgment
+/// does.
 ///
 /// # Errors
-/// The launch is off its row's stored login, or under another row than the one named.
+/// The launch is off its row's stored login.
 pub fn account_of(
     who: &ProcessLogin,
     roster: Option<&Roster>,
-    named: Named<'_>,
     login_email: &dyn Fn(Option<&str>) -> Option<String>,
     why: &dyn Fn() -> Option<String>,
 ) -> Result<(Account, Option<TokenEntry>), String> {
@@ -498,25 +484,6 @@ pub fn account_of(
     match who.route.for_account(entry) {
         accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. } => {}
         accounts::AuthRoute::Outside => return Err(outside()),
-    }
-    match named {
-        Named::Auto => {}
-        Named::Label(name) if name.contains('@') => {
-            if !accounts::email_matches(&account.email, name) {
-                return Err(format!(
-                    "`{}` names the login of another account than {name}",
-                    accounts::LOGIN_ENV
-                ));
-            }
-        }
-        Named::Label(label) => {
-            if account.label.as_deref() != Some(label) {
-                return Err(format!(
-                    "`{}` names another row's login than {label}'s",
-                    accounts::LOGIN_ENV
-                ));
-            }
-        }
     }
     let entry = entry.filter(|_| !account.email.is_empty());
     Ok((account, entry))

@@ -154,6 +154,23 @@ fn renamed(scratch: &Scratch, number: u32, at: u64) -> file::MachineName {
     .name
 }
 
+/// The Undo Settings ▸ This Mac offers after the renames `names` (number and nickname, oldest
+/// first), as its read makes it ([`history::undo_of`]) from the History this Mac's registry row
+/// would hold after them, built by hand: no test reads a registry.
+///
+/// [`history::undo_of`]: aterm_agent::machine_name::history::undo_of
+fn offered(names: &[(u32, &str)]) -> aterm_agent::machine_name::history::Undo {
+    aterm_agent::machine_name::history::undo_of(&super::page::fixture::renames(names))
+        .expect("the row's newest rename can be undone")
+}
+
+/// A naming hold, or an aterm.toml that cannot be read, refuses a number edit, a nickname edit
+/// and Undo Last Rename before any of them enters the canonical setter, reads the vault's labels
+/// or the roster, or reaches macOS: the name file, aterm.toml and the system port are as they
+/// were. The undo reads the policy for the number it would publish under (`undo_publishes`, the
+/// m8 it takes back) before `undo_last` reads anything.
+/// NEGATIVE CONTROL: with `change_undo` reading the policy after `undo_last`, the undo reads the
+/// vault's labels first and its `lab` closure panics.
 #[test]
 fn naming_policy_refuses_before_the_canonical_set_or_any_system_operation() {
     for policy in ["[identity]\nname = false\n", "[identity\n"] {
@@ -161,6 +178,7 @@ fn naming_policy_refuses_before_the_canonical_set_or_any_system_operation() {
         renamed(&scratch, 8, NOW);
         // A second rename, so Undo Last Rename has m8 to take back and a number to publish.
         let before = renamed(&scratch, 9, NOW);
+        let undo = offered(&[(8, "Heron"), (9, "Heron")]);
         std::fs::write(&scratch.config, policy).unwrap();
         let names = Names::new(false);
         assert!(
@@ -190,7 +208,7 @@ fn naming_policy_refuses_before_the_canonical_set_or_any_system_operation() {
             change_undo(
                 &scratch.state,
                 &scratch.config,
-                &before.history[0],
+                &undo,
                 &names,
                 || panic!("a rejected policy must not enter the undo"),
                 || panic!("a rejected policy must not read the roster"),
@@ -204,43 +222,95 @@ fn naming_policy_refuses_before_the_canonical_set_or_any_system_operation() {
     }
 }
 
-/// Undo Last Rename takes back the change the page showed and publishes what it leaves as a
-/// Save does: the number goes back, History records the undo over the change it marks undone,
-/// and macOS is given the names of the number it went back to.
-/// NEGATIVE CONTROL: a change shown before a later rename is no longer History's newest, so the
-/// undo is refused as `undo_last` refuses it (`Unseen`), writing nothing and publishing nothing.
+/// Undo Last Rename writes only while this Mac's History, read again under the naming locks,
+/// still gives the Undo the page showed (`history::fence`): over a name kept where no registry
+/// row is this Mac's (a scratch folder, whose History is none), `change_undo` with the policy
+/// admitting the number refuses as `undo_last` refuses it (`Cause::Unseen`), after the vault's
+/// labels were read, and changes nothing: `machine-name.toml` keeps its bytes, the fleet's
+/// primary name and aterm.toml theirs, and macOS is asked for nothing.
+/// The control: while History, read again, gives that Undo (`history::with_history`), the undo
+/// takes the rename back and publishes what it leaves as a Save does: m8 goes back into the file
+/// and macOS is given its names.
+/// NEGATIVE CONTROL: with `change_undo` setting the Undo's `to` through `set_name` in place of
+/// `undo_last` (a rename back with no fence on the row), the undo succeeds, m8 goes back into
+/// the file and to macOS, and the refusal's `let Err` fails.
 #[test]
-fn an_undo_takes_back_the_last_change_and_publishes_it_as_a_set_does() {
+fn an_undo_over_a_row_that_does_not_show_it_writes_nothing() {
     use aterm_agent::machine_name::{Cause, Refused, undo_last};
-    use file::Why;
     let scratch = fresh();
     renamed(&scratch, 8, NOW);
-    let seen = renamed(&scratch, 86, NOW).history[0].clone();
+    renamed(&scratch, 86, NOW);
+    let undo = offered(&[(8, "Heron"), (86, "Heron")]);
+    let kept = scratch.state.join(file::FILE);
+    let bytes = std::fs::read(&kept).unwrap();
+    let primary = aterm_net::fleet_member::read_primary_name(&scratch.state).unwrap();
+    let config = std::fs::read(&scratch.config).ok();
     let names = Names::new(false);
-    let undone = change_undo(
+    let labels_read = Cell::new(false);
+    let Err(refused) = change_undo(
         &scratch.state,
         &scratch.config,
-        &seen,
+        &undo,
         &names,
-        || Ok(LabLabels::default()),
+        || {
+            labels_read.set(true);
+            Ok(LabLabels::default())
+        },
         || Ok(None),
         NOW + 2,
+    ) else {
+        panic!("no registry row here shows the rename the undo takes back");
+    };
+    assert!(labels_read.get(), "the undo got past its policy and labels");
+    let writer = undo_last(
+        &scratch.state,
+        &undo,
+        || Ok(LabLabels::default()),
+        ByKind::Person,
+        || Ok(None),
+        NOW + 2,
+        false,
     )
-    .expect("the undo");
+    .expect_err("undo_last refuses it");
+    assert_eq!(
+        Refused::of(&writer).map(|refused| &refused.cause),
+        Some(&Cause::Unseen)
+    );
+    assert_eq!(refused, writer.to_string());
+    assert_eq!(
+        std::fs::read(&kept).unwrap(),
+        bytes,
+        "machine-name.toml keeps its bytes"
+    );
+    assert_eq!(
+        aterm_net::fleet_member::read_primary_name(&scratch.state).unwrap(),
+        primary
+    );
+    assert_eq!(std::fs::read(&scratch.config).ok(), config);
+    assert!(
+        names.calls.borrow().is_empty(),
+        "{:?}",
+        names.calls.borrow()
+    );
+
+    let history = super::page::fixture::renames(&[(8, "Heron"), (86, "Heron")]);
+    let undone = aterm_agent::machine_name::history::with_history(Ok(history), || {
+        change_undo(
+            &scratch.state,
+            &scratch.config,
+            &undo,
+            &names,
+            || Ok(LabLabels::default()),
+            || Ok(None),
+            NOW + 2,
+        )
+    })
+    .expect("the control: History still gives the undo");
     assert!(undone.changed);
     assert!(undone.publication.is_none(), "{:?}", undone.publication);
     let saved = file::read(&scratch.state).unwrap().expect("a name");
     assert_eq!(saved, undone.name);
     assert_eq!(saved.num, Some(Number::new(8).unwrap()));
-    assert_eq!(saved.history[0].why, Why::Undone);
-    assert!(saved.history[1].undone);
-    assert_eq!(
-        saved.history[1],
-        file::Change {
-            undone: true,
-            ..seen
-        }
-    );
     assert!(
         names
             .calls
@@ -249,40 +319,6 @@ fn an_undo_takes_back_the_last_change_and_publishes_it_as_a_set_does() {
         "{:?}",
         names.calls.borrow()
     );
-
-    let scratch = fresh();
-    renamed(&scratch, 8, NOW);
-    let stale = renamed(&scratch, 86, NOW).history[0].clone();
-    let later = renamed(&scratch, 90, NOW + 1);
-    let names = Names::new(false);
-    let Err(refused) = change_undo(
-        &scratch.state,
-        &scratch.config,
-        &stale,
-        &names,
-        || Ok(LabLabels::default()),
-        || Ok(None),
-        NOW + 2,
-    ) else {
-        panic!("the change shown is no longer the newest");
-    };
-    let writer = undo_last(
-        &scratch.state,
-        Some(&stale),
-        || Ok(LabLabels::default()),
-        ByKind::Person,
-        || Ok(None),
-        NOW + 2,
-        true,
-    )
-    .expect_err("undo_last refuses it");
-    assert_eq!(
-        Refused::of(&writer).map(|refused| &refused.cause),
-        Some(&Cause::Unseen)
-    );
-    assert_eq!(refused, writer.to_string());
-    assert_eq!(file::read(&scratch.state).unwrap(), Some(later));
-    assert!(names.calls.borrow().is_empty());
 }
 
 #[test]

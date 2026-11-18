@@ -165,3 +165,81 @@ fn an_expired_local_broker_hello_is_still_refused() {
         Err(LanError::Io(error)) if error.kind() == io::ErrorKind::TimedOut
     ));
 }
+
+/// A browse's add of instance `name`, as the broker streams it.
+fn added(name: &str) -> Event {
+    Event::Added(wire::Instance {
+        name: name.to_owned(),
+        service: "_alab-vault._tcp.".to_owned(),
+        domain: "local.".to_owned(),
+        interface: 4,
+    })
+}
+
+/// A request's end of a broker connection, its hellos done, and the broker's end.
+fn events_pair() -> (Events, CtlStream) {
+    let (client, broker) = crate::kept_out(CtlStream::pair).unwrap();
+    let events = Events {
+        stream: client,
+        reader: Reader::new(1),
+        ended: false,
+    };
+    (events, broker)
+}
+
+/// `Events::next_beside` hands over every event already read off the connection before it
+/// looks at its cancel; with none read, a readable cancel wins over what the connection holds,
+/// which the next call takes; and a cancel ends no request. NEGATIVE CONTROLS: a cancel looked
+/// at before the events already read answers the second call `None` with `m2` held back; a
+/// connection looked at before the cancel answers the fourth with `m3`; a cancel that ends the
+/// request fails the fifth.
+#[test]
+fn next_beside_returns_buffered_frames_before_cancel_and_keeps_the_stream() {
+    let hang = Duration::from_secs(60);
+    let (mut events, broker) = events_pair();
+    let cancel = crate::ready::Doorbell::new().unwrap();
+    let mut two = wire::encode(&Frame::Event(added("m1"))).unwrap();
+    two.extend(wire::encode(&Frame::Event(added("m2"))).unwrap());
+    // One write: the first receive takes both frames in.
+    io::Write::write_all(&mut &broker, &two).unwrap();
+    assert_eq!(events.next_beside(cancel.fd()).unwrap(), Some(added("m1")));
+    assert!(events.buffered(), "both frames came in one receive");
+    cancel.ring();
+    assert_eq!(events.next_beside(cancel.fd()).unwrap(), Some(added("m2")));
+    assert_eq!(events.next_beside(cancel.fd()).unwrap(), None, "cancelled");
+    wire::send(&broker, &Frame::Event(added("m3"))).unwrap();
+    assert_eq!(
+        crate::ready::any_until(&[events.as_fd()], Instant::now() + hang).unwrap(),
+        [0],
+        "m3 waits on the connection"
+    );
+    assert_eq!(
+        events.next_beside(cancel.fd()).unwrap(),
+        None,
+        "the cancel wins over what the connection holds"
+    );
+    assert!(cancel.clear());
+    assert_eq!(events.next_beside(cancel.fd()).unwrap(), Some(added("m3")));
+    assert!(!events.ended, "no cancel ended the request");
+}
+
+/// The broker's end of a request ends it, under `Events::next_beside` as under every other
+/// wait: once, then `UnexpectedEof` for good; a cancel never does. NEGATIVE CONTROL: a
+/// cancel that sets `ended` fails the first assertion's follow-up read.
+#[test]
+fn next_beside_ends_the_stream_on_eof_not_on_cancel() {
+    let (mut events, broker) = events_pair();
+    let cancel = crate::ready::Doorbell::new().unwrap();
+    cancel.ring();
+    assert_eq!(events.next_beside(cancel.fd()).unwrap(), None);
+    assert!(!events.ended, "a cancel ends no request");
+    assert!(cancel.clear());
+    wire::send(&broker, &Frame::Event(added("m1"))).unwrap();
+    assert_eq!(events.next_beside(cancel.fd()).unwrap(), Some(added("m1")));
+    drop(broker);
+    let ended = |result: Result<Option<Event>, LanError>| matches!(result, Err(LanError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof);
+    assert!(ended(events.next_beside(cancel.fd())), "the broker's end");
+    assert!(events.ended);
+    cancel.ring();
+    assert!(ended(events.next_beside(cancel.fd())), "ended for good");
+}

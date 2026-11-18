@@ -79,6 +79,18 @@ impl Fixture {
             .unwrap()
     }
 
+    /// The row `label` as the report's JSON names it: its account's key, else its label.
+    fn id(&self, label: &str) -> Value {
+        Value::from(
+            crate::harness::account_names::Listing::of(
+                Cli::Codex,
+                &self.records().roster.rows,
+                None,
+            )
+            .id(label),
+        )
+    }
+
     fn reports(&self) -> (String, Value) {
         let records = self.records();
         let render = |json| {
@@ -120,7 +132,7 @@ impl Fixture {
                     ..Launch::default()
                 },
             ),
-            &rotation,
+            (&rotation, None),
             records
                 .state
                 .active
@@ -178,7 +190,7 @@ fn reports_refuse_a_known_default_identity_mismatch_without_changing_records() {
         );
         assert!(text.contains("next: none"));
         assert!(text.contains("other@example.test"), "{text}");
-        assert_eq!(json["active"].as_str(), Some("main"));
+        assert_eq!(json["active"], fixture.id("main"));
         assert_eq!(json["sessions"], Value::from(0));
         assert_eq!(fixture.use_takes(), UseTakes::Refused);
         assert_eq!(fixture.images(), before);
@@ -189,7 +201,7 @@ fn reports_refuse_a_known_default_identity_mismatch_without_changing_records() {
             if mode == "off" {
                 assert_eq!(fixture.use_takes(), UseTakes::NoRow);
             } else {
-                assert_eq!(json["next"]["to"].as_str(), Some("main"));
+                assert_eq!(json["next"]["to"], fixture.id("main"));
             }
             assert!(
                 !json["next"]["none"]
@@ -215,7 +227,7 @@ fn reports_keep_an_independent_dedicated_login_when_the_default_has_drifted() {
         .unwrap();
     let before = fixture.images();
     let (_, json) = fixture.reports();
-    assert_eq!(json["next"]["to"].as_str(), Some("work"));
+    assert_eq!(json["next"]["to"], fixture.id("work"));
     assert_eq!(fixture.use_takes(), UseTakes::Row("work".into()));
     assert_eq!(fixture.images(), before);
 }
@@ -256,7 +268,7 @@ fn reports_refuse_a_selected_dedicated_login_that_names_another_account() {
             let accepted = auth_document(email);
             std::fs::write(&work_auth, &accepted).unwrap();
             let (_, json) = fixture.reports();
-            assert_eq!(json["next"]["to"].as_str(), Some("work"));
+            assert_eq!(json["next"]["to"], fixture.id("work"));
             assert_eq!(fixture.use_takes(), UseTakes::Row("work".into()));
             assert_eq!(fixture.images(), before);
             assert_eq!(std::fs::read(&work_auth).unwrap(), accepted);
@@ -283,7 +295,7 @@ fn reports_and_review_choose_the_valid_alternative_a_managed_launch_uses() {
     std::fs::write(&work_auth, &displaced).unwrap();
     let before = fixture.images();
     let (_, json) = fixture.reports();
-    assert_eq!(json["next"]["to"].as_str(), Some("main"));
+    assert_eq!(json["next"]["to"], fixture.id("main"));
     assert_eq!(fixture.use_takes(), UseTakes::Row("main".into()));
     let capture = crate::harness::accounts_sync::capture_current_review(
         &fixture.store,

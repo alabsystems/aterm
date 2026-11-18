@@ -9,7 +9,8 @@
 //! any other key is inert and counted, as for the claims rows. The writer's machine is
 //! resolved through the binding in **the roster the record names** (`Session::
 //! historical_binding`), never through current membership alone, so a removed Mac's rows stay
-//! attributable. Each key's latest row ranks by (period, n, sequence).
+//! attributable. Each key's latest row ranks by (period, n, sequence), an exact tie by the
+//! smallest operation digest.
 
 use super::{Collection, Kind, SCHEMA, Table, Writers, keys};
 use crate::database::Change;
@@ -95,15 +96,7 @@ fn log_entry<'c>(
     change: &'c Change,
     signer: Option<[u8; 16]>,
 ) -> Option<([u8; 16], u64, &'c Value)> {
-    let (uuid, text) = change.key.split_once('.')?;
-    if text.is_empty()
-        || (text.len() > 1 && text.starts_with('0'))
-        || !text.bytes().all(|b| b.is_ascii_digit())
-    {
-        return None;
-    }
-    let n = text.parse::<u64>().ok()?;
-    let machine = keys::parse_uuid32(uuid).filter(|m| Some(*m) == signer)?;
+    let (machine, n) = log_key(&change.key).filter(|(machine, _)| Some(*machine) == signer)?;
     let value = change.value.as_ref().filter(|v| bounded(collection, v))?;
     Some((machine, n, value))
 }
@@ -172,11 +165,11 @@ pub fn read_owned(
                 continue;
             };
             let rank = (op.period, n, op.sequence);
-            if read
-                .rows
-                .get(&change.key)
-                .is_none_or(|held| held.rank < rank)
-            {
+            // An exact rank tie goes to the smallest operation digest, whatever order `ops`
+            // come in, so a fold from a checkpoint's rows gives what a fold of everything gives.
+            if read.rows.get(&change.key).is_none_or(|held| {
+                held.rank < rank || (held.rank == rank && op.id < held.operation)
+            }) {
                 read.rows.insert(
                     change.key.clone(),
                     OwnedRow {
@@ -214,8 +207,8 @@ pub struct LogRead {
 }
 
 /// Read a log collection: append-only per writer, `<uuid32>.<n>` keys, each inert unless its
-/// uuid is its signer's machine. A counter a writer reused keeps its first entry, by period and
-/// then by sequence within the period's table.
+/// uuid is its signer's machine. A counter a writer reused keeps its first entry, by period,
+/// then by sequence within the period's table, then by the smallest operation digest.
 pub fn read_log(
     collection: &Collection,
     ops: &[Op],
@@ -248,10 +241,15 @@ pub fn read_log(
                 operation: op.id,
             };
             // A writer's sequence starts again in each period table, so the period ranks first.
+            // An exact (period, sequence) tie goes to the smallest operation digest, whatever
+            // order `ops` come in.
             match seen.get(&(machine, n)).copied() {
                 Some(at)
-                    if (read.entries[at].period, read.entries[at].sequence)
-                        <= (op.period, op.sequence) =>
+                    if (
+                        read.entries[at].period,
+                        read.entries[at].sequence,
+                        read.entries[at].operation,
+                    ) <= (op.period, op.sequence, op.id) =>
                 {
                     read.inert += 1;
                 }
@@ -268,6 +266,99 @@ pub fn read_log(
     }
     read.entries.sort_unstable_by_key(|e| (e.machine, e.n));
     read
+}
+
+/// The machine uuid and counter a log entry's key `<uuid32>.<n>` names: `n` in decimal with no
+/// leading zero, so one entry has one spelling.
+pub fn log_key(key: &str) -> Option<([u8; 16], u64)> {
+    let (uuid, text) = key.split_once('.')?;
+    if text.is_empty()
+        || (text.len() > 1 && text.starts_with('0'))
+        || !text.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let n = text.parse::<u64>().ok()?;
+    Some((keys::parse_uuid32(uuid)?, n))
+}
+
+/// The key of `machine`'s entry `n` of a log.
+pub fn log_entry_key(machine: &[u8; 16], n: u64) -> String {
+    format!("{}.{n}", keys::uuid32(machine))
+}
+
+/// The highest counter `machine` has spent in the log `collection` among `ops`: every key of an
+/// operation its signer resolves to `machine` counts, an entry readers hold inert included (a
+/// row past its cap, a second entry at one key), so a new entry's key is never one a reader
+/// already holds. 0 where it has spent none.
+pub fn log_spent(
+    collection: &Collection,
+    ops: &[Op],
+    resolve: impl Fn(&Digest, &Actor) -> Option<[u8; 16]>,
+    machine: &[u8; 16],
+) -> u64 {
+    ops.iter()
+        .filter(|op| {
+            op.changes.iter().any(|c| c.collection == collection.name)
+                && resolve(&op.roster, &op.actor).as_ref() == Some(machine)
+        })
+        .flat_map(|op| &op.changes)
+        .filter(|change| change.collection == collection.name)
+        .filter_map(|change| log_key(&change.key))
+        .filter(|(named, _)| named == machine)
+        .map(|(_, n)| n)
+        .max()
+        .unwrap_or(0)
+}
+
+/// The stored row of entry `n` of the log `collection`: `fields` (each a live column's, typed as
+/// its column says; a column that takes no null present) with the row's collection version `r`
+/// and its counter `n`, within the collection's row cap.
+///
+/// # Errors
+/// The collection is no log, a field is no live column of it or breaks its column's type, a
+/// column that takes no null is absent, `fields` writes `r` or `n`, or the row passes its cap.
+/// The rule names the column, never the value.
+pub fn log_row(collection: &Collection, fields: &aterm_json::Map, n: u64) -> crate::Result<Value> {
+    let refuse = |column: &str, rule: &str| {
+        crate::Error::new(&format!("{}.{column}: {rule}", collection.name))
+    };
+    if collection.kind != Kind::Log {
+        return Err(crate::Error::new(&format!(
+            "{}: not a log collection",
+            collection.name
+        )));
+    }
+    for (name, x) in fields {
+        if name == "r" || name == "n" {
+            return Err(refuse(name, "the append writes this column itself"));
+        }
+        let column = collection
+            .column(name)
+            .filter(|column| column.live_at(collection.version))
+            .ok_or_else(|| refuse(name, "no live column of that name"))?;
+        super::cell::rule(&column.ty, x, column.null).map_err(|rule| refuse(name, rule))?;
+    }
+    for column in collection
+        .columns
+        .iter()
+        .filter(|column| column.live_at(collection.version) && column.name != "n")
+    {
+        if !column.null && fields.get(column.name).is_none_or(Value::is_null) {
+            return Err(refuse(column.name, "this column needs a value"));
+        }
+    }
+    let mut row = fields.clone();
+    row.insert("r".to_owned(), Value::from(collection.version));
+    row.insert("n".to_owned(), Value::from(n));
+    let row = Value::Object(row);
+    if !bounded(collection, &row) {
+        return Err(crate::Error::new(&format!(
+            "{}: the row passes its {} byte cap",
+            collection.name, collection.max_row
+        )));
+    }
+    Ok(row)
 }
 
 /// A collection's stored schema row, as generic tools see it.

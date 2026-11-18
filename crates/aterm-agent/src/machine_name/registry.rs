@@ -54,7 +54,7 @@ const fn by_word(kind: ByKind) -> &'static str {
 
 /// The live vault home's paths where `state` is this account's live naming state; `None` for a
 /// name kept anywhere else, whose registry row this is not.
-fn live(state: &Path) -> Option<aterm_secrets::client::Paths> {
+pub(super) fn live(state: &Path) -> Option<aterm_secrets::client::Paths> {
     if aterm_types::dirs::runs_under_private_state_root()
         || aterm_types::dirs::state_dir().as_deref() != Some(state)
     {
@@ -102,6 +102,8 @@ fn here(state: &Path) -> Option<aterm_db::file::HereRow> {
             attempt: Duration::ZERO,
             json: false,
             stdin: None,
+            editor: &|_, _, _| Err("a held name write giving way opens no editor".to_owned()),
+            say: &|_| {},
         };
         #[expect(
             clippy::disallowed_methods,
@@ -436,7 +438,8 @@ thread_local! {
 }
 
 /// Run `body` while [`queue_rename`] answers `answer` on this thread, with the writes it was
-/// asked to queue, each as its cells (`<column>=<value>`).
+/// asked to queue, each as its cells (`<column>=<value>`) and then who asked, as the write's
+/// `by` says it (`by=person`, `by=program`).
 #[cfg(test)]
 pub(crate) fn with_door<T>(answer: Written, body: impl FnOnce() -> T) -> (T, Vec<Vec<String>>) {
     let held = DOOR.with(|door| door.replace(Some((answer, Vec::new()))));
@@ -468,6 +471,7 @@ pub fn queue_rename(
                 cells
                     .iter()
                     .map(|(cell, value)| format!("{}={value}", cell.column()))
+                    .chain([format!("by={}", by_word(kind))])
                     .collect(),
             );
             answer.clone()
@@ -486,6 +490,8 @@ pub fn queue_rename(
             attempt: Duration::ZERO,
             json: false,
             stdin: None,
+            editor: &|_, _, _| Err("a rename opens no editor".to_owned()),
+            say: &|_| {},
         };
         #[expect(
             clippy::disallowed_methods,

@@ -5,7 +5,10 @@
 //! projection of the replica, a plain local file every program reads and only a pass writes.
 //!
 //! JSON Lines: one header, one line per row, and a last line holding the SHA-256 of every byte
-//! before it, so a reader never takes a cut file for a short table. A row holds each cell as the
+//! before it, so a reader never takes a cut file for a short table. The header states each
+//! column, and for a column this build's schema compiles its type and whether it may be empty
+//! ([`Column::ty`], [`Column::null`]), so a reader needs no store to know what a cell is. A row
+//! holds each cell as the
 //! face shows it (`c`) and, for a column this build types, its value as JSON (`v`); an empty
 //! cell is left out of both. No cell holds a secret: a file has no `Secret` column, and a value
 //! shaped like a credential is left out by the pass that projects it.
@@ -24,6 +27,8 @@ pub const MAX_BYTES: u64 = 16 * 1024 * 1024;
 pub const READ_ONLY: char = '=';
 /// The key column's name; its header is `=pk@<rev>`, always last.
 pub const PK: &str = "pk";
+/// A table's face's extension.
+pub const TABLE_EXT: &str = "tsv";
 
 /// Where a column's cells come from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,7 +44,9 @@ pub enum Source {
 }
 
 impl Source {
-    const fn as_str(self) -> &'static str {
+    /// The word a snapshot's header and `aterm file schema` say it with.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Schema => "schema",
             Self::Unknown => "unknown",
@@ -56,7 +63,7 @@ impl Source {
 }
 
 /// One column of a table's snapshot.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Column {
     pub name: String,
     pub source: Source,
@@ -64,6 +71,25 @@ pub struct Column {
     pub read_only: bool,
     /// The shared file whose rows this column's cells name by key, when one is bound.
     pub refers: Option<String>,
+    /// The column's type as the schema spells it (`"time"`, `{"text":64}`, `{"ref":"account"}`:
+    /// the word a stored schema row holds), for a [`Source::Schema`] column a pass projected.
+    /// None for the key, a derived or unknown column, a column only a queued write names, and
+    /// every column of a snapshot an earlier build wrote.
+    pub ty: Option<Value>,
+    /// Whether a row may leave the column empty, where the schema says; None wherever
+    /// [`Self::ty`] is, and for a column whose schema does not say.
+    pub null: Option<bool>,
+}
+
+/// What a column is, apart from what its schema says of it: the members every build has
+/// written, which are the ones a snapshot's content covers ([`Snapshot::content`]).
+fn column_content(column: &Column) -> Value {
+    let mut object = Map::new();
+    object.insert("name".to_owned(), Value::from(column.name.as_str()));
+    object.insert("source".to_owned(), Value::from(column.source.as_str()));
+    object.insert("ro".to_owned(), Value::from(column.read_only));
+    object.insert("ref".to_owned(), Value::from(column.refers.as_deref()));
+    Value::Object(object)
 }
 
 impl Column {
@@ -118,7 +144,8 @@ pub struct Snapshot {
     pub kind: String,
     /// The face's extension (`tsv`).
     pub ext: String,
-    /// Moves by one whenever a pass writes different content.
+    /// Moves by one whenever a pass writes different content ([`Self::content`], which a
+    /// column's type and nullability are no part of).
     pub rev: u64,
     /// No retained record could still become visible when this was projected.
     pub complete: bool,
@@ -160,17 +187,30 @@ fn row_line(row: &Row) -> String {
 }
 
 fn column_json(column: &Column) -> Value {
-    let mut object = Map::new();
-    object.insert("name".to_owned(), Value::from(column.name.as_str()));
-    object.insert("source".to_owned(), Value::from(column.source.as_str()));
-    object.insert("ro".to_owned(), Value::from(column.read_only));
-    object.insert("ref".to_owned(), Value::from(column.refers.as_deref()));
+    let Value::Object(mut object) = column_content(column) else {
+        return Value::Null;
+    };
+    // Left out where nothing is stated, so such a column's object is the one every earlier
+    // build wrote, and a reader that predates the members reads the rest by key.
+    if let Some(ty) = &column.ty {
+        object.insert("type".to_owned(), ty.clone());
+    }
+    if let Some(null) = column.null {
+        object.insert("null".to_owned(), Value::from(null));
+    }
     Value::Object(object)
 }
 
 impl Snapshot {
     /// The digest of what the snapshot says, its revision and time left out: two projections
     /// of one content share it, so a pass that changes nothing keeps the revision.
+    ///
+    /// A column's type and nullability are left out too. They restate the schema and change no
+    /// cell, and a build from before they were stated reads and writes the same table without
+    /// them: with them in the digest, that build and this one, passing over one home in turn,
+    /// would each see the other's snapshot as different content and move the revision, every
+    /// face header and every baseline on each turn. So one revision can name a snapshot with
+    /// the two members and one without.
     #[must_use]
     pub fn content(&self) -> [u8; 32] {
         let mut sha = Sha256::new();
@@ -180,7 +220,7 @@ impl Snapshot {
         sha.update(self.kind.as_bytes());
         sha.update([0, u8::from(self.complete)]);
         for column in &self.columns {
-            sha.update(column_json(column).to_string().as_bytes());
+            sha.update(column_content(column).to_string().as_bytes());
             sha.update([0]);
         }
         for handle in &self.handles {
@@ -274,6 +314,8 @@ impl Snapshot {
                     source: Source::parse(column.get("source")?.as_str()?)?,
                     read_only: column.get("ro")?.as_bool()?,
                     refers: column.get("ref").and_then(Value::as_str).map(str::to_owned),
+                    ty: column.get("type").filter(|ty| !ty.is_null()).cloned(),
+                    null: column.get("null").and_then(Value::as_bool),
                 })
             })
             .collect::<Option<Vec<_>>>()

@@ -1190,8 +1190,11 @@ pub(crate) const VERSION_HEADER: &str = "version v1";
 const MAX_VERSION_LEN: usize = 128;
 
 /// Whether `version` is one a record keeps: 1 to [`MAX_VERSION_LEN`] bytes of visible ASCII
-/// (no space or control byte), so it prints on one line as one word.
-fn version_word(version: &str) -> bool {
+/// (no space or control byte), so it prints on one line as one word. It is the bound of every
+/// version an image proof reads from a build, so a reader of one holds it to this and nothing
+/// narrower.
+#[must_use]
+pub fn version_word(version: &str) -> bool {
     !version.is_empty()
         && version.len() <= MAX_VERSION_LEN
         && version.bytes().all(|b| b.is_ascii_graphic())

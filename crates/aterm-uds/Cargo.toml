@@ -11,7 +11,8 @@ description = "aterm — the portable control-socket stream: pure type aliases t
 
 # Transport and process readers use OS FFI with first-party observation and I/O
 # helpers. Plain process values and folding rules live in aterm-process-facts;
-# this crate supplies their native reads and keeps process custody.
+# this crate supplies their native reads and keeps process custody. A `trace`
+# reads by aterm-time's raw-read count and aterm-digest's SHA-256.
 [dependencies]
 # Quiet placement for process-lifetime test roots, including short socket roots. The
 # allocator is dependency-free; its reverse edge to this crate is test-only.
@@ -22,6 +23,14 @@ aterm-process-facts = { workspace = true }
 # build the LAN broker's hello names (`lan::hello_build`) where the front door set
 # none. No dependencies of its own, and a constant version.
 aterm-stamp = { workspace = true }
+# aterm-time: its per-thread count of raw wall reads (`raw_reads`), by which a
+# trace (`trace::scope`) is poisoned where the run it records read the wall
+# clock without comparing through `trace::Now`. No dependencies of its own.
+aterm-time = { workspace = true }
+# aterm-digest: astream-digest's SHA-256, re-exported, which a trace's listing
+# (`trace::fs::read_dir`) digests a directory's names and kinds with. Its one
+# dependency, astream-digest, has none.
+aterm-digest = { workspace = true }
 
 [target.'cfg(any(unix, windows))'.dependencies]
 # aterm-sysprobe: `procargs`, the workspace's one `KERN_PROCARGS2` reader and
@@ -53,7 +62,8 @@ aterm-durable = { workspace = true }
 # aterm-dirfd: on Unix, bound private-directory transactions keep locks and I/O on the same
 # open directory; on Windows, `acl` (re-exported) is its security descriptors, which
 # `private_file` makes and judges every private file and folder with, and with which
-# aterm-dirfd's own handle-relative creates make owner-only ones. Dependency-free (libc on
+# aterm-dirfd's own handle-relative creates make owner-only ones, and its `fstat` is a
+# `file_watch::FileStamp`'s file id and change time. Dependency-free (libc on
 # Unix, raw FFI on Windows); its own edge to this crate is dev-only.
 aterm-dirfd = { workspace = true }
 

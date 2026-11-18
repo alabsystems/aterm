@@ -193,6 +193,13 @@ fn a_tail_this_build_cannot_read_names_no_head() {
         "at x",
         "at Any",
         "at any any",
+        "at own",
+        "at Own4",
+        "at own+4",
+        "at met",
+        "at Met4",
+        "at met+4",
+        "at metown4",
         "at 1 at 2",
         "pin-at 3 later 4",
         "\u{ff}",
@@ -249,6 +256,74 @@ fn a_head_anywhere_reads_back_as_any() {
     assert_eq!(
         Frame::of_record(reserve.body().as_bytes(), b"at any").as_ref(),
         Some(&reserve)
+    );
+}
+
+/// **A KEYED RE-POST'S OWN HEAD IS `own<n>`** (ATERM-KI-1114-1414, `Head::OwnFrom`): a record's
+/// head and its pin's each read back as written, beside a number or `any`, and the journal
+/// encodes them. A build before it reads one as no head, as it reads `any`: its `Head::of_word`
+/// takes `any` and a number of digits and nothing else, and a tail with a word it cannot read
+/// names no head at all (the record published again at its pin, as every build before this one
+/// published such a record).
+#[test]
+fn a_keyed_own_head_reads_back_as_own() {
+    let own = InFlight {
+        at: Some(Head::OwnFrom(61)),
+        ..entry(7)
+    };
+    for (entry, tail) in [
+        (own.clone(), "at own61 pin-at 47"),
+        (
+            InFlight {
+                pin: PublishPin {
+                    at: Some(Head::OwnFrom(0)),
+                    ..pin(8)
+                },
+                ..own.clone()
+            },
+            "at own61 pin-at own0",
+        ),
+        (
+            InFlight {
+                at: Some(Head::From(0)),
+                ..own.clone()
+            },
+            "at 0 pin-at 47",
+        ),
+        (InFlight { pin: pin(8), ..own }, "at own61 pin-at any"),
+    ] {
+        let frame = Frame::InFlight(entry);
+        assert_eq!(frame.tail(), tail);
+        assert_eq!(
+            Frame::of_record(frame.body().as_bytes(), tail.as_bytes()).as_ref(),
+            Some(&frame),
+            "{tail}"
+        );
+        encode(0, &frame).expect("the journal encodes it");
+    }
+    let reserve = Frame::Reserve {
+        sid: "s-a".to_string(),
+        id: 2,
+        pin: PublishPin {
+            at: Some(Head::OwnFrom(90)),
+            ..pin(7)
+        },
+    };
+    assert_eq!(reserve.tail(), "at own90");
+    assert_eq!(
+        Frame::of_record(reserve.body().as_bytes(), b"at own90").as_ref(),
+        Some(&reserve)
+    );
+    assert_eq!(Head::of_word("own90"), Some(Head::OwnFrom(90)));
+    assert_eq!(
+        Head::of_word("met90"),
+        None,
+        "a word this build never wrote"
+    );
+    assert_eq!(
+        super::number("own90"),
+        None,
+        "a number of digits, the only head a build before `any` reads"
     );
 }
 

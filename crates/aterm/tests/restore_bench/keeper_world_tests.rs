@@ -9,17 +9,26 @@ use std::path::PathBuf;
 use crate::keeper_world::{World, keeper_code, scan_unrun_copies, unrun_copies};
 
 #[test]
-fn a_world_without_copies_can_be_removed() {
-    let root = aterm_tempfile::tempdir().expect("scratch world");
-    let witness = root.path().join("witness");
-    std::fs::write(&witness, b"owned fixture").expect("witness");
-    assert!(
-        unrun_copies(root.path())
-            .expect("no code directory")
-            .is_empty()
-    );
-    drop(World(root.path().to_path_buf()));
-    assert!(!witness.exists());
+fn a_world_without_copies_is_removed_only_after_success() {
+    for failing in [false, true] {
+        let root = aterm_tempfile::tempdir().expect("scratch world");
+        let witness = root.path().join("witness");
+        std::fs::write(&witness, b"owned fixture log").expect("witness");
+        assert!(
+            unrun_copies(root.path())
+                .expect("no code directory")
+                .is_empty()
+        );
+        let result = std::panic::catch_unwind(|| {
+            let _world = World(root.path().to_path_buf());
+            assert!(!failing, "the fixture failed before making a code copy");
+        });
+        assert_eq!(result.is_err(), failing);
+        assert_eq!(witness.exists(), failing);
+        if failing {
+            assert_eq!(std::fs::read(&witness).unwrap(), b"owned fixture log");
+        }
+    }
 }
 
 #[test]

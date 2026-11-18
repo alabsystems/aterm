@@ -63,7 +63,7 @@ fn protocol_success_requires_a_complete_ok_token() {
 const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[cfg(unix)]
-static PROBE_SOCKET_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(super) static PROBE_SOCKET_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn abandon_socket(path: &Path) {
     drop(aterm_uds::CtlListener::bind(path).expect("bind then abandon"));

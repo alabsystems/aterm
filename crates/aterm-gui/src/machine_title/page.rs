@@ -9,14 +9,17 @@
 //! ([`crate::App::machine_page_read`]). A press resolves against the read the page showed
 //! ([`page_change`]), with Rename This Mac…'s own judges, and a page write's failure comes back
 //! to the page alone ([`crate::App::machine_page_not_set`]), never to the next Rename panel.
-//! Each read also says what Undo Last Rename gives back, or why it cannot ([`undo_offer`]), and
-//! lists History in `aterm name history`'s lines ([`history_rows`]), both made once as the read
-//! lands, never at a draw; the undo takes back only the change that read showed.
+//! Each read also reads this Mac's History from its registry row, bounded by
+//! [`PAGE_HISTORY_WAIT`] so the writer it runs on never waits long behind it, and says what Undo
+//! Last Rename gives back, or why it cannot ([`undo_offer`]), and lists History in `aterm name
+//! history`'s lines ([`history_rows`]), both made once as the read lands, never at a draw; the
+//! undo takes back only the rename that read showed.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use aterm_agent::machine_name::file::{Change, MachineName};
-use aterm_agent::machine_name::{InFleet, NickTo, UndoTo, undo_to};
+use aterm_agent::machine_name::history::{self, History, NO_HISTORY, NO_ROW, PAGE_ROWS, Undo};
+use aterm_agent::machine_name::{InFleet, NickTo, UndoTo};
 use aterm_types::machine_name::OS_NOUN;
 use aterm_window::event_loop::EventLoopProxy;
 
@@ -26,12 +29,30 @@ use crate::machine_rename_sheet::{Field, Held, RenameTo, Snapshot, request, sent
 use crate::native_app::MachineRequest;
 use crate::native_settings::{PageRead, THIS_MACHINE};
 
-/// What one page read found: Rename This Mac…'s snapshot, and this Mac's fleet membership where
-/// the read got that far.
+/// How long a page read gives this Mac's History ([`history::read`]): it runs on the window's one
+/// name writer, so a Save pressed meanwhile waits behind it at most this long; past it the page
+/// says History was not read, offers no undo, and Refresh reads again.
+pub(crate) const PAGE_HISTORY_WAIT: Duration = Duration::from_secs(2);
+
+/// What one page read found: Rename This Mac…'s snapshot, this Mac's fleet membership where the
+/// read got that far, and its History, or why it was not read.
 #[derive(Debug)]
 pub(crate) struct PageFound {
     pub(crate) snapshot: Snapshot,
     pub(crate) fleet: Option<InFleet>,
+    pub(crate) history: Result<History, String>,
+}
+
+/// History as the page shows it ([`history_rows`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PageHistory {
+    /// Its lines, newest first ([`History::lines`]).
+    Rows(Vec<String>),
+    /// One sentence in place of rows: no registry row is this Mac's ([`NO_ROW`]), or it holds no
+    /// write to its number or nickname ([`NO_HISTORY`]).
+    Empty(&'static str),
+    /// History was not read: why.
+    Unread(String),
 }
 
 /// What the name writer brings Settings ▸ This Mac.
@@ -55,38 +76,52 @@ pub(crate) struct PageSnapshot {
     pub(crate) facts: Vec<(String, String)>,
     /// What Undo Last Rename offers over this read ([`undo_offer`]).
     pub(crate) undo: UndoOffer,
-    /// History's lines, newest first ([`history_rows`]); `None` where the read found no name
+    /// History as the page shows it ([`history_rows`]); `None` where the read found no name
     /// (the editor kept over a failed read).
-    pub(crate) history: Option<Vec<String>>,
+    pub(crate) history: Option<PageHistory>,
 }
 
-/// What Undo Last Rename offers over one read: its words, and the newest change it takes back
-/// where it is available. `seen` is the one change `undo_last` takes back, refusing any other.
+/// What Undo Last Rename offers over one read: its words, and the undo it writes where it is
+/// available. `undo` names the one rename `undo_last` takes back, refusing where the row no
+/// longer shows it.
 #[derive(Debug)]
 pub(crate) struct UndoOffer {
     pub(crate) line: String,
-    pub(crate) seen: Option<Change>,
+    pub(crate) undo: Option<Undo>,
 }
 
-/// What Undo Last Rename offers over `snapshot`, as `aterm name undo` would answer from the same
-/// read ([`aterm_agent::machine_name::RenamePreview::undo_unchecked`]): the title it returns this
-/// Mac to ([`UndoTo::title`]), a number left for the undo to check where the vault's labels were
-/// not read, as Save leaves one; or why it cannot, in the backend's words, after the title it
-/// would return to where History names one. With no read of the name it waits on one.
-pub(crate) fn undo_offer(snapshot: &Snapshot) -> UndoOffer {
+/// What Undo Last Rename offers over `snapshot` and `history`, as `aterm name undo` would answer
+/// from the same read ([`history::undo_of`], then
+/// [`aterm_agent::machine_name::RenamePreview::undo_unchecked`]): the title it returns this Mac
+/// to ([`UndoTo::title`]), a number left for the undo to check where the vault's labels were not
+/// read, as Save leaves one; or why it cannot, in the backend's words, after the title it would
+/// return to where History names one. With no read of the name it waits on one, and with no
+/// History read it says why.
+pub(crate) fn undo_offer(snapshot: &Snapshot, history: &Result<History, String>) -> UndoOffer {
+    let refused = |line: String| UndoOffer { line, undo: None };
     let Some(preview) = snapshot.preview() else {
-        return UndoOffer {
-            line: format!(
-                "Undo Last Rename waits on a fresh read of this {OS_NOUN}'s name; Refresh reads \
-                 it again."
-            ),
-            seen: None,
-        };
+        return refused(format!(
+            "Undo Last Rename waits on a fresh read of this {OS_NOUN}'s name; Refresh reads it \
+             again."
+        ));
+    };
+    let history = match history {
+        Ok(history) => history,
+        Err(why) => {
+            return refused(format!(
+                "Undo Last Rename needs this {OS_NOUN}'s History, which was not read ({why}); \
+                 Refresh reads it again."
+            ));
+        }
+    };
+    let undo = match history::undo_of(history) {
+        Ok(undo) => undo,
+        Err(refused_undo) => return refused(sentence(&refused_undo.why)),
     };
     let name = preview.name();
-    match preview.undo_unchecked() {
-        Ok((to, unchecked)) => {
-            let unchecked = match (unchecked, &to) {
+    match preview.undo_unchecked(&undo) {
+        Ok(unchecked) => {
+            let unchecked = match (unchecked, &undo.to) {
                 (Some(why), UndoTo::Name(back)) => format!(
                     " {} could not be checked here ({why}); Undo Last Rename checks it.",
                     back.num
@@ -96,29 +131,31 @@ pub(crate) fn undo_offer(snapshot: &Snapshot) -> UndoOffer {
             UndoOffer {
                 line: format!(
                     "Undo Last Rename returns this {OS_NOUN} to {}.{unchecked}",
-                    to.title(name)
+                    undo.to.title(name)
                 ),
-                seen: name.history.first().cloned(),
+                undo: Some(undo),
             }
         }
-        Err(refused) => UndoOffer {
-            line: match undo_to(name) {
-                Ok(to) => format!(
-                    "Undo Last Rename would return this {OS_NOUN} to {}. {}",
-                    to.title(name),
-                    sentence(&refused.why)
-                ),
-                Err(_) => sentence(&refused.why),
-            },
-            seen: None,
-        },
+        Err(why) => refused(format!(
+            "Undo Last Rename would return this {OS_NOUN} to {}. {}",
+            undo.to.title(name),
+            sentence(&why.why)
+        )),
     }
 }
 
-/// History's changes as `aterm name history` lists them, newest first, one line each
-/// ([`Change::line`]).
-pub(crate) fn history_rows(name: &MachineName) -> Vec<String> {
-    name.history.iter().map(Change::line).collect()
+/// History as `aterm name history` lists it, newest first, one line each, at most
+/// [`PAGE_ROWS`] writes ([`History::lines`]); one sentence where no row is this Mac's or it
+/// holds no write; or why it was not read.
+pub(crate) fn history_rows(history: &Result<History, String>) -> PageHistory {
+    match history {
+        Err(why) => PageHistory::Unread(why.clone()),
+        Ok(history) if history.row.is_none() => PageHistory::Empty(NO_ROW),
+        Ok(history) if history.writes.is_empty() && history.pending.is_empty() => {
+            PageHistory::Empty(NO_HISTORY)
+        }
+        Ok(history) => PageHistory::Rows(history.lines(Some(PAGE_ROWS))),
+    }
 }
 
 /// What a press asks of the writer, resolved against the read the page showed.
@@ -150,8 +187,8 @@ pub(super) const RETRIED_IN_THE_PANEL: &str =
 /// automatic number saves it, a chosen one whose publication is pending synchronizes it), and
 /// is refused where the live line refuses it or nothing would change; Retry Sync and Authorize
 /// are only what the untouched fields resolve to; New Random Name draws a noun again; Undo Last
-/// Rename takes back the newest change the read showed, and is refused in the words the page
-/// showed where the read offers no undo.
+/// Rename takes back the registry row's newest rename as the read showed it, and is refused in
+/// the words the page showed where the read offers no undo.
 pub(crate) fn page_change(asked: &MachineRequest, read: &PageSnapshot) -> PageWrite {
     let rev = match asked {
         MachineRequest::Read => return PageWrite::Refused("a read writes nothing".to_owned()),
@@ -173,9 +210,9 @@ pub(crate) fn page_change(asked: &MachineRequest, read: &PageSnapshot) -> PageWr
     match asked {
         MachineRequest::Read => unreachable!("answered above"),
         MachineRequest::Random { .. } => PageWrite::Change(NameChange::Nickname(NickTo::Random)),
-        MachineRequest::Undo { .. } => read.undo.seen.clone().map_or_else(
+        MachineRequest::Undo { .. } => read.undo.undo.clone().map_or_else(
             || PageWrite::Refused(read.undo.line.clone()),
-            |seen| PageWrite::Change(NameChange::Undo(seen)),
+            |undo| PageWrite::Change(NameChange::Undo(undo)),
         ),
         MachineRequest::Save { number, nick, .. } => {
             let number = Field::open(number.as_deref(), read.held.number_text());
@@ -255,7 +292,11 @@ pub(crate) fn page_read(
     view: Option<&MachineView>,
     previous: Option<&PageSnapshot>,
 ) -> PageRead {
-    let PageFound { snapshot, fleet } = found;
+    let PageFound {
+        snapshot,
+        fleet,
+        history,
+    } = found;
     let fleet = fleet.or_else(|| view.map(|view| view.fleet.clone()));
     let mut facts = Vec::new();
     let held = match (&snapshot, snapshot.preview()) {
@@ -266,8 +307,8 @@ pub(crate) fn page_read(
             facts.push(("Nickname".to_owned(), held.nick.clone()));
             facts.push(("Claimed".to_owned(), claimed(name, held.waits)));
             // A read never mints the key; the first write of this Mac's name does (a Save or
-            // New Random Name here, the panel's or `aterm name`'s), so History's `by` can name
-            // this node, and so does joining a fleet.
+            // New Random Name here, the panel's or `aterm name`'s), whose checks are judged as
+            // this node's against the books, and so does joining a fleet.
             facts.push((
                 "Node".to_owned(),
                 preview.node().map_or_else(
@@ -321,10 +362,8 @@ pub(crate) fn page_read(
         (Snapshot::Reading | Snapshot::Read(_), None) => return PageRead::Reading,
     };
     // Made once here, as the read lands, so no draw or press judges History again.
-    let undo = undo_offer(&snapshot);
-    let history = snapshot
-        .preview()
-        .map(|preview| history_rows(preview.name()));
+    let undo = undo_offer(&snapshot, &history);
+    let history = snapshot.preview().map(|_| history_rows(&history));
     PageRead::Read(Arc::new(PageSnapshot {
         rev: seq,
         held,
@@ -337,29 +376,31 @@ pub(crate) fn page_read(
 
 /// Read `seq`: what Rename This Mac… reads ([`super::read_preview`]: the books, the vault's
 /// labels, this Mac's membership and its naming status from local files), with no diagnostics
-/// or discovery, brought to the window thread as [`PageWake::Read`].
+/// or discovery, then this Mac's History from its registry row within [`PAGE_HISTORY_WAIT`]
+/// ([`history::read`], which only reads), brought to the window thread as [`PageWake::Read`].
 pub(super) fn read_page(seq: u64, proxy: &EventLoopProxy<Wake>) {
     use aterm_agent::machine_name::{
         lab_labels, rename_preview, standing_vault, vault_roster_label,
     };
     let mut fleet = None;
-    let snapshot = match aterm_types::dirs::state_dir() {
+    let state = aterm_types::dirs::state_dir();
+    let snapshot = match &state {
         None => Snapshot::Unread("aterm has no state folder".to_owned()),
         Some(state) => {
             let vault = standing_vault();
             let lab = || lab_labels(vault.as_ref());
             match rename_preview(
-                &state,
+                state,
                 lab,
                 vault_roster_label,
                 aterm_netplace::unix_ms_now(),
             ) {
                 Ok(preview) => match aterm_types::dirs::aterm_config_path() {
                     Some(config) => {
-                        let membership = InFleet::read(&state, vault.as_ref());
+                        let membership = InFleet::read(state, vault.as_ref());
                         fleet = Some(membership.clone());
                         let names =
-                            naming::NamingStatus::read_local(&state, &config, preview.name())
+                            naming::NamingStatus::read_local(state, &config, preview.name())
                                 .with_fleet_membership(membership);
                         Snapshot::named(preview, names)
                     }
@@ -372,7 +413,25 @@ pub(super) fn read_page(seq: u64, proxy: &EventLoopProxy<Wake>) {
             }
         }
     };
-    page_landed(proxy, seq, PageFound { snapshot, fleet });
+    let history = match &state {
+        None => Err("aterm has no state folder".to_owned()),
+        Some(state) => {
+            let read = history::read(state, std::time::Instant::now() + PAGE_HISTORY_WAIT);
+            if let Err(why) = &read {
+                aterm_log::info!("machine name: the page's History read failed: {why}");
+            }
+            read
+        }
+    };
+    page_landed(
+        proxy,
+        seq,
+        PageFound {
+            snapshot,
+            fleet,
+            history,
+        },
+    );
 }
 
 /// Bring read `seq`'s `found` to the window thread.
@@ -393,6 +452,7 @@ impl crate::App {
                 PageFound {
                     snapshot: Snapshot::Unread(NO_WRITER.to_owned()),
                     fleet: None,
+                    history: Err(NO_WRITER.to_owned()),
                 },
             ),
         }

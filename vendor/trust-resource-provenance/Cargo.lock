@@ -105,6 +105,7 @@ dependencies = [
  "aterm-tempfile",
  "aterm-uds",
  "libc 0.2.191",
+ "trust-exec-policy",
  "trust-sha2",
 ]
 

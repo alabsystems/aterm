@@ -158,7 +158,7 @@ fn two_historical_trees() {
             let results: Vec<_> = [(ARM64, None), (X86_64, Some(X86_64))]
                 .into_iter()
                 .map(|(triple, target)| {
-                    require_rustup_target(X86_64).unwrap();
+                    require_rustup_target_in(take.stock_context().unwrap(), X86_64).unwrap();
                     // Sequential and deliberately unwrapped: use the unmeasured slice's
                     // exclusive learning admission. Match the cut's warm target, source,
                     // release profile and sealed environment; only omit its executable wrapper.

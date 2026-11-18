@@ -2087,7 +2087,7 @@ fn a_view_whose_lockup_draws_no_road_keeps_no_images() {
     );
     let (_, narrow) = lockup_of(&compile_in(&app, &view, 200.0, 644.0));
     assert!(
-        !narrow.spec.kitty,
+        !narrow.spec.road,
         "too narrow for the road: {:?}",
         narrow.spec
     );
@@ -2110,7 +2110,9 @@ fn a_compact_page_asks_only_for_its_own_images_and_holds_the_last_moment_meanwhi
     let view = SystemStateViewState::default();
     let compiled = compile_in(&app, &view, 900.0, 520.0);
     let (rect, paint) = lockup_of(&compiled);
-    assert!(paint.spec.px <= 17.0, "a compact lockup: {:?}", paint.spec);
+    // A compact page's side pad is 16 points, a regular one's 24 (a narrow pane's 12).
+    let (pad, _, _) = measures(&compiled);
+    assert_eq!(pad, 16.0, "a compact page: {:?}", paint.spec);
     let requests = super::prebake::take_requests();
     assert_eq!(
         requests,

@@ -173,13 +173,15 @@ struct SelectedCommand {
 }
 
 /// What a relaunch line types for a token decision ([`token_route::Decision::Token`]):
-/// `<aterm> harness accounts token-run <named> -- <build> <flags…>` (§5.4).
+/// `<aterm> harness accounts token-run <key> -- <build> <flags…>` (§5.4).
 #[derive(Clone, Debug)]
 pub(super) struct TokenServe {
     /// The aterm the line runs.
     pub(super) aterm: PathBuf,
-    /// The row's label, or a row-less account's email.
-    pub(super) named: String,
+    /// The account's key (`ac-…`): the word the wrapper resolves back to the account
+    /// ([`super::accounts_token_run::account_key_of`]), never a label or an address, since the
+    /// line reaches the ledger and the scrollback.
+    pub(super) key: String,
     /// The store build, as the twin names it ([`super::upgrade_drive::twin_build`]).
     pub(super) build: PathBuf,
     /// The account's token entry.
@@ -190,13 +192,30 @@ pub(super) struct TokenServe {
 }
 
 impl TokenServe {
+    /// The account as a ledger row names it: its key, with its slug beside it where the lab this
+    /// process holds names it ([`super::account_names::Named::logged`]), never its address. Read
+    /// only where a line is refused, so a plan reads no lab.
+    fn logged(&self) -> String {
+        let lab = super::alab_roster::current();
+        super::account_names::Named {
+            pk: self.key.clone(),
+            row: None,
+            names: lab
+                .as_deref()
+                .and_then(|lab| lab.names.get(&self.key))
+                .cloned()
+                .unwrap_or_default(),
+        }
+        .logged()
+    }
+
     /// The wrapper's arguments around `flags`.
     fn args(&self, flags: &[String]) -> Vec<String> {
         token_route::VERB
             .iter()
             .map(|word| (*word).to_owned())
             .chain([
-                self.named.clone(),
+                self.key.clone(),
                 "--".to_owned(),
                 self.build.to_string_lossy().into_owned(),
             ])
@@ -649,7 +668,15 @@ fn token_serve(opts: &Opts, launch: &Launch<'_>, cwd: &str) -> Option<TokenServe
     match token_route::judge(&facts, &asked) {
         token_route::Decision::Token { account, entry } => Some(TokenServe {
             aterm: token_aterm()?,
-            named: account.named().to_owned(),
+            // The canonical key of the account (its row's claims address, else its login's), as
+            // the wrapper's resolver keys every account.
+            key: super::account_names::names_of_login(
+                accounts::Cli::Claude,
+                None,
+                &account.email,
+                None,
+            )?
+            .0,
             build: build?,
             entry,
             stored: super::profile::login_record(
@@ -712,7 +739,6 @@ impl token_route::Ask for PlanAsk<'_> {
         token_route::account_of(
             &who,
             roster.as_ref(),
-            token_route::Named::Auto,
             &|login| {
                 super::profile::login_record(&self.opts.home, login).map(|record| record.email)
             },
@@ -1408,7 +1434,7 @@ fn line_tap_selected(
                     detail: format!(
                         "the token wrapper left this relaunch line ({why}), and {} has no \
                          stored login on this Mac to start on without it",
-                        serve.named
+                        serve.logged()
                     ),
                 });
             }
@@ -5973,7 +5999,7 @@ fn restart_locked(
     r.session.clone_from(&session);
     r.from.clone_from(&sf.version);
     r.to = format!("{}(same)", sf.version);
-    let prior = match load_record(opts, &session) {
+    let mut prior = match load_record(opts, &session) {
         Ok(record) => record,
         Err(_) => {
             return said(
@@ -5986,12 +6012,16 @@ fn restart_locked(
     // A record an earlier build wrote, naming its agent by pid alone, takes no start from this
     // live snapshot: a process born since at that pid would read as its agent. Its carry judges
     // it unproven while that pid lives (`wait:exit-unproven`), never waiting on the bare pid.
+    if let Some(st) = prior
+        .as_mut()
+        .filter(|st| st.in_flight() && !st.native_retired_unissued && st.tab != tab)
+        && let Some(wait) = other_tab_claim(opts, &r, st, &session)
+    {
+        return wait;
+    }
     if let Some(st) = prior.clone().filter(St::in_flight) {
         if st.native_retired_unissued {
             return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
-        }
-        if st.tab != tab {
-            return said(r, "wait:conversation-in-other-tab");
         }
         if let Some(wait) = fence.broken() {
             return said(r, wait);
@@ -8482,14 +8512,20 @@ fn after_exit_as(
         return carry_own(opts, r, st, &session, &snap.tab);
     }
     let mut relaunched_before = false;
+    let mut prior = prior;
+    if !host_ended
+        && let Some(st) = prior
+            .as_mut()
+            .filter(|st| st.in_flight() && !st.native_retired_unissued && st.tab != snap.tab)
+        && let Some(wait) = other_tab_claim(opts, &r, st, &session)
+    {
+        return wait;
+    }
     if let Some(mut st) = prior.filter(St::in_flight) {
         if st.native_retired_unissued {
             return carry_in_flight(opts, r, st, &session, &snap.tab);
         }
         r.to = format!("{}({})", st.to, st.source);
-        if st.tab != snap.tab && !host_ended {
-            return said(r, "wait:conversation-in-other-tab");
-        }
         // A record an earlier build wrote names its agent by pid alone: it takes the start the
         // snapshot of that pid carries (the layout's, after a restore), as RS1 carries an
         // earlier host's restart by identity.
@@ -8854,6 +8890,58 @@ fn launch_after_exit(
     let r = relaunch(opts, r, &mut st, &mut c, &session, &Live);
     save(opts, &session, &st);
     r
+}
+
+/// The step of a conversation whose restart is in flight in another tab, while anything of that
+/// restart can still act ([`other_tab_claim`]).
+pub(super) const WAIT_OTHER_TAB: &str = "wait:conversation-in-other-tab";
+
+/// What `st`, session `session`'s restart in flight for a tab other than `r`'s, is to the
+/// conversation now, for every carrier that meets it (a restart asked in `r`'s tab, an exit
+/// there, the upgrade's visit): a claim, answered [`WAIT_OTHER_TAB`] with the record as it
+/// lay, while anything of it can still act ([`St::claim_lives`]: its agent, its relaunch or its
+/// shell, a bare pid weighed by the second its record was last written), and otherwise
+/// overtaken. Nothing can type its line or land its relaunch then, and the conversation is in
+/// `r`'s tab (resumed there by hand, say), so the record is closed `resumed-elsewhere`
+/// ([`St::close_overtaken`]), saved, its ledger saying why, and the caller carries on as over
+/// any closed record (`None`). An operation the record still kept is answered by the next
+/// carrier's replay, as a failed record's is. A dry run closes only the copy it was handed.
+pub(super) fn other_tab_claim(
+    opts: &Opts,
+    r: &Report,
+    st: &mut St,
+    session: &str,
+) -> Option<Report> {
+    let claim = Report {
+        to: format!("{}({})", st.to, st.source),
+        ..r.clone()
+    };
+    let saved_s =
+        std::fs::metadata(super::upgrade_drive::state_dir(opts).join(format!("{session}.json")))
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|since| since.as_secs());
+    if st.claim_lives(saved_s, alive, kernel_start) {
+        return Some(said(claim, WAIT_OTHER_TAB));
+    }
+    let relaunch = if st.relaunched_pid == 0 {
+        String::new()
+    } else {
+        format!(", its relaunch (pid {})", st.relaunched_pid)
+    };
+    let detail = format!(
+        "the restart in flight for tab {} can act no longer: its agent (pid {}){relaunch} and \
+         its shell (pid {}) are gone, and the conversation is held in this tab, outside that \
+         restart; its record is closed",
+        st.tab, st.pid, st.shell
+    );
+    st.close_overtaken("resumed-elsewhere", now_s());
+    if !opts.dry_run {
+        ledger(opts, &said(claim, "failed:resumed-elsewhere"), &detail);
+        save(opts, session, st);
+    }
+    None
 }
 
 /// Whether the in-flight restart `st` was waiting on its agent's exit and that agent is proven

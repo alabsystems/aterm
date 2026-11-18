@@ -373,6 +373,8 @@ impl Walk {
             me: Some(test_machine("m16")),
             bound: Default::default(),
             accounts,
+            names: Default::default(),
+            barred: Default::default(),
             aliases: BTreeMap::new(),
             mailboxes: BTreeMap::new(),
             #[cfg(unix)]
@@ -434,8 +436,14 @@ impl Walk {
                 None
             }
             Event::Pin(label) => {
-                let line = format!("accounts use {label} --cli codex");
-                if self.records().roster.row(label).is_some() {
+                // `use` names the row's account by its word; a row with no address has none, and
+                // no step pins it.
+                let roster = self.records().roster;
+                let word = roster.row(label).and_then(|row| {
+                    crate::harness::account_names::word_of_row(Cli::Codex, row, &roster.rows, None)
+                });
+                if let Some(word) = word {
+                    let line = format!("accounts use {word} --cli codex");
                     let _ = self.pool.run_on(&line, &self.host);
                 }
                 None
@@ -577,7 +585,8 @@ impl Walk {
         }
         let not = not_next_json(&json);
         for row in roster.rows.iter().filter(|row| row.held_by.is_none()) {
-            if self.names_another(row).is_some() && !not.contains_key(&row.label) {
+            let shown = crate::harness::account_names::shown_row(Cli::Codex, row, None);
+            if self.names_another(row).is_some() && !not.contains_key(&shown) {
                 wrong.push(format!(
                     "the report does not say `{}`'s login names another account: {text}",
                     row.label
@@ -612,7 +621,8 @@ impl Walk {
                 ));
             }
         }
-        // A sync that refuses leaves the roster or its receipt names each change.
+        // A sync that refuses leaves the roster or its receipt names each change, by the row's
+        // account (the walk's labs name none, so as a row is named with no lab).
         if *code != ExitCode::SUCCESS {
             let raw = Roster::load_for(
                 Cli::Codex,
@@ -625,7 +635,8 @@ impl Walk {
             .expect("the roster");
             for row in &raw.rows {
                 let same = before.raw.iter().any(|old| old == row);
-                if !same && !out.contains(&row.label) && !err.contains(&row.label) {
+                let shown = crate::harness::account_names::shown_row(Cli::Codex, row, None);
+                if !same && !out.contains(&shown) && !err.contains(&shown) {
                     wrong.push(format!(
                         "a refused sync changed `{}` and did not say so: {out}{err}",
                         row.label

@@ -38,33 +38,48 @@ impl Peers for Meanwhile<'_> {
             })
             .map_err(io::Error::other)?;
         assert_eq!(events, [], "the wall seen again is no new wall");
-        let account = AccountKey::parse(POOL_A).expect("a key");
-        let at = |t: i64| u64::try_from(t).expect("a time");
-        let row = QuotaRow {
+        Ok(lifting(self.peer, accounts::SESSION_LIMIT))
+    }
+}
+
+/// A peer's quota rows: `pool-a`'s, lifting its wall of `window` by a proof at `T0 + 5` that
+/// names [`RESET`], as the log holds it.
+fn lifting(peer: Node, window: &str) -> BTreeMap<(Node, Cli, AccountKey), QuotaRow> {
+    let account = AccountKey::parse(POOL_A).expect("a key");
+    let at = |t: i64| u64::try_from(t).expect("a time");
+    let row = QuotaRow {
+        at: at(T0 + 5),
+        cli: Cli::Claude,
+        account,
+        label: Label::new("pool-a").expect("a label"),
+        condition: Word::new("usable").expect("a word"),
+        enrolled: true,
+        pct5: Some(20),
+        pct7: None,
+        five_hour_reset: Some(at(RESET)),
+        week_reset: None,
+        walled_until: None,
+        last_used: None,
+        signin: None,
+        last_start: None,
+        last_end: None,
+        sessions_7d: 0,
+        plan: None,
+        lifts: vec![Lift {
+            window: Word::new(window).expect("a word"),
             at: at(T0 + 5),
-            cli: Cli::Claude,
-            account,
-            label: Label::new("pool-a").expect("a label"),
-            condition: Word::new("usable").expect("a word"),
-            enrolled: true,
-            pct5: Some(20),
-            pct7: None,
-            five_hour_reset: Some(at(RESET)),
-            week_reset: None,
-            walled_until: None,
-            last_used: None,
-            signin: None,
-            last_start: None,
-            last_end: None,
-            sessions_7d: 0,
-            plan: None,
-            lifts: vec![Lift {
-                window: Word::new(accounts::SESSION_LIMIT).expect("a word"),
-                at: at(T0 + 5),
-                reset: Some(at(RESET)),
-            }],
-        };
-        Ok(BTreeMap::from([((self.peer, Cli::Claude, account), row)]))
+            reset: Some(at(RESET)),
+        }],
+    };
+    BTreeMap::from([((peer, Cli::Claude, account), row)])
+}
+
+/// A peer's rows as they stand, read with nothing happening meanwhile.
+struct Still(BTreeMap<(Node, Cli, AccountKey), QuotaRow>);
+
+impl Peers for Still {
+    fn rows(&self) -> io::Result<BTreeMap<(Node, Cli, AccountKey), QuotaRow>> {
+        Ok(self.0.clone())
     }
 }
 
@@ -130,5 +145,57 @@ fn a_session_that_met_the_wall_while_the_peers_were_read_resumes_at_their_lift()
         mark(&|| T0),
         (T0, None),
         "a mark read before the log is older than the session's wall"
+    );
+}
+
+/// A PEER'S LIFT OF FABLE'S WEEK IS READ WHERE ONLY FABLE'S WALL STANDS (FL-206): a model's own
+/// weekly wall walls no account ([`accounts::Account::limited_until`] is `None`), yet it is a wall
+/// a peer's lift lifts, so the reader looks at the peers' rows while it stands and lifts it by
+/// their lift of its window. NEGATIVE CONTROL: with no wall of any kind standing, the reader does
+/// not look.
+#[test]
+fn a_peers_lift_of_fables_week_is_read_where_only_fables_wall_stands() {
+    const FABLE: &str = "seven_day_overage_included";
+    let read = |walled: bool| {
+        let dir = aterm_tempfile::TempDir::new().expect("a scratch dir");
+        let harness = dir.path().join("harness");
+        let store = accounts::Store::at(&harness);
+        let mut state = accounts::State {
+            machine: "0a0b".to_owned(),
+            ..accounts::State::default()
+        };
+        if walled {
+            let events =
+                accounts::note_wall(&mut state, "pool-a", FABLE, Some(RESET), T0 - 100, T0 - 100);
+            assert_eq!(events.len(), 1, "{events:?}");
+        }
+        state.accounts.entry("pool-a".to_owned()).or_default().pk = Some(POOL_A.to_owned());
+        let account = &state.accounts["pool-a"];
+        assert_eq!(
+            account.limited_until(T0),
+            None,
+            "Fable's wall walls no account"
+        );
+        assert_eq!(account.model_walls(T0).next().is_some(), walled);
+        store.save(&state).expect("the store saves");
+        let peer = Node::of_key(&[8; 32]);
+        let reader = Reader::new(Some(harness.clone()), None);
+        let read = reader.read(&Still(lifting(peer, FABLE)), Node::of_key(&[7; 32]), &|| T0);
+        let (state, _) = store.load(T0 + 6).expect("the store reads");
+        (
+            (read.looked, read.lifted, read.failed),
+            state.accounts["pool-a"].model_limited_until(FABLE, T0 + 6),
+        )
+    };
+    assert_eq!(
+        read(true),
+        ((true, 1, None), None),
+        "the peer's lift lifts it"
+    );
+    // NEGATIVE CONTROL.
+    assert_eq!(
+        read(false),
+        ((false, 0, None), None),
+        "nothing stands: no look"
     );
 }

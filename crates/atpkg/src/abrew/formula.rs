@@ -112,6 +112,361 @@ pub struct ServiceInfo {
 /// `tap::parse_livecheck_block` for the accepted grammar; the
 /// full brew DSL also allows a strategy block of arbitrary
 /// Ruby, recorded here only as `strategy_block`).
+/// Stored in a spec regex where the tap wrote
+/// `#{Regexp.escape(version.major_minor)}`: replaced
+/// with the checked unit's escaped major.minor at
+/// plan time.
+pub const MAJOR_MINOR_SENTINEL: &str = "\u{1}";
+
+/// The method names a `version…` interpolation
+/// chain may use (`Cask::DSL::Version`'s surface
+/// as the taps exercise it).
+const VERSION_CHAIN_METHODS: &[&str] = &[
+    "major",
+    "minor",
+    "patch",
+    "major_minor",
+    "major_minor_patch",
+    "minor_patch",
+    "csv",
+    "first",
+    "second",
+    "third",
+    "fourth",
+    "fifth",
+    "last",
+    "before_comma",
+    "after_comma",
+    "no_dots",
+    "no_hyphens",
+    "no_underscores",
+    "no_dividers",
+    "dots_to_hyphens",
+    "dots_to_underscores",
+    "hyphens_to_dots",
+    "hyphens_to_underscores",
+    "underscores_to_dots",
+    "underscores_to_hyphens",
+];
+
+/// Whether `token` is a `version(.method)*`
+/// interpolation chain (syntax only).
+#[must_use]
+pub fn version_chain_syntax(token: &str) -> bool {
+    let mut parts = token.split('.');
+    if parts.next() != Some("version") {
+        return false;
+    }
+    parts.all(|m| VERSION_CHAIN_METHODS.contains(&m))
+}
+
+/// One `MAJOR_MINOR_PATCH_REGEX` component of a
+/// cask version (`^([^.,:]+)(?:.([^.,:]+)…` — the
+/// separators are single arbitrary characters).
+fn cask_mmp(version: &str) -> [String; 3] {
+    let mut out = [String::new(), String::new(), String::new()];
+    let mut rest = version;
+    for slot in &mut out {
+        let end = rest.find(['.', ',', ':']).unwrap_or(rest.len());
+        *slot = rest[..end].to_string();
+        rest = &rest[end..];
+        if rest.is_empty() {
+            break;
+        }
+        rest = &rest[rest.char_indices().nth(1).map_or(rest.len(), |(i, _)| i)..];
+    }
+    out
+}
+
+/// Evaluate a `version(.method)*` interpolation
+/// token with `Cask::DSL::Version` semantics.
+/// `None` for chains outside the modeled surface
+/// or indexing a missing CSV part mid-chain.
+#[must_use]
+/// Split a `version(.method)*` token into chain
+/// segments, keeping parenthesized literal args
+/// (`tr(",", "-")`) whole. `None` outside that
+/// grammar.
+fn split_version_chain(token: &str) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut chars = token.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                cur.push(c);
+                if c == '\\' {
+                    if let Some(e) = chars.next() {
+                        cur.push(e);
+                    }
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '"' | '\'' => {
+                    quote = Some(c);
+                    cur.push(c);
+                }
+                '(' => {
+                    depth += 1;
+                    cur.push('(');
+                }
+                ')' => {
+                    depth = depth.checked_sub(1)?;
+                    cur.push(')');
+                }
+                '.' if depth == 0 => {
+                    parts.push(std::mem::take(&mut cur));
+                }
+                ' ' | '\t' if depth == 0 => return None,
+                _ => cur.push(c),
+            },
+        }
+    }
+    if depth != 0 || quote.is_some() {
+        return None;
+    }
+    parts.push(cur);
+    Some(parts)
+}
+
+/// A quoted literal arg, unescaped for the common
+/// escapes; `None` for anything else.
+fn chain_str_arg(s: &str) -> Option<(String, &str)> {
+    let s = s.trim();
+    let q = *s.as_bytes().first()?;
+    if q != b'"' && q != b'\'' {
+        return None;
+    }
+    let mut out = String::new();
+    let mut chars = s[1..].char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => {
+                let (_, e) = chars.next()?;
+                match e {
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
+                    'r' => out.push('\r'),
+                    '\\' | '"' | '\'' | '-' | '^' => out.push(e),
+                    _ => return None,
+                }
+            }
+            c if c as u32 == q as u32 => return Some((out, &s[i + 2..])),
+            '#' if q == b'"' => {
+                // Interpolation inside an arg is
+                // outside the modeled surface.
+                if s[1 + i + 1..].starts_with('{') {
+                    return None;
+                }
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    None
+}
+
+/// Ruby `String#tr` for the conservative subset:
+/// no `^` negation, no ranges (`a-z`), no squeeze.
+/// `None` outside it.
+fn ruby_tr_set(s: &str, from: &str, to: &str) -> Option<String> {
+    let from_c: Vec<char> = from.chars().collect();
+    let to_c: Vec<char> = to.chars().collect();
+    if from_c.first() == Some(&'^') {
+        return None;
+    }
+    for (i, c) in from_c.iter().enumerate() {
+        if *c == '-' && i != 0 && i + 1 != from_c.len() {
+            return None;
+        }
+        if *c == '\\' {
+            return None;
+        }
+    }
+    for (i, c) in to_c.iter().enumerate() {
+        if *c == '-' && i != 0 && i + 1 != to_c.len() {
+            return None;
+        }
+        if *c == '\\' {
+            return None;
+        }
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match from_c.iter().position(|f| *f == c) {
+            Some(idx) => {
+                if let Some(t) = to_c.get(idx).or_else(|| to_c.last()) {
+                    out.push(*t);
+                }
+            }
+            None => out.push(c),
+        }
+    }
+    Some(out)
+}
+
+/// Apply one arg-taking chain segment
+/// (`tr(a, b)`, `sub(a, b)`, …) to `cur`.
+fn apply_chain_arg_method(cur: &str, seg: &str) -> Option<String> {
+    let (name, args) = seg.split_once('(')?;
+    let args = args.strip_suffix(')')?;
+    let (a, rest) = chain_str_arg(args)?;
+    match name {
+        "delete_prefix" => {
+            if !rest.trim().is_empty() {
+                return None;
+            }
+            Some(cur.strip_prefix(&a).unwrap_or(cur).to_string())
+        }
+        "delete_suffix" => {
+            if !rest.trim().is_empty() {
+                return None;
+            }
+            Some(cur.strip_suffix(&a).unwrap_or(cur).to_string())
+        }
+        "delete" => {
+            if !rest.trim().is_empty() || a.starts_with('^') || a.contains('\\') {
+                return None;
+            }
+            let set: Vec<char> = a.chars().collect();
+            for (i, c) in set.iter().enumerate() {
+                if *c == '-' && i != 0 && i + 1 != set.len() {
+                    return None;
+                }
+            }
+            Some(cur.chars().filter(|c| !set.contains(c)).collect())
+        }
+        "tr" | "sub" | "gsub" => {
+            let rest = rest.trim().strip_prefix(',')?;
+            let (b, rest) = chain_str_arg(rest)?;
+            if !rest.trim().is_empty() {
+                return None;
+            }
+            match name {
+                "tr" => ruby_tr_set(cur, &a, &b),
+                // Literal-string sub/gsub only; a
+                // backslash in the replacement is
+                // Ruby backref syntax, unmodeled.
+                _ if b.contains('\\') => None,
+                "sub" => Some(cur.replacen(&a, &b, 1)),
+                _ => Some(cur.replace(&a, &b)),
+            }
+        }
+        _ => None,
+    }
+}
+
+pub fn cask_version_token(version: &str, token: &str) -> Option<String> {
+    if !version_chain_syntax(token) {
+        // Arg-taking tails (`version.tr(",", "-")`):
+        // evaluate segment-wise, plain methods by
+        // the strict path below, arg methods by
+        // `apply_chain_arg_method`.
+        if !token.contains('(') {
+            return None;
+        }
+        let parts = split_version_chain(token)?;
+        if parts.first().map(String::as_str) != Some("version") {
+            return None;
+        }
+        let mut cur = version.to_string();
+        let mut plain: Vec<&str> = Vec::new();
+        for seg in &parts[1..] {
+            if seg.contains('(') {
+                if !plain.is_empty() {
+                    let joined = format!("version.{}", plain.join("."));
+                    cur = cask_version_token(&cur, &joined)?;
+                    plain.clear();
+                }
+                cur = apply_chain_arg_method(&cur, seg)?;
+            } else if VERSION_CHAIN_METHODS.contains(&seg.as_str()) {
+                plain.push(seg);
+            } else {
+                return None;
+            }
+        }
+        if !plain.is_empty() {
+            let joined = format!("version.{}", plain.join("."));
+            cur = cask_version_token(&cur, &joined)?;
+        }
+        return Some(cur);
+    }
+    let mut cur = version.to_string();
+    let mut methods = token.split('.').skip(1).peekable();
+    while let Some(m) = methods.next() {
+        cur = match m {
+            "major" | "minor" | "patch" | "major_minor" | "major_minor_patch" | "minor_patch" => {
+                let [major, minor, patch] = cask_mmp(&cur);
+                match m {
+                    "major" => major,
+                    "minor" => minor,
+                    "patch" => patch,
+                    "major_minor" => [major, minor]
+                        .into_iter()
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                    "major_minor_patch" => [major, minor, patch]
+                        .into_iter()
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                    _ => [minor, patch]
+                        .into_iter()
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                }
+            }
+            "csv" => {
+                // Only <part> selection may follow.
+                let idx = match methods.next()? {
+                    "first" => 0,
+                    "second" => 1,
+                    "third" => 2,
+                    "fourth" => 3,
+                    "fifth" => 4,
+                    "last" => usize::MAX,
+                    _ => return None,
+                };
+                let parts: Vec<&str> = cur.split(',').collect();
+                let part = if idx == usize::MAX {
+                    parts.last()
+                } else {
+                    parts.get(idx)
+                };
+                match part {
+                    Some(p) => p.to_string(),
+                    None if methods.peek().is_none() => String::new(),
+                    None => return None,
+                }
+            }
+            "before_comma" => cur.split(',').next().unwrap_or_default().to_string(),
+            "after_comma" => cur
+                .split_once(',')
+                .map_or(String::new(), |(_, rest)| rest.to_string()),
+            "no_dots" => cur.replace('.', ""),
+            "no_hyphens" => cur.replace('-', ""),
+            "no_underscores" => cur.replace('_', ""),
+            "no_dividers" => cur.replace(['.', '-', '_'], ""),
+            "dots_to_hyphens" => cur.replace('.', "-"),
+            "dots_to_underscores" => cur.replace('.', "_"),
+            "hyphens_to_dots" => cur.replace('-', "."),
+            "hyphens_to_underscores" => cur.replace('-', "_"),
+            "underscores_to_dots" => cur.replace('_', "."),
+            "underscores_to_hyphens" => cur.replace('_', "-"),
+            // Bare csv part selectors apply to the
+            // whole string only via `csv`.
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LivecheckSpec {
     /// The `url` argument: a `:symbol` (stored without the
@@ -119,10 +474,25 @@ pub struct LivecheckSpec {
     /// (`using: :post`, headers, …) set `url_options`.
     pub url: Option<LivecheckUrl>,
     pub url_options: bool,
+    /// The `compressed: false` url option: fetch
+    /// without `--compressed` (brew requests a
+    /// compressed response by default).
+    pub compressed_false: bool,
     /// The `user_agent:` url option: `":browser"` for the
     /// symbol, the literal string for a quoted value. Other
     /// url options still set `url_options` (and delegate).
     pub user_agent: Option<String>,
+    /// The `post_form:` url option as written-order
+    /// key/value pairs (values keep `#{version...}`
+    /// tokens for check-time substitution).
+    pub post_form: Option<Vec<(String, String)>>,
+    /// The `post_json:` url option as generated JSON
+    /// text (`"{}"` for the empty hash, which still
+    /// forces a bodyless POST in the oracle).
+    pub post_json: Option<String>,
+    /// The `header:` url option(s), verbatim
+    /// `Name: value` strings.
+    pub header: Option<Vec<String>>,
     /// The regex source verbatim (delimiters stripped) and the
     /// option letters that followed it (e.g. `i`).
     pub regex: Option<String>,
@@ -152,6 +522,20 @@ pub struct LivecheckSpec {
     /// a data shape (see `GhRelBlock`); other blocks
     /// stay `None`.
     pub ghrel_block: Option<GhRelBlock>,
+    /// A `:git` strategy block reduced to a data shape
+    /// (see `GitBlock`); other blocks stay `None`.
+    pub git_block: Option<GitBlock>,
+    /// A `:github_latest` strategy block reduced to
+    /// a data shape (see `LatestBlock`); other blocks
+    /// stay `None`.
+    pub latest_block: Option<LatestBlock>,
+    /// A `:sparkle` strategy block (or block-pass
+    /// symbol) reduced to a data shape (see
+    /// `SparkleBlock`); other blocks stay `None`.
+    pub sparkle_block: Option<SparkleBlock>,
+    /// A `:header_match` strategy block reduced to
+    /// a data shape (see `HeaderBlock`).
+    pub header_block: Option<HeaderBlock>,
     /// `skip` was declared; the string is its optional message.
     pub skip: Option<String>,
     /// `throttle <versions>` / `throttle days: <days>`.
@@ -201,17 +585,128 @@ pub enum JsonShape {
     FirstKey(String),
     /// `….map { |item| <next guards> item["k"]… }`.
     MapGuarded(Vec<JsonKey>, Box<MapGuard>),
+    /// `….map { |_, g| g["k"]&.map { |item| … } }&.flatten`:
+    /// a guarded map over each object value's `k`
+    /// array, flattened.
+    ValuesMap(Vec<JsonKey>, String, Box<MapGuard>),
+    /// A statement body: locals dug from the base
+    /// value, an optional guarded regex match, and a
+    /// value/template rendering (cask-tap forms).
+    Template(Box<JsonTemplate>),
+}
+
+/// One named value a `:json` template body digs
+/// from its base (the root, or one map item).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonLocal {
+    Dig(Vec<JsonKey>),
+    /// `….split("s")&.first/second` (index 0/1).
+    DigSplit(Vec<JsonKey>, String, usize),
+    /// `….[](regex, 1)` with the block regex.
+    DigCapture(Vec<JsonKey>),
+    /// `….[/lit/flags, 1]` (source, flags).
+    DigCaptureLit(Vec<JsonKey>, String, String),
+    /// `<dig> || <dig> || …`: the first present dig.
+    DigOr(Vec<Vec<JsonKey>>),
+    /// A dig with a string tail transform
+    /// (`&.tr("v", "")`).
+    DigTail(Vec<JsonKey>, JsonTail),
+    /// `….sub(/pat/flags, "tmpl")` (first
+    /// substitution, backref template).
+    DigSubRe(Vec<JsonKey>, String, String, String),
+}
+
+/// One part of a `:json` template string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonPart {
+    Lit(String),
+    /// `match[N]` of the body's regex match.
+    Cap(usize),
+    /// A body local by index.
+    Local(usize),
+    /// `item["k"]` in a map body.
+    Field(String),
+}
+
+/// A trailing transform on a single rendered
+/// value (`&.tr(...)` and friends).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonTail {
+    None,
+    ToS,
+    Tr(String, String),
+    Sub(String, String),
+    DeletePrefix(String),
+    DeleteSuffix(String),
+    DeleteChars(String),
+}
+
+/// What a `:json` template body returns per item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonRender {
+    Template(Vec<JsonPart>),
+    /// One value (a local index, a match capture,
+    /// or a map item field) plus its tail chain.
+    Value(JsonValue, JsonTail),
+}
+
+/// A single-value source for `JsonRender::Value`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonValue {
+    Local(usize),
+    Cap(usize),
+    Field(String),
+    /// `<local>[regex, 1]`: the block regex's first
+    /// capture of a local's string value.
+    LocalCapture(usize),
+}
+
+/// A statement-form `:json` block reduced to data
+/// (see `tap::parse_json_template_shape`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonTemplate {
+    /// Dig path to the base value (the map's array
+    /// when `map`, else the base object itself).
+    pub path: Vec<JsonKey>,
+    pub map: bool,
+    pub locals: Vec<JsonLocal>,
+    /// Locals guarded `blank?`: a missing/empty one
+    /// skips the item (or yields nothing).
+    pub require: Vec<usize>,
+    /// The dig whose value the block regex matches
+    /// (`match = <dig>&.match(regex)`), if any.
+    pub match_src: Option<Vec<JsonKey>>,
+    /// Skip unless this local matches the regex.
+    pub local_match_guard: Option<usize>,
+    pub guards: Vec<JsonGuard>,
+    pub render: JsonRender,
 }
 
 /// A guarded map body reduced to data: the projection
-/// (item key, `None` = the item itself; `regex` =
-/// first-capture application) and its `next` guards in
-/// order.
+/// (item key, `None` = the item itself), its capture
+/// and trailing `tr`/`sub` chain, and its `next`
+/// guards in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapGuard {
     pub item_key: Option<String>,
-    pub regex: bool,
+    pub capture: MapCapture,
+    pub tr: Option<(String, String)>,
+    /// A trailing `.sub(/pat/flags, "template")`
+    /// (backreference template), after any `tr`.
+    pub sub: Option<(String, String, String)>,
     pub guards: Vec<JsonGuard>,
+}
+
+/// How a guarded map's projection captures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MapCapture {
+    /// The projected value verbatim.
+    None,
+    /// The block's `regex`, first capture.
+    BlockRegex,
+    /// A literal regex in the projection
+    /// (source, flags), first capture.
+    Literal(String, String),
 }
 
 /// One `next if`/`next unless` guard (`unless` false =
@@ -234,6 +729,13 @@ pub enum JsonCond {
     StartsWithMajorMinor(String),
     /// `item["f"]&.downcase&.include?("lit")`.
     DowncaseIncludes(String, String),
+    /// `item["f"].none? { |el| el["g"].match?(regex) }`
+    /// (outer field, element field).
+    NoneMatch(String, String),
+    /// `item["f"]&.match?("lit")` (substring search).
+    MatchLit(String, String),
+    /// `item["f"]&.include?("lit")`.
+    Includes(String, String),
 }
 
 /// A literal in a guard comparison.
@@ -257,6 +759,123 @@ pub struct XmlBlock {
 pub enum XmlShape {
     Texts(Vec<String>),
     TextsRegex(Vec<String>),
+    /// A statement body over XPath queries (see
+    /// `XmlTemplate`).
+    Template(Box<XmlTemplate>),
+}
+
+/// One XPath step: a tag (bare or `prefix:local`)
+/// with an optional enumerable predicate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XmlStep {
+    pub tag: String,
+    pub pred: Option<XmlPred>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum XmlPred {
+    /// `[text()='v']`
+    TextEq(String),
+    /// `[Child='v']`
+    ChildTextEq(String, String),
+    /// `[@attr='v']`
+    AttrEq(String, String),
+    /// `[@a='v' and not(@b) and …]`: each attribute
+    /// must equal its value, or be absent (`None`).
+    AttrAll(Vec<(String, Option<String>)>),
+}
+
+/// An XPath path: `//a/b` (descendant first step)
+/// or `/a/b` (absolute from the root element).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XmlPathQ {
+    pub absolute: bool,
+    pub steps: Vec<XmlStep>,
+}
+
+/// A named value an `:xml` template body reads:
+/// the first matching element's text, optionally
+/// its next sibling element's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XmlLocal {
+    pub path: XmlPathQ,
+    pub next: bool,
+}
+
+/// How one mapped element projects to a string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum XmlProj {
+    /// `item.text&.strip`
+    Text,
+    /// `item.next_element&.text&.strip`
+    NextText,
+    /// `item.attributes["k"]`
+    Attr(String),
+    /// `item.attributes["k"]&.[](regex, 1)`
+    AttrCapture(String),
+    /// `match = item.text&.match(regex)` + render
+    /// (`true` reads the next sibling's text).
+    TextMatch(bool),
+}
+
+/// One per-item local in an xml map body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum XmlItemLocal {
+    /// `item.attributes["k"]`
+    Attr(String),
+    /// `item.text`
+    Text,
+    /// `item.text&.[](regex, 1)`
+    TextCapture,
+}
+
+/// The `get_elements(...).map` half of a template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XmlMap {
+    pub path: XmlPathQ,
+    pub proj: XmlProj,
+    /// A trailing `.grep(regex)` keeps only
+    /// projections the regex matches (whole).
+    pub grep: bool,
+    /// Per-item locals (attr/text reads rendered
+    /// by a template), empty for plain projections.
+    pub locals: Vec<XmlItemLocal>,
+}
+
+/// One part of an `:xml` template string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum XmlPart {
+    Lit(String),
+    Local(usize),
+    /// `#{local.strip}`
+    LocalStrip(usize),
+    /// `match[N]` (MatchData indexing).
+    Cap(usize),
+}
+
+/// What an `:xml` template body returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum XmlRender {
+    Template(Vec<XmlPart>),
+    /// One local's value, optionally stripped.
+    LocalValue(usize, bool),
+    /// `match[N]` of the body's regex match.
+    CapValue(usize),
+    /// The map projection itself.
+    Projection,
+}
+
+/// A statement-form `:xml` block reduced to data
+/// (see `tap::parse_xml_template_shape`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XmlTemplate {
+    pub locals: Vec<XmlLocal>,
+    pub require: Vec<usize>,
+    /// The local the block regex matches
+    /// (`match = <local>.match(regex)`).
+    pub match_local: Option<usize>,
+    pub map: Option<XmlMap>,
+    pub render: XmlRender,
 }
 
 /// A `:yaml` strategy block reduced to data.
@@ -272,6 +891,15 @@ pub struct YamlBlock {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageBlock {
     pub shape: PageShape,
+}
+
+/// One part of a page-match template string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PagePart {
+    Lit(String),
+    Cap(usize),
+    /// `match[N].tr("from", "to")`
+    CapTr(usize, String, String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,6 +930,15 @@ pub enum PageShape {
     ScanJoin(String),
     /// `match[1] ? "#{match[0]},#{match[1]}" : match[0]`.
     ScanCsvOpt,
+    /// `v = match[0].tr(a, b); match[1].present? ?
+    /// "#{v},#{match[1]}" : v`.
+    ScanCsvOptTr(String, String),
+    /// `"#{match[2]},#{match[0]}"` per scan match
+    /// (indexes are capture indexes, 0 = group 1).
+    ScanTemplate(Vec<PagePart>),
+    /// `match = page.match(regex)` + template
+    /// (indexes are MatchData indexes, 0 = whole).
+    MatchTemplate(Vec<PagePart>),
     /// `match.first.sub(/pat/flags, '\1.\2')`: first
     /// regex match replaced by a backreference
     /// template (`\1`..`\9`, `\0` whole, `\\`).
@@ -316,6 +953,59 @@ pub enum PageShape {
     /// directories on the first page, fetch the
     /// newest directory's page, scan it for files.
     DirWalk(Box<DirWalk>),
+    /// `Date.parse(page[regex, 1]).strftime(fmt)`
+    /// (or via `page.match(regex)[1]`): the first
+    /// capture parsed as a date — `true` renders
+    /// dashed (`%Y-%m-%d`), `false` basic (`%Y%m%d`).
+    FirstDate(bool),
+    /// `page.scan(regex).select { |m| Version.new(m.first) < N }.flatten`:
+    /// keep captures whose version is below the bound
+    /// (the regex must have exactly one group).
+    ScanSelectLt(String),
+    /// A second-fetch ("hop") body: extract a path or
+    /// directory value from the first page, fetch the
+    /// page it names, and scan that with the block
+    /// regex.
+    HopScan(Box<HopScan>),
+}
+
+/// A reduced second-fetch page block: how the hop
+/// value is picked from page one, how the second
+/// URL is formed, and whether only the last stage-2
+/// capture is the version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HopScan {
+    /// The hop regex (source, flags); `None` = the
+    /// block regex.
+    pub hop_re: Option<(String, String)>,
+    pub pick: HopPick,
+    pub target: HopTarget,
+    /// Stage 2 keeps only its last capture
+    /// (`.scan(regex)&.flatten&.last`).
+    pub last_only: bool,
+}
+
+/// How a hop-scan picks its value from page one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HopPick {
+    /// `page[/lit/, 1]`
+    First,
+    /// `page.scan(re)&.flatten&.last`
+    ScanLast,
+    /// `page.scan(re).map { … }.max_by { Version.new }`
+    ScanMax,
+}
+
+/// How a hop-scan forms the second URL from the
+/// hop value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HopTarget {
+    /// `URI.join("<literal>", v)`
+    JoinLiteral(String),
+    /// `URI.join(@url, v)`
+    JoinSelf,
+    /// `"<pre>#{v}<post>"`
+    Template(String, String),
 }
 
 /// A two-stage directory-walk page block reduced
@@ -356,17 +1046,55 @@ pub enum DirBlank {
 }
 
 /// A `:github_releases` strategy block reduced to
-/// data: per-release guards, the text the regex
+/// data: per-release guards, an optional release-
+/// level pre-capture local, the text the regex
 /// captures from, and what the map returns per match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GhRelBlock {
     pub skip_draft: bool,
     pub skip_prerelease: bool,
+    /// `next unless release["prerelease"]` (and its
+    /// `!`-guard spelling).
+    pub require_prerelease: bool,
+    /// `next if release["tag_name"] != "lit"`.
+    pub tag_ne: Option<String>,
+    /// `next unless release["tag_name"]&.start_with?("lit")`.
+    pub tag_prefix: Option<String>,
+    /// `next unless release["assets"]&.any? { … }`:
+    /// at least one asset must satisfy the test.
+    pub asset_any: Option<GhRelAny>,
     /// Skip when the release `name` matches this
     /// regex (source, flags), searched.
     pub name_skip: Option<(String, String)>,
+    /// `local = release[field]&.[](re, 1)` with a
+    /// blank guard; renders read it as `GhRelPart::Local`.
+    pub pre_capture: Option<GhRelCapture>,
     pub source: GhRelSource,
     pub then: GhRelThen,
+    /// `end.presence || release["tag_name"]&.[](/…/, 1)`
+    /// on an assets `filter_map`: when a release's
+    /// assets yield nothing, this literal regex
+    /// (source, flags) captures from the tag instead.
+    pub fallback_tag: Option<(String, String)>,
+}
+
+/// An asset-existence test over asset names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GhRelAny {
+    /// `asset["name"]&.match?(/…/)` (source, flags).
+    NameMatch(String, String),
+    /// `asset["name"]&.end_with?("lit")`.
+    NameEndsWith(String),
+}
+
+/// A release-level `release[field]&.[](re, 1)` local.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhRelCapture {
+    /// `"name"` or `"tag_name"`.
+    pub field: String,
+    /// A literal regex (source, flags); `None` reads
+    /// the livecheck's own regex.
+    pub lit: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -376,6 +1104,13 @@ pub enum GhRelSource {
     /// Each asset's `browser_download_url`
     /// (the block flattens).
     AssetDownloadUrl,
+    /// Each asset's `name` (the block flattens).
+    AssetName,
+    /// No per-item match: the render reads only the
+    /// pre-capture local and the tag.
+    PreCaptureOnly,
+    /// `release["name"]`
+    Name,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,6 +1122,382 @@ pub enum GhRelThen {
     /// `Version.new(match[1])`, skipped when its
     /// patch token is zero/absent.
     NonZeroPatch,
+    /// An interpolation/body expression over parts.
+    Template(Vec<GhRelPart>),
+    /// `(a == b) ? then_parts : else_parts`.
+    EqElse {
+        a: GhRelOp,
+        b: GhRelOp,
+        then: Vec<GhRelPart>,
+        els: Vec<GhRelPart>,
+    },
+    /// `match[n] ? then : els` (Ruby truthiness: only
+    /// a non-participating capture is falsy).
+    TruthyElse {
+        cap: usize,
+        then: Vec<GhRelPart>,
+        els: Vec<GhRelPart>,
+    },
+}
+
+/// One operand of a render template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GhRelPart {
+    /// `match[n]` (MatchData indexing: 0 is whole).
+    Cap(usize),
+    Lit(String),
+    /// The pre-capture local.
+    Local,
+    /// `release["tag_name"]` verbatim.
+    Tag,
+    /// `release["tag_name"]&.tr("from", "to")`.
+    TagTr(String, String),
+    /// `release["tag_name"]&.[](/…/, 1)` (source, flags).
+    TagCapture(String, String),
+}
+
+/// One side of an `EqElse` comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GhRelOp {
+    Cap(usize),
+    Local,
+    /// The release's raw `tag_name`.
+    Tag,
+}
+
+/// A `:git` strategy block reduced to data: tags to
+/// skip outright, and the transform applied to each
+/// remaining tag's regex capture (`tag[regex, 1]`).
+/// `map` and `filter_map` bodies are the same data:
+/// the oracle compacts block returns either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitBlock {
+    /// The body reads `regex` without declaring it as
+    /// a block parameter, i.e. the livecheck's own
+    /// regex; without one the oracle yields no regex
+    /// to the body (and crashes), so planning refuses.
+    pub needs_spec_regex: bool,
+    /// Tags skipped before capture
+    /// (`next if malformed_tags.include?(tag)`).
+    pub skip_tags: Vec<String>,
+    pub op: GitOp,
+}
+
+/// The transform a reduced `:git` block applies to a
+/// tag's regex capture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitOp {
+    /// The capture verbatim.
+    Identity,
+    /// `&.tr("from", "to")`
+    Tr(String, String),
+    /// `&.gsub("from", "to")` (literal, all matches).
+    GsubLit(String, String),
+    /// `&.gsub(/pat/flags, "template")` (all matches;
+    /// template `\0`..`\9` backreferences, `\\` a
+    /// backslash).
+    GsubRe(String, String, String),
+}
+
+/// A `:github_latest` strategy block reduced to
+/// data: which release text the regex reads, scan
+/// vs first capture, and an optional `tr` on each
+/// capture. With a block the oracle applies no
+/// draft/prerelease filter of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatestBlock {
+    /// The body reads `regex` without declaring it
+    /// (see `GitBlock::needs_spec_regex`).
+    pub needs_spec_regex: bool,
+    pub source: LatestSource,
+    /// `.scan(regex).map { |m| m[0] }` (every match's
+    /// first capture) vs a single first capture.
+    pub scan: bool,
+    pub tr: Option<(String, String)>,
+    /// A match/scan render beyond the plain capture
+    /// (`Capture` keeps the capture+`tr` behavior).
+    pub render: LatestRender,
+    /// For `LatestRender::TwoEq`: the second field
+    /// whose first capture `source`'s is compared to.
+    pub two_b: Option<LatestSource>,
+    /// A block-level local computed from one field
+    /// before the assets map (blank-guarded); renders
+    /// read it as `LatestPart::Local`.
+    pub pre_capture: Option<LatestPre>,
+}
+
+/// A `:github_latest` pre-capture local: one field's
+/// first capture (or the field itself) with plain
+/// string ops applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatestPre {
+    pub source: LatestSource,
+    /// A literal capture regex (source, flags);
+    /// `None` captures with the livecheck regex.
+    pub lit: Option<(String, String)>,
+    /// Whether the local is a regex capture at all
+    /// (vs the field text with `ops` applied).
+    pub capture: bool,
+    pub ops: Vec<LatestPreOp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LatestPreOp {
+    Tr(String, String),
+    DeletePrefix(String),
+}
+
+/// What a reduced `:github_latest` block returns
+/// per match (MatchData indexing except the `Scan*`
+/// forms, which index scan capture arrays where 0
+/// is capture 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LatestRender {
+    Capture,
+    Template(Vec<LatestPart>),
+    EqElse {
+        a: LatestOp,
+        b: LatestOp,
+        then: Vec<LatestPart>,
+        els: Vec<LatestPart>,
+    },
+    PresentElse {
+        cap: usize,
+        then: Vec<LatestPart>,
+        els: Vec<LatestPart>,
+    },
+    /// `match[n] ? then : els` (Ruby truthiness).
+    TruthyElse {
+        cap: usize,
+        then: Vec<LatestPart>,
+        els: Vec<LatestPart>,
+    },
+    ScanTemplate(Vec<LatestPart>),
+    ScanPresentElse {
+        cap: usize,
+        then: Vec<LatestPart>,
+        els: Vec<LatestPart>,
+    },
+    /// `(a == b) ? b : "#{a},#{b}"` over two fields'
+    /// first captures (`source` is `a`, `two_b` is `b`).
+    TwoEq,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LatestPart {
+    Cap(usize),
+    Lit(String),
+    /// The `LatestPre` local.
+    Local,
+}
+
+/// One side of a latest `EqElse` comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LatestOp {
+    Cap(usize),
+    Local,
+}
+
+/// Which latest-release text a reduced
+/// `:github_latest` block regexes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LatestSource {
+    /// `json["tag_name"]`
+    TagName,
+    /// `json["name"]`
+    Name,
+    /// `json["body"]`
+    Body,
+    /// `json["published_at"]`
+    PublishedAt,
+    /// Each `json["assets"]` entry's `name`
+    /// (first capture each).
+    AssetName,
+    /// Each `json["assets"]` entry's
+    /// `browser_download_url`.
+    AssetDownloadUrl,
+}
+
+/// A `:header_match` strategy block reduced to
+/// data: one response header's value, matched or
+/// scanned with the spec regex, rendered as a
+/// version template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderBlock {
+    pub header: String,
+    pub shape: HeaderShape,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeaderShape {
+    /// `match = headers[h]&.match(regex)` guarded,
+    /// MatchData-indexed template.
+    Template(Vec<PagePart>),
+    /// `headers[h]&.scan(regex)&.map { … }`,
+    /// scan-indexed per match.
+    ScanTemplate(Vec<PagePart>),
+    /// `match = headers[h]&.scan(regex)&.flatten`
+    /// guarded, template over the flat captures.
+    ScanFlatten(Vec<PagePart>),
+    /// `headers[h]` verbatim.
+    Bare,
+    /// `match[2] ? "#{match[1]},#{match[2]}" : match[1]`.
+    CsvOpt,
+}
+
+/// A `:sparkle` strategy block reduced to data.
+/// The oracle filters and sorts appcast items, then
+/// yields either the first (`|item|`, block-pass
+/// `&:field`) or all of them (`|items|`); the block
+/// returns version strings the oracle compacts and
+/// deduplicates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparkleBlock {
+    /// `|items|`: the expression runs per item and
+    /// every result is a version. Otherwise only the
+    /// first (channel-matching) item is evaluated.
+    pub all: bool,
+    /// The block is an `items.find` form: the match
+    /// guard participates in item selection (the
+    /// oracle's `find` skips non-matching items)
+    /// rather than vetoing the newest item.
+    pub find: bool,
+    /// A channel gate (`items.find { |item|
+    /// item.channel.nil? }`, `next if item.channel
+    /// != "release"`).
+    pub channel: Option<SpChannel>,
+    /// A presence gate: skip the item unless the
+    /// regex matches this field
+    /// (`next unless item.x&.match?(regex)`).
+    pub match_guard: Option<SpField>,
+    /// Field-presence gates: skip the item when any
+    /// listed field is blank (`next if
+    /// item.version.blank?`, `next if
+    /// item&.version.nil? || …`).
+    pub present: Vec<SpField>,
+    /// The body reads the spec `regex` (declared as
+    /// a block parameter or not); without one the
+    /// oracle errors, so planning refuses.
+    pub needs_spec_regex: bool,
+    pub expr: SpExpr,
+}
+
+/// A sparkle channel gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpChannel {
+    /// `item.channel.nil?`
+    Nil,
+    /// `item.channel == "x"`
+    Eq(String),
+    /// `item.channel != "x"` (a `next if` skip).
+    Ne(String),
+    /// `item.channel == "x" || item.channel.nil?`
+    EqOrNil(String),
+}
+
+/// A Sparkle item field a block can read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpField {
+    Short,
+    Full,
+    Nice,
+    Title,
+    Url,
+}
+
+/// One part of a sparkle string-interpolation
+/// template (`"#{item.short_version},#{match[1]}"`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpPart {
+    Lit(String),
+    Field(SpField),
+    /// `match[N]`; in a `scan` the indexing is over
+    /// the captures array (N is capture N+1).
+    Cap(usize),
+    /// `match[N].tr("from", "to")`
+    CapTr(usize, String, String),
+    /// `match[N].presence || "fallback"`
+    CapOr(usize, String),
+    /// A precomputed local (`id = item.url[regex, 1]`)
+    /// rendered in the template.
+    Local,
+    /// `item.field.split("sep").first` (or `.last`
+    /// when the flag is set) in the template.
+    FieldSplit(SpField, String, bool),
+    /// `item.field[regex, N]` inline in the template.
+    FieldIndex(SpField, usize),
+}
+
+/// The enumerable expression shapes a reduced
+/// `:sparkle` block body can take (see
+/// `tap::parse_sparkle_shape`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpExpr {
+    /// `item.field` (also block-pass `&:field` and
+    /// `items.map(&:field)`).
+    Field(SpField),
+    /// `item.field.split.first`
+    FieldSplitFirst(SpField),
+    /// `item.field.tr("from", "to")`
+    FieldTr(SpField, String, String),
+    /// `item.field.delete_prefix("p")`
+    FieldDeletePrefix(SpField, String),
+    /// `item.field.delete_suffix("p")`
+    FieldDeleteSuffix(SpField, String),
+    /// `item.field[regex, N]` (optionally safe-nav).
+    FieldIndex(SpField, usize),
+    /// `match.captures.join(",")` over the match of
+    /// the regex against a field.
+    CapturesJoin(SpField),
+    /// A `"#{...}"` template. `from` names the field
+    /// the regex matched (`match = item.f.match(regex)`,
+    /// blank-guarded); `local` names the field+index
+    /// a `Local` part renders (`id = item.f[regex, N]`,
+    /// blank-guarded). A `Cap(0)` is the whole match.
+    Template {
+        from: Option<SpField>,
+        local: Option<(SpField, usize)>,
+        parts: Vec<SpPart>,
+    },
+    /// `item.field.scan(regex).map { |match| "..." }`
+    /// — one template per match; `Cap(N)` indexes the
+    /// captures array.
+    Scan { from: SpField, parts: Vec<SpPart> },
+    /// `item.field.chars.join("sep")`.
+    FieldCharsJoin(SpField, String),
+    /// `(a == b) ? then : els` over the match against
+    /// `from` (blank-guarded like `Template`).
+    EqElse {
+        from: Option<SpField>,
+        local: Option<(SpField, usize)>,
+        a: SpOp,
+        b: SpOp,
+        then: Vec<SpPart>,
+        els: Vec<SpPart>,
+    },
+    /// `next <then> unless match[n]` (or `if`, when
+    /// `invert` is false) before the `els` template.
+    CapElse {
+        from: Option<SpField>,
+        cap: usize,
+        invert: bool,
+        then: Vec<SpPart>,
+        els: Vec<SpPart>,
+    },
+    /// `next <blank> if match.blank?` before the
+    /// `parts` template.
+    BlankElse {
+        from: Option<SpField>,
+        blank: Vec<SpPart>,
+        parts: Vec<SpPart>,
+    },
+}
+
+/// One side of a sparkle `EqElse` comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpOp {
+    Cap(usize),
+    Field(SpField),
 }
 
 /// An `:extract_plist` strategy block reduced to data:
@@ -420,6 +1531,56 @@ pub enum YamlShape {
     /// `….split("-")&.first` — value up to the first
     /// separator.
     DigSplitFirst(Vec<JsonKey>, String),
+    /// A dug string with a plain tail transform
+    /// (`yaml["version"]&.delete_suffix("-ow")`).
+    DigTail(Vec<JsonKey>, YamlTail),
+    /// `yaml["files"].map { |item| match item[key] … }`
+    /// (the electron-builder files list).
+    FilesMap {
+        key: String,
+        render: YamlRender,
+    },
+    /// `match = yaml[key]&.match(regex); … render`
+    /// against a root scalar (the electron-builder
+    /// root `path`).
+    RootMatch {
+        key: String,
+        render: YamlRender,
+    },
+}
+
+/// A plain-string tail on a dug yaml scalar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum YamlTail {
+    DeleteSuffix(String),
+    DeletePrefix(String),
+    /// `sub("a", "b")` (first literal occurrence).
+    SubLit(String, String),
+    /// `sub(/pat/flags, "b")` with a backslash-free
+    /// replacement (no backrefs modeled).
+    SubRe(String, String, String),
+}
+
+/// A yaml match render over regex captures and root
+/// fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum YamlRender {
+    Template(Vec<YamlPart>),
+    /// `match[n].present? ? then : els`.
+    PresentElse {
+        cap: usize,
+        then: Vec<YamlPart>,
+        els: Vec<YamlPart>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum YamlPart {
+    /// `match[n]` (MatchData indexing).
+    Cap(usize),
+    Lit(String),
+    /// `yaml["field"]` as a string.
+    Root(String),
 }
 
 /// A livecheck `url` argument.

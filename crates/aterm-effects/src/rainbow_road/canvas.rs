@@ -5,7 +5,8 @@
 //! ellipses), an affine stack onto a device [`Tile`], fills through [`fill_path`] (4×4
 //! supersampled, union across paths), strokes as coverage of the distance to their centreline
 //! (round caps and joins, as the design's SVG strokes), butt-ended bands, and a separable box
-//! blur (three passes, about a gaussian) for glows and shadows.
+//! blur (three passes, about a gaussian) for glows and shadows, each drawn on a layer of the
+//! canvas or, for a disc's glow, a layer cropped to the disc and the blur's reach.
 
 use aterm_scene::{PathCmd, PathTransform, Tile, fill_path};
 
@@ -314,6 +315,17 @@ pub(super) struct Canvas {
     pub(super) tile: Tile,
     /// Design units to device pixels.
     pub(super) map: Affine,
+    /// Where the tile's top-left pixel stands, in device pixels of the canvas it is a layer of:
+    /// `(0, 0)` for a canvas of its own and a whole layer, the crop's corner for the layer
+    /// [`Self::dot_glow`] cuts to its disc. Only a dot is drawn on a cropped layer: its centre is
+    /// mapped as on that canvas, then moved back by this whole number of pixels, which in `f32`
+    /// is exact (the corner is 0 or lies at or before the centre, so the difference is a multiple
+    /// of the centre's last place no larger than it). Each subsample's offset from the centre is
+    /// then the difference of the same two exact values on either tile, rounded alike, so the
+    /// disc covers the very pixels it covers there. A path is never drawn on one ([`Self::fill`]
+    /// and [`Self::stroke`] assert it): its curves are flattened from moved points, which round
+    /// otherwise and can put a subsample across an edge, a level off in an edge pixel.
+    origin: (i32, i32),
 }
 
 impl Canvas {
@@ -321,12 +333,37 @@ impl Canvas {
         Self {
             tile: Tile::new(w, h),
             map,
+            origin: (0, 0),
         }
     }
 
     /// An empty canvas of the same size and map: a layer to blur or composite.
     pub(super) fn layer(&self) -> Self {
         Self::new(self.tile.width(), self.tile.height(), self.map)
+    }
+
+    /// An empty layer over just the part of this canvas a glow of a disc needs: the device box
+    /// of the design box `(x0, y0)..(x1, y1)` the disc lies in, grown by a blur of `sigma`
+    /// design units' whole reach (and a few pixels for edge coverage), clipped to the canvas.
+    /// Private to [`Self::dot_glow`], so nothing but a dot is drawn on it.
+    fn layer_around(&self, (x0, y0, x1, y1): (f32, f32, f32, f32), sigma: f32) -> Self {
+        let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)].map(|p| self.map.apply(p));
+        let (mut lo, mut hi) = ((f32::MAX, f32::MAX), (f32::MIN, f32::MIN));
+        for (x, y) in corners {
+            lo = (lo.0.min(x), lo.1.min(y));
+            hi = (hi.0.max(x), hi.1.max(y));
+        }
+        let grow = (blur_reach(sigma * self.unit()) + 3) as f32;
+        let (cw, ch) = (self.tile.width() as i32, self.tile.height() as i32);
+        let left = ((lo.0 - grow).floor() as i32).clamp(0, cw);
+        let top = ((lo.1 - grow).floor() as i32).clamp(0, ch);
+        let right = ((hi.0 + grow).ceil() as i32).clamp(left, cw);
+        let bottom = ((hi.1 + grow).ceil() as i32).clamp(top, ch);
+        Self {
+            tile: Tile::new((right - left) as u32, (bottom - top) as u32),
+            map: self.map,
+            origin: (self.origin.0 + left, self.origin.1 + top),
+        }
     }
 
     /// Draw with `inner` applied before the current map.
@@ -344,6 +381,7 @@ impl Canvas {
     }
 
     pub(super) fn fill(&mut self, shape: &Shape, rgb: Rgb, alpha: f32) {
+        debug_assert_eq!(self.origin, (0, 0), "a path on a cropped layer");
         let device = shape.mapped(self.map);
         fill_path(
             &mut self.tile,
@@ -361,6 +399,7 @@ impl Canvas {
 
     /// Stroke `shape`'s centreline `width` design units wide, with round caps and joins.
     pub(super) fn stroke(&mut self, shape: &Shape, width: f32, rgb: Rgb, alpha: f32) {
+        debug_assert_eq!(self.origin, (0, 0), "a path on a cropped layer");
         let device = shape.mapped(self.map);
         let lines = device.flatten(|control| ((control / 2.5).ceil() as usize).clamp(4, 64));
         let width = width * self.unit();
@@ -398,13 +437,32 @@ impl Canvas {
     /// A disc of radius `r` design units at `(x, y)`.
     pub(super) fn dot(&mut self, x: f32, y: f32, r: f32, rgb: Rgb, alpha: f32) {
         let (dx, dy) = self.map.apply((x, y));
+        let (dx, dy) = (dx - self.origin.0 as f32, dy - self.origin.1 as f32);
         let r = r * self.unit();
         self.tile.disc(dx, dy, r, rgb, alpha);
     }
 
-    /// `layer` blurred by a gaussian of about `sigma` design units, drawn over this canvas at
-    /// `alpha`, moved `(dx, dy)` design units (rounded to whole device pixels).
-    pub(super) fn glow(&mut self, layer: &Tile, sigma: f32, alpha: f32, offset: (f32, f32)) {
+    /// A disc of radius `r` design units at `(x, y)` in `rgb`, blurred by a gaussian of about
+    /// `sigma` design units and drawn over this canvas at `alpha`: the very pixels the disc
+    /// blurred on a whole layer gives, from a tile and a blur the size of the disc and the blur's
+    /// reach rather than of the canvas.
+    pub(super) fn dot_glow(
+        &mut self,
+        (x, y): (f32, f32),
+        r: f32,
+        rgb: Rgb,
+        sigma: f32,
+        alpha: f32,
+    ) {
+        let mut layer = self.layer_around((x - r, y - r, x + r, y + r), sigma);
+        layer.dot(x, y, r, rgb, 1.0);
+        self.glow(&layer, sigma, alpha, (0.0, 0.0));
+    }
+
+    /// `layer` (a layer of this canvas) blurred by a gaussian of about `sigma` design units,
+    /// drawn over this canvas where it stands at `alpha`, moved `(dx, dy)` design units (rounded
+    /// to whole device pixels).
+    pub(super) fn glow(&mut self, layer: &Self, sigma: f32, alpha: f32, offset: (f32, f32)) {
         self.glow_fading(layer, sigma, alpha, offset, Fade::default());
     }
 
@@ -412,15 +470,21 @@ impl Canvas {
     /// and bottom edges, so where it reaches them it ends softly, never cut.
     pub(super) fn glow_fading(
         &mut self,
-        layer: &Tile,
+        layer: &Self,
         sigma: f32,
         alpha: f32,
         (dx, dy): (f32, f32),
         fade: Fade,
     ) {
         let unit = self.unit();
-        let mut blurred = blur(layer, sigma * unit);
-        let (w, h) = (blurred.width() as usize, blurred.height() as usize);
+        let mut blurred = blur(&layer.tile, sigma * unit);
+        let lw = blurred.width() as usize;
+        // Where the layer's top-left pixel stands on this canvas, whose edges the fade is from.
+        let (ox, oy) = (
+            (layer.origin.0 - self.origin.0) as f32,
+            (layer.origin.1 - self.origin.1) as f32,
+        );
+        let (w, h) = (self.tile.width() as f32, self.tile.height() as f32);
         let (left, right, bottom) = (fade.left * unit, fade.right * unit, fade.bottom * unit);
         // Moved by `dy`, the blur's row `y` lands `dy` pixels lower.
         let shift = dy * unit;
@@ -434,16 +498,19 @@ impl Canvas {
             if px[3] == 0 {
                 continue;
             }
-            let (x, y) = ((at % w) as f32 + 0.5, (at / w) as f32 + 0.5 + shift);
+            let (x, y) = (
+                ox + (at % lw) as f32 + 0.5,
+                oy + (at / lw) as f32 + 0.5 + shift,
+            );
             let mut keep = 1.0;
             if left > 0.0 {
                 keep *= super::smooth(x / left);
             }
             if right > 0.0 {
-                keep *= super::smooth((w as f32 - x) / right);
+                keep *= super::smooth((w - x) / right);
             }
             if bottom > 0.0 {
-                keep *= super::smooth((h as f32 - y) / bottom);
+                keep *= super::smooth((h - y) / bottom);
             }
             px[3] = (f32::from(px[3]) * keep).round() as u8;
         }
@@ -451,13 +518,24 @@ impl Canvas {
             &mut self.tile,
             &blurred,
             alpha,
-            ((dx * unit).round() as i32, (dy * unit).round() as i32),
+            (
+                layer.origin.0 - self.origin.0 + (dx * unit).round() as i32,
+                layer.origin.1 - self.origin.1 + (dy * unit).round() as i32,
+            ),
         );
     }
 
-    /// `layer` drawn over this canvas as it is.
-    pub(super) fn draw(&mut self, layer: &Tile) {
-        composite(&mut self.tile, layer, 1.0, (0, 0));
+    /// `layer` (a layer of this canvas) drawn over this canvas as it is, where it stands.
+    pub(super) fn draw(&mut self, layer: &Self) {
+        composite(
+            &mut self.tile,
+            &layer.tile,
+            1.0,
+            (
+                layer.origin.0 - self.origin.0,
+                layer.origin.1 - self.origin.1,
+            ),
+        );
     }
 }
 
@@ -585,9 +663,7 @@ fn to_srgb(v: f32) -> f32 {
 fn blur(src: &Tile, sigma: f32) -> Tile {
     let (w, h) = (src.width() as usize, src.height() as usize);
     let mut out = Tile::new(src.width(), src.height());
-    // Three boxes of width b have variance 3·(b² − 1)/12.
-    let box_w = (4.0 * sigma * sigma + 1.0).sqrt();
-    let r = (((box_w - 1.0) / 2.0).round() as usize).max(1);
+    let r = blur_radius(sigma);
     let px = src.pixels();
     let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
     for (at, p) in px.as_chunks::<4>().0.iter().enumerate() {
@@ -602,7 +678,7 @@ fn blur(src: &Tile, sigma: f32) -> Tile {
     if x0 >= x1 || y0 >= y1 {
         return out;
     }
-    let reach = 3 * r + 1;
+    let reach = blur_reach(sigma);
     let (x0, y0) = (x0.saturating_sub(reach), y0.saturating_sub(reach));
     let (x1, y1) = ((x1 + reach).min(w), (y1 + reach).min(h));
     let (bw, bh) = (x1 - x0, y1 - y0);
@@ -642,6 +718,18 @@ fn blur(src: &Tile, sigma: f32) -> Tile {
         ]);
     }
     out
+}
+
+/// The radius of each of [`blur`]'s three boxes for a gaussian of about `sigma` pixels.
+fn blur_radius(sigma: f32) -> usize {
+    // Three boxes of width b have variance 3·(b² − 1)/12.
+    let box_w = (4.0 * sigma * sigma + 1.0).sqrt();
+    (((box_w - 1.0) / 2.0).round() as usize).max(1)
+}
+
+/// How many pixels past the drawn ones [`blur`] works: its three boxes' spread, and one more.
+fn blur_reach(sigma: f32) -> usize {
+    3 * blur_radius(sigma) + 1
 }
 
 /// One box pass over the `n` values of `buf` from `start`, `stride` apart, `2r + 1` wide.

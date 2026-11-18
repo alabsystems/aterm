@@ -58,6 +58,7 @@ fn clone_stage_refuses_to_replace_a_concurrent_destination_file() {
     let stage = CloneStage::for_op(&GitOp::Clone {
         dest: destination.clone(),
         depth: None,
+        cache: None,
     })
     .unwrap()
     .unwrap();
@@ -90,6 +91,7 @@ fn clone_stage_publishes_over_the_still_empty_admitted_destination() {
     let stage = CloneStage::for_op(&GitOp::Clone {
         dest: destination.clone(),
         depth: None,
+        cache: None,
     })
     .unwrap()
     .unwrap();

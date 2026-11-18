@@ -4,6 +4,7 @@
 //! Platform clock facade: re-exports `std::time` on native targets and
 //! bridges to browser clocks (`performance.now()` / `Date.now()`) on
 //! `wasm32-unknown-unknown`, where `std::time::Instant::now()` panics.
+//! Its wall-clock accessors count their reads per thread ([`raw_reads`]).
 #![cfg_attr(
     not(all(target_arch = "wasm32", target_os = "unknown")),
     forbid(unsafe_code)
@@ -93,27 +94,57 @@ pub fn unix_millis_at(now: SystemTime) -> Option<u64> {
     since_epoch_at(now).map(duration_to_millis_saturating)
 }
 
+std::thread_local! {
+    /// The calling thread's count of wall reads made by [`wall_now`]: the
+    /// value [`raw_reads`] returns.
+    static RAW_READS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// One read of the platform wall clock, added to the calling thread's
+/// [`raw_reads`] count.
+#[inline]
+fn wall_now() -> SystemTime {
+    RAW_READS.with(|reads| reads.set(reads.get().wrapping_add(1)));
+    SystemTime::now()
+}
+
+/// How many times the calling thread has read the wall clock through
+/// [`since_epoch`], [`unix_secs`] or [`unix_millis`], wrapping at `u64::MAX`.
+///
+/// A thread starts at zero, and each call of one of the three adds one. The
+/// `*_at` conversions take a reading the caller already holds and add
+/// nothing. A `SystemTime::now()` called directly is not counted either. No
+/// other thread's reads move it, so two values taken on one thread, compared
+/// with `wrapping_sub`, say whether the code that ran on that thread between
+/// them read the wall clock through these accessors.
+#[must_use]
+#[inline]
+pub fn raw_reads() -> u64 {
+    RAW_READS.with(core::cell::Cell::get)
+}
+
 /// The wall clock's distance past the Unix epoch, or `None` when it reads
-/// before 1970.
+/// before 1970. Each call is one read in [`raw_reads`].
 #[must_use]
 #[inline]
 pub fn since_epoch() -> Option<Duration> {
-    since_epoch_at(SystemTime::now())
+    since_epoch_at(wall_now())
 }
 
 /// Whole seconds since the Unix epoch ([`since_epoch`]), `None` before it.
+/// Each call is one read in [`raw_reads`].
 #[must_use]
 #[inline]
 pub fn unix_secs() -> Option<u64> {
-    unix_secs_at(SystemTime::now())
+    unix_secs_at(wall_now())
 }
 
 /// Milliseconds since the Unix epoch ([`since_epoch`]), saturating at
-/// `u64::MAX`; `None` before it.
+/// `u64::MAX`; `None` before it. Each call is one read in [`raw_reads`].
 #[must_use]
 #[inline]
 pub fn unix_millis() -> Option<u64> {
-    unix_millis_at(SystemTime::now())
+    unix_millis_at(wall_now())
 }
 
 /// Nanoseconds per millisecond (`1_000_000`).

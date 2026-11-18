@@ -22,7 +22,7 @@ use aterm_secrets::commons::roster::Role;
 pub(crate) const WID: WindowId = WindowId(0);
 pub(crate) const MC: &str = "mc-0000000000000009";
 
-fn put(column: &str, value: aterm_json::Value) -> aterm_db::database::Change {
+pub(crate) fn put(column: &str, value: aterm_json::Value) -> aterm_db::database::Change {
     put_in(&MACHINE, MC, column, value)
 }
 
@@ -524,6 +524,7 @@ fn an_edit_waits_for_every_move_asked_for() {
     tables.take(Reply::Read {
         read: Ok(head),
         moved: true,
+        revision: None,
     });
     tables.stage("machine", MC, "nickname", "Backup".into());
     assert!(tables.staged.is_empty(), "the second move has not answered");
@@ -538,6 +539,7 @@ fn an_edit_waits_for_every_move_asked_for() {
     tables.take(Reply::Read {
         read: Ok(past),
         moved: true,
+        revision: None,
     });
     tables.stage("machine", MC, "nickname", "Backup".into());
     assert!(tables.staged.is_empty(), "a past table takes no edit");
@@ -549,6 +551,7 @@ fn an_edit_waits_for_every_move_asked_for() {
             ..Shown::default()
         })),
         moved: true,
+        revision: None,
     });
     tables.stage("machine", MC, "nickname", "Backup".into());
     assert_eq!(tables.staged.len(), 1);
@@ -1631,12 +1634,7 @@ fn not_written_is_one_fixed_blue_whatever_the_accent() {
     key_in(&mut app, TextInputEvent::Submit);
     let painted = render(&app).painted(roles);
     install_system_accent(None);
-    let wash = crate::native_appearance::mix_srgb(
-        roles.elevated,
-        roles.unwritten,
-        crate::native_appearance::UNWRITTEN_WASH,
-    );
-    let blues = [roles.unwritten, roles.unwritten_ink, wash];
+    let blues = [roles.unwritten, roles.unwritten_ink, roles.unwritten_wash];
     let wears: std::collections::BTreeSet<String> = painted
         .iter()
         .filter(|(_, prims)| {
@@ -3543,8 +3541,11 @@ fn rail_heading(ui: &CompiledUi, name: &str) -> &'static str {
     ["STORED", "SET BY ATERM", "REFERENCE"]
         .into_iter()
         .filter_map(|word| {
-            ui.semantic(&UiKey::new(format!("tables/rail/group/{word}")))
-                .map(|node| (word, node.rect.y))
+            ui.semantic(&UiKey::new(format!(
+                "tables/rail/group/{}",
+                crate::native_ui::key_word(word)
+            )))
+            .map(|node| (word, node.rect.y))
         })
         .filter(|(_, y)| *y < at)
         .max_by(|a, b| a.1.total_cmp(&b.1))

@@ -9,7 +9,7 @@
 //! call builds too, and last the closing call, today's command over the run's selection, byte for
 //! byte, which finds what the cuts built fresh.
 
-use crate::memory::{Key, Records};
+use crate::memory::{Key, Records, ShapingSource};
 use crate::unitgraph::{Graph, Interner, UnitName};
 
 /// WHAT ONE CALL OF A SHAPED TEST COMPILE SELECTS: its crates, and whether it builds their
@@ -179,7 +179,7 @@ pub fn refusal_key(checkout: &str, whole: &Piece, cut: &Piece) -> Key {
 #[derive(Clone, Copy, Debug)]
 pub struct Shaping<'a> {
     /// Verify's own record.
-    pub records: &'a Records,
+    pub records: &'a dyn ShapingSource,
     /// The plain builds' record.
     pub plain: &'a Records,
     /// The run's checkout ([`crate::Ctx::root`]).
@@ -233,7 +233,7 @@ pub struct Call {
 /// The most any checkout's record of `stage` over exactly `crates`, under `variant`, kept, and
 /// the checkout that kept it.
 fn most(
-    records: &Records,
+    records: &dyn ShapingSource,
     stage: &str,
     crates: &[String],
     variant: Option<&str>,

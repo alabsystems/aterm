@@ -156,7 +156,13 @@ impl<C: Ctl> Session<'_, C> {
         seq: u64,
     ) {
         match reading.wall.clone() {
-            Some(w) if is_kept(&w) && !self.turn_end.left_bucket(w.kind, &w.message) => {
+            // The limit a move left is the left account's: no wall of this session's to wait
+            // on, so none is remembered or booked ([`Self::limit_left_at`]).
+            Some(w)
+                if is_kept(&w)
+                    && !self.turn_end.left_bucket(w.kind, &w.message)
+                    && !self.limit_left_at(seq) =>
+            {
                 self.remember_wall(&w, reader.program(), seq);
             }
             Some(_) => self.forget_wall(seq),

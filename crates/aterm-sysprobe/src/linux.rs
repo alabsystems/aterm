@@ -2266,6 +2266,7 @@ impl Root {
                 scheduling: None,
                 pid,
                 start,
+                birth: Some(stat.start),
                 ppid: stat.ppid,
                 exec: Some(stat.exec()),
                 cpu_ns: Some(cpu_ns),

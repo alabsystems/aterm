@@ -94,6 +94,7 @@ const NO_STEWARD: &str = "this Mac holds no admin key of the ALab vault";
 /// Ports that read from fields and record every call: each read kind reads due until its apply,
 /// then right. `aterm init --converge`'s tests run the runner over them.
 pub(crate) struct Inert {
+    pub(crate) identity_result: bool,
     prerequisites: Option<Arc<repository_prerequisites::Packages>>,
     state: PathBuf,
     own: bool,
@@ -225,6 +226,7 @@ impl Inert {
     pub(crate) fn new(state: &Path) -> Self {
         Self {
             prerequisites: None,
+            identity_result: true,
             state: state.to_path_buf(),
             own: true,
             console: true,
@@ -290,9 +292,10 @@ impl Inert {
             shared_fails: Mutex::new(None),
             accounts: Mutex::new(AccountsRead::Due("the roster's sources changed".to_owned())),
             release: Mutex::new(ReleaseRead::NotApplicable("no release ring".into())),
-            fabric: Mutex::new(FabricRead::Due(
-                "the broker runs a replaced build".to_owned(),
-            )),
+            fabric: Mutex::new(FabricRead::Due {
+                from: "the broker runs a replaced build".to_owned(),
+                to: "the broker runs this build".to_owned(),
+            }),
             fabric_needs_node: true,
             awake: Mutex::new(AwakeRead::Current("the mug (pid 9) holds".to_owned())),
             awake_done: Mutex::new(Ok("launchd was asked to start the mug".to_owned())),
@@ -392,6 +395,9 @@ impl Inert {
 }
 
 impl Ports for Inert {
+    fn identity_result_requested(&self) -> bool {
+        self.identity_result
+    }
     fn background(&self, trigger: Trigger) {
         self.backgrounds.lock().unwrap().push(trigger);
     }
@@ -937,7 +943,7 @@ fn the_requests_pass_runs_only_where_the_table_is_reached_and_never_in_a_plan() 
             let paths = Paths::for_home(scratch.path());
             let raised = Mutex::new(None);
             let observed = Arc::new(Mutex::new(Vec::new()));
-            let clone = || {
+            let clone = |_| {
                 let row = need::raise(
                     &paths,
                     need::Want::Gh(need::GhProfile::Dev),
@@ -971,6 +977,7 @@ fn the_requests_pass_runs_only_where_the_table_is_reached_and_never_in_a_plan() 
                     ))
                 },
                 clone: &clone,
+                observe: None,
                 control: None,
                 forget: &|| Ok(()),
             };
@@ -1776,7 +1783,7 @@ fn the_base_layer_runs_on_a_new_build_from_the_installed_app_and_never_the_store
             });
             let dir = scratch.path().join(FileJournal::DIR);
             aterm_uds::private_file::ensure_private_dir(&dir).unwrap();
-            write_record(&dir, &seen).unwrap();
+            write_record(&dir, &mut seen).unwrap();
         }
         let pass = ran(ports.pass(Trigger::Window, Mode::Apply));
         let ids: Vec<&str> = pass.rows.iter().map(|row| row.id.as_str()).collect();
@@ -3236,6 +3243,44 @@ fn a_failed_renewal_keeps_its_error_in_the_ledger_line_and_the_journal() {
     );
 }
 
+/// `sync.fabric`'s change is journaled as its read gave it: what was due, the program as
+/// written, and what the apply leaves, the installed app's path, so a program the pass
+/// rewrote is on record from the old path to the new; the row reads changed.
+/// NEGATIVE CONTROL: the mapping before this put one fixed `to` ("the broker runs this build")
+/// on every renewal, so the journal never said which program a job or command was rewritten
+/// to.
+#[test]
+fn a_rewritten_fabric_program_is_journaled_from_the_old_path_to_the_new() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    let app = "/Applications/aterm.app/Contents/MacOS/aterm";
+    let from = format!(
+        "the broker job runs /gone/aterm, which names no file now (the installed app is {app})"
+    );
+    let to = format!("the broker job runs {app}, the installed app");
+    *ports.fabric.lock().unwrap() = FabricRead::Due {
+        from: from.clone(),
+        to: to.clone(),
+    };
+    let pass = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    let fabric = row(&pass.rows, FABRIC);
+    assert_eq!(fabric.outcome, Outcome::Changed, "{fabric:?}");
+    assert!(ports.applies().contains(&"fabric"), "{:?}", ports.applies());
+    let journal = aterm_converge::FileJournal::under(scratch.path()).path();
+    let lines: Vec<aterm_json::Value> = std::fs::read_to_string(&journal)
+        .unwrap()
+        .lines()
+        .map(|l| aterm_json::from_str(l).unwrap())
+        .collect();
+    let journaled: Vec<&aterm_json::Value> = lines
+        .iter()
+        .filter(|l| l["id"].as_str() == Some(FABRIC))
+        .collect();
+    assert_eq!(journaled.len(), 1, "one change: {lines:?}");
+    assert_eq!(journaled[0]["from"].as_str(), Some(from.as_str()));
+    assert_eq!(journaled[0]["to"].as_str(), Some(to.as_str()));
+}
+
 #[test]
 fn a_trigger_reads_back_its_own_word() {
     for trigger in [
@@ -3271,7 +3316,13 @@ fn sync_identity_applies_before_fleet_and_accounts_and_skips_personal_vaults() {
         from: "[ai] machine unset, [fleet] machine unset".to_owned(),
         to: "label m112 in [ai] and [fleet] machine".to_owned(),
     };
+    let planned = ran(ports.pass(Trigger::Subscriber, Mode::Plan));
+    assert!(
+        !planned.identity_complete(),
+        "a plan does not complete identity"
+    );
     let first = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    assert!(first.identity_complete());
     assert_eq!(
         ports.applies(),
         ["identity", "fleet", "accounts", "fabric"],
@@ -3287,6 +3338,7 @@ fn sync_identity_applies_before_fleet_and_accounts_and_skips_personal_vaults() {
     ports.now.fetch_add(60_000, Ordering::SeqCst);
     let second = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
     assert_eq!(row(&second.rows, IDENTITY).outcome, Outcome::Ok);
+    assert!(second.identity_complete());
 
     let personal = aterm_tempfile::tempdir().unwrap();
     let personal_ports = Inert::new(personal.path());
@@ -3294,6 +3346,7 @@ fn sync_identity_applies_before_fleet_and_accounts_and_skips_personal_vaults() {
         IdentityRead::NotApplicable("no swarm label applies on this Mac".to_owned());
     let pass = ran(personal_ports.pass(Trigger::Subscriber, Mode::Apply));
     assert_eq!(row(&pass.rows, IDENTITY).outcome, Outcome::NotApplicable);
+    assert!(pass.identity_complete());
     assert!(!personal_ports.applies().contains(&"identity"));
 }
 
@@ -3388,7 +3441,13 @@ fn swarm_enabled_false_marks_every_sync_item_not_applicable_and_reads_nothing() 
 fn independent_fabric_runs_before_remote_work_and_node_hosting_waits_for_node() {
     for needs_node in [false, true] {
         for (before, effect) in [
-            (FabricRead::Due("replaced broker".into()), "fabric"),
+            (
+                FabricRead::Due {
+                    from: "replaced broker".into(),
+                    to: "renewed".into(),
+                },
+                "fabric",
+            ),
             (FabricRead::Unset("never turned off".into()), "fabric-on"),
         ] {
             let scratch = aterm_tempfile::tempdir().unwrap();
@@ -3828,12 +3887,29 @@ pub(crate) mod owed_clone {
                 dyn Fn(Option<&crate::init_github::RepositoryReadback>) -> Result<OwedClone, String>
                     + Sync
             ),
-        pub(crate) clone: &'a (dyn Fn() -> Result<crate::init::CloneOwedOutcome, String> + Sync),
+        pub(crate) clone: &'a (
+                dyn Fn(
+            Option<repository_refresh::Execution>,
+        ) -> Result<crate::init::CloneOwedOutcome, String>
+                    + Sync
+            ),
+        pub(crate) observe: Option<
+            &'a (
+                    dyn Fn(
+                Option<repository_refresh::Execution>,
+            )
+                -> Result<Option<crate::init_github::RepositoryReadback>, String>
+                        + Sync
+                ),
+        >,
         pub(crate) control: Option<&'a (dyn Fn() -> Result<Option<String>, String> + Sync)>,
         pub(crate) forget: &'a (dyn Fn() -> Result<(), String> + Sync),
     }
 
     impl Ports for Hooked<'_> {
+        fn identity_result_requested(&self) -> bool {
+            self.inner.identity_result_requested()
+        }
         fn background(&self, trigger: Trigger) {
             self.inner.background(trigger);
         }
@@ -3922,11 +3998,20 @@ pub(crate) mod owed_clone {
         ) -> Result<OwedClone, String> {
             (self.owed)(readback)
         }
+        fn observe_empty_repositories(
+            &self,
+            execution: Option<repository_refresh::Execution>,
+        ) -> Result<Option<crate::init_github::RepositoryReadback>, String> {
+            match self.observe {
+                Some(observe) => observe(execution),
+                None => Ok(None),
+            }
+        }
         fn clone_owed(
             &self,
-            _execution: Option<repository_refresh::Execution>,
+            execution: Option<repository_refresh::Execution>,
         ) -> Result<crate::init::CloneOwedOutcome, String> {
-            (self.clone)()
+            (self.clone)(execution)
         }
         fn refresh_repositories(
             &self,
@@ -4017,12 +4102,13 @@ pub(crate) mod owed_clone {
         let owed = |_: Option<&crate::init_github::RepositoryReadback>| {
             Ok(OwedClone::Due("the GitHub token is here".to_owned()))
         };
-        let clone = || panic!("a Stop before repository cloning must hold it");
+        let clone = |_| panic!("a Stop before repository cloning must hold it");
         let ports = Hooked {
             inner: Inert::new(scratch.path()),
             held: &held,
             owed: &owed,
             clone: &clone,
+            observe: None,
             control: None,
             forget: &|| Ok(()),
         };
@@ -4078,7 +4164,8 @@ pub(crate) mod owed_clone {
             inner: Inert::new(scratch.path()),
             held: &held,
             owed: &|_| Ok(OwedClone::Nothing("aterm init owes no clone".into())),
-            clone: &|| panic!("nothing is owed"),
+            clone: &|_| panic!("nothing is owed"),
+            observe: None,
             control: None,
             forget: &|| Ok(()),
         };
@@ -4227,13 +4314,12 @@ pub(crate) mod owed_clone {
         sys
     }
 
-    /// `n` subscriber passes over an owed clone: each one's clone row, and how many times the
-    /// GitHub step asked `GET /user` in all.
-    fn owed_passes(
+    /// Real owed-clone ports over the inert native system, retained for the whole scenario.
+    fn with_owed_ports<T>(
         sys: &crate::port::Fake,
         state: &Path,
-        n: usize,
-    ) -> (Vec<(Outcome, Option<String>)>, usize) {
+        run: impl FnOnce(&dyn Ports) -> T,
+    ) -> T {
         let held = || None;
         let owed = |readback: Option<&crate::init_github::RepositoryReadback>| {
             crate::init::owed_clone_in_pass(
@@ -4244,33 +4330,137 @@ pub(crate) mod owed_clone {
                 aterm_secrets::converge::RepositoryWork::Refresh,
             )
         };
-        let clone = || crate::init::clone_owed(sys, state);
+        let clone = |_| crate::init::clone_owed(sys, state);
         let ports = Hooked {
             inner: Inert::new(state),
             held: &held,
             owed: &owed,
             clone: &clone,
+            observe: None,
             control: None,
             forget: &|| crate::init::forget_owed_clone(state),
         };
-        let mut said = Vec::new();
-        for _ in 0..n {
-            let pass = ran(converge(
-                &ports,
-                Trigger::Subscriber,
-                Mode::Apply,
-                aterm_secrets::converge::RepositoryWork::Refresh,
-                &mut |_| {},
-            ));
-            let clone_row = row(&pass.rows, CLONE);
-            said.push((clone_row.outcome, clone_row.why.clone()));
-        }
+        run(&ports)
+    }
+
+    /// `n` subscriber passes over an owed clone: each one's clone row, and how many times the
+    /// GitHub step asked `GET /user` in all.
+    fn owed_passes(
+        sys: &crate::port::Fake,
+        state: &Path,
+        n: usize,
+    ) -> (Vec<(Outcome, Option<String>)>, usize) {
+        let said = with_owed_ports(sys, state, |ports| {
+            (0..n)
+                .map(|_| {
+                    let pass = ran(converge(
+                        ports,
+                        Trigger::Subscriber,
+                        Mode::Apply,
+                        aterm_secrets::converge::RepositoryWork::Refresh,
+                        &mut |_| {},
+                    ));
+                    let clone_row = row(&pass.rows, CLONE);
+                    (clone_row.outcome, clone_row.why.clone())
+                })
+                .collect()
+        });
         let asked = sys
             .calls()
             .iter()
             .filter(|call| call.contains("agh GET /user"))
             .count();
         (said, asked)
+    }
+
+    #[test]
+    fn a_standing_row_with_a_refused_token_waits_for_changed_input_and_then_recovers() {
+        for failure in [
+            crate::port::GithubFailure::Unauthenticated,
+            crate::port::GithubFailure::Unreached,
+            crate::port::GithubFailure::Other,
+        ] {
+            let scratch = aterm_tempfile::tempdir().unwrap();
+            let sys = profiled("alice", Err(failure));
+            if failure == crate::port::GithubFailure::Unauthenticated {
+                // Queue recovery before the first request consumes its scripted refusal.
+                let user = crate::port::System::identity(&sys).unwrap().user;
+                crate::git_credential::script::launcher(&sys, &user);
+                crate::git_credential::script::alike(&sys, &user);
+                crate::git_credential::script::lookups_hold(
+                    &sys,
+                    &user,
+                    crate::git_credential::GITHUB,
+                    "alice",
+                    "fixture_token_next",
+                );
+                sys.on_github_api(
+                    &user,
+                    "/user",
+                    Ok(crate::port::GithubResponse {
+                        status: 200,
+                        headers: Vec::new(),
+                        body: br#"{"login":"alice"}"#.to_vec(),
+                    }),
+                );
+                sys.on_github_api(&user, "/user/repos?affiliation=owner&visibility=all&per_page=30&sort=full_name&direction=asc&page=1", Ok(crate::port::GithubResponse {
+                    status: 200, headers: Vec::new(), body: b"[]".to_vec(),
+                }));
+            }
+            owe_a_clone(scratch.path());
+            with_owed_ports(&sys, scratch.path(), |ports| {
+                let pass = || {
+                    ran(converge(
+                        ports,
+                        Trigger::Subscriber,
+                        Mode::Apply,
+                        aterm_secrets::converge::RepositoryWork::Refresh,
+                        &mut |_| {},
+                    ))
+                };
+                let first = pass();
+                if failure != crate::port::GithubFailure::Unauthenticated {
+                    assert!(
+                        !first.waits_for_input(),
+                        "an unclassified or unreachable failure keeps its retry"
+                    );
+                    return;
+                }
+                assert!(
+                    first.waits_for_input(),
+                    "an unchanged known refused token must not request a timed retry"
+                );
+                assert!(!first.complete());
+                assert_ne!(row(&first.rows, CLONE).outcome, Outcome::Person);
+                let again = pass();
+                assert!(again.waits_for_input());
+                let probes = || {
+                    sys.calls()
+                        .iter()
+                        .filter(|call| call.ends_with(" agh GET /user"))
+                        .count()
+                };
+                assert_eq!(
+                    probes(),
+                    1,
+                    "the unchanged token is not authenticated again"
+                );
+
+                sys.vault_set(
+                    "/Users//alice",
+                    crate::init_github::TOKEN_ENTRY,
+                    b"fixture_token_next",
+                );
+                let recovered = pass();
+                assert!(recovered.complete(), "{:#?}", recovered.rows);
+                assert!(!recovered.waits_for_input());
+                assert_eq!(
+                    probes(),
+                    2,
+                    "a new token receives one new authentication probe"
+                );
+            });
+        }
     }
 
     /// Nothing loops: the vault's token landed, but it signs in as another account than
@@ -4379,12 +4569,13 @@ pub(crate) mod owed_clone {
         let owed = |readback: Option<&crate::init_github::RepositoryReadback>| {
             crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE, readback)
         };
-        let clone = || crate::init::clone_owed(&sys, &state);
+        let clone = |_| crate::init::clone_owed(&sys, &state);
         let ports = Hooked {
             inner: Inert::new(scratch.path()),
             held: &held,
             owed: &owed,
             clone: &clone,
+            observe: None,
             control: None,
             forget: &|| crate::init::forget_owed_clone(&state),
         };
@@ -4480,7 +4671,7 @@ pub(crate) mod owed_clone {
             let owed = |readback: Option<&crate::init_github::RepositoryReadback>| {
                 crate::init::owed_clone(&sys, &state, &now, readback)
             };
-            let clone = || {
+            let clone = |_| {
                 cloned.store(true, Ordering::SeqCst);
                 Ok(crate::init::CloneOwedOutcome {
                     said: "cloned".to_owned(),
@@ -4492,6 +4683,7 @@ pub(crate) mod owed_clone {
                 held: &held,
                 owed: &owed,
                 clone: &clone,
+                observe: None,
                 control: Some(&control),
                 forget: &|| crate::init::forget_owed_clone(&state),
             };
@@ -4588,7 +4780,8 @@ pub(crate) mod owed_clone {
     /// `work` (`~/unborn`), a checkout without a commit of `empty`, an empty bare repository,
     /// under `origin`, the GitHub name the vault's scripted inventory selects. `sys` runs each
     /// git command in `work` or naming `origin` for real, reading `empty` wherever a remote
-    /// read or fetch names `origin`; `advertisements` counts the remote reads.
+    /// read or fetch names `origin`, and stats the index real git leaves in `work`;
+    /// `advertisements` counts the remote reads.
     pub(crate) struct EmptyRemote<'a> {
         pub(crate) repos: crate::checkout::tests::Repos<'a>,
         pub(crate) sys: crate::port::Fake,
@@ -4654,7 +4847,7 @@ pub(crate) mod owed_clone {
             empty.clone(),
             std::ffi::OsString::from(origin.clone()),
         );
-        sys.simulate(move |_, command| {
+        sys.simulate(move |sys, command| {
             let in_work = command
                 .args
                 .windows(2)
@@ -4684,7 +4877,13 @@ pub(crate) mod owed_clone {
                     }
                 }
             }
-            Some(Live::new().run_complete_stdout(&command).unwrap())
+            let result = Live::new().run_complete_stdout(&command).unwrap();
+            // Keep the fixture's filesystem view current with the index real Git writes.
+            let index = at.join(".git/index");
+            if let Ok(written) = Live::new().stat(&index) {
+                sys.stat_of(index.to_str().unwrap(), written);
+            }
+            Some(result)
         });
         let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&repos.who));
         let state = home.join("sync-state");
@@ -4745,7 +4944,8 @@ pub(crate) mod owed_clone {
                 inner: Inert::new(&state),
                 held: &|| None::<String>,
                 owed: &owed,
-                clone: &|| panic!("a plan clones nothing"),
+                clone: &|_| panic!("a plan clones nothing"),
+                observe: None,
                 control: None,
                 forget: &|| Ok(()),
             };
@@ -4780,13 +4980,14 @@ pub(crate) mod owed_clone {
         let owed = |readback: Option<&crate::init_github::RepositoryReadback>| {
             crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE, readback)
         };
-        let clone = || crate::init::clone_owed(&sys, &state);
+        let clone = |_| crate::init::clone_owed(&sys, &state);
         let forget = || crate::init::forget_owed_clone(&state);
         let ports = Hooked {
             inner: Inert::new(&state),
             held: &held,
             owed: &owed,
             clone: &clone,
+            observe: None,
             control: None,
             forget: &forget,
         };
@@ -4871,7 +5072,7 @@ pub(crate) mod owed_clone {
         let cloned = AtomicU32::new(0);
         let after_probe = AtomicU32::new(u32::MAX);
         let guard_validations = AtomicU32::new(u32::MAX);
-        let clone = || {
+        let clone = |_| {
             if cloned.load(Ordering::SeqCst) == 0 {
                 guard_validations.store(
                     validations
@@ -4900,9 +5101,9 @@ pub(crate) mod owed_clone {
             assert!(
                 matches!(
                     read(None, &crate::init::Holds::NONE)?,
-                    OwedClone::Unobserved(_)
+                    OwedClone::Verified(_)
                 ),
-                "no durable completion substitutes for the item's proof"
+                "the owned durable observation is reusable after the item ends"
             );
             if cloned.fetch_add(1, Ordering::SeqCst) == 0 {
                 let mut left = crate::init::Holds::NONE;
@@ -5039,6 +5240,7 @@ pub(crate) mod owed_clone {
             held: &held,
             owed: &owed,
             clone: &clone,
+            observe: None,
             control: Some(&control),
             forget: &|| crate::init::forget_owed_clone(&state),
         };
@@ -5074,13 +5276,25 @@ pub(crate) mod owed_clone {
             1,
             "all read-backs reuse the current item's admission"
         );
+        let checked_before = validations.load(Ordering::SeqCst);
         assert!(
             matches!(
                 read(None, &crate::init::Holds::NONE).unwrap(),
-                OwedClone::Unobserved(_)
+                OwedClone::Verified(_)
             ),
-            "a later item needs its own current admission"
+            "a later local item can reuse the durable observation"
         );
+        assert!(
+            validations.load(Ordering::SeqCst) > checked_before,
+            "reuse still requires its own current local admission"
+        );
+        // A real local input move calls for another acquisition. That acquisition's source
+        // then moves before readback, so neither its ephemeral nor durable proof can settle it.
+        repos.g(&work, &["symbolic-ref", "HEAD", "refs/heads/later-pass"]);
+        assert!(matches!(
+            read(None, &crate::init::Holds::NONE).unwrap(),
+            OwedClone::Unobserved(_)
+        ));
         let changed = ran(converge(
             &ports,
             Trigger::Subscriber,
@@ -5102,13 +5316,663 @@ pub(crate) mod owed_clone {
         );
     }
 
-    /// A checkout without a commit is acquisition's, never the refresh's: each Refresh pass's
-    /// `sync.clone` reads that remote once (a commit there would be acquired, never assumed
-    /// away) and its read-back verifies the empty one, and `sync.refresh` reads it no second
-    /// time. An acquisition that proves nothing fails the row instead of reading in step.
-    /// CONTROL: a plan plans the read as a change and reads no remote.
+    /// Real Git and the on-disk alignment record: a fresh local pass reuses an empty-origin
+    /// observation, writes no change journal entry and runs no acquisition. Physical identity
+    /// and branch/ref changes each prevent reuse; a refresh observes anew, and one that cannot
+    /// read the remote leaves no evidence. A moved source is
+    /// `empty_origin_evidence_is_not_reused_under_another_refresh_scope`'s.
     #[test]
-    fn an_empty_remote_checked_out_is_read_once_by_acquisition_in_every_refresh_pass() {
+    fn an_empty_checkout_is_verified_across_passes_without_repeating_acquisition() {
+        use crate::port::{Live, System};
+        use aterm_secrets::converge::RepositoryWork;
+
+        let live = Live::new();
+        let EmptyRemote {
+            repos,
+            mut sys,
+            ctx,
+            state,
+            work,
+            empty,
+            origin,
+            advertisements,
+            ..
+        } = empty_remote(&live, "sync-durable-empty");
+        sys.repository_record_file = Some(state.clone());
+        let refresh = AtomicBool::new(false);
+        let acquisitions = AtomicU32::new(0);
+        let selected = || {
+            if refresh.load(Ordering::SeqCst) {
+                RepositoryWork::Refresh
+            } else {
+                RepositoryWork::Repair
+            }
+        };
+        let owed = |readback: Option<&crate::init_github::RepositoryReadback>| {
+            crate::init::owed_clone_captured(
+                &sys,
+                &state,
+                &crate::init::Holds::NONE,
+                crate::init_github::InitialRepositoryInputs::capture(&sys, &ctx)?,
+                || Ok(true),
+                readback,
+                selected(),
+            )
+        };
+        let clone = |execution| {
+            acquisitions.fetch_add(1, Ordering::SeqCst);
+            crate::init::clone_owed_captured(
+                &sys,
+                &state,
+                crate::init_github::InitialRepositoryInputs::capture(&sys, &ctx)?
+                    .with_repository_execution(execution),
+                || Ok(true),
+            )
+        };
+        let observe = |execution| {
+            crate::init_github::observe_empty_repositories_captured(
+                &sys,
+                &ctx,
+                crate::init_github::InitialRepositoryInputs::capture(&sys, &ctx)?
+                    .with_repository_execution(execution),
+                || Ok(true),
+            )
+        };
+        let ports = Hooked {
+            inner: Inert::new(&state),
+            held: &|| None,
+            owed: &owed,
+            clone: &clone,
+            observe: Some(&observe),
+            control: None,
+            forget: &|| crate::init::forget_owed_clone(&state),
+        };
+        let pass = || {
+            ran(converge(
+                &ports,
+                Trigger::Subscriber,
+                Mode::Apply,
+                selected(),
+                &mut |_| {},
+            ))
+        };
+        assert!(matches!(owed(None).unwrap(), OwedClone::Unobserved(_)));
+        let first = pass();
+        assert_eq!(row(&first.rows, CLONE).outcome, Outcome::Ok, "{first:?}");
+        assert_eq!(advertisements.load(Ordering::SeqCst), 1);
+        let journal = FileJournal::under(&state).path();
+        let before = std::fs::read(&journal).unwrap_or_default();
+        let second = pass();
+        assert_eq!(row(&second.rows, CLONE).outcome, Outcome::Ok, "{second:?}");
+        assert!(second.complete(), "{second:?}");
+        assert_eq!(
+            advertisements.load(Ordering::SeqCst),
+            1,
+            "local repair reads no remote"
+        );
+        assert_eq!(
+            acquisitions.load(Ordering::SeqCst),
+            0,
+            "observations need no acquisition"
+        );
+        assert_eq!(
+            std::fs::read(&journal).unwrap_or_default(),
+            before,
+            "a second local pass journals no change"
+        );
+
+        let receipt = repository_refresh::record_path(&state);
+        let bytes = std::fs::read(&receipt).unwrap();
+        let record: aterm_json::Value = aterm_json::from_slice(&bytes).unwrap();
+        let evidence = &record["repositories"]["empty"];
+        assert_eq!(evidence["subjects"].as_object().unwrap().len(), 1);
+        let digest = |text: &str| {
+            text.len() == 64
+                && text
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        assert!(
+            evidence["subjects"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .all(|(checkout, subject)| {
+                    digest(checkout) && subject.as_str().is_some_and(digest)
+                }),
+            "stored checkout evidence contains digests alone"
+        );
+        // A fresh native owner also reuses the disk evidence and leaves its receipt untouched.
+        let version = live.file_version(&receipt).unwrap();
+        let captured = crate::init_github::InitialRepositoryInputs::capture(&sys, &ctx).unwrap();
+        let native = crate::init_github::run_initial_repositories_captured(
+            &sys,
+            &ctx,
+            Mode::Apply,
+            RepositoryWork::Repair,
+            crate::init_github::RepositorySteps::Both,
+            captured,
+            || Ok(true),
+        )
+        .unwrap();
+        assert!(
+            native.iter().all(|row| !row.outcome.is_failure()),
+            "{native:?}"
+        );
+        assert_eq!(advertisements.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            live.file_version(&receipt).unwrap(),
+            version,
+            "unchanged evidence rewrites no receipt"
+        );
+        assert_eq!(std::fs::read(&receipt).unwrap(), bytes);
+
+        // A changed unborn branch is a different local subject. Re-observation replaces the
+        // old key, so returning to that branch does not revive the retired observation.
+        let branch = repos.g(&work, &["symbolic-ref", "HEAD"]);
+        repos.g(&work, &["symbolic-ref", "HEAD", "refs/heads/another"]);
+        assert!(matches!(owed(None).unwrap(), OwedClone::Unobserved(_)));
+        assert_eq!(row(&pass().rows, CLONE).outcome, Outcome::Ok);
+        repos.g(&work, &["symbolic-ref", "HEAD", &branch]);
+        assert!(matches!(owed(None).unwrap(), OwedClone::Unobserved(_)));
+        assert_eq!(row(&pass().rows, CLONE).outcome, Outcome::Ok);
+        assert_eq!(advertisements.load(Ordering::SeqCst), 3);
+
+        // Local refs can move while HEAD remains unborn and its branch and storage stay put.
+        let tree = repos.g(&work, &["mktree"]);
+        repos.g(&work, &["update-ref", "refs/tags/observation", &tree]);
+        assert!(matches!(owed(None).unwrap(), OwedClone::Unobserved(_)));
+        assert_eq!(row(&pass().rows, CLONE).outcome, Outcome::Ok);
+        repos.g(&work, &["update-ref", "-d", "refs/tags/observation"]);
+        assert!(matches!(owed(None).unwrap(), OwedClone::Unobserved(_)));
+        assert_eq!(row(&pass().rows, CLONE).outcome, Outcome::Ok);
+        assert_eq!(advertisements.load(Ordering::SeqCst), 5);
+
+        // Replacing the checkout at the same path never borrows its predecessor's evidence.
+        let preserved = work.with_file_name("previous-empty-checkout");
+        std::fs::rename(&work, &preserved).unwrap();
+        repos.clone_into(&empty, &work);
+        repos.g(&work, &["remote", "set-url", "origin", &origin]);
+        for path in [work.clone(), work.join(".git"), work.join(".git/objects")] {
+            sys.file_id_of(&path, live.file_id(&path).unwrap());
+        }
+        assert!(matches!(owed(None).unwrap(), OwedClone::Unobserved(_)));
+        assert_eq!(row(&pass().rows, CLONE).outcome, Outcome::Ok);
+        assert_eq!(advertisements.load(Ordering::SeqCst), 6);
+
+        refresh.store(true, Ordering::SeqCst);
+        assert_eq!(row(&pass().rows, CLONE).outcome, Outcome::Ok);
+        assert_eq!(
+            advertisements.load(Ordering::SeqCst),
+            7,
+            "a refresh renews the observation"
+        );
+        let refreshed = pass();
+        assert_eq!(
+            row(&refreshed.rows, CLONE).outcome,
+            Outcome::Ok,
+            "{refreshed:?}"
+        );
+        assert_eq!(advertisements.load(Ordering::SeqCst), 8);
+        assert_eq!(acquisitions.load(Ordering::SeqCst), 0);
+        let acquisitions_in = |bytes: &[u8]| {
+            std::str::from_utf8(bytes)
+                .unwrap()
+                .lines()
+                .map(|line| aterm_json::from_str::<aterm_json::Value>(line).unwrap())
+                .filter(|entry| {
+                    entry["id"].as_str() == Some(CLONE)
+                        || entry["id"]
+                            .as_str()
+                            .is_some_and(|id| id.starts_with("init.github.native@"))
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            acquisitions_in(&std::fs::read(&journal).unwrap_or_default()),
+            acquisitions_in(&before),
+            "unchanged refresh observations journal no acquisition"
+        );
+        refresh.store(false, Ordering::SeqCst);
+        assert_eq!(row(&pass().rows, CLONE).outcome, Outcome::Ok);
+        assert_eq!(advertisements.load(Ordering::SeqCst), 8);
+
+        // A refresh that cannot observe the remote retires its prior positive evidence.
+        let remote = sys
+            .calls()
+            .into_iter()
+            .rev()
+            .find(|call| call.contains("ls-remote") && !call.contains("--get-url"))
+            .unwrap();
+        sys.refuse_complete_stdout(&remote, "the fixture remote is unavailable");
+        refresh.store(true, Ordering::SeqCst);
+        let failed = pass();
+        assert!(row(&failed.rows, CLONE).outcome.is_failure(), "{failed:?}");
+        refresh.store(false, Ordering::SeqCst);
+        assert!(
+            !matches!(owed(None).unwrap(), OwedClone::Verified(_)),
+            "failed observation retires old evidence"
+        );
+    }
+
+    /// [`EmptyRemote`]'s `sync.clone` over the alignment record `sys` keeps on disk, its ports
+    /// kept for the whole scenario: `run` is handed one converge pass and the row's own read with
+    /// no read-back, each of the work `refresh` selects (a Refresh while it holds, else a
+    /// Repair). Each acquisition's captured source reads as current while `current` says so.
+    fn with_durable_ports<T>(
+        sys: &crate::port::Fake,
+        ctx: &crate::items::Ctx,
+        state: &Path,
+        refresh: &AtomicBool,
+        current: &Arc<dyn Fn() -> bool + Send + Sync>,
+        run: impl FnOnce(&dyn Fn() -> Pass, &dyn Fn() -> Result<OwedClone, String>) -> T,
+    ) -> T {
+        use aterm_secrets::converge::RepositoryWork;
+        assert_eq!(sys.repository_record_file.as_deref(), Some(state));
+        let selected = || {
+            if refresh.load(Ordering::SeqCst) {
+                RepositoryWork::Refresh
+            } else {
+                RepositoryWork::Repair
+            }
+        };
+        let owed = |readback: Option<&crate::init_github::RepositoryReadback>| {
+            crate::init::owed_clone_captured(
+                sys,
+                state,
+                &crate::init::Holds::NONE,
+                crate::init_github::InitialRepositoryInputs::capture(sys, ctx)?,
+                || Ok(true),
+                readback,
+                selected(),
+            )
+        };
+        let clone = |execution| {
+            let current = Arc::clone(current);
+            crate::init::clone_owed_captured(
+                sys,
+                state,
+                crate::init_github::InitialRepositoryInputs::capture(sys, ctx)?
+                    .with_repository_execution(execution),
+                move || Ok(current()),
+            )
+        };
+        let ports = Hooked {
+            inner: Inert::new(state),
+            held: &|| None,
+            owed: &owed,
+            clone: &clone,
+            control: None,
+            observe: None,
+            forget: &|| crate::init::forget_owed_clone(state),
+        };
+        let pass = || {
+            ran(converge(
+                &ports,
+                Trigger::Subscriber,
+                Mode::Apply,
+                selected(),
+                &mut |_| {},
+            ))
+        };
+        run(&pass, &|| owed(None))
+    }
+
+    /// The empty-origin evidence in the alignment record on disk under `state` (`Null`: none).
+    fn empty_evidence(state: &Path) -> aterm_json::Value {
+        let bytes = std::fs::read(repository_refresh::record_path(state)).unwrap();
+        let record: aterm_json::Value = aterm_json::from_slice(&bytes).unwrap();
+        record["repositories"]["empty"].clone()
+    }
+
+    /// Real Git and the on-disk alignment record: an acquisition retires a checkout's empty-origin
+    /// evidence before it reads the remote, so a probe that reads the remote and then stops short
+    /// of its own verdict leaves no evidence for a later pass to reuse. Here the remote gains its
+    /// first commit, and a Refresh's acquisition reads it and then finds its source moved: the
+    /// receipt holds no evidence, the next Repair read finds the checkout unobserved, and that
+    /// pass acquires the first commit.
+    /// NEGATIVE CONTROL: without the clear `NativeRepositories::probe` makes before its remote
+    /// reads (`self.remember_empty(sys, &plan, true)`), the stopped probe leaves the old evidence
+    /// in the receipt and the next Repair read counts the checkout `Verified`, which then stays
+    /// without its first commit until a Refresh.
+    #[test]
+    fn a_remote_read_that_stops_before_its_verdict_leaves_no_empty_evidence() {
+        use crate::port::System;
+        let live = crate::port::Live::new();
+        let EmptyRemote {
+            repos,
+            mut sys,
+            ctx,
+            state,
+            work,
+            empty,
+            advertisements,
+            ..
+        } = empty_remote(&live, "sync-empty-stopped");
+        sys.repository_record_file = Some(state.clone());
+        let refresh = AtomicBool::new(false);
+        // The remote reads after which an acquisition's captured source reads as moved.
+        let moves_after = Arc::new(AtomicU32::new(u32::MAX));
+        let (served, after) = (Arc::clone(&advertisements), Arc::clone(&moves_after));
+        let current: Arc<dyn Fn() -> bool + Send + Sync> =
+            Arc::new(move || served.load(Ordering::SeqCst) <= after.load(Ordering::SeqCst));
+        with_durable_ports(&sys, &ctx, &state, &refresh, &current, |pass, owed| {
+            let first = pass();
+            assert_eq!(
+                row(&first.rows, CLONE).outcome,
+                Outcome::Changed,
+                "{first:?}"
+            );
+            assert!(matches!(owed().unwrap(), OwedClone::Verified(_)));
+            assert_eq!(
+                empty_evidence(&state)["subjects"]
+                    .as_object()
+                    .unwrap()
+                    .len(),
+                1
+            );
+
+            // The publisher adds the first commit after this clone was legitimately empty.
+            repos.g(
+                &repos.seed,
+                &["push", "--quiet", empty.to_str().unwrap(), "main"],
+            );
+            let tip = repos.head(&repos.seed);
+            let read = advertisements.load(Ordering::SeqCst);
+            moves_after.store(read, Ordering::SeqCst);
+            refresh.store(true, Ordering::SeqCst);
+            let stopped = pass();
+            refresh.store(false, Ordering::SeqCst);
+            moves_after.store(u32::MAX, Ordering::SeqCst);
+            assert_eq!(
+                advertisements.load(Ordering::SeqCst),
+                read + 1,
+                "the acquisition read the remote before its source moved: {stopped:?}"
+            );
+            assert!(
+                !matches!(
+                    row(&stopped.rows, CLONE).outcome,
+                    Outcome::Ok | Outcome::Changed
+                ),
+                "{stopped:?}"
+            );
+            assert!(
+                !live
+                    .run_complete_stdout(
+                        &crate::checkout::git(&live, &repos.who, Some(&work)).args([
+                            "rev-parse",
+                            "--verify",
+                            "--quiet",
+                            "HEAD^{commit}",
+                        ])
+                    )
+                    .unwrap()
+                    .success(),
+                "the stopped pass acquired nothing"
+            );
+            assert!(
+                empty_evidence(&state).is_null(),
+                "the stopped read leaves no empty evidence: {}",
+                empty_evidence(&state)
+            );
+            assert!(
+                matches!(owed().unwrap(), OwedClone::Unobserved(_)),
+                "the next Repair does not count the checkout verified"
+            );
+            let repaired = pass();
+            assert_eq!(
+                row(&repaired.rows, CLONE).outcome,
+                Outcome::Changed,
+                "{repaired:?}"
+            );
+            assert!(
+                advertisements.load(Ordering::SeqCst) > read + 1,
+                "the Repair reads the remote again"
+            );
+            assert_eq!(
+                repos.head(&work),
+                tip,
+                "the Repair acquired the first commit"
+            );
+        });
+    }
+
+    /// Real Git and the on-disk alignment record: empty-origin evidence holds only for the
+    /// refresh scope that recorded it. A new private inventory naming the same repository moves
+    /// only that scope, the checkout and its remote staying as they were: the checkout reads
+    /// unobserved, and the next Repair pass reads its remote again and records evidence under
+    /// the new scope. CONTROL: with the recorded inventory back, the same untouched evidence
+    /// verifies the checkout again.
+    /// NEGATIVE CONTROL: without the scope comparison in `EmptyCheckouts::has_checkout` and
+    /// `EmptyCheckouts::contains` (`self.scope == Some(scope)`), the new inventory inherits the
+    /// old evidence and the checkout reads `Verified` with no remote read.
+    #[test]
+    fn empty_origin_evidence_is_not_reused_under_another_refresh_scope() {
+        let live = crate::port::Live::new();
+        let EmptyRemote {
+            repos,
+            mut sys,
+            ctx,
+            state,
+            advertisements,
+            ..
+        } = empty_remote(&live, "sync-empty-scope");
+        sys.repository_record_file = Some(state.clone());
+        let inventory = |id| {
+            crate::init_github::scripted::metadata(
+                &sys,
+                &repos.who,
+                aterm_json::json!([crate::init_github::scripted::repository(
+                    &repos.who.name,
+                    "unborn",
+                    id
+                )]),
+            );
+        };
+        let current: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| true);
+        let refresh = AtomicBool::new(false);
+        with_durable_ports(&sys, &ctx, &state, &refresh, &current, |pass, owed| {
+            let first = pass();
+            assert_eq!(
+                row(&first.rows, CLONE).outcome,
+                Outcome::Changed,
+                "{first:?}"
+            );
+            assert_eq!(advertisements.load(Ordering::SeqCst), 1);
+            assert!(matches!(owed().unwrap(), OwedClone::Verified(_)));
+            let receipt = repository_refresh::record_path(&state);
+            let recorded = std::fs::read(&receipt).unwrap();
+            let scope = empty_evidence(&state)["scope"].clone();
+            assert!(!scope.is_null(), "{}", empty_evidence(&state));
+
+            inventory(2);
+            assert!(
+                matches!(owed().unwrap(), OwedClone::Unobserved(_)),
+                "evidence recorded under another scope is not reused"
+            );
+            assert_eq!(
+                std::fs::read(&receipt).unwrap(),
+                recorded,
+                "a read rewrites no receipt"
+            );
+            inventory(1);
+            assert!(
+                matches!(owed().unwrap(), OwedClone::Verified(_)),
+                "the recorded scope's evidence still verifies the checkout"
+            );
+
+            inventory(2);
+            let renewed = pass();
+            assert_eq!(
+                row(&renewed.rows, CLONE).outcome,
+                Outcome::Changed,
+                "{renewed:?}"
+            );
+            assert_eq!(
+                advertisements.load(Ordering::SeqCst),
+                2,
+                "the new scope reads the remote again"
+            );
+            let evidence = empty_evidence(&state);
+            assert_eq!(evidence["subjects"].as_object().unwrap().len(), 1);
+            assert_ne!(
+                evidence["scope"], scope,
+                "the new evidence names the new scope"
+            );
+            assert_eq!(row(&pass().rows, CLONE).outcome, Outcome::Ok);
+            assert_eq!(advertisements.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    /// A newly published first commit survives the observation phase as real acquisition;
+    /// owner work instead remains unfinished and untouched. Neither can be relabeled empty.
+    #[test]
+    fn empty_observation_keeps_first_commit_acquisition_and_preserves_owner_work() {
+        use crate::port::{Live, System};
+        use aterm_secrets::converge::RepositoryWork;
+        let live = Live::new();
+        for preserved in [false, true] {
+            let EmptyRemote {
+                repos,
+                mut sys,
+                ctx,
+                state,
+                work,
+                empty,
+                advertisements,
+                ..
+            } = empty_remote(&live, "sync-empty-observe-first-commit");
+            sys.repository_record_file = Some(state.clone());
+            let acquisitions = AtomicU32::new(0);
+            let owed = |readback: Option<&crate::init_github::RepositoryReadback>| {
+                crate::init::owed_clone_captured(
+                    &sys,
+                    &state,
+                    &crate::init::Holds::NONE,
+                    crate::init_github::InitialRepositoryInputs::capture(&sys, &ctx)?,
+                    || Ok(true),
+                    readback,
+                    RepositoryWork::Refresh,
+                )
+            };
+            let observe = |execution| {
+                crate::init_github::observe_empty_repositories_captured(
+                    &sys,
+                    &ctx,
+                    crate::init_github::InitialRepositoryInputs::capture(&sys, &ctx)?
+                        .with_repository_execution(execution),
+                    || Ok(true),
+                )
+            };
+            let clone = |execution| {
+                acquisitions.fetch_add(1, Ordering::SeqCst);
+                crate::init::clone_owed_captured(
+                    &sys,
+                    &state,
+                    crate::init_github::InitialRepositoryInputs::capture(&sys, &ctx)?
+                        .with_repository_execution(execution),
+                    || Ok(true),
+                )
+            };
+            let ports = Hooked {
+                inner: Inert::new(&state),
+                held: &|| None,
+                owed: &owed,
+                clone: &clone,
+                observe: Some(&observe),
+                control: None,
+                forget: &|| crate::init::forget_owed_clone(&state),
+            };
+            let pass = |mode| {
+                ran(converge(
+                    &ports,
+                    Trigger::Subscriber,
+                    mode,
+                    RepositoryWork::Refresh,
+                    &mut |_| {},
+                ))
+            };
+            let denied = crate::init_github::observe_empty_repositories_captured(
+                &sys,
+                &ctx,
+                crate::init_github::InitialRepositoryInputs::capture(&sys, &ctx).unwrap(),
+                || Ok(false),
+            )
+            .unwrap();
+            assert!(denied.is_none());
+            assert_eq!(
+                advertisements.load(Ordering::SeqCst),
+                0,
+                "a withheld source fence reads no remote"
+            );
+            let planned = pass(Mode::Plan);
+            assert_eq!(row(&planned.rows, CLONE).outcome, Outcome::Planned);
+            assert_eq!(
+                advertisements.load(Ordering::SeqCst),
+                0,
+                "a plan performs no observation"
+            );
+            let verified = pass(Mode::Apply);
+            assert_eq!(
+                row(&verified.rows, CLONE).outcome,
+                Outcome::Ok,
+                "{verified:?}"
+            );
+            assert_eq!(acquisitions.load(Ordering::SeqCst), 0);
+            assert_eq!(advertisements.load(Ordering::SeqCst), 1);
+            let owner_file = work.join("README");
+            if preserved {
+                std::fs::write(&owner_file, b"owner work\n").unwrap();
+            }
+            let branch_before = std::fs::read(work.join(".git/HEAD")).unwrap();
+            let index_before = std::fs::read(work.join(".git/index")).ok();
+            let owner_identity = preserved.then(|| live.file_id(&owner_file).unwrap());
+            repos.g(
+                &repos.seed,
+                &["push", "--quiet", empty.to_str().unwrap(), "main"],
+            );
+            let expected = repos.head(&repos.seed);
+            let completed = pass(Mode::Apply);
+            let clone_row = row(&completed.rows, CLONE);
+            let journal = std::fs::read(FileJournal::under(&state).path()).unwrap_or_default();
+            let records: Vec<aterm_json::Value> = std::str::from_utf8(&journal)
+                .unwrap()
+                .lines()
+                .map(|line| aterm_json::from_str(line).unwrap())
+                .filter(|entry: &aterm_json::Value| entry["id"].as_str() == Some(CLONE))
+                .collect();
+            if preserved {
+                assert_ne!(clone_row.outcome, Outcome::Ok, "{completed:?}");
+                assert_ne!(clone_row.outcome, Outcome::Changed, "{completed:?}");
+                assert_eq!(std::fs::read(&owner_file).unwrap(), b"owner work\n");
+                assert_eq!(live.file_id(&owner_file).unwrap(), owner_identity.unwrap());
+                assert_eq!(
+                    std::fs::read(work.join(".git/HEAD")).unwrap(),
+                    branch_before
+                );
+                assert_eq!(std::fs::read(work.join(".git/index")).ok(), index_before);
+            } else {
+                assert_eq!(clone_row.outcome, Outcome::Changed, "{completed:?}");
+                assert_eq!(acquisitions.load(Ordering::SeqCst), 1);
+                assert_eq!(repos.head(&work), expected);
+                assert_eq!(std::fs::read(&owner_file).unwrap(), b"one\n");
+                assert_eq!(records.len(), 1, "real acquisition is journaled");
+            }
+            assert!(
+                !sys.calls()
+                    .iter()
+                    .any(|call| [" reset ", " clean ", " stash "]
+                        .iter()
+                        .any(|verb| call.contains(verb))),
+                "owner work is never discarded"
+            );
+        }
+    }
+
+    /// A refresh cannot borrow an older durable empty observation when its current producer
+    /// withholds readback. The local Repair reader can reuse it; the Refresh must fail.
+    #[test]
+    fn a_refresh_without_current_readback_cannot_borrow_durable_empty_evidence() {
         let live = crate::port::Live::new();
         // `repos` holds the scratch home: dropping it removes the checkout.
         let EmptyRemote {
@@ -5131,21 +5995,36 @@ pub(crate) mod owed_clone {
                 refresh,
             )
         };
-        let proves = AtomicBool::new(true);
-        let clone = || {
+        let seeded = crate::init::clone_owed_captured(
+            &sys,
+            &state,
+            crate::init_github::InitialRepositoryInputs::capture(&sys, &ctx).unwrap(),
+            || Ok(true),
+        )
+        .unwrap();
+        assert!(seeded.readback.is_some());
+        assert_eq!(advertisements.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            crate::init::owed_clone_in_pass(
+                &sys,
+                &state,
+                &crate::init::Holds::NONE,
+                None,
+                aterm_secrets::converge::RepositoryWork::Repair
+            )
+            .unwrap(),
+            OwedClone::Verified(_)
+        ));
+        let clone = |_| {
             let outcome = crate::init::clone_owed_captured(
                 &sys,
                 &state,
                 crate::init_github::InitialRepositoryInputs::capture(&sys, &ctx)?,
                 || Ok(true),
             )?;
-            Ok(if proves.load(Ordering::SeqCst) {
-                outcome
-            } else {
-                crate::init::CloneOwedOutcome {
-                    readback: None,
-                    ..outcome
-                }
+            Ok(crate::init::CloneOwedOutcome {
+                readback: None,
+                ..outcome
             })
         };
         let held = || None;
@@ -5154,6 +6033,7 @@ pub(crate) mod owed_clone {
             held: &held,
             owed: &owed,
             clone: &clone,
+            observe: None,
             control: None,
             forget: &|| crate::init::forget_owed_clone(&state),
         };
@@ -5166,35 +6046,12 @@ pub(crate) mod owed_clone {
                 &mut |_| {},
             ))
         };
-        let planned = pass(Mode::Plan);
-        assert_eq!(
-            row(&planned.rows, CLONE).outcome,
-            Outcome::Planned,
-            "{planned:?}"
-        );
+        let unproved = pass(Mode::Apply);
         assert_eq!(
             advertisements.load(Ordering::SeqCst),
-            0,
-            "a plan reads no remote"
+            2,
+            "a refresh obtains its own observation despite older durable evidence"
         );
-        for reads in 1..=2 {
-            let applied = pass(Mode::Apply);
-            let clone_row = row(&applied.rows, CLONE);
-            assert_eq!(clone_row.outcome, Outcome::Changed, "{applied:?}");
-            assert_eq!(
-                clone_row.to.as_deref(),
-                Some("vault repositories: 1 of 1 ready, verified on this machine"),
-                "{clone_row:?}"
-            );
-            assert!(applied.complete(), "{applied:?}");
-            assert_eq!(
-                advertisements.load(Ordering::SeqCst),
-                reads,
-                "each pass reads the remote once"
-            );
-        }
-        proves.store(false, Ordering::SeqCst);
-        let unproved = pass(Mode::Apply);
         let clone_row = row(&unproved.rows, CLONE);
         assert_eq!(clone_row.outcome, Outcome::Failed, "{unproved:?}");
         assert!(
@@ -5278,7 +6135,7 @@ pub(crate) mod owed_clone {
                 stopped.store(true, Ordering::SeqCst);
                 Ok(reading())
             };
-            let clone = || {
+            let clone = |_| {
                 cloned.store(true, Ordering::SeqCst);
                 Ok(crate::init::CloneOwedOutcome {
                     said: "cloned".to_owned(),
@@ -5290,6 +6147,7 @@ pub(crate) mod owed_clone {
                 held: &held,
                 owed: &owed,
                 clone: &clone,
+                observe: None,
                 control: None,
                 forget: &|| Ok(()),
             };

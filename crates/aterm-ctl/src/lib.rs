@@ -54,6 +54,9 @@ pub mod fleet_activity;
 pub mod fleet_telemetry;
 pub mod github_usage;
 mod graph_hygiene;
+mod peer_client;
+pub use graph_hygiene::{Served, session_served_in};
+pub use peer_client::PeerClient;
 /// The release-line holder query a fleet survey carries (`survey holder=…`) and its answer row.
 pub mod release_holder;
 pub use drift::{CastDriftFn, CastDriftJob, DriftCut, DriftPeer, LocalVerbs};
@@ -67,6 +70,8 @@ pub use remote::{
 mod survey;
 mod verb_first;
 mod vouch;
+#[cfg(any(test, debug_assertions))]
+pub use survey::survey_json_of_replies;
 pub use survey::{
     AuthenticatedPeer, DEFAULT_BUDGET, EXCERPT_CHARS, EXCERPT_WIDE_CHARS, EXCERPTS_CUT,
     FLEET_UNREAD, FLEET_WITHIN, FleetAsk, FleetRead, FleetRefused, FleetSurveyFn, HostAsk,
@@ -1020,6 +1025,14 @@ fn graph_entry_sock_in(dir: &Path, sid: aterm_types::control_request::Sid<'_>) -
     control_socket::graph_entry_sock(&body)
 }
 
+/// What this machine's discovery graph says of session `sid`: [`session_served_in`] over the
+/// control directory every instance publishes its sessions to or mirrors them into
+/// ([`aterm_uds::control_socket_dir`]); [`Served::Unknown`] with none.
+#[must_use]
+pub fn session_served(sid: &str) -> Served {
+    socket_dir().map_or(Served::Unknown, |dir| session_served_in(&dir, sid))
+}
+
 /// The socket of the instance hosting the session `sid`.
 #[must_use]
 pub fn hosting_sock(dir: &Path, sid: aterm_types::control_request::Sid<'_>) -> Option<String> {
@@ -1950,17 +1963,20 @@ pub fn exchange_lines(
     verb: &str,
     within: std::time::Duration,
 ) -> io::Result<Vec<String>> {
-    match probe_exchange(
-        stream,
-        Some(token),
-        None,
-        verb,
-        ProbeDeadline::after(within),
-    ) {
+    exchange_lines_until(stream, token, verb, ProbeDeadline::after(within))
+}
+
+fn exchange_lines_until(
+    stream: &CtlStream,
+    token: &str,
+    verb: &str,
+    deadline: ProbeDeadline,
+) -> io::Result<Vec<String>> {
+    match probe_exchange(stream, Some(token), None, verb, deadline) {
         Probe::Answered(lines) => Ok(lines),
         Probe::Timeout => Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("no answer within {}", deadline_words(within)),
+            format!("no answer within {}", deadline_words(deadline.budget)),
         )),
         Probe::Other(e) => Err(e),
         refused => Err(io::Error::other(probe_cause(0, &refused))),

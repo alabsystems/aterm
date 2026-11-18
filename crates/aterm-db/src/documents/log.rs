@@ -4,6 +4,7 @@
 use crate::documents::materialized::{Materialized, Read, materialize};
 use crate::{
     Error, Result,
+    checkpoint::Tip,
     database::{Cell, Change, Command},
     documents::{Cells, Unwritten},
     table::{
@@ -90,13 +91,17 @@ pub struct Snapshot {
 impl Snapshot {
     /// All locally retained operations have usable membership, ancestry and
     /// payloads. The store's withheld count includes missing causal parents.
-    /// This makes no claim about operations this replica has not seen.
+    /// This makes no claim about operations this replica has not seen. A revert refused for
+    /// naming an edit a final checkpoint settled is a judged record, not missing history.
     pub fn history_complete(&self) -> bool {
         self.withheld == 0
-            && self
-                .operations
-                .iter()
-                .all(|op| op.available && op.refusal.is_none())
+            && self.operations.iter().all(|op| {
+                op.available
+                    && op
+                        .refusal
+                        .as_deref()
+                        .is_none_or(|refusal| refusal == SETTLED_REVERT_REFUSAL)
+            })
     }
 }
 
@@ -110,11 +115,20 @@ pub(crate) struct Log {
     /// answer [`Self::observes`] without walking the graph.
     projection: Projection,
     records: BTreeMap<Digest, (Operation, Option<Command>)>,
+    /// The frontier of the floor the judgments below are made above: for a read, the settled
+    /// floor S's, the newest final checkpoint's ([`crate::checkpoint::finals`]); for a state's
+    /// digest, the cut it is of ([`Self::settled_at`]). A record at or below it is settled.
+    floor: Option<BTreeMap<Actor, Tip>>,
     conflicts: BTreeSet<Digest>,
+    /// The writers with an unavailable record above the floor.
     opaque_authors: BTreeSet<Actor>,
+    /// The records of `opaque_authors` above the floor, which their writers' unavailable
+    /// records hold back.
+    opaque: BTreeSet<Digest>,
     ordered: Vec<Digest>,
     eligible: BTreeSet<Digest>,
-    revert_refusals: BTreeSet<Digest>,
+    /// Each refused revert, with what refuses it.
+    revert_refusals: BTreeMap<Digest, &'static str>,
 }
 
 /// The last cells each recently read table made in this process, most recent first, so the next
@@ -128,6 +142,16 @@ const MATERIALIZED_TABLES: usize = 32;
 
 const REVERT_REFUSAL: &str =
     "revert does not name a structurally valid observed edit with the same keys";
+
+/// A revert above a final checkpoint naming an edit at or below it (decision LT-B10D-REVERT):
+/// the checkpoint's cells pin what the edit wrote, so its writer writes the value it wants.
+pub(crate) const SETTLED_REVERT_REFUSAL: &str =
+    "revert names an edit a final checkpoint settled; write the value it would restore instead";
+
+/// What the snapshot says of a record its writer's unavailable record holds back.
+const OPAQUE_REFUSAL: &str = "author has unavailable retained request history";
+
+const REQUEST_REFUSAL: &str = "request identity reused with different commands";
 
 fn decode_with_merge(payload: &[u8], application: fn(&[u8]) -> Result<Command>) -> Result<Command> {
     application(payload)
@@ -167,11 +191,13 @@ impl Log {
             index: Index::new(metadata.len()),
             projection: Projection::default(),
             records: BTreeMap::new(),
+            floor: None,
             conflicts: BTreeSet::new(),
             opaque_authors: BTreeSet::new(),
+            opaque: BTreeSet::new(),
             ordered: Vec::new(),
             eligible: BTreeSet::new(),
-            revert_refusals: BTreeSet::new(),
+            revert_refusals: BTreeMap::new(),
         };
         for evidence in metadata {
             let control = evidence.is_table_control();
@@ -190,10 +216,7 @@ impl Log {
                     Ok(command) => (Some(command), None),
                     Err(error) => (None, Some(error.0)),
                 },
-                None => {
-                    log.opaque_authors.insert(header.actor);
-                    (None, None)
-                }
+                None => (None, None),
             };
             let operation = Operation {
                 header,
@@ -214,8 +237,123 @@ impl Log {
             };
             log.records.insert(id, (operation, command));
         }
+        log.retained = log.records.len();
+        let withheld = log
+            .records
+            .iter()
+            .filter_map(|(id, (op, _))| (!op.catalog_eligible).then_some(*id))
+            .collect();
+        log.projection = log.index.project_excluding(&withheld);
+        // The settled floor and the final checkpoints below it, from what every replica holding
+        // their tips holds alike: the checkpoint records, the membership and the tips.
+        let finals = crate::checkpoint::finals(
+            store.checkpoints(),
+            scope.digest(),
+            scope.generation(),
+            &session.member_actors(),
+            |actor, tip| log.tip_ms(actor, tip),
+        );
+        let floor = finals
+            .into_iter()
+            .next_back()
+            .map(|(body, _)| body.frontier);
+        log.judge(floor);
+        Ok(log)
+    }
+
+    /// The authored time of the record `tip` names, where this log holds it as `actor`'s record
+    /// at the tip's sequence: what a checkpoint's finality reads of its cut.
+    pub(crate) fn tip_ms(&self, actor: &Actor, tip: &Tip) -> Option<u64> {
+        self.records
+            .get(&tip.digest)
+            .filter(|(operation, _)| {
+                operation.header.actor == *actor && operation.header.sequence == tip.sequence
+            })
+            .map(|(operation, _)| operation.authored_ms)
+    }
+
+    /// The frontier of the floor this log was judged above: for a read, the settled floor S's
+    /// ([`crate::checkpoint::finals`]).
+    #[cfg(test)]
+    pub(crate) const fn settled_frontier(&self) -> Option<&BTreeMap<Actor, Tip>> {
+        self.floor.as_ref()
+    }
+
+    /// Whether the cut at `frontier` holds the retained record `id`: its writer's sequence is
+    /// within the frontier and a tip observes it or is it.
+    fn within(&self, frontier: &BTreeMap<Actor, Tip>, id: &Digest) -> bool {
+        let Some((operation, _)) = self.records.get(id) else {
+            return false;
+        };
+        let header = &operation.header;
+        let Some(own) = frontier.get(&header.actor) else {
+            return false;
+        };
+        header.sequence <= own.sequence
+            && (own.digest == *id
+                || self.observes(&own.digest, id)
+                || frontier
+                    .values()
+                    .any(|tip| tip.digest != own.digest && self.observes(&tip.digest, id)))
+    }
+
+    /// Whether the floor holds the retained record `id`: nothing above it changes how `id` is
+    /// judged.
+    pub(crate) fn is_settled(&self, id: &Digest) -> bool {
+        self.floor
+            .as_ref()
+            .is_some_and(|frontier| self.within(frontier, id))
+    }
+
+    /// Judge every retained record on either side of `floor` (design §5, "Nothing above S
+    /// changes what S's state holds", tracker LT-B10D1), so no record above it reaches one at or
+    /// below it:
+    ///
+    /// - request identities are compared only between records on one side, so a record above
+    ///   the floor that reuses the request id of one at or below it is not compared with it,
+    ///   and neither is marked;
+    /// - a revert above the floor of an edit at or below it is refused
+    ///   ([`SETTLED_REVERT_REFUSAL`]);
+    /// - an unavailable record above the floor makes its writer's records above it ineligible;
+    ///   an unavailable record at or below it makes none so.
+    ///
+    /// None of these judgments of a record at or below the floor then reads a record above it,
+    /// so they are the judgments the state the floor's checkpoint signed made
+    /// ([`Self::settled_at`]); what the store withholds from the catalog projection (membership,
+    /// cutoffs, quarantine) is judged before this, from the control history. Records at or below
+    /// the floor are still awaited ([`Self::awaited`]) while a read folds them. With no floor
+    /// every record is on one side and the judgments are those of a log without checkpoints.
+    fn judge(&mut self, floor: Option<BTreeMap<Actor, Tip>>) {
+        self.floor = floor;
+        self.conflicts.clear();
+        self.opaque_authors.clear();
+        self.opaque.clear();
+        for (operation, command) in self.records.values_mut() {
+            operation.duplicate_of = None;
+            // A refusal of a record with a command is a request judgment; one without is its
+            // payload's, which no judgment here changes.
+            if command.is_some() {
+                operation.refusal = None;
+            }
+        }
+        self.opaque_authors = self
+            .records
+            .iter()
+            .filter(|(id, (operation, _))| !operation.available && !self.is_settled(id))
+            .map(|(_, (operation, _))| operation.header.actor)
+            .collect();
+        if !self.opaque_authors.is_empty() {
+            self.opaque = self
+                .records
+                .iter()
+                .filter(|(id, (operation, _))| {
+                    self.opaque_authors.contains(&operation.header.actor) && !self.is_settled(id)
+                })
+                .map(|(id, _)| *id)
+                .collect();
+        }
         let mut requests = BTreeMap::<(Actor, [u8; 16]), Vec<Digest>>::new();
-        for (id, (operation, command)) in &log.records {
+        for (id, (operation, command)) in &self.records {
             if let Some(command) = command {
                 requests
                     .entry((operation.header.actor, command.request()))
@@ -223,38 +361,42 @@ impl Log {
                     .push(*id);
             }
         }
-        for ids in requests.values_mut() {
-            if ids.len() <= 1 {
-                continue;
-            }
-            ids.sort_unstable_by_key(|id| (log.records[id].0.header.sequence, *id));
-            let first = ids[0];
-            let first_cmd = &log.records[&first].1;
-            if ids[1..].iter().any(|id| &log.records[id].1 != first_cmd) {
-                for id in ids.iter() {
-                    log.conflicts.insert(*id);
-                    log.records.get_mut(id).unwrap().0.refusal =
-                        Some("request identity reused with different commands".into());
-                }
-            } else {
-                for id in ids.iter().skip(1) {
-                    log.records.get_mut(id).unwrap().0.duplicate_of = Some(first);
+        let mut conflicts = Vec::new();
+        let mut duplicates = Vec::new();
+        for ids in requests.into_values().filter(|ids| ids.len() > 1) {
+            let (settled, hot): (Vec<Digest>, Vec<Digest>) =
+                ids.into_iter().partition(|id| self.is_settled(id));
+            for mut ids in [settled, hot].into_iter().filter(|ids| ids.len() > 1) {
+                ids.sort_unstable_by_key(|id| (self.records[id].0.header.sequence, *id));
+                let first = ids[0];
+                let first_cmd = &self.records[&first].1;
+                if ids[1..].iter().any(|id| &self.records[id].1 != first_cmd) {
+                    conflicts.extend(ids);
+                } else {
+                    duplicates.extend(ids[1..].iter().map(|id| (*id, first)));
                 }
             }
         }
-        log.retained = log.records.len();
-        let withheld = log
-            .records
-            .iter()
-            .filter_map(|(id, (op, _))| (!op.catalog_eligible).then_some(*id))
-            .collect();
+        for id in conflicts {
+            self.conflicts.insert(id);
+            if let Some((operation, _)) = self.records.get_mut(&id) {
+                operation.refusal = Some(REQUEST_REFUSAL.into());
+            }
+        }
+        for (id, first) in duplicates {
+            if let Some((operation, _)) = self.records.get_mut(&id) {
+                operation.duplicate_of = Some(first);
+            }
+        }
         let mut structural = BTreeSet::new();
+        let mut revert_refusals = BTreeMap::new();
+        let mut ordered = Vec::new();
+        let mut eligible = BTreeSet::new();
         // Request conflicts are inert application data, not a signed-chain fork.
         // Keep their headers as dependencies so one author cannot suppress the
         // well-formed later edits of every peer that observed the bad request.
-        log.projection = log.index.project_excluding(&withheld);
-        for id in log.projection.ordered.clone() {
-            let (operation, Some(command)) = &log.records[&id] else {
+        for id in &self.projection.ordered {
+            let (operation, Some(command)) = &self.records[id] else {
                 continue;
             };
             if let Command::Revert {
@@ -262,32 +404,135 @@ impl Log {
                 changes,
                 ..
             } = command
-                && (!log.observes(&id, target)
+            {
+                // A revert of a revert refused for reaching below the floor reaches below it too.
+                let refusal = if (self.is_settled(target) && !self.is_settled(id))
+                    || revert_refusals.get(target) == Some(&SETTLED_REVERT_REFUSAL)
+                {
+                    Some(SETTLED_REVERT_REFUSAL)
+                } else if !self.observes(id, target)
                     || !structural.contains(target)
-                    || !log
+                    || !self
                         .records
                         .get(target)
                         .and_then(|(_, command)| command.as_ref())
                         .and_then(Command::changes)
-                        .is_some_and(|target| crate::database::same_change_keys(target, changes)))
-            {
-                log.revert_refusals.insert(id);
-                continue;
+                        .is_some_and(|target| crate::database::same_change_keys(target, changes))
+                {
+                    Some(REVERT_REFUSAL)
+                } else {
+                    None
+                };
+                if let Some(refusal) = refusal {
+                    revert_refusals.insert(*id, refusal);
+                    continue;
+                }
             }
             // Structural validity depends only on the authenticated causal past,
             // not on a later request collision by the target's author. Such a
             // collision cannot convert an honest reverter into a faulty writer.
-            structural.insert(id);
-            if log.conflicts.contains(&id)
+            structural.insert(*id);
+            if self.conflicts.contains(id)
                 || operation.duplicate_of.is_some()
-                || log.opaque_authors.contains(&operation.header.actor)
+                || self.opaque.contains(id)
             {
                 continue;
             }
-            log.ordered.push(id);
-            log.eligible.insert(id);
+            ordered.push(*id);
+            eligible.insert(*id);
         }
-        Ok(log)
+        self.revert_refusals = revert_refusals;
+        self.ordered = ordered;
+        self.eligible = eligible;
+    }
+
+    /// This log read again as though the retained record `id` were quarantined here: what
+    /// [`Self::read_with`] makes of the evidence a store gives for a quarantined payload
+    /// (`Store::metadata_from`): `id` unavailable, and `id`, each later record of its writer
+    /// and each record depending on one withheld from the catalog projection, as the store's
+    /// quarantine closure withholds them (`Store::quarantine_closure`).
+    #[cfg(test)]
+    pub(crate) fn with_quarantined(&self, id: &Digest) -> Self {
+        let mut log = self.as_of_cut(&self.records.keys().copied().collect());
+        let Some((writer, sequence)) = log
+            .records
+            .get(id)
+            .map(|(operation, _)| (operation.header.actor, operation.header.sequence))
+        else {
+            return log;
+        };
+        if let Some((operation, command)) = log.records.get_mut(id) {
+            operation.available = false;
+            operation.request = None;
+            operation.reverts = None;
+            operation.refusal = None;
+            *command = None;
+        }
+        let mut withheld: BTreeSet<Digest> = log
+            .records
+            .iter()
+            .filter(|(_, (operation, _))| {
+                operation.header.actor == writer && operation.header.sequence >= sequence
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        loop {
+            let more: Vec<Digest> = log
+                .records
+                .iter()
+                .filter(|(id, (operation, _))| {
+                    !withheld.contains(*id)
+                        && operation
+                            .header
+                            .parents
+                            .iter()
+                            .chain(operation.header.previous.iter())
+                            .any(|parent| withheld.contains(parent))
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            withheld.extend(more);
+        }
+        for id in &withheld {
+            if let Some((operation, _)) = log.records.get_mut(id) {
+                operation.catalog_eligible = false;
+            }
+        }
+        log.projection = log.index.project_excluding(&withheld);
+        let floor = log.floor.clone();
+        log.judge(floor);
+        log
+    }
+
+    /// This log judged with the cut `cut` (a causally closed set of its records) as its floor:
+    /// what a read will judge of the cut's records once a checkpoint of it is final, so a
+    /// checkpoint's state ([`crate::att::checkpoint::state`]) is what a fold from it reads. Its
+    /// request, revert and opaque-author judgments of the cut's records then read the cut alone,
+    /// not the records above it nor which checkpoints this replica finds final.
+    pub(crate) fn settled_at(&self, cut: &BTreeSet<Digest>) -> Self {
+        let mut frontier = BTreeMap::<Actor, Tip>::new();
+        for id in cut {
+            let Some((operation, _)) = self.records.get(id) else {
+                continue;
+            };
+            let header = &operation.header;
+            let tip = frontier.entry(header.actor).or_insert(Tip {
+                sequence: 0,
+                digest: [0; 32],
+            });
+            if header.sequence > tip.sequence {
+                *tip = Tip {
+                    sequence: header.sequence,
+                    digest: header.id,
+                };
+            }
+        }
+        let mut log = self.as_of_cut(&self.records.keys().copied().collect());
+        log.judge(Some(frontier));
+        log
     }
     /// The log as of the causal cut `at` names: `at` and every retained operation it observed
     /// through its signed parents and its writer's chain, and nothing else. An operation's
@@ -341,8 +586,10 @@ impl Log {
                 .filter(|(id, _)| cut.contains(*id))
                 .map(|(id, record)| (*id, record.clone()))
                 .collect(),
+            floor: self.floor.clone(),
             conflicts: self.conflicts.intersection(cut).copied().collect(),
             opaque_authors: self.opaque_authors.clone(),
+            opaque: self.opaque.intersection(cut).copied().collect(),
             ordered: self
                 .ordered
                 .iter()
@@ -350,7 +597,12 @@ impl Log {
                 .copied()
                 .collect(),
             eligible: self.eligible.intersection(cut).copied().collect(),
-            revert_refusals: self.revert_refusals.intersection(cut).copied().collect(),
+            revert_refusals: self
+                .revert_refusals
+                .iter()
+                .filter(|(id, _)| cut.contains(*id))
+                .map(|(id, refusal)| (*id, *refusal))
+                .collect(),
         }
     }
     /// [`Index::observes`] of this log's index, answered from the projection's version vectors
@@ -430,14 +682,25 @@ impl Log {
     pub(crate) fn retained_ids(&self) -> impl Iterator<Item = &Digest> {
         self.records.keys()
     }
+    /// The refused reverts a writer is answerable for: every one but a revert of an edit a final
+    /// checkpoint settled, which a well-formed revert written before its writer found the
+    /// checkpoint final can become ([`SETTLED_REVERT_REFUSAL`]), and which no recovery undoes.
+    fn faulty_reverts(&self) -> impl Iterator<Item = &Digest> {
+        self.revert_refusals
+            .iter()
+            .filter(|(_, refusal)| **refusal != SETTLED_REVERT_REFUSAL)
+            .map(|(id, _)| id)
+    }
     /// A digest of how this replica judges each retained record now: the judgments that can
     /// move while the records do not (a payload key this Mac comes to hold, a membership change
-    /// that makes a cutoff count), in record-id order. With the retained ids (which commit to
+    /// that makes a cutoff count), in record-id order, and the floor the request, revert and
+    /// opaque-author judgments are made above ([`Self::judge`]), which a membership change can
+    /// move too. With the retained ids (which commit to
     /// each authenticated record, so to everything decoded from it) it fixes what a projection
     /// of the log reads: the shared files' projection key (`file::materialize`).
     pub(crate) fn judgment(&self) -> [u8; 32] {
         let mut sha = aterm_digest::Sha256::new();
-        sha.update(b"aterm/db/log/judgment/1\0");
+        sha.update(b"aterm/db/log/judgment/2\0");
         sha.update((self.records.len() as u64).to_le_bytes());
         for (id, (operation, _command)) in &self.records {
             // Every field takes a position: a new one does not compile until it does.
@@ -472,10 +735,22 @@ impl Log {
                 }
             }
         }
+        match &self.floor {
+            None => sha.update([0]),
+            Some(frontier) => {
+                sha.update([1]);
+                sha.update((frontier.len() as u64).to_le_bytes());
+                for (actor, tip) in frontier {
+                    sha.update(actor);
+                    sha.update(tip.sequence.to_le_bytes());
+                    sha.update(tip.digest);
+                }
+            }
+        }
         sha.finalize()
     }
     pub(crate) fn history_complete(&self) -> bool {
-        self.revert_refusals.is_empty()
+        self.faulty_reverts().next().is_none()
             && self.opaque_authors.is_empty()
             && self
                 .records
@@ -531,8 +806,8 @@ impl Log {
                 (!op.available
                     || !op.catalog_eligible
                     || op.refusal.is_some()
-                    || self.revert_refusals.contains(id)
-                    || self.opaque_authors.contains(&op.header.actor))
+                    || self.revert_refusals.contains_key(id)
+                    || self.opaque.contains(id))
                     && !awaited.contains(id)
             })
             .map(|(id, _)| *id)
@@ -712,13 +987,21 @@ impl Log {
             .map(|(id, (operation, _))| {
                 let mut operation = operation.clone();
                 operation.eligible = self.eligible.contains(id);
-                if self.revert_refusals.contains(id) {
-                    operation.refusal = Some(REVERT_REFUSAL.into());
+                match self.revert_refusals.get(id) {
+                    // A settled refusal never hides another the record has (a reused request
+                    // id), which its writer answers for.
+                    Some(&SETTLED_REVERT_REFUSAL) => {
+                        operation
+                            .refusal
+                            .get_or_insert_with(|| SETTLED_REVERT_REFUSAL.into());
+                    }
+                    Some(refusal) => operation.refusal = Some((*refusal).into()),
+                    None => {}
                 }
-                if self.opaque_authors.contains(&operation.header.actor) {
-                    operation.refusal.get_or_insert_with(|| {
-                        "author has unavailable retained request history".into()
-                    });
+                if self.opaque.contains(id) {
+                    operation
+                        .refusal
+                        .get_or_insert_with(|| OPAQUE_REFUSAL.into());
                 }
                 operation
             })
@@ -740,7 +1023,10 @@ impl Log {
     /// causal past has not all arrived, with its descendants, and a record of `own` (this
     /// Mac's writer) that is withheld or unavailable. A record this build refuses, a cut-off
     /// or forked writer's and a quarantined payload never project here, and a new append names
-    /// only the catalog projection's heads, so such records are inert rather than awaited.
+    /// only the catalog projection's heads, so such records are inert rather than awaited. A
+    /// settled record ([`Self::is_settled`]) is awaited like any other: every record this
+    /// awaits is missing from the cells this log folds, a settled one too, until a read takes the
+    /// cells at the floor from the checkpoint's state (tracker LT-B10D2).
     pub(crate) fn awaited(&self, own: Actor) -> BTreeSet<Digest> {
         let mut awaited = BTreeSet::new();
         for (id, (operation, _)) in &self.records {
@@ -801,7 +1087,7 @@ impl Log {
                 op.header.actor == actor
                     && (!op.available || !op.catalog_eligible || op.refusal.is_some())
             })
-            || self.revert_refusals.iter().any(|id| {
+            || self.faulty_reverts().any(|id| {
                 self.records
                     .get(id)
                     .is_some_and(|(op, _)| op.header.actor == actor)
@@ -855,9 +1141,7 @@ impl Log {
                     None => false,
                 };
                 if !matched || self.conflicts.contains(id) {
-                    return Err(Error::new(
-                        "request identity reused with different commands",
-                    ));
+                    return Err(Error::new(REQUEST_REFUSAL));
                 }
                 let candidate = (operation.header.sequence, *id);
                 if first.is_none_or(|old| candidate < old) {
@@ -946,6 +1230,9 @@ impl Log {
             .changes()
             .filter(|changes| !changes.is_empty())
             .ok_or_else(|| Error::new("target proposal has no value changes to revert"))?;
+        if self.is_settled(&target) {
+            return Err(Error::new(SETTLED_REVERT_REFUSAL));
+        }
         if !self.eligible.contains(&target) || excluded.contains(&target) {
             return Err(Error::new("target proposal is not eligible"));
         }

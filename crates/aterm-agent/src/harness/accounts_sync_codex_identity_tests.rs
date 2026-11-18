@@ -115,6 +115,7 @@ impl World {
             None,
             before_publish,
         )
+        .map_err(|why| why.said)
     }
     fn records(&self) -> Vec<Option<Vec<u8>>> {
         let store = self.store();
@@ -417,6 +418,7 @@ fn codex_sync_reassigns_the_default_without_moving_account_history_or_sessions()
                 account: "a".into(),
                 at: NOW,
                 held: None,
+                owner: None,
             },
         );
         store.save(&state).unwrap();
@@ -545,6 +547,8 @@ fn the_second_lab_sync_follows_the_native_default_after_the_actual_first_import(
                 preferred: vec![(test_machine("m16"), Some(index as u64 + 1))],
             })
             .collect(),
+        names: Default::default(),
+        barred: Default::default(),
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
         #[cfg(unix)]
@@ -914,10 +918,23 @@ fn a_default_login_moved_back_takes_the_rows_own_directory_back() {
         let CliSync::Synced(synced) = world.sync().unwrap() else {
             panic!("{case}: a synced fleet");
         };
-        let refused = synced.default_login.refused.expect(case);
+        let refusal = synced.default_login.refused.expect(case);
+        let refused = refusal.said;
+        // The row is named by its account, never by its label: the receipt's words by its name,
+        // which says its address, and a log's by its key, with no address in them at all.
+        let b = crate::harness::account_names::tests::row_name(Cli::Codex, &world.roster, "b");
         assert!(
-            refused.contains("`b`'s managed directory") && refused.ends_with("no row moved"),
+            refused.contains(&format!("of {} holds", b.shown))
+                && refused.starts_with("the managed directory ")
+                && refused.ends_with("no row moved"),
             "{case}: {refused}"
+        );
+        let logged = refusal.logged;
+        assert!(
+            logged.contains(&format!("of {} holds", b.logged))
+                && logged.ends_with("no row moved")
+                && !logged.contains('@'),
+            "{case}: {logged}"
         );
         assert_eq!(
             world.rows().row_for_login(None).unwrap().label,
@@ -968,12 +985,17 @@ fn a_sync_with_no_source_still_follows_the_default_login() {
         out.contains("default login: it names far@example.com"),
         "{out}"
     );
+    let word = crate::harness::account_names::tests::row_name(Cli::Codex, &world.roster, "a").word;
     assert!(
-        out.contains("`aterm harness accounts renew a --cli codex`"),
+        out.contains(&format!(
+            "`aterm harness accounts renew {word} --cli codex`"
+        )),
         "{out}"
     );
     assert_eq!(world.rows(), before, "nothing holds that address");
-    let step = "aterm harness accounts add <label> --cli codex --email far@example.com";
+    // The step asks for the account a person names, and types no address (decision 3).
+    let step = "or list that account, and a sync moves the login to it: `aterm harness accounts \
+                add <account> --cli codex`";
     assert!(out.contains(step), "{out}");
 
     let mut rows = world.rows();
@@ -993,7 +1015,11 @@ fn a_sync_with_no_source_still_follows_the_default_login() {
     world.save_rows(&rows);
     let (code, out, err) = sync_words(&world);
     assert_eq!(code, ExitCode::SUCCESS, "{out}{err}");
-    assert!(out.contains("on this machine's own login: far"), "{out}");
+    let far = crate::harness::account_names::tests::row_name(Cli::Codex, &world.roster, "far");
+    assert!(
+        out.contains(&format!("on this machine's own login: {}", far.shown)),
+        "{out}"
+    );
     assert_eq!(world.rows().row_for_login(None).unwrap().label, "far");
     assert_eq!(
         world.rows().row("a").unwrap().dir.as_deref(),

@@ -44,6 +44,10 @@ pub struct Missing {
     pub records: Vec<Record>,
     /// The store holds more that the peer lacks, past [`Self::records`]: the cap ended them.
     pub more: bool,
+    /// What a log rooted at a final checkpoint serves a peer that lacks a root's cut
+    /// ([`super::served`]): its roots and their stubs, which the reply's bytes count, ahead of
+    /// its records. `None` for a whole log, whose reply is as it was.
+    pub served: Option<super::Served>,
 }
 
 /// The most ids [`Store::have`] names: more than a pull's URL has room for (about 120 of 8 KiB,
@@ -70,6 +74,54 @@ pub fn read_records<'a>(records: impl IntoIterator<Item = &'a Record>) -> std::i
         record.write_to(&mut out)?;
     }
     Ok(out)
+}
+
+/// The bytes of a reply ([`Store::missing_within`]): its records' stream ([`read_records`]), then,
+/// where it serves a root, its one served frame ([`super::Served::encode`]). A reply that serves
+/// none is its records' stream alone.
+///
+/// # Errors
+/// As [`read_records`].
+pub fn read_reply(missing: &Missing) -> std::io::Result<Vec<u8>> {
+    let mut out = read_records(&missing.records)?;
+    if let Some(served) = &missing.served {
+        out.extend_from_slice(&served.encode());
+    }
+    Ok(out)
+}
+
+/// The records of a reply [`read_reply`] wrote and the frame it serves, if any: the frame is
+/// read only as its last, and each record as [`decode_records_in`] reads it.
+///
+/// # Errors
+/// As [`decode_records_in`] over the records, or the served frame fails
+/// [`super::Served::decode`].
+pub fn decode_reply(
+    bytes: &[u8],
+    record_limit: usize,
+    reading: Reading,
+) -> Result<(Vec<Record>, Option<super::Served>)> {
+    if bytes.len() > MAX_RECORDS_STREAM {
+        return Err(Error::new("membership record stream is too large"));
+    }
+    let mut at = 0usize;
+    let mut count = 0usize;
+    while at < bytes.len() && !bytes[at..].starts_with(super::served::SERVED_MAGIC) {
+        if count >= record_limit {
+            return Err(Error::new("membership record stream exceeds record bound"));
+        }
+        let len = Record::wire_len_prefix(&bytes[at..], reading)?;
+        at = at
+            .checked_add(len)
+            .filter(|end| *end <= bytes.len() && len <= MAX_RECORD)
+            .ok_or_else(|| Error::new("membership record is truncated"))?;
+        count += 1;
+    }
+    let records = decode_records_in(&bytes[..at], record_limit, reading)?;
+    let served = (at < bytes.len())
+        .then(|| super::Served::decode(&bytes[at..], reading))
+        .transpose()?;
+    Ok((records, served))
 }
 
 /// Decode and verify every [`Record`] in `bytes`, refusing the whole stream if any record is
@@ -556,6 +608,18 @@ fn make_room(log: &mut Log) {
             return;
         }
     }
+}
+
+/// The held records of `log` a peer whose pull names `have` lacks, in causal order: those
+/// outside the causal past of every record `have` names that `log` holds or dropped.
+fn lacked_by<'a>(log: &'a Log, have: &[RecordId]) -> impl Iterator<Item = &'a Record> + 'a {
+    // A peer that names a record this log dropped holds what that record follows.
+    let known = log.reach.closure(log.have_indexes(have));
+    log.order
+        .iter()
+        .enumerate()
+        .filter(move |(i, _)| (known[i / 64] >> (i % 64)) & 1 == 0)
+        .map(|(_, r)| r)
 }
 
 impl Store {
@@ -1049,18 +1113,32 @@ impl Store {
         ids
     }
 
-    /// Every causally complete record id held from genesis, sorted. Waiting records missing a
-    /// parent and records held before a genesis are omitted so peers never offer orphans.
+    /// Every causally complete record id held from genesis, and each record a root of a log
+    /// rooted at a final checkpoint dropped ([`super::rooted`]), sorted: the set a set-reconciling
+    /// peer (the mesh's inventory, aterm-db's records exchange) compares with its own. Waiting
+    /// records missing a parent and records held before a genesis are omitted so peers never
+    /// offer orphans. A dropped record reads as known, as the whole log holds it, so a whole peer
+    /// sends back none of them (this log refuses each) and a rooted and a whole log of one
+    /// history summarize alike. None is sent: [`Store::complete_missing`] names held records
+    /// alone, and a set-difference offer (the mesh's) that names a dropped id is sent no record
+    /// for it, since the wires a peer is sent are held records'. A peer behind the cut then
+    /// differs from this log until it takes the root, which a records-only exchange cannot carry
+    /// (rooted.rs "Not yet"). A log with no root reads as before.
     #[must_use]
     pub fn complete_inventory(&self) -> BTreeSet<RecordId> {
         self.log.as_ref().map_or_else(BTreeSet::new, |log| {
-            log.order.iter().map(|r| r.id).collect()
+            let mut ids: BTreeSet<RecordId> = log.order.iter().map(|r| r.id).collect();
+            if let Some(rooting) = log.rooting() {
+                ids.extend(rooting.stubs.keys().copied());
+            }
+            ids
         })
     }
 
     /// Up to `limit` causally complete record ids held here that `remote` lacks, in causal order
     /// after `after` (wrapping around to genesis) so every parent precedes its children without
     /// starving later records behind a deferred one.
+    /// A cursor this log no longer holds (a record a prune dropped) starts again at genesis.
     #[must_use]
     pub fn complete_missing(
         &self,
@@ -1136,22 +1214,17 @@ impl Store {
     /// key's forks, past a URL's room) can be sent records it holds on every ask
     /// (ATERM-KI-1116-1470). A prefix of a causal order is closed under parents: each record's
     /// parents are among what `have` names or before it. [`Missing::more`] says the cap ended it.
+    /// It serves records alone, rooted log or not ([`Missing::served`] is `None`): a reader of
+    /// records alone ([`decode_records`]) refuses a served frame, so only a puller that says it
+    /// takes one is sent one ([`Store::missing_served`]).
     #[must_use]
     pub fn missing_within(&self, have: &[RecordId], cap: usize) -> Missing {
         let Some(log) = &self.log else {
             return Missing::default();
         };
-        // A peer that names a record this log dropped holds what that record follows.
-        let known = log.reach.closure(log.have_indexes(have));
-        let lacked = log
-            .order
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| (known[i / 64] >> (i % 64)) & 1 == 0)
-            .map(|(_, r)| r);
         let mut out = Missing::default();
         let mut bytes = 0usize;
-        for record in lacked {
+        for record in lacked_by(log, have) {
             let next = bytes.saturating_add(record.wire_len());
             if !out.records.is_empty() && next > cap {
                 out.more = true;
@@ -1161,6 +1234,87 @@ impl Store {
             out.records.push(record.clone());
         }
         out
+    }
+
+    /// [`Store::missing_within`] for a puller that takes a served frame
+    /// ([`Store::ingest_served`]): where this log is rooted at a final checkpoint and `have`
+    /// does not show every root's cut ([`Log::named_cuts`]), its roots and their stubs
+    /// ([`Missing::served`]) and every record the peer lacks, past `cap`, within
+    /// [`MAX_RECORDS_STREAM`]; otherwise exactly what [`Store::missing_within`] serves.
+    ///
+    /// Decided here: a served root's reply is not cut at `cap`. The puller takes the root and
+    /// the records all or none, and a root is taken only with its settling shares, which follow
+    /// the cut and, through the records the cut's prune dropped, may wait on the stubs: a prefix
+    /// capped short of them is refused whole, and the next pull, naming the same `have`, is
+    /// served the same prefix for ever. So the reply holds them all, as a whole store's would,
+    /// and a store holds no more than [`MAX_RECORDS_STREAM`] in all (its stubs counted in its
+    /// bytes). Where the frame and the records pass that (a store past the stream bound, which
+    /// no store of this build is), it serves records alone, capped, and the puller waits on a
+    /// peer that holds the cut (rooted.rs "Not yet").
+    #[must_use]
+    pub fn missing_served(&self, have: &[RecordId], cap: usize) -> Missing {
+        let Some(log) = &self.log else {
+            return Missing::default();
+        };
+        let Some(served) = log
+            .rooting()
+            .and_then(|_| (!log.named_cuts(have)).then(|| log.served()).flatten())
+        else {
+            return self.missing_within(have, cap);
+        };
+        #[cfg(test)]
+        if super::served::mutant(super::served::Mutant::CappedServed) {
+            let mut out = Missing {
+                served: Some(served),
+                ..Missing::default()
+            };
+            let mut bytes = out.served.as_ref().map_or(0, super::Served::wire_len);
+            for record in lacked_by(log, have) {
+                let next = bytes.saturating_add(record.wire_len());
+                if !out.records.is_empty() && next > cap {
+                    out.more = true;
+                    break;
+                }
+                bytes = next;
+                out.records.push(record.clone());
+            }
+            return out;
+        }
+        let mut bytes = served.wire_len();
+        let mut records = Vec::new();
+        for record in lacked_by(log, have) {
+            bytes = bytes.saturating_add(record.wire_len());
+            if bytes > MAX_RECORDS_STREAM {
+                return self.missing_within(have, cap);
+            }
+            records.push(record.clone());
+        }
+        Missing {
+            records,
+            more: false,
+            served: Some(served),
+        }
+    }
+
+    /// Whether `have` names a record this store neither holds nor dropped: the puller holds
+    /// records this store lacks, and is asked to post them. A record a root of this log dropped
+    /// ([`Log::knows`]) is not lacked: a post of it would be refused as known, and asked for
+    /// again on every pull.
+    #[must_use]
+    pub fn lacks_any(&self, have: &[RecordId]) -> bool {
+        #[cfg(test)]
+        if super::served::mutant(super::served::Mutant::HeldHave) {
+            return !have.is_empty()
+                && !self
+                    .log
+                    .as_ref()
+                    .is_some_and(|log| have.iter().all(|id| log.get(id).is_some()));
+        }
+        !have.is_empty()
+            && !self
+                .log
+                .as_ref()
+                .is_some_and(|log| have.iter().all(|id| log.knows(id)))
     }
 
     /// Insert one decoded [`Record`], returning `true` when it was new to this store, or when it
@@ -1337,6 +1491,47 @@ impl Store {
             return Err(e);
         }
         Ok(added)
+    }
+
+    /// [`Store::ingest_records`] of a reply's `records` and, where it serves roots, `served`
+    /// ([`super::served`]): the store takes the roots it can authenticate with the records
+    /// ([`Log::take_served`]) and is pruned there, or takes nothing. Returns how many ids it now
+    /// holds or dropped that it did not.
+    ///
+    /// # Errors
+    /// With `served`: no genesis is held or among `records`, or [`Log::take_served`] refuses;
+    /// the store is unchanged. Without it, as [`Store::ingest_records`].
+    pub fn ingest_served(
+        &mut self,
+        records: Vec<Record>,
+        served: Option<&super::Served>,
+    ) -> Result<usize> {
+        let Some(served) = served else {
+            return self.ingest_records(records);
+        };
+        let before = self.inventory();
+        let mut next = self.clone();
+        if next.log.is_none() {
+            let genesis = records
+                .iter()
+                .find(|record| record.kind() == Kind::Genesis)
+                .cloned()
+                .ok_or_else(|| Error::new("a served root needs the genesis of its log"))?;
+            next.insert(genesis)?;
+        }
+        let log = next
+            .log
+            .as_ref()
+            .ok_or_else(|| Error::new("a served root needs the genesis of its log"))?;
+        let mut taken = log.take_served(served, records)?;
+        make_room(&mut taken);
+        next.log = Some(taken);
+        #[cfg(any(unix, windows))]
+        {
+            next.file_order = None;
+        }
+        *self = next;
+        Ok(self.inventory().difference(&before).count())
     }
 
     /// Ingest `records` (causal order as [`Store::ingest_records`]), and say per record: held

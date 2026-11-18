@@ -438,6 +438,30 @@ fn the_process_sweep_reads_each_birth_from_its_creation_time() {
 }
 
 #[test]
+fn the_process_sweep_keeps_microsecond_lifetimes_with_identical_display_births() {
+    const EPOCH: i64 = 116_444_736_000_000_000;
+    let buf = entries(&[entry(4, 0, EPOCH + 123_451), entry(8, 0, EPOCH + 123_461)]);
+    let sweep = processes(&buf, BASE);
+    assert_eq!(
+        sweep
+            .procs
+            .iter()
+            .map(|row| row.birth_ms)
+            .collect::<Vec<_>>(),
+        [Some(12), Some(12)]
+    );
+    assert_eq!(
+        sweep.procs.iter().map(|row| row.birth).collect::<Vec<_>>(),
+        [Some(12_345), Some(12_346)]
+    );
+    assert_eq!(sweep.procs[0].start, Some((EPOCH + 123_451) as u64));
+    assert_eq!(
+        crate::procs::birth_micros_of_filetime((EPOCH - 1) as u64),
+        None
+    );
+}
+
+#[test]
 fn a_bad_process_buffer_reads_no_garbage() {
     let one = |name| Proc {
         pid: 42,

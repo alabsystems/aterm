@@ -369,6 +369,7 @@ fn a_file_written_from_another_thread_answers_a_parked_await() {
         hung_up: &never,
         exited: &never,
         arm_slots: &unarmed,
+        arm_split: &unarmed,
     };
     let answer = await_wake(&host, &*rig, &a, Some(400), 1, &waits);
     stop.store(true, Ordering::SeqCst);

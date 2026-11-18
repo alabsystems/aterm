@@ -87,16 +87,20 @@ words!(
 
 impl Kind {
     /// A sharp event goes out within the flusher's next pass while this Mac is under its pace
-    /// (design §3.9): a sign-in, a sign-out, a wrong account, an ended login, a wall or a
-    /// blocked sign-in (docs/DESIGN-shared-files-2026-11-11.md §10, "Publication pace").
+    /// (design §3.9): a sign-in, a sign-out (a displacement by the vendor's own sign-in among
+    /// them), a wrong account, an ended login, a wall hit or cleared, or a blocked sign-in
+    /// (docs/DESIGN-shared-files-2026-11-11.md §10, "Publication pace"), so the `login` or
+    /// `usage` row it changes goes in the same record.
     pub const fn sharp(self) -> bool {
         matches!(
             self,
             Self::SignedIn
                 | Self::SignedOut
+                | Self::Displaced
                 | Self::WrongAccount
                 | Self::LoginEnded
                 | Self::Wall
+                | Self::WallCleared
                 | Self::SignInBlocked
         )
     }
@@ -136,6 +140,11 @@ pub const SIGNIN_WORDS: [&str; 6] = [
     SIGNIN_FAILED,
     SIGNIN_UNKNOWN,
 ];
+
+/// The reason word a `sign-in-failed` event carries where the sign-in was blocked
+/// (`AttemptOutcome::Blocked` in the harness), and an `error` where a blocked sign-in left a
+/// login that still works here signed in.
+pub const SIGNIN_BLOCKED: &str = "blocked";
 
 /// The reason word a `seen` event carries on a first sighting of its (tab, account) pair.
 pub const SEEN_FIRST: &str = "first";
@@ -331,15 +340,18 @@ impl Event {
         }
     }
 
-    /// Whether the flusher sends this event out on its next pass (design §3.9): a sharp kind,
-    /// or a `seen` of a tab's first sighting or changed account. An hourly refresh of a
-    /// sighting waits for the routine flush.
+    /// Whether the flusher sends this event out on its next pass (design §3.9): a sharp kind, a
+    /// sign-in a bot protection or a person's step stopped (why `blocked`: a `sign-in-failed`,
+    /// or the `error` the harness notes where the login it would have renewed still works here;
+    /// the forms builds before SF-08 read, since they drop the `sign-in-blocked` kind), or a
+    /// `seen` of a tab's first sighting or changed account. An hourly refresh of a sighting
+    /// waits for the routine flush.
     pub fn sharp(&self) -> bool {
+        let why = self.why.as_ref().map(Word::as_str);
         self.kind.sharp()
-            || (self.kind == Kind::Seen
-                && self
-                    .why
-                    .is_some_and(|why| matches!(why.as_str(), SEEN_FIRST | SEEN_CHANGED)))
+            || (matches!(self.kind, Kind::SignInFailed | Kind::Error)
+                && why == Some(SIGNIN_BLOCKED))
+            || (self.kind == Kind::Seen && matches!(why, Some(SEEN_FIRST | SEEN_CHANGED)))
     }
 }
 

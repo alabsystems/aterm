@@ -5770,6 +5770,7 @@ fn read_reach(root: &Path, from: &str, paths: Option<&[String]>) -> Reach {
         }
     };
     match selection {
+        crate::changed::Selection::Unavailable(why) => Reach::Unread(why),
         crate::changed::Selection::Widened(why) => Reach::Everything(why),
         crate::changed::Selection::Narrowed { crates, .. } => Reach::Crates(
             crates

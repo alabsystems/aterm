@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use crate::blockage::{ZombieBook, per_min_deci};
+use crate::blockage::ZombieFacts;
 
 use super::step::{self, Cx, Evidence, Fault, Progress, Track};
 use super::wait::{self, JobFacts, Scene};
@@ -16,8 +16,7 @@ use super::{
     ExitOf, Findings, GateWord, HELD_AT_ONCE, HeldEpisode, HeldProc, Holder, InputGate,
     JobCounters, JobKind, JobProc, JobRow, JobTab, JobTick, JobsView, KERNEL_WAIT_MS, MemberMap,
     Named, NamedRow, NamedWait, ProcState, Standing, StartWait, Stop, StoppedUnstarted, SweepProc,
-    TermWord, TierB, TtyMode, Verdict, WaitName, Want, ZOMBIE_AGE_MS, ZombieParent, Zombies,
-    command_class,
+    TermWord, TierB, TtyMode, Verdict, WaitName, Want, ZombieParent, Zombies, command_class,
 };
 
 #[cfg(test)]
@@ -806,9 +805,6 @@ pub struct Jobs {
     /// A pass identity independent of its clock, so acceptance requires another actual probe.
     read_revision: u64,
     classes: ClassTable,
-    /// Every zombie this engine's passes saw, by parent ([`crate::blockage::ZombieBook`]): its
-    /// own book, not the model's the Processes row reads, which every whole reading notes.
-    zombies: ZombieBook,
     d_since: HashMap<u32, u64>,
     /// The first reading that saw each `(pid, exec)` not started, by what keeps it
     /// ([`StartWait`]), kept for the keys the last reading held. An unavailable exec version's
@@ -1289,7 +1285,11 @@ impl Jobs {
         let sweep: HashMap<u32, &SweepProc> = tick.sweep.iter().map(|p| (p.pid, p)).collect();
         let facts: HashMap<u32, &JobProc> = tick.procs.iter().map(|p| (p.pid, p)).collect();
         let children = children_of(&tick.sweep);
-        self.note_zombies(at, &tick.sweep);
+        let canonical_zombies = tick
+            .zombie_facts
+            .as_ref()
+            .filter(|facts| tick.source_seq == Some(facts.seq()) && facts.whole())
+            .cloned();
         self.note_d_state(at, &tick.sweep, &facts);
         self.note_held(tick);
         self.adopted
@@ -2496,7 +2496,7 @@ impl Jobs {
                 pid,
                 name,
             });
-            let zombies = zombie_facts(&now, &live, &sweep, &self.zombies, at);
+            let zombies = zombie_facts(&live, canonical_zombies.as_deref());
             let leaves = leaves_of(&live, &now, &sweep);
             let gate = tab.map_or(InputGate::default(), |t| t.input);
             let shell_pid = tab.map_or(0, |t| t.shell_pid);
@@ -2980,7 +2980,7 @@ impl Jobs {
             }
             r
         };
-        let findings = self.findings(tick, &sweep, &flat_on_dylib);
+        let findings = self.findings(tick, &sweep, &flat_on_dylib, canonical_zombies.as_deref());
         let at_person: BTreeSet<(u64, &str)> = self
             .jobs
             .iter()
@@ -3003,17 +3003,8 @@ impl Jobs {
             lanes_off,
             parked_tabs,
             at_ms: at,
+            zombie_facts: canonical_zombies,
         }
-    }
-
-    fn note_zombies(&mut self, at: u64, sweep: &[SweepProc]) {
-        self.zombies.note(
-            at,
-            sweep
-                .iter()
-                .filter(|p| p.state == ProcState::Zombie)
-                .map(|p| (p.pid, p.ppid)),
-        );
     }
 
     fn note_d_state(&mut self, at: u64, sweep: &[SweepProc], facts: &HashMap<u32, &JobProc>) {
@@ -3138,6 +3129,7 @@ impl Jobs {
         tick: &JobTick,
         sweep: &HashMap<u32, &SweepProc>,
         flat_on_dylib: &BTreeMap<u32, String>,
+        zombie_facts: Option<&ZombieFacts>,
     ) -> Findings {
         let at = tick.at_ms;
         let job_of: HashMap<u32, (u64, JobKind)> = self
@@ -3171,15 +3163,16 @@ impl Jobs {
                 f.own_procs += p.threads.map_or(1, u64::from);
             }
         }
-        for (ppid, count) in self.zombies.piles(at) {
-            let since = self.zombies.pile_since(ppid).unwrap_or(at);
-            f.zombies.push(ZombieParent {
-                ppid,
-                name: name(ppid),
-                count,
-                per_min_deci: per_min_deci(count, at.saturating_sub(since)),
-                tab: tab_of(&ppid),
-            });
+        if let Some(facts) = zombie_facts {
+            for pile in facts.piles() {
+                f.zombies.push(ZombieParent {
+                    ppid: pile.parent(),
+                    name: name(pile.parent()),
+                    count: pile.count(),
+                    per_min_deci: pile.per_min_deci(),
+                    tab: tab_of(&pile.parent()),
+                });
+            }
         }
         for (pid, since) in &self.d_since {
             let own = sweep
@@ -4439,35 +4432,29 @@ fn leaves_of(
         .collect()
 }
 
-fn zombie_facts(
-    now: &MemberMap,
-    live: &[u32],
-    sweep: &HashMap<u32, &SweepProc>,
-    book: &ZombieBook,
-    at: u64,
-) -> Option<Zombies> {
+fn zombie_facts(live: &[u32], facts: Option<&ZombieFacts>) -> Option<Zombies> {
+    let facts = facts?;
     let live: BTreeSet<u32> = live.iter().copied().collect();
-    let mut by_parent: BTreeMap<u32, u32> = BTreeMap::new();
-    for pid in now.keys() {
-        let Some((first, ppid)) = book.seen(*pid) else {
-            continue;
-        };
-        if sweep.get(pid).is_some_and(|s| s.state == ProcState::Zombie)
-            && at.saturating_sub(first) >= ZOMBIE_AGE_MS
-            && live.contains(&ppid)
-        {
-            *by_parent.entry(ppid).or_default() += 1;
+    let mut count = 0u32;
+    let mut parent: Option<&crate::blockage::ZombiePile> = None;
+    for pile in facts
+        .piles()
+        .iter()
+        .filter(|pile| live.contains(&pile.parent()))
+    {
+        count = count.checked_add(pile.count())?;
+        if parent.is_none_or(|other| {
+            (pile.count(), std::cmp::Reverse(pile.parent()))
+                > (other.count(), std::cmp::Reverse(other.parent()))
+        }) {
+            parent = Some(pile);
         }
     }
-    let count: u32 = by_parent.values().sum();
-    let (parent, _) = by_parent
-        .iter()
-        .max_by_key(|(p, c)| (**c, std::cmp::Reverse(**p)))?;
-    let since = book.pile_since(*parent).unwrap_or(at);
+    let parent = parent?;
     Some(Zombies {
         count,
-        parent: *parent,
-        per_min_deci: per_min_deci(count, at.saturating_sub(since)),
+        parent: parent.parent(),
+        per_min_deci: parent.per_min_deci(),
     })
 }
 

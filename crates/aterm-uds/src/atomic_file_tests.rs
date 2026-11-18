@@ -731,6 +731,13 @@ fn a_lock_name_swapped_after_its_check_is_still_refused() {
     assert_eq!(mode_of(&lock), 0o644, "the FIFO is not made private");
 }
 
+/// A save after the first check still refuses the edit, and so does one before it, the target
+/// left as the save left it; each refusal carries [`ChangedSinceRead`] (the check before the
+/// rename's as much as the first one's), and an error of another kind carries none.
+/// NEGATIVE CONTROL: an `unchanged` that refuses with a plain error (as the one before this did)
+/// carries no marker, and nor does a check before the rename whose refusal the write's context
+/// keeps wrapped, so a caller reads a Settings save between its read and its write as a failed
+/// write.
 #[test]
 fn a_save_after_the_first_check_still_refuses_the_edit() {
     let scratch = Scratch::new("late");
@@ -740,11 +747,33 @@ fn a_save_after_the_first_check_still_refuses_the_edit() {
     let edit = file.lock().expect("lock");
     let editor = config.clone();
     racing(move || std::fs::write(&editor, "theme = \"Solarized\"\n").expect("the editor"));
-    assert!(edit.replace("theme = \"Dracula\"\n").is_err());
+    let late = edit
+        .replace("theme = \"Dracula\"\n")
+        .expect_err("a late save refuses");
+    assert!(ChangedSinceRead::of(&late).is_some(), "{late}");
     assert_eq!(
         std::fs::read_to_string(&config).expect("read"),
         "theme = \"Solarized\"\n"
     );
+
+    let file = ConfigFile::open(&config).expect("open");
+    std::fs::write(&config, "theme = \"Gruvbox\"\n").expect("the editor");
+    let early = file
+        .lock()
+        .expect("lock")
+        .replace("theme = \"Dracula\"\n")
+        .expect_err("an early save refuses");
+    assert!(ChangedSinceRead::of(&early).is_some(), "{early}");
+    assert_eq!(
+        std::fs::read_to_string(&config).expect("read"),
+        "theme = \"Gruvbox\"\n"
+    );
+    for other in [
+        io::Error::from_raw_os_error(libc::EIO),
+        io::Error::other("changed meanwhile"),
+    ] {
+        assert!(ChangedSinceRead::of(&other).is_none(), "{other}");
+    }
 }
 
 #[cfg(target_vendor = "apple")]

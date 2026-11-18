@@ -203,25 +203,24 @@ fn automatic_follow_requires_admission_and_the_current_owning_number() {
     assert_eq!(
         row_nick(root.path()),
         Some(Some(heron())),
-        "history remains readable"
+        "the row remains readable"
     );
-    assert!(follow_registry(root.path(), 2).is_err());
+    assert!(follow_registry(root.path()).is_err());
     assert_eq!(
         file::read(root.path()).unwrap(),
         Some(held.clone()),
-        "a refused source changes neither nickname, RowSeen nor history"
+        "a refused source changes neither nickname nor RowSeen"
     );
 
     allowed.store(true, Ordering::Release);
     super::ROW.with(|row| follow_of(&mut row.borrow_mut()).number = Number::new(86));
-    assert_eq!(follow_registry(root.path(), 3).unwrap(), None);
+    assert_eq!(follow_registry(root.path()).unwrap(), None);
     assert_eq!(file::read(root.path()).unwrap(), Some(held.clone()));
     super::ROW.with(|row| follow_of(&mut row.borrow_mut()).number = Some(number));
-    let followed = follow_registry(root.path(), 4).unwrap().unwrap();
+    let followed = follow_registry(root.path()).unwrap().unwrap();
     assert_eq!(followed.nick, heron());
     assert_eq!(followed.num, held.num);
     assert_eq!(followed.rev, held.rev + 1);
     assert_eq!(followed.row, file::RowSeen::Saw(Some(heron())));
-    assert_eq!(followed.history.len(), held.history.len() + 1);
-    assert_eq!(follow_registry(root.path(), 5).unwrap(), None);
+    assert_eq!(follow_registry(root.path()).unwrap(), None);
 }

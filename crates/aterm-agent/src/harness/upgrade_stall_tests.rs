@@ -289,17 +289,7 @@ struct Agent {
 #[cfg(unix)]
 impl Agent {
     fn start(opts: &Opts, st: &St) -> Agent {
-        let child = Command::new(std::env::current_exe().expect("exe"))
-            .arg(PARK[0])
-            .env(PARK_ENV, "1")
-            .env("ATERM_PARENT_SESSION_ID", TAB)
-            .env_remove("HOME")
-            .setsid(true)
-            .stdin(aterm_uds::spawnfd::Stdio::null())
-            .stdout(aterm_uds::spawnfd::Stdio::null())
-            .stderr(aterm_uds::spawnfd::Stdio::null())
-            .spawn()
-            .expect("agent");
+        let child = parked_bare().setsid(true).spawn().expect("agent");
         wait_exec(child.id());
         let sf = register(&opts.home, child.id(), SESSION);
         let st = St {

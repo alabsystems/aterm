@@ -54,7 +54,7 @@ fn owed_reads_each_step_and_an_unreadable_one_owes_nothing() {
         .stat_of(ADMITTED_NAME_RULE, rule_stat(0, 0o440))
         .on(
             "/usr/bin/mdutil -s /System/Volumes/Data",
-            Ran::ok("Indexing enabled."),
+            Ran::ok("/System/Volumes/Data:\n\tIndexing enabled.\n"),
         );
     assert_eq!(owed(&account), vec![Owed::Spotlight]);
     account.file(

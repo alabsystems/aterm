@@ -30,8 +30,10 @@ pub(crate) fn capture(repo: &Path, output: &[u8], seal: &str) -> Result<Observat
     let mut graph = BTreeSet::new();
     let mut roots = BTreeSet::new();
     let mut packages = BTreeMap::new();
+    let mut script_targets = BTreeMap::new();
     let mut selected = BTreeSet::new();
     let mut scripts = Vec::new();
+    let mut executed_scripts = BTreeSet::new();
     let mut all_fresh = true;
     for line in output.split(|b| *b == b'\n') {
         let Ok(mut row) = aterm_json::from_slice::<Value>(line) else {
@@ -41,6 +43,14 @@ pub(crate) fn capture(repo: &Path, output: &[u8], seal: &str) -> Result<Observat
             Some("compiler-artifact") => {
                 all_fresh &= row["fresh"].as_bool().ok_or("missing Cargo freshness")?;
                 let id = string(&row, "package_id")?.to_owned();
+                let (fingerprint_name, is_script) = selected_target(&row)?;
+                if is_script
+                    && script_targets
+                        .insert(id.clone(), fingerprint_name.clone())
+                        .is_some_and(|previous| previous != fingerprint_name)
+                {
+                    return Err("ambiguous selected build-script target".into());
+                }
                 let manifest = PathBuf::from(string(&row, "manifest_path")?);
                 let package = manifest.parent().ok_or("no package directory")?.to_owned();
                 let text = std::fs::read_to_string(&manifest).map_err(|e| e.to_string())?;
@@ -57,41 +67,24 @@ pub(crate) fn capture(repo: &Path, output: &[u8], seal: &str) -> Result<Observat
                 packages.insert(id, package);
                 roots.insert(manifest);
                 let files = row["filenames"].as_array().ok_or("no compiler outputs")?;
-                let dirs: BTreeSet<_> = files
+                let files: BTreeSet<PathBuf> = files
                     .iter()
-                    .filter_map(Value::as_str)
-                    .filter_map(|p| Path::new(p).parent().map(Path::to_owned))
-                    .collect();
-                if dirs.is_empty() {
+                    .map(|file| {
+                        file.as_str()
+                            .map(PathBuf::from)
+                            .ok_or("non-string compiler output")
+                    })
+                    .collect::<Result<_, _>>()?;
+                if files.is_empty() {
                     return Err("no compiler output directory".into());
                 }
-                for dir in dirs {
-                    let mut found = false;
-                    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
-                        let path = entry.map_err(|e| e.to_string())?.path();
-                        if path.extension().is_some_and(|e| e == "d") {
-                            found = true;
-                            let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-                            graph.insert(text.clone());
-                            roots.extend(crate::cutter::declared_sources(&text)?.into_iter().map(
-                                |path| {
-                                    if path.is_absolute() {
-                                        path
-                                    } else {
-                                        repo.join(path)
-                                    }
-                                },
-                            ));
-                        }
-                    }
-                    if !found {
-                        return Err("compiler output has no source dep-info".into());
-                    }
+                for file in files {
+                    let dir = file.parent().ok_or("no compiler output directory")?;
                     let has_fingerprint = dir
                         .parent()
                         .is_some_and(|unit| unit.join("fingerprint").is_dir());
                     if has_fingerprint {
-                        fingerprint(&dir, &mut graph, None, &mut roots)?;
+                        fingerprint(dir, &fingerprint_name, &mut graph, None, &mut roots)?;
                     // Published executables have aggregate dep-info in target/. Their
                     // producer identity authenticates this shape; sources and config
                     // still enter the digest, including every script's control output.
@@ -100,7 +93,7 @@ pub(crate) fn capture(repo: &Path, output: &[u8], seal: &str) -> Result<Observat
                         .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("bin")))
                         && row["executable"]
                             .as_str()
-                            .is_some_and(|path| Path::new(path).parent() == Some(dir.as_path()))
+                            .is_some_and(|path| Path::new(path) == file)
                         && row["trust_unit_identity_sha256"]
                             .as_str()
                             .is_some_and(|id| aterm_codec::hex::is_lower(id, 64)))
@@ -110,6 +103,21 @@ pub(crate) fn capture(repo: &Path, output: &[u8], seal: &str) -> Result<Observat
                             dir.display()
                         ));
                     }
+                    let dep = selected_dep_info(&row, &file, !has_fingerprint)?;
+                    let text = crate::durable::read_text(&dep)
+                        .map_err(|e| format!("{}: {e}", dep.display()))?;
+                    graph.insert(text.clone());
+                    roots.extend(
+                        crate::cutter::declared_sources(&text)?
+                            .into_iter()
+                            .map(|path| {
+                                if path.is_absolute() {
+                                    path
+                                } else {
+                                    repo.join(path)
+                                }
+                            }),
+                    );
                 }
                 let artifact = row.as_object_mut().ok_or("artifact is not an object")?;
                 artifact.remove("fresh");
@@ -127,11 +135,20 @@ pub(crate) fn capture(repo: &Path, output: &[u8], seal: &str) -> Result<Observat
         return Err("no compiler graph".into());
     }
     for script in scripts {
-        let package = packages
-            .get(string(&script, "package_id")?)
-            .ok_or("unknown build-script package")?;
+        let id = string(&script, "package_id")?;
+        let package = packages.get(id).ok_or("unknown build-script package")?;
+        let target = script_targets
+            .get(id)
+            .ok_or("no selected build-script compiler artifact")?;
+        executed_scripts.insert(id.to_owned());
         let out = PathBuf::from(string(&script, "out_dir")?);
-        fingerprint(&out, &mut graph, Some(package), &mut roots)?;
+        fingerprint(
+            &out,
+            &format!("run-{target}"),
+            &mut graph,
+            Some(package),
+            &mut roots,
+        )?;
         // Cargo's control output and generated tree are build inputs too. The pinned
         // driver does not advertise native integrity checks for these cached files.
         roots.insert(
@@ -141,6 +158,12 @@ pub(crate) fn capture(repo: &Path, output: &[u8], seal: &str) -> Result<Observat
         );
         roots.insert(out);
         graph.insert(script.to_string());
+    }
+    if script_targets
+        .keys()
+        .any(|id| !executed_scripts.contains(id))
+    {
+        return Err("selected build-script has no execution record".into());
     }
     // Workspace identity is runtime data. All other manifest data remains an input.
     // An actual include/rerun read of this manifest also enters `roots` unnormalized.
@@ -213,7 +236,7 @@ pub(crate) fn capture(repo: &Path, output: &[u8], seal: &str) -> Result<Observat
     }
     let sources = aterm_codec::hex::encode_lower(&sources.finalize());
     let mut digest = Sha256::new();
-    digest.update(b"cutter-inputs/1\0");
+    digest.update(b"cutter-inputs/2\0");
     frame(&mut digest, seal.as_bytes());
     frame(&mut digest, sources.as_bytes());
     for row in graph {
@@ -240,53 +263,198 @@ fn frame(hash: &mut Sha256, bytes: &[u8]) {
     hash.update(bytes);
 }
 
+/// The pinned driver's fingerprint_file_path uses the target description and literal
+/// target name, not the crate name or an arbitrary JSON sibling. This capture is for
+/// the cutter's build mode; other modes and unknown target kinds decline adoption.
+fn selected_target(row: &Value) -> Result<(String, bool), String> {
+    if row["profile"]["test"].as_bool() != Some(false) {
+        return Err("unknown cutter compiler mode".into());
+    }
+    let target = &row["target"];
+    let name = string(target, "name")?;
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("unknown compiler target name".into());
+    }
+    let kinds = target["kind"]
+        .as_array()
+        .ok_or("missing compiler target kind")?;
+    let (kind, script) = match kinds.as_slice() {
+        [kind] if kind.as_str() == Some("bin") => ("bin", false),
+        [kind] if kind.as_str() == Some("custom-build") => ("build-script", true),
+        kinds
+            if !kinds.is_empty()
+                && kinds.iter().all(|kind| {
+                    matches!(
+                        kind.as_str(),
+                        Some("lib" | "rlib" | "dylib" | "cdylib" | "staticlib" | "proc-macro")
+                    )
+                }) =>
+        {
+            ("lib", false)
+        }
+        _ => return Err("unknown cutter compiler target kind".into()),
+    };
+    Ok((format!("{kind}-{name}"), script))
+}
+
+fn selected_dep_info(row: &Value, artifact: &Path, aggregate: bool) -> Result<PathBuf, String> {
+    let name = string(&row["target"], "name")?;
+    if aggregate {
+        if artifact.file_name().and_then(|name| name.to_str()) != Some(name) {
+            return Err("unknown published compiler output name".into());
+        }
+        return Ok(artifact.with_extension("d"));
+    }
+    let (target, _) = selected_target(row)?;
+    let stem = artifact
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .ok_or("unknown compiler output name")?;
+    let stem = if target.starts_with("lib-") {
+        stem.strip_prefix("lib")
+            .ok_or("unknown library output name")?
+    } else {
+        stem
+    };
+    let crate_name = name.replace('-', "_");
+    if stem != crate_name
+        && !stem
+            .strip_prefix(&format!("{crate_name}-"))
+            .is_some_and(|hash| aterm_codec::hex::is_lower(hash, 16))
+    {
+        return Err("compiler output names another target".into());
+    }
+    Ok(artifact
+        .parent()
+        .ok_or("no compiler output directory")?
+        .join(format!("{stem}.d")))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+enum ScriptInput {
+    RerunIfChanged {
+        output: PathBuf,
+        paths: Vec<PathBuf>,
+    },
+    RerunIfChangedContent {
+        output: PathBuf,
+        paths: Vec<PathBuf>,
+        snapshot: Option<ContentSnapshot>,
+    },
+    RerunIfEnvChanged {
+        var: String,
+        val: Value,
+    },
+    Precalculated(String),
+}
+
+/// Exact Trust 5062 Snapshot wire and bounds. A missing snapshot is uncacheable,
+/// not evidence of an empty declared input set.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContentSnapshot {
+    version: u32,
+    entries: u64,
+    bytes: u64,
+    sha256: String,
+}
+
+impl ContentSnapshot {
+    fn valid(&self) -> bool {
+        self.version == 1
+            && self.entries <= 100_000
+            && self.bytes <= 512 * 1024 * 1024
+            && aterm_codec::hex::is_lower(&self.sha256, 64)
+    }
+}
+
 /// Trust's pinned layout keeps each unit's fingerprint beside its output directory.
 /// Missing/unknown records fail closed; no guessed source list licenses adoption.
 fn fingerprint(
     out: &Path,
+    selected: &str,
     graph: &mut BTreeSet<String>,
     package: Option<&Path>,
     roots: &mut BTreeSet<PathBuf>,
 ) -> Result<(), String> {
     let folder = out.parent().ok_or("no unit directory")?.join("fingerprint");
-    let mut found = false;
-    for entry in std::fs::read_dir(folder).map_err(|e| e.to_string())? {
-        let path = entry.map_err(|e| e.to_string())?.path();
-        if !path.extension().is_some_and(|e| e == "json") {
-            continue;
-        }
-        found = true;
-        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let value: Value = aterm_json::from_str(&text).map_err(|e| e.to_string())?;
-        graph.insert(value.to_string());
-        if let Some(package) = package {
-            for local in value["local"]
-                .as_array()
-                .ok_or("missing build-script input declarations")?
-            {
-                if let Some(changed) = local.get("RerunIfChanged") {
-                    for path in changed["paths"]
-                        .as_array()
-                        .ok_or("unknown build-script paths")?
-                    {
-                        roots.insert(
-                            package.join(path.as_str().ok_or("non-string build-script path")?),
-                        );
+    let value = fingerprint_record(&folder.join(selected).with_extension("json"))?;
+    let local = value["local"]
+        .as_array()
+        .ok_or("missing selected fingerprint declarations")?;
+    graph.insert(value.to_string());
+    if let Some(package) = package {
+        for input in local {
+            let input: ScriptInput = aterm_json::from_value(input.clone())
+                .map_err(|e| format!("unknown build-script input declaration: {e}"))?;
+            let (output, paths) = match input {
+                ScriptInput::RerunIfChanged { output, paths } => (output, paths),
+                ScriptInput::RerunIfChangedContent {
+                    output,
+                    paths,
+                    snapshot,
+                } => {
+                    if !snapshot.is_some_and(|snapshot| snapshot.valid()) {
+                        return Err("unavailable build-script content snapshot".into());
                     }
-                } else if local.get("RerunIfEnvChanged").is_some() {
-                    // Cargo checked the child environment; its recorded value is in `graph`.
-                } else if local.get("Precalculated").is_some() {
-                    roots.insert(package.to_owned());
-                } else {
-                    return Err("unknown build-script input declaration".into());
+                    (output, paths)
                 }
+                ScriptInput::RerunIfEnvChanged { var, val } => {
+                    let valid_value = match val {
+                        Value::Null => true,
+                        Value::String(value) => !value.contains('\0'),
+                        _ => false,
+                    };
+                    if var.is_empty() || var.contains('\0') || !valid_value {
+                        return Err("invalid build-script environment declaration".into());
+                    }
+                    // Cargo checked this environment; retain its exact recorded value in graph.
+                    continue;
+                }
+                ScriptInput::Precalculated(_value) => {
+                    roots.insert(package.to_owned());
+                    continue;
+                }
+            };
+            if !output.ends_with("run/stdout")
+                || output
+                    .components()
+                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+                || !out
+                    .parent()
+                    .ok_or("no build-script unit")?
+                    .join("run/stdout")
+                    .ends_with(&output)
+            {
+                return Err("build-script control output names another unit".into());
             }
+            roots.extend(paths.into_iter().map(|path| package.join(path)));
         }
-    }
-    if !found {
-        return Err("no compiler fingerprint".into());
+    } else {
+        // Pinned Trust build units also publish their output-integrity receipt. Keep
+        // that selected receipt in the graph, but never let it replace the fingerprint.
+        let receipt = fingerprint_record(
+            &folder
+                .join(format!("outputs-{selected}"))
+                .with_extension("json"),
+        )?;
+        if receipt["schema"].as_u64() != Some(4) || !receipt["outputs"].is_array() {
+            return Err("unknown selected compiler output receipt".into());
+        }
+        graph.insert(receipt.to_string());
     }
     Ok(())
+}
+
+fn fingerprint_record(path: &Path) -> Result<Value, String> {
+    let text = crate::durable::read_regular_text(path, 16 * 1024 * 1024)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    aterm_json::from_str(&text).map_err(|e| e.to_string())
 }
 
 fn hash_path(path: &Path, hash: &mut Sha256, active: &mut BTreeSet<PathBuf>) -> Result<(), String> {

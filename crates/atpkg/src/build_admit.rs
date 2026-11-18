@@ -586,7 +586,7 @@ pub fn need(
     build: &Build,
     key: &Key,
     own: &Records,
-    verify: &Records,
+    verify: &dyn book::ShapingSource,
     physical: Option<u64>,
 ) -> BuildNeed {
     let like = build.analogue.map(|stage| Key {
@@ -1188,7 +1188,7 @@ fn admit_for(
     let verify = seat
         .verify
         .as_deref()
-        .map(Records::load)
+        .map(book::ShapingHistory::load)
         .unwrap_or_default();
     let reading = seat.machine.read(None);
     let need = need(build, &key, &own, &verify, reading.physical);
@@ -2590,7 +2590,8 @@ pub fn run_if_claimed(
 /// [`reader::QUERY_ENV`] selector on that same safe capability entry reports the reader schema and namespace
 /// without taking a claim. In the shim's form, a
 /// tree whose `trust.lock` names a build runs that build's tool in place of `target`
-/// ([`crate::trust_lock::shim_target`]; a lock that does not read, or a build this store does not
+/// ([`crate::trust_lock::shim_target_for_call`], from the directory a global `-C` names when
+/// present; a lock that does not read, or a build this store does not
 /// hold as it names it, is exit 75 with no build started). The shim's form
 /// first registers the call's build cache as the shim's own registration call did
 /// ([`crate::build_cache::registered::observe_shim_call`]: a refusal is exit 75, no build
@@ -2648,27 +2649,40 @@ pub fn run_hidden(argv: &[std::ffi::OsString]) -> std::process::ExitCode {
     {
         crate::build_cache::shared_units::note(&home);
     }
-    // A shim's target is the build it was laid for; in a tree whose trust.lock names another,
-    // the hop runs that one, so plain `targo` and verify compile with one compiler.
-    let locked = match (shim, std::env::current_dir()) {
-        (Some(_), Ok(cwd)) => match crate::trust_lock::shim_target(
-            Path::new(target),
-            &cwd,
-            &mut crate::trust_lock::install_named,
-        ) {
+    let words = rest
+        .iter()
+        .map(|a| a.to_str().map(str::to_owned))
+        .collect::<Option<Vec<String>>>();
+    // Select from the directory the call builds in, including a global -C, before admitting
+    // its cache or invoking the tool. The launcher's lock has no authority over another tree.
+    let locked = if let Some((tool, placed)) = shim {
+        let selected = words
+            .as_deref()
+            .ok_or_else(|| "compiler-shim arguments are not UTF-8".to_owned())
+            .and_then(|words| {
+                let cwd = std::env::current_dir().map_err(|error| {
+                    format!("the compiler shim cannot read its directory: {error}")
+                })?;
+                crate::trust_lock::shim_target_for_call(
+                    Path::new(target),
+                    &cwd,
+                    tool,
+                    placed.to_str().unwrap_or(""),
+                    words,
+                    &mut crate::trust_lock::install_named,
+                )
+            });
+        match selected {
             Ok(locked) => locked,
             Err(why) => {
                 eprintln!("atpkg: {why}; no build started");
                 return std::process::ExitCode::from(75);
             }
-        },
-        _ => None,
+        }
+    } else {
+        None
     };
     let target = locked.as_deref().unwrap_or_else(|| Path::new(target));
-    let words = rest
-        .iter()
-        .map(|a| a.to_str().map(str::to_owned))
-        .collect::<Option<Vec<String>>>();
     // Where a build started in a tab leaves its line, and what the shim's call builds, for that
     // line: none for a call that builds nothing, and none asked for outside a tab.
     #[cfg(unix)]

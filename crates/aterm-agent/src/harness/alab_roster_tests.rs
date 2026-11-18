@@ -349,6 +349,8 @@ fn the_lab_fleet_adds_this_macs_preferred_accounts_in_rank_order() {
             account("fay", Cli::Kimi, "kimi-ffffff", &[("m22", Some(1))]),
             paused,
         ],
+        names: Default::default(),
+        barred: Default::default(),
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
         #[cfg(unix)]
@@ -397,6 +399,8 @@ fn a_preference_never_drops_a_row() {
             account("ann", Cli::Claude, "claude-aaaaaa", &[("m22", Some(1))]),
             account("cy", Cli::Claude, "claude-cccccc", &[("m20", Some(1))]),
         ],
+        names: Default::default(),
+        barred: Default::default(),
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
         #[cfg(unix)]
@@ -457,6 +461,8 @@ fn a_label_another_account_holds_stays_with_its_row() {
             account("gil", Cli::Claude, "work", &[("m22", Some(1))]),
             account("ann", Cli::Claude, "claude-aaaaaa", &[("m22", Some(2))]),
         ],
+        names: Default::default(),
+        barred: Default::default(),
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
         #[cfg(unix)]
@@ -518,6 +524,8 @@ fn a_source_the_owner_set_wins_over_the_lab() {
             account("ann", Cli::Claude, "claude-aaaaaa", &[("m22", Some(1))]),
             account("fay", Cli::Kimi, "kimi-ffffff", &[("m22", Some(1))]),
         ],
+        names: Default::default(),
+        barred: Default::default(),
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
         #[cfg(unix)]
@@ -657,6 +665,8 @@ fn preference_bed(state: &aterm_spec::interp::State) -> (Lab, Roster) {
         me: Some(test_machine("m1")),
         bound: Default::default(),
         accounts: vec![x],
+        names: Default::default(),
+        barred: Default::default(),
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
         #[cfg(unix)]
@@ -790,20 +800,58 @@ fn a_sync_takes_the_preference_models_steps() {
     assert!(!model.successors("Sync", paused).contains(&next));
 }
 
-/// An account asked for by name (§0, §7) is the lab's row for it, found by its label, its legacy
-/// label or its account key, under its lab label with its address and derived order (an account
-/// another Mac prefers is a pool row here), and a sync then keeps it as it keeps every row: the
-/// request writes no preference, so the lab is as it was. A name the lab does not know is no
-/// lab row (a new label, as it always was), and so is any name where the lab names no machine for
-/// this Mac; a paused account or a name two accounts share is refused.
+/// `lab` with each account keyed by its realm and address and named as the lab names it
+/// ([`Lab::names`]), its slug the label it was made with, and then labelled as LabView labels a
+/// pooled account, with its reserved slug, which names nothing: what [`asked_row`] resolves a
+/// word among.
+fn keyed_and_named(mut lab: Lab) -> Lab {
+    use aterm_db::typed::keys;
+    let realm = |account: &LabAccount| match (account.cli, account.vendor.region) {
+        (Cli::Kimi, Some(Region::MainlandCn)) => "kimi:mainland-cn",
+        (Cli::Kimi, _) => "kimi:global",
+        _ => "claude",
+    };
+    for account in &mut lab.accounts {
+        account.pk = keys::account_pk(realm(account), &account.email).expect("a key");
+    }
+    lab.names = lab
+        .accounts
+        .iter()
+        .map(|account| {
+            let realm = realm(account);
+            let names = aterm_file::AccountNames {
+                realm: realm.to_owned(),
+                slug: account.label.clone(),
+                name: keys::account_name(realm, &account.email),
+                email: Some(account.email.clone()),
+                login: Some(account.email.clone()),
+                live: true,
+            };
+            (account.pk.clone(), names)
+        })
+        .collect();
+    for account in &mut lab.accounts {
+        account.label = keys::reserved_slug(realm(account), &account.pk);
+    }
+    lab
+}
+
+/// An account asked for by name (§0, §7) is the lab's row for it, found by its slug, its key, or
+/// its provider word and address as the lab names it ([`Lab::names`]), under its lab label with
+/// its address and derived order (an account another Mac prefers is a pool row here), and a sync
+/// then keeps it as it keeps every row: the request writes no preference, so the lab is as it
+/// was. A word that names no account is no lab row, nor a legacy label, which names nothing, and
+/// neither is any word where the lab names no machine for this Mac; a paused account, a slug two
+/// accounts share and another pool's account are refused.
 /// NEGATIVE CONTROL: with `asked_row`'s `joinable` check removed, the paused account is a row
-/// (`a paused account is refused`); with its `legacy_label` match removed, the legacy name
-/// finds nothing (`by its legacy label`).
+/// (`a paused account is refused`). With `asked_row_from` first taking the lab account whose label
+/// is the word, the reserved slug the lab labels ann's row with names it (`the lab's label names
+/// nothing`) (2026-11-16, by hand on SF-07H S6's review settle, then restored).
 #[test]
 fn an_account_asked_for_by_name_joins_with_no_preference() {
     let mut paused = account("carol", Cli::Claude, "claude-cccccc", &[("m20", Some(1))]);
     paused.joinable = false;
-    let lab = Lab {
+    let lab = keyed_and_named(Lab {
         me: Some(test_machine("m1")),
         bound: Default::default(),
         accounts: vec![
@@ -817,31 +865,46 @@ fn an_account_asked_for_by_name_joins_with_no_preference() {
             account("eve", Cli::Kimi, "claude-dupdup", &[]),
             account("eveline", Cli::Claude, "claude-dupdup", &[]),
         ],
+        names: Default::default(),
+        barred: Default::default(),
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
         #[cfg(unix)]
         machine_name: None,
         places: Default::default(),
-    };
+    });
     let before = lab.clone();
+    let reserved = |local: &str| {
+        let pk = aterm_db::typed::keys::account_pk("claude", &email(local)).expect("a key");
+        aterm_db::typed::keys::reserved_slug("claude", &pk)
+    };
     with_lab(lab.clone(), || {
-        let key = format!("ac-{:0>16}", "ann".len());
+        let key = aterm_db::typed::keys::account_pk("claude", &email("ann")).expect("a key");
+        let name = format!("claude {}", email("ann"));
         for (name, why) in [
-            ("claude-aaaaaa", "by its label"),
-            ("m20-m1", "by its legacy label"),
+            ("claude-aaaaaa", "by its slug"),
+            (name.as_str(), "by its provider word and address"),
             (key.as_str(), "by its account key"),
         ] {
             let row = asked_row(Cli::Claude, name)
                 .unwrap_or_else(|| panic!("{why}"))
                 .unwrap();
-            assert_eq!(row.label, "claude-aaaaaa", "{why}");
+            assert_eq!(row.label, reserved("ann"), "{why}: the lab's label");
             assert_eq!(row.email.as_deref(), Some(email("ann").as_str()));
             assert_eq!(row.class, Class::Pool, "another Mac prefers it");
             assert_eq!(row.dir, None);
         }
         assert!(asked_row(Cli::Claude, "nobody").is_none());
         assert!(
-            asked_row(Cli::Kimi, "claude-aaaaaa").is_none(),
+            asked_row(Cli::Claude, "m20-m1").is_none(),
+            "a legacy label names nothing"
+        );
+        assert!(
+            asked_row(Cli::Claude, &reserved("ann")).is_none(),
+            "the lab's label names nothing"
+        );
+        assert!(
+            matches!(asked_row(Cli::Kimi, "claude-aaaaaa"), Some(Err(why)) if why.contains("--cli claude")),
             "another CLI's"
         );
         assert!(
@@ -856,7 +919,7 @@ fn an_account_asked_for_by_name_joins_with_no_preference() {
         let asked = asked_row(Cli::Claude, "claude-gggggg").unwrap().unwrap();
         let synced = preference_sync(&lab, &Roster { rows: vec![asked] });
         let kept = synced
-            .row("claude-gggggg")
+            .row(&reserved("gilbert"))
             .expect("the sync keeps the asked row");
         assert_eq!(kept.class, Class::Pool);
     });
@@ -891,6 +954,8 @@ fn an_empty_lab_roster_stays_empty_and_keeps_every_row() {
             "claude-aaaaaa",
             &[("m20", Some(1))],
         )],
+        names: Default::default(),
+        barred: Default::default(),
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
         #[cfg(unix)]
@@ -953,6 +1018,8 @@ fn a_sync_is_due_only_when_the_lab_would_change_the_roster() {
                 "m20-m1",
             ),
         ],
+        names: Default::default(),
+        barred: Default::default(),
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
         #[cfg(unix)]

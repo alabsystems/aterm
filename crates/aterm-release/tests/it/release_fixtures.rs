@@ -786,9 +786,7 @@ fn main_reader_records_then_checks_the_splice_without_blessing_old_answers() {
                         assert!(args.iter().any(|a| a == "--ignored"));
                         assert!(args.iter().any(|a| a == "serde_corpus_tests::record_shipped_state_for_landing"));
                         assert_eq!(fs::read_to_string(tree.join(fixtures::SHIPPED_STATE_CORPUS)).unwrap(), corpus());
-                        // Main also changed an old answer. It must remain an oracle,
-                        // not be silently blessed along with the new producer's cases.
-                        fs::write(env_of(cmd, fixtures::ANSWERS_OUT).unwrap(), rendered.replace("fnv1a64:5", "fnv1a64:OLD-MOVED")).unwrap();
+                        fs::write(env_of(cmd, fixtures::ANSWERS_OUT).unwrap(), &rendered).unwrap();
                         "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n".into()
                     }
                     3 => {
@@ -822,6 +820,89 @@ fn main_reader_records_then_checks_the_splice_without_blessing_old_answers() {
                 .filter(|l| l.starts_with("worktree "))
                 .count(),
             2
+        );
+    }
+}
+
+#[test]
+fn main_reader_refuses_answer_drift_before_writing_but_lands_producer_truth() {
+    for historical in [true, false] {
+        let o = Origin::new();
+        let staged = fixtures::stage(
+            &targo(),
+            &o.work,
+            &o.stage_root(),
+            &pins(7),
+            &mut generator(&["history"], &Cell::new(0)),
+        )
+        .unwrap();
+        let producer_answers = fs::read(&staged.answers).unwrap();
+        let parent = fs::read(staged.dir.join("history/parent.toml")).unwrap();
+        let mut calls = 0;
+        let mut reader_tree = None;
+        let observed = if historical {
+            staged_answers(&["history"]).replace("fnv1a64:5", "fnv1a64:OLD-MOVED")
+        } else {
+            staged_answers(&["history"]).replace(
+                "v0.6.0/history/manifest\tok\t",
+                "v0.6.0/history/manifest\terr\t",
+            )
+        };
+        let landed = fixtures::land(
+            &Git::new(&o.work), &native(&o), &staged, &pins(7), &mut |preview| {
+                let reading = fixtures::MainReader::new(&o.work).unwrap().read(
+                    &targo(), preview, &pins(7), &mut |cmd| {
+                        calls += 1;
+                        let tree = cmd.get_current_dir().unwrap();
+                        reader_tree = Some(tree.to_path_buf());
+                        let stdout = match calls {
+                            1 => artifact(tree, &o.work.join("target/.ubd/main.noindex/debug/deps/aterm_gui-0123456789abcdef")),
+                            2 => {
+                                assert!(cmd.get_args().any(|arg| arg == "serde_corpus_tests::record_shipped_state_for_landing"));
+                                fs::write(env_of(cmd, fixtures::ANSWERS_OUT).unwrap(), &observed).unwrap();
+                                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n".to_owned()
+                            }
+                            _ => panic!("invalid answers must stop before field/consumer checks or a golden write"),
+                        };
+                        Ok(Output { status: exit(0), stdout: stdout.into_bytes(), stderr: Vec::new() })
+                    },
+                );
+                assert!(reading.answers.is_err());
+                assert!(reading.checks.contains(if historical { "v0.5.0/history/manifest" } else { "v0.6.0/history/manifest" }), "{}", reading.checks);
+                reading
+            },
+        ).unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(
+            fs::read(reader_tree.unwrap().join(fixtures::SHIPPED_STATE_CORPUS)).unwrap(),
+            corpus().as_bytes()
+        );
+        assert_eq!(
+            o.on_main(fixtures::SHIPPED_STATE_CORPUS),
+            corpus().as_bytes()
+        );
+        assert!(matches!(
+            landed,
+            Landed::Pushed {
+                answers: Answers::Unrecorded(_),
+                ..
+            }
+        ));
+        assert_eq!(
+            o.on_main(&format!(
+                "{HANDOFF_FIXTURE_ROOT}/v0.6.0/history/parent.toml"
+            )),
+            parent
+        );
+        assert!(
+            String::from_utf8(o.on_main(HANDOFF_FIXTURE_GUARD))
+                .unwrap()
+                .contains("(\"v0.6.0\", \"history\")")
+        );
+        assert_eq!(fs::read(&staged.answers).unwrap(), producer_answers);
+        assert_eq!(
+            fs::read(staged.dir.join("history/parent.toml")).unwrap(),
+            parent
         );
     }
 }
@@ -2074,16 +2155,14 @@ fn the_release_answers_go_after_the_case_they_follow_and_a_corpus_that_cannot_ta
     assert_eq!((merged.as_str(), cases), (staged.as_str(), 2));
 
     let moved = corpus().replace("fnv1a64:5 len=5", "fnv1a64:55 len=55");
-    let (merged, _) = fixtures::with_release_answers(&moved, &staged, "v0.6.0").unwrap();
+    assert!(fixtures::with_release_answers(&moved, &staged, "v0.6.0").is_err());
+    // An intentional reader change is admissible once the historical golden on main was
+    // explicitly updated too. Adding a producer does not perform that separate review.
+    let reviewed = staged.replace("fnv1a64:5 len=5", "fnv1a64:55 len=55");
+    let (merged, _) = fixtures::with_release_answers(&moved, &reviewed, "v0.6.0").unwrap();
     assert_eq!(
-        merged,
-        format!(
-            "{HEADER}v0.5.0/history/manifest\tok\tfnv1a64:55 len=55\n\
-             v0.6.0/history/manifest\tok\tfnv1a64:6 len=6\n\
-             v0.6.0/twelve-panes/manifest\tok\tfnv1a64:6 len=6\n\
-             negative-control/torn-manifest\terr\tTOML parse error\n"
-        ),
-        "main's answer kept, the release's after it"
+        merged, reviewed,
+        "the reviewed main answer and new release's rows are both exact"
     );
 
     let refused = |corpus: &str, staged: &str| {
@@ -2093,13 +2172,123 @@ fn the_release_answers_go_after_the_case_they_follow_and_a_corpus_that_cannot_ta
     };
     assert!(refused(&staged, &staged).contains("records v0.6.0 already"));
     let lost = corpus().replace("v0.5.0/history/manifest\tok\tfnv1a64:5 len=5\n", "");
-    assert!(refused(&lost, &staged).contains("holds 0 lines with the case id they go after"));
+    assert!(refused(&lost, &staged).contains("v0.5.0/history/manifest"));
     assert!(refused(&corpus(), &corpus()).contains("hold no case of its desks"));
     let apart = staged.replacen("v0.6.0/twelve-panes/manifest\tok\tfnv1a64:6 len=6\n", "", 1)
         + "v0.6.0/twelve-panes/manifest\tok\tfnv1a64:6 len=6\n";
     assert!(refused(&corpus(), &apart).contains("apart, not as one block"));
     let first = format!("v0.6.0/history/manifest\tok\tfnv1a64:6 len=6\n{}", corpus());
-    assert!(refused(&corpus(), &first).contains("before the file's header"));
+    assert!(refused(&corpus(), &first).contains("header"));
+}
+
+#[test]
+fn the_release_answers_refuse_changed_history_and_invalid_new_rows() {
+    let old = "v0.5.0/history/manifest\tok\tfnv1a64:5 len=5\n";
+    let negative = "negative-control/torn-manifest\terr\tTOML parse error\n";
+    let new = "v0.6.0/history/manifest\tok\tfnv1a64:6 len=6\n";
+    let staged = staged_answers(&["history"]);
+    let committed = corpus();
+    let mut variants = vec![
+        ("old answer", staged.replace("fnv1a64:5", "fnv1a64:changed")),
+        (
+            "old verdict",
+            staged.replace(
+                "v0.5.0/history/manifest\tok\t",
+                "v0.5.0/history/manifest\terr\t",
+            ),
+        ),
+        (
+            "old error",
+            staged.replace("TOML parse error", "different error"),
+        ),
+        ("missing old case", staged.replace(old, "")),
+        (
+            "reordered old cases",
+            format!("{HEADER}{negative}{new}{old}"),
+        ),
+        (
+            "unrelated new case",
+            staged.replace(old, &format!("{old}v0.4.0/other/manifest\tok\tother\n")),
+        ),
+        (
+            "changed header",
+            staged.replace("# ok: the value.", "# changed header"),
+        ),
+        ("blank row", staged.replace(old, &format!("{old}\n"))),
+        ("changed line endings", staged.replace('\n', "\r\n")),
+        (
+            "missing terminal newline",
+            staged.trim_end_matches('\n').to_owned(),
+        ),
+        (
+            "duplicate old case",
+            staged.replace(old, &format!("{old}{old}")),
+        ),
+        (
+            "duplicate new case",
+            staged.replace(new, &format!("{new}{new}")),
+        ),
+        (
+            "different duplicate new answer",
+            staged.replace(new, &format!("{new}v0.6.0/history/manifest\tok\tother\n")),
+        ),
+        (
+            "new parser refusal",
+            staged.replace(
+                "v0.6.0/history/manifest\tok\t",
+                "v0.6.0/history/manifest\terr\t",
+            ),
+        ),
+        (
+            "unknown verdict",
+            staged.replace(
+                "v0.6.0/history/manifest\tok\t",
+                "v0.6.0/history/manifest\tmaybe\t",
+            ),
+        ),
+        (
+            "missing answer field",
+            staged.replace(new, "v0.6.0/history/manifest\tok\n"),
+        ),
+        (
+            "extra field",
+            staged.replace(new, "v0.6.0/history/manifest\tok\tvalue\textra\n"),
+        ),
+        (
+            "raw control",
+            staged.replace(new, "v0.6.0/history/manifest\tok\tvalue\r\r\n"),
+        ),
+        ("tag lookalike", staged.replace("v0.6.0/", "v0.6.00/")),
+    ];
+    variants.push(("case before header", format!("{new}{staged}")));
+    for (why, rendered) in variants {
+        assert!(
+            fixtures::with_release_answers(&committed, &rendered, "v0.6.0").is_err(),
+            "{why}"
+        );
+    }
+    // Matching malformed old input must refuse too; equality alone cannot license duplicates.
+    let duplicate_old = committed.replace(old, &format!("{old}{old}"));
+    let duplicate_rendered = staged.replace(old, &format!("{old}{old}"));
+    assert!(fixtures::with_release_answers(&duplicate_old, &duplicate_rendered, "v0.6.0").is_err());
+    let crlf_old = committed.replace('\n', "\r\n");
+    let crlf_new = staged.replace('\n', "\r\n");
+    assert_eq!(
+        fixtures::with_release_answers(&crlf_old, &crlf_new, "v0.6.0").unwrap(),
+        (crlf_new, 1),
+        "matching CRLF history must be preserved, not normalized"
+    );
+    let empty_answer = staged.replace(new, "v0.6.0/history/manifest\tok\t\n");
+    assert_eq!(
+        fixtures::with_release_answers(&committed, &empty_answer, "v0.6.0").unwrap(),
+        (empty_answer, 1),
+        "an empty successful answer is a valid third field"
+    );
+    let first = format!("{HEADER}{new}{old}{negative}");
+    assert_eq!(
+        fixtures::with_release_answers(&committed, &first, "v0.6.0").unwrap(),
+        (first, 1)
+    );
 }
 
 #[test]
@@ -2125,7 +2314,7 @@ fn a_landing_whose_corpus_cannot_take_the_answers_lands_the_desks_and_says_so() 
         panic!("{landed:?}");
     };
     assert!(
-        matches!(answers, Answers::Unrecorded(why) if why.contains("the case id they go after")),
+        matches!(answers, Answers::Unrecorded(why) if why.contains("v0.5.0/history/manifest")),
         "{answers:?}"
     );
     assert!(

@@ -471,6 +471,7 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
     let ctx = repo.ctx_with_windows(&land(), Scope::workspace());
     let spec_of = |id: StageId| {
         plan::plan(&ctx)
+            .expect("complete graph and plan")
             .into_iter()
             .find(|s| s.id == id)
             .unwrap_or_else(|| panic!("{id:?} is planned"))
@@ -507,6 +508,7 @@ fn an_objc_drive_that_exits_0_without_its_verdict_or_after_a_finding_is_red() {
     repo.with_stage2("exit 0");
     let ctx = repo.ctx_with_windows(&land(), Scope::workspace());
     let spec = plan::plan(&ctx)
+        .expect("complete graph and plan")
         .into_iter()
         .find(|s| s.id == StageId::ObjcDrives)
         .expect("planned");
@@ -558,6 +560,7 @@ fn objc_drives_build_once_and_keep_runtime_failures_separate() {
     repo.driver_stub(&objc_stub(second.example), 1);
     let ctx = repo.ctx_with_windows(&land(), Scope::workspace());
     let spec = plan::plan(&ctx)
+        .expect("complete graph and plan")
         .into_iter()
         .find(|s| s.id == StageId::ObjcDrives)
         .expect("planned");
@@ -730,7 +733,7 @@ fn whole_and_shaped_compiles_are_followed_by_one_fresh_recording_pass() {
         );
         let mut ctx = repo.ctx(&[Check::Test], Scope::crate_only("fixture"));
         ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
-        let planned = plan::plan(&ctx);
+        let planned = plan::plan(&ctx).expect("complete graph and plan");
         let compile = planned
             .iter()
             .find(|spec| spec.id == StageId::TestCompile)
@@ -849,7 +852,7 @@ fn recording_metadata_names_the_fresh_executable_and_target() {
     }
     let mut ctx = repo.ctx(&[Check::Test], Scope::crate_only("fixture"));
     ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
-    let planned = plan::plan(&ctx);
+    let planned = plan::plan(&ctx).expect("complete graph and plan");
     let compile = planned
         .iter()
         .find(|spec| spec.id == StageId::TestCompile)
@@ -907,6 +910,7 @@ fn an_overriding_runner_cannot_escape_the_exact_host_recorder() {
     let mut ctx = repo.ctx(&[Check::Test], Scope::crate_only("fixture"));
     ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
     let spec = plan::plan(&ctx)
+        .expect("complete graph and plan")
         .into_iter()
         .find(|spec| spec.id == StageId::Test)
         .unwrap();
@@ -948,7 +952,7 @@ fn missing_recording_artifacts_cannot_reuse_the_previous_compile() {
     );
     let mut ctx = repo.ctx(&[Check::Test], Scope::crate_only("fixture"));
     ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
-    let planned = plan::plan(&ctx);
+    let planned = plan::plan(&ctx).expect("complete graph and plan");
     let compile = planned
         .iter()
         .find(|spec| spec.id == StageId::TestCompile)
@@ -1007,6 +1011,7 @@ fn a_failed_recording_build_is_not_replayed_after_valid_metadata() {
     let mut ctx = repo.ctx(&[Check::Test], Scope::crate_only("fixture"));
     ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
     let spec = plan::plan(&ctx)
+        .expect("complete graph and plan")
         .into_iter()
         .find(|spec| spec.id == StageId::Test)
         .unwrap();
@@ -1055,6 +1060,7 @@ fn admitted_test_workers_keep_their_share_on_replay() {
     ctx = ctx.with_test_threads(NonZeroU32::new(2));
     ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
     let spec = plan::plan(&ctx)
+        .expect("complete graph and plan")
         .into_iter()
         .find(|s| s.id == StageId::Test)
         .expect("test stage");
@@ -1079,6 +1085,7 @@ fn invalid_managed_admission_refuses_before_any_stage_or_cli_check() {
     assert_eq!(code, exit::USAGE, "{block}");
     assert!(block.contains("no check was run"), "{block}");
     let spec = plan::plan(&ctx)
+        .expect("complete graph and plan")
         .into_iter()
         .find(|s| s.id == StageId::TestCompile)
         .expect("compile stage");
@@ -1185,6 +1192,7 @@ fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
     let history = repo.scratch.join("verify/test-binaries.json");
     ctx.test_history = Some(history.clone());
     let spec = plan::plan(&ctx)
+        .expect("complete graph and plan")
         .into_iter()
         .find(|s| s.id == StageId::Test)
         .expect("the test stage");
@@ -1311,6 +1319,7 @@ fn binary_order_uses_recorded_duration_then_memory() {
     ctx.env.build_slot_held = Some("1".into());
     ctx.env.cargo_build_jobs = Some("1".into());
     let spec = plan::plan(&ctx)
+        .expect("complete graph and plan")
         .into_iter()
         .find(|s| s.id == StageId::Test)
         .expect("test stage");
@@ -1415,6 +1424,7 @@ fn a_failed_test_reruns_at_the_width_its_binary_ran_at() {
     )
     .expect("keep");
     let spec = plan::plan(&ctx)
+        .expect("complete graph and plan")
         .into_iter()
         .find(|s| s.id == StageId::Test)
         .expect("test stage");
@@ -1489,6 +1499,7 @@ fn the_first_failing_test_binary_ends_a_halted_run_and_nothing_else_does() {
         ctx.env.build_slot_held = Some("1".into());
         ctx.env.cargo_build_jobs = Some("1".into());
         let spec = plan::plan(&ctx)
+            .expect("complete graph and plan")
             .into_iter()
             .find(|s| s.id == StageId::Test)
             .expect("the test stage");
@@ -1593,6 +1604,7 @@ fn a_json_binary_ends_at_its_first_decisive_red_case_and_nothing_else_does() {
         ctx.env.cargo_build_jobs = Some("1".into());
         ctx.child_ceiling = Some(aterm_spec::wait::MUST_HAPPEN);
         let spec = plan::plan(&ctx)
+            .expect("complete graph and plan")
             .into_iter()
             .find(|s| s.id == StageId::Test)
             .expect("the test stage");
@@ -1671,6 +1683,7 @@ fn a_refused_probe_runs_every_binary_in_the_human_format() {
     ctx.env.build_slot_held = Some("1".into());
     ctx.env.cargo_build_jobs = Some("1".into());
     let spec = plan::plan(&ctx)
+        .expect("complete graph and plan")
         .into_iter()
         .find(|s| s.id == StageId::Test)
         .expect("the test stage");
@@ -1731,6 +1744,7 @@ fn a_probe_a_crash_leaves_unanswered_asks_the_next_binary() {
         ctx.env.build_slot_held = Some("1".into());
         ctx.env.cargo_build_jobs = Some("1".into());
         let spec = plan::plan(&ctx)
+            .expect("complete graph and plan")
             .into_iter()
             .find(|s| s.id == StageId::Test)
             .expect("the test stage");
@@ -1781,6 +1795,7 @@ fn a_recording_that_does_not_add_up_fails_closed_without_running_a_binary() {
         let mut ctx = repo.ctx(&land(), Scope::workspace());
         ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
         let spec = plan::plan(&ctx)
+            .expect("complete graph and plan")
             .into_iter()
             .find(|s| s.id == StageId::Test)
             .expect("the test stage");
@@ -1816,6 +1831,7 @@ fn a_runner_that_ran_no_test_is_could_not_run_never_ok() {
     let mut ctx = repo.ctx(&land(), Scope::workspace());
     ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
     let spec = plan::plan(&ctx)
+        .expect("complete graph and plan")
         .into_iter()
         .find(|s| s.id == StageId::Test)
         .expect("the test stage");
@@ -1859,6 +1875,7 @@ fn a_recorded_binary_that_cannot_start_is_its_own_could_not_run_row() {
     let mut ctx = repo.ctx(&land(), Scope::workspace());
     ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
     let spec = plan::plan(&ctx)
+        .expect("complete graph and plan")
         .into_iter()
         .find(|s| s.id == StageId::Test)
         .expect("the test stage");

@@ -19,7 +19,9 @@ use aterm_vitals::Peaks;
 use aterm_vitals::explain::{
     CoalLane, CoalSample, CoalUsage, IdMap, IdSet, LeadIdentity, TimelineSample,
 };
-use aterm_vitals::history::{FreeHistory, FreeSeries, FreeWeeks, SavedFree, VolumeId};
+use aterm_vitals::history::{
+    FreeHistory, FreeSeries, FreeWeeks, SavedFree, SavedSpotlight, SpotlightHistory, VolumeId,
+};
 use aterm_vitals::model::{
     AccountIx, AneCheck, AneSample, ClusterSpec, CommitSample, DeedBy, DeedKind, DiskDeed,
     DiskFacts, DiskLevel, GpuSample, Hog, LinkKind, LinkSample, MemCounters, MemSample, PlanFact,
@@ -84,6 +86,21 @@ const WEEKS_MAX_BYTES: u64 = 128 * 1024;
 /// Schema 1: [`FREE_FILE`]'s schema-2 form of hour buckets. A day's file restores nothing here,
 /// and this file nothing there. A new schema names a new [`WEEKS_FILE`].
 const WEEKS_SCHEMA: u32 = 1;
+/// The Spotlight family's day ([`SpotlightHistory`]), kept beside [`FREE_FILE`] in a file of its
+/// own, written as the day's free history is. Its name carries [`SPOTLIGHT_SCHEMA`].
+const SPOTLIGHT_FILE: &str = "vitals-spotlight-v1.json";
+/// The bound [`SPOTLIGHT_FILE`] is read under: a day of the widest buckets of its three figures
+/// fits in 75 % of it.
+const SPOTLIGHT_MAX_BYTES: u64 = 128 * 1024;
+/// Schema 1: [`FREE_FILE`]'s bucket form, one list a figure (CPU, reads, footprint).
+const SPOTLIGHT_SCHEMA: u32 = 1;
+/// How long a run of `mdutil -s -a` may take before it is killed and the volumes count as
+/// unread this time: it measured 0.01 s on m42, and it runs on the probe thread at most once a
+/// minute ([`aterm_vitals::spotlight::Cadence`]).
+const MDUTIL_WAIT: Duration = Duration::from_secs(2);
+/// How long a killed `mdutil` is given to be reaped before it is left to the reaper: the probe
+/// thread waits on a run at most [`MDUTIL_WAIT`] plus this.
+const MDUTIL_REAP: Duration = Duration::from_millis(250);
 /// How often the probe thread reads the disk journal's tail again once it changed, while a window
 /// holds a Disk lens open or a window in view draws the bars (the Disk Custody band shows the
 /// newest deed beside the freed-today figure, which is live): one read of a file whose length or
@@ -147,7 +164,8 @@ pub(crate) const SPLIT_WINDOW_MAX: Duration =
 pub(crate) const SPLIT_COLD_MARGIN: Duration = Duration::from_secs(1);
 const WHY_FIXTURE_SEAM: &str = "ATERM_DEV_WHY_FIXTURE";
 
-/// Pulls that arm the split set (`sys why`).
+/// Pulls that arm the split set: `sys why` and the `sys` queries that print the family, an
+/// `await sys` naming `spotlight`, and a parked `await wake` whose wake names it.
 pub(crate) static SPLIT_ARMED: Arming = Arming::new();
 /// Queries that print CPU hardware (`sys cores`, `sys report`, a forced `sys why`): a pull that
 /// begins while one waits takes a CPU Stats sample ([`Request::hardware`]), which no other
@@ -470,6 +488,9 @@ impl Wall {
     }
 }
 
+#[path = "vitals_process_memory.rs"]
+pub(crate) mod memory;
+
 /// What the loop asks the thread to read.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Request {
@@ -499,6 +520,8 @@ pub(crate) struct Request {
     pub(crate) layout: Vec<PaneFact>,
     /// Authenticated global session ids for those process-local tab keys.
     pub(crate) session_ids: Vec<(u64, String)>,
+    /// Launch identities observed with those same shell roots, for identity-bound peer reads.
+    pub(crate) pane_sources: Vec<crate::vitals_host::memory::PaneSource>,
     /// Every session aterm's table holds, its local key and id: `sys disk held`'s live set
     /// ([`crate::sys_host::held_for`]). `session_ids` leaves out a session with no pooled
     /// terminal or no shell, which that reply still counts as at work.
@@ -839,6 +862,8 @@ pub(crate) enum Msg {
     Read(Box<Request>),
     Facts(Box<Request>),
     Pull,
+    /// A memory consumer needs one full census, without a CPU cold pair.
+    MemoryPull,
     AssessmentReady,
     BootReady,
     CpuPolicy(aterm_vitals::sys::json::Jv),
@@ -1382,11 +1407,17 @@ impl VitalsHost {
 
 trait Source: Sized {
     fn reading(&mut self, req: &Request) -> Snapshot;
+    fn process_receipt(&self) -> Option<Arc<crate::vitals_host::memory::Receipt>> {
+        None
+    }
     fn model(&mut self) -> &mut aterm_vitals::Vitals;
     fn machine(&self) -> Option<&Machine> {
         None
     }
     fn machine_at(&self) -> Option<Instant> {
+        None
+    }
+    fn observed_at(&self) -> Option<memory::ObservedAt> {
         None
     }
     fn jobs_at(&self) -> Option<Instant> {
@@ -1494,6 +1525,12 @@ impl Source for Reader {
     fn machine_at(&self) -> Option<Instant> {
         self.machine_observed_at
     }
+    fn observed_at(&self) -> Option<memory::ObservedAt> {
+        Some(self.observed_at)
+    }
+    fn process_receipt(&self) -> Option<Arc<crate::vitals_host::memory::Receipt>> {
+        self.process_receipt.clone()
+    }
     fn jobs_at(&self) -> Option<Instant> {
         self.assessment.reading().jobs_at
     }
@@ -1567,6 +1604,7 @@ struct Asked {
     /// A [`Msg::Read`] came earlier in this drain: a later one keeps what it asked.
     asked_read: bool,
     pull: bool,
+    memory: bool,
     assessment_ready: bool,
     facts: bool,
     cpu_policy: Option<aterm_vitals::sys::json::Jv>,
@@ -1610,6 +1648,7 @@ impl Asked {
                 self.facts = true;
             }
             Msg::Pull => self.pull = true,
+            Msg::MemoryPull => self.memory = true,
             Msg::AssessmentReady => self.assessment_ready = true,
             Msg::BootReady => {}
             Msg::CpuPolicy(report) => {
@@ -1736,6 +1775,7 @@ fn run(
     });
     let free = peaks.as_deref().map(|p| p.with_file_name(FREE_FILE));
     let weeks = peaks.as_deref().map(|p| p.with_file_name(WEEKS_FILE));
+    let spotlight = peaks.as_deref().map(|p| p.with_file_name(SPOTLIGHT_FILE));
     let home = peaks
         .as_deref()
         .and_then(Path::parent)
@@ -1750,6 +1790,8 @@ fn run(
     source.model().restore_free_history(kept);
     let (mut weeks, kept_weeks) = WeeksFile::open(weeks, open_at, open_ms);
     source.model().restore_free_weeks(kept_weeks);
+    let (mut spotlight, kept_spotlight) = SpotlightFile::open(spotlight, open_at, open_ms);
+    source.model().restore_spotlight_history(kept_spotlight);
     let mut strip = restore_strip(
         home.as_deref(),
         open_at,
@@ -1791,7 +1833,7 @@ fn run(
             assessment::Work::Publish => asked.assessment_ready = true,
             assessment::Work::None => {}
         }
-        let assessment_only = asked.assessment_ready && !(asked.read || asked.pull);
+        let assessment_only = asked.assessment_ready && !(asked.read || asked.pull || asked.memory);
         if assessment_only {
             asked.pull = true;
         }
@@ -1808,7 +1850,7 @@ fn run(
         {
             sys.set_facts(req.layout.clone());
         }
-        if !(asked.read || asked.pull || checkpoint) {
+        if !(asked.read || asked.pull || asked.memory || checkpoint) {
             continue;
         }
         if req.self_pid == 0 {
@@ -1819,6 +1861,12 @@ fn run(
         req.assessment_only = assessment_only;
         let mut snap = if asked.pull {
             pull(&mut source, &mut req, last_whole, !asked.names.is_empty())
+        } else if asked.memory {
+            let mut memory_req = req.clone();
+            memory_req.machine_only = false;
+            memory_req.assessment_only = false;
+            memory_req.pull = true;
+            source.reading(&memory_req)
         } else if checkpoint {
             let mut checkpoint_req = req.clone();
             checkpoint_req.machine_only = false;
@@ -1861,12 +1909,15 @@ fn run(
             })
         });
         let hidden = !req.in_view;
-        let observed_at = source.machine_at().unwrap_or(began);
+        let observed_at = source.observed_at().unwrap_or(memory::ObservedAt {
+            instant: source.machine_at().unwrap_or(began),
+            continuous_ns: None,
+        });
         let jobs_moved = hand_over_allocation(
             latest,
             &snap,
             words,
-            observed_at,
+            observed_at.instant,
             leases,
             source.jobs_at(),
             source.jobs_continuous(),
@@ -1880,6 +1931,7 @@ fn run(
                 source.jobs_at(),
                 source.left_at(),
                 source.jobs_continuous(),
+                source.process_receipt(),
             );
         }
         if (asked.read
@@ -1905,6 +1957,7 @@ fn run(
                     Msg::Told(told) => req.left_told = told,
                     Msg::Read(r) | Msg::Facts(r) => req.left_told = r.left_told,
                     Msg::Pull
+                    | Msg::MemoryPull
                     | Msg::AssessmentReady
                     | Msg::BootReady
                     | Msg::CpuPolicy(_)
@@ -1922,6 +1975,7 @@ fn run(
         peaks.keep_owned(source.model().peaks(), kept_at, false, &mut writer);
         free.keep(source.model().free_history(), kept_at, false);
         weeks.keep(source.model().free_weeks(), kept_at, false);
+        spotlight.keep(source.model().spotlight_history(), kept_at, false);
         strip.keep(source.model(), kept_at, &mut writer);
     }
     let stop_at = Instant::now();
@@ -1932,6 +1986,7 @@ fn run(
     peaks.keep_owned(source.model().peaks(), stop_at, true, &mut writer);
     free.keep(source.model().free_history(), stop_at, true);
     weeks.keep(source.model().free_weeks(), stop_at, true);
+    spotlight.keep(source.model().spotlight_history(), stop_at, true);
     strip.stop(source.model(), quit, stop_at, &mut writer);
     // The lock goes only after the stop's write, so the aterm that takes it next writes after it.
     drop(writer);
@@ -2520,6 +2575,8 @@ pub(crate) struct ProcsAsk {
     ids: aterm_sysprobe::coalitions::CoalitionIds,
     uid: u32,
     ownership: Option<OwnershipAsk>,
+    memory: crate::vitals_host::memory::Probes,
+    observed_at: memory::ObservedAt,
 }
 
 struct OwnershipAsk {
@@ -2572,12 +2629,20 @@ pub(crate) struct ProcsAnswer {
     /// Every process and this user's, from the pid lists ([`aterm_sysprobe::pid_counts`]).
     pids: (Option<u64>, Option<u64>),
     ownership: Option<OwnershipAnswer>,
+    memory: Option<crate::vitals_host::memory::Captured>,
 }
 
 /// The process reads, wherever they run: the sweep, then the pid counts.
 fn read_procs(ask: ProcsAsk) -> ProcsAnswer {
     let mut ids = ask.ids;
+    let memory = ask
+        .sweep
+        .is_some()
+        .then(|| crate::vitals_host::memory::Pending::begin(ask.memory, ask.observed_at));
     let mut sweep = ask.sweep.and_then(|(sweep, opts)| sweep(opts, &mut ids));
+    let memory = memory
+        .zip(sweep.as_ref())
+        .map(|(pending, sweep)| pending.finish(sweep));
     let ownership = sweep
         .as_mut()
         .zip(ask.ownership)
@@ -2587,6 +2652,7 @@ fn read_procs(ask: ProcsAsk) -> ProcsAnswer {
         ids,
         pids: aterm_sysprobe::pid_counts(ask.uid),
         ownership,
+        memory,
     }
 }
 
@@ -2599,6 +2665,7 @@ struct ProcReads {
     /// The lanes the reading found stalled.
     stalled: Vec<aterm_vitals::lanes::LaneStall>,
     ownership: Option<OwnershipAnswer>,
+    memory: Option<crate::vitals_host::memory::Captured>,
 }
 
 /// Where a reading's process reads run. Every read of another process can sit in the kernel
@@ -3282,6 +3349,8 @@ impl WhyFixture {
 /// The readers and the model: one per thread.
 pub(crate) struct Reader {
     boot: crate::vitals_host::boot_capture::BootCapture,
+    memory_probes: crate::vitals_host::memory::Probes,
+    process_receipt: Option<Arc<crate::vitals_host::memory::Receipt>>,
     probe: aterm_sysprobe::Probe,
     ownership: ownership::Images,
     hardware: aterm_sysprobe::cpu_hardware::Probe,
@@ -3298,6 +3367,7 @@ pub(crate) struct Reader {
     vitals: aterm_vitals::Vitals,
     assessment: assessment::Lane,
     machine_observed_at: Option<Instant>,
+    observed_at: memory::ObservedAt,
     epoch: Instant,
     /// The pass's clock ([`Request::tab_reads`]): the machine's, or a test's own, which no load
     /// spaces.
@@ -3313,6 +3383,10 @@ pub(crate) struct Reader {
     /// on Linux, the packages' energy.
     heat: HeatReaders,
     counter_throttle: Option<(Instant, Option<Thermal>)>,
+    /// When `mdutil -s -a` runs, and what it last read ([`aterm_vitals::spotlight::Cadence`]).
+    spotlight: aterm_vitals::spotlight::Cadence,
+    /// Its port: [`MDUTIL_LIVE`], or a unit test's inert arm.
+    pub(crate) mdutil: aterm_vitals::spotlight::MdutilProbe,
     /// The Neural Engine reader (A2 §3.1), which every reading reads beside the GPU; `None`
     /// where the OS has none, and in a unit test's reader, which reads no registry.
     pub(crate) ane: Option<aterm_sysprobe::neural_engine::Reader>,
@@ -3430,14 +3504,14 @@ impl TabReads {
 pub(crate) fn jobs_step(
     pass: &mut crate::vitals_jobs::JobsPass,
     reads: &TabReads,
-    sweep: Option<&[aterm_sysprobe::procs::ProcessReading]>,
+    facts: &crate::vitals_jobs::ProcessFacts,
     req: &Request,
     thrashing: bool,
 ) -> Option<Arc<aterm_vitals::jobs::JobsView>> {
     let view = pass.tick(
         reads.at_ms,
         || reads.now_ms(),
-        sweep,
+        facts,
         &req.tabs,
         &reads.ttys,
         &reads.feeds,
@@ -3481,6 +3555,12 @@ impl Reader {
             } else {
                 crate::vitals_host::boot_capture::BootCapture::native()
             },
+            memory_probes: if cfg!(test) || fixture.as_ref().is_some_and(WhyFixture::is_recorded) {
+                crate::vitals_host::memory::Probes::INERT
+            } else {
+                crate::vitals_host::memory::Probes::NATIVE
+            },
+            process_receipt: None,
             probe: aterm_sysprobe::Probe::new(),
             ownership: if cfg!(test) {
                 ownership::Images::INERT
@@ -3513,6 +3593,10 @@ impl Reader {
             vitals: aterm_vitals::Vitals::new(),
             assessment: assessment::Lane::new(),
             machine_observed_at: None,
+            observed_at: memory::ObservedAt {
+                instant: Instant::now(),
+                continuous_ns: None,
+            },
             epoch: Instant::now(),
             clock: Instant::now,
             slots: aterm_sysprobe::slots::SlotReader::new(
@@ -3553,6 +3637,12 @@ impl Reader {
                 HeatReaders::native()
             },
             counter_throttle: None,
+            spotlight: aterm_vitals::spotlight::Cadence::default(),
+            mdutil: if cfg!(test) {
+                aterm_vitals::spotlight::MdutilProbe::INERT
+            } else {
+                MDUTIL_LIVE
+            },
             ane: if cfg!(test) {
                 None
             } else {
@@ -3640,13 +3730,21 @@ impl Reader {
                 identities: req.shell_identities.clone(),
                 epoch: self.epoch,
             }),
+            memory: self.memory_probes,
+            observed_at: self.observed_at,
         };
-        let (sweep, pids, procs, ownership) = match self.procs.read(ask) {
+        let (sweep, pids, procs, ownership, memory) = match self.procs.read(ask) {
             Ok(answer) => {
                 self.split.coalition_ids = answer.ids;
-                (answer.sweep, answer.pids, None, answer.ownership)
+                (
+                    answer.sweep,
+                    answer.pids,
+                    None,
+                    answer.ownership,
+                    answer.memory,
+                )
             }
-            Err(stall) => (None, (None, None), stall, None),
+            Err(stall) => (None, (None, None), stall, None, None),
         };
         match (procs, self.procs_stalled) {
             (Some(stall), None) => {
@@ -3672,6 +3770,7 @@ impl Reader {
             pids,
             stalled,
             ownership,
+            memory,
         }
     }
 
@@ -3742,6 +3841,8 @@ impl Reader {
 
     /// Takes one full reading (machine counters, process sweep, split set if due, and jobs pass).
     pub(crate) fn read(&mut self, req: &Request) -> Snapshot {
+        self.observed_at =
+            memory::ObservedAt::capture(self.clock, self.memory_probes.continuous_ns);
         let boot_before = self.boot.begin();
         let reads = req.tab_reads(self.epoch, self.clock);
         self.machine_observed_at = Some(reads.observed_at);
@@ -3756,12 +3857,18 @@ impl Reader {
         let at_unix_ms = unix_ms_now();
         // Every whole reading reads the pid version of each process whose
         // start it cannot read (another user's), so the births kept for them
-        // (`SplitReader::known`) hold from one reading to the next.
+        // (`SplitReader::known`) hold from one reading to the next. Only a
+        // reading with the coalition lane on (and no recorded scene) asks for
+        // coalitions, and with them keeps each name at the short name's cut
+        // in `SplitReader::coalition_ids` across readings (a stalled ask
+        // loses them, `read_procs`); with the lane off the sweep reads such
+        // a name whole every reading.
         let ProcReads {
             sweep,
             pids,
             stalled,
             ownership,
+            memory,
         } = self.read_procs(
             Some(aterm_sysprobe::SweepOpts {
                 coalitions: live_accounting,
@@ -3799,6 +3906,10 @@ impl Reader {
         sample.stalled = stalled;
         sample.starts = self.split.start_count(coalitions.as_mut(), &self.probe);
         sample.machine_only = false;
+        sample.spotlight_volumes = self
+            .spotlight
+            .step(sample.mono_ms, self.vitals.spotlight_busy(), &self.mdutil)
+            .cloned();
         if let aterm_vitals::blockage::DStateRead::Census(pass) = &mut sample.dstate {
             *pass = self.census.step(now, self.epoch);
         }
@@ -3920,11 +4031,16 @@ impl Reader {
         let thrashing = sample.mem.is_some_and(|m| m.pressure == Pressure::Critical);
         let events_before = snap.strip_events.len();
         let complete = !sweep.as_ref().is_some_and(|s| s.truncated);
+        let process_facts = crate::vitals_jobs::ProcessFacts::new(
+            sweep.map(|s| s.procs),
+            complete,
+            scene.is_none().then_some((&sample, &snap)),
+            self.vitals.current_zombie_facts(),
+        );
         let assessed = self.assessment.read(
             assessment::Input::new(
                 reads,
-                sweep.map(|s| s.procs),
-                complete,
+                process_facts,
                 req,
                 u64::try_from(at_unix_ms).unwrap_or(0),
                 thrashing,
@@ -3941,6 +4057,21 @@ impl Reader {
             self.vitals.record_strip_event(ev);
         }
         self.watch_jobs(&mut snap);
+        self.process_receipt = memory.filter(|_| scene.is_none()).map(|memory| {
+            let panes = req
+                .pane_sources
+                .iter()
+                .filter(|pane| {
+                    !sample.unproved_tabs.contains(&pane.local)
+                        && req
+                            .tabs
+                            .iter()
+                            .any(|root| root.key == pane.local && root.shell_pid > 0)
+                })
+                .cloned()
+                .collect();
+            Arc::new(memory.publish(&snap, panes))
+        });
         if sample.procs.is_some() {
             self.last_procs = sample.procs;
         }
@@ -3965,12 +4096,15 @@ impl Reader {
 
     /// Takes a hidden deck's reading (machine counters alone, no process sweep).
     pub(crate) fn read_machine(&mut self, req: &Request) -> Snapshot {
+        self.observed_at =
+            memory::ObservedAt::capture(self.clock, self.memory_probes.continuous_ns);
         self.machine_observed_at = Some((self.clock)());
         let ProcReads { pids, stalled, .. } = self.read_procs(None, None);
         let mut coalitions = self.coalitions();
         let mut sample = self.machine_sample(req, unix_ms_now(), None, pids);
         sample.stalled = stalled;
         sample.machine_only = true;
+        sample.spotlight_volumes = self.spotlight.last().cloned();
         sample.starts = self.split.start_count(coalitions.as_mut(), &self.probe);
         sample.timeline = self.split.timeline();
         let place = self.situate(&mut sample);
@@ -4177,6 +4311,8 @@ impl Reader {
             // ([`Self::situate`]).
             place: None,
             stuck_work: None,
+            // A whole reading runs `mdutil` where its cadence says ([`Self::read`]).
+            spotlight_volumes: None,
         };
         // After the core ticks: Linux's `procs_blocked` comes from their read of `/proc/stat`.
         sample.dstate = dstate_read(&self.probe);
@@ -4252,6 +4388,17 @@ fn read_sockets(
     }
 }
 
+/// The model's process-state vocabulary for one original native observation.
+pub(crate) const fn proc_state(state: RunState) -> ProcState {
+    match state {
+        RunState::Running | RunState::Sleeping | RunState::Idle => ProcState::Run,
+        RunState::Uninterruptible => ProcState::Uninterruptible,
+        RunState::Stopped => ProcState::Stopped,
+        RunState::Zombie => ProcState::Zombie,
+        RunState::Unknown => ProcState::Unknown,
+    }
+}
+
 /// Converts a swept [`aterm_sysprobe::ProcessReading`] into a [`ProcSample`].
 pub(crate) fn proc_sample(p: &aterm_sysprobe::ProcessReading, epoch: Instant) -> ProcSample {
     ProcSample {
@@ -4277,13 +4424,7 @@ pub(crate) fn proc_sample(p: &aterm_sysprobe::ProcessReading, epoch: Instant) ->
         uid: p.uid,
         pgid: p.pgid,
         sid: p.sid,
-        state: match p.state {
-            RunState::Running | RunState::Sleeping | RunState::Idle => ProcState::Run,
-            RunState::Uninterruptible => ProcState::Uninterruptible,
-            RunState::Stopped => ProcState::Stopped,
-            RunState::Zombie => ProcState::Zombie,
-            RunState::Unknown => ProcState::Unknown,
-        },
+        state: proc_state(p.state),
         runnable_ns: p.runnable_ns,
         peak: p.peak_footprint,
         at_ns: p.read_at.map(|t| {
@@ -4771,6 +4912,8 @@ type PeakFile = KeptFile<Peaks>;
 type FreeFile = KeptFile<FreeHistory>;
 /// [`WEEKS_FILE`].
 type WeeksFile = KeptFile<FreeWeeks>;
+/// [`SPOTLIGHT_FILE`].
+type SpotlightFile = KeptFile<SpotlightHistory>;
 type CpuReportFile = KeptFile<Option<aterm_vitals::sys::json::Jv>>;
 
 impl<T: Clone + Default + PartialEq> KeptFile<T> {
@@ -4880,6 +5023,22 @@ impl KeptFile<FreeWeeks> {
             "the disk's three-week history",
             weeks_json,
             |text| weeks_of(text, now_unix_ms),
+        )
+    }
+}
+
+impl KeptFile<SpotlightHistory> {
+    /// The file's Spotlight day ending at `now_unix_ms`; empty when it is missing, damaged or of
+    /// another schema.
+    fn open(path: Option<PathBuf>, now: Instant, now_unix_ms: i64) -> (Self, SpotlightHistory) {
+        Self::read(
+            path,
+            now,
+            PEAKS_EVERY,
+            SPOTLIGHT_MAX_BYTES,
+            "the Spotlight family's history",
+            spotlight_json,
+            |text| spotlight_of(text, now_unix_ms),
         )
     }
 }
@@ -5359,6 +5518,75 @@ fn free_json(history: &FreeHistory) -> Option<String> {
 fn free_of(text: &str, now_unix_ms: i64) -> Option<FreeHistory> {
     series_of(text, FREE_SCHEMA, now_unix_ms)
 }
+
+/// [`SPOTLIGHT_FILE`]'s form: one bucket list a figure, each as [`FreeDoc`]'s.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct SpotlightDoc {
+    schema: u32,
+    cpu_mc: Vec<(i64, u32, u16, u32, f64, f64, f64)>,
+    read_bps: Vec<(i64, u32, u16, u32, f64, f64, f64)>,
+    footprint: Vec<(i64, u32, u16, u32, f64, f64, f64)>,
+}
+
+/// The Spotlight family's day as its file holds it; `None` with nothing read.
+fn spotlight_json(history: &SpotlightHistory) -> Option<String> {
+    let saved = history.saved()?;
+    let doc = SpotlightDoc {
+        schema: SPOTLIGHT_SCHEMA,
+        cpu_mc: saved.cpu_mc.iter().map(strip::agg_doc).collect(),
+        read_bps: saved.read_bps.iter().map(strip::agg_doc).collect(),
+        footprint: saved.footprint.iter().map(strip::agg_doc).collect(),
+    };
+    aterm_json::to_string(&doc).ok()
+}
+
+/// The Spotlight day a file holds, restored at `now_unix_ms`; `None` for a damaged file or
+/// another schema.
+fn spotlight_of(text: &str, now_unix_ms: i64) -> Option<SpotlightHistory> {
+    let doc: SpotlightDoc = aterm_json::from_str(text).ok()?;
+    (doc.schema == SPOTLIGHT_SCHEMA).then(|| {
+        let saved = SavedSpotlight {
+            cpu_mc: doc.cpu_mc.into_iter().map(strip::agg_of).collect(),
+            read_bps: doc.read_bps.into_iter().map(strip::agg_of).collect(),
+            footprint: doc.footprint.into_iter().map(strip::agg_of).collect(),
+        };
+        SpotlightHistory::restored(&saved, now_unix_ms)
+    })
+}
+
+/// `mdutil -s -a`: every local volume's Spotlight indexing, which needs no root, killed at
+/// [`MDUTIL_WAIT`] and reaped within [`MDUTIL_REAP`], past which a child that has not died is
+/// the reaper's, so the probe thread never waits on it longer. macOS alone has Spotlight.
+fn mdutil_status_all() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        use aterm_types::macos_setup::spotlight_scope::MDUTIL;
+        let mut status = aterm_uds::spawnfd::command(MDUTIL);
+        status.args(aterm_vitals::spotlight::MDUTIL_ARGS);
+        let out = aterm_uds::deadline::outputs_until(
+            &mut [&mut status],
+            Instant::now() + MDUTIL_WAIT,
+            MDUTIL_REAP,
+        )
+        .pop()
+        .unwrap_or(Err(aterm_uds::deadline::RunError::TimedOut))
+        .map_err(|error| format!("{MDUTIL} -s -a: {error}"))?;
+        if out.status.success() {
+            String::from_utf8(out.stdout).map_err(|error| error.to_string())
+        } else {
+            Err(format!("{MDUTIL} -s -a: {}", out.status))
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("unsupported".into())
+    }
+}
+
+/// The live arm of the Spotlight volumes' port ([`aterm_vitals::spotlight::MdutilProbe`]).
+const MDUTIL_LIVE: aterm_vitals::spotlight::MdutilProbe = aterm_vitals::spotlight::MdutilProbe {
+    status_all: mdutil_status_all,
+};
 
 fn weeks_json(weeks: &FreeWeeks) -> Option<String> {
     series_json(weeks, WEEKS_SCHEMA)
@@ -6637,6 +6865,7 @@ impl crate::App {
         let store = self.store.read().unwrap_or_else(|p| p.into_inner());
         let windowless = tabs.len();
         let mut session_ids = Vec::new();
+        let mut pane_sources = Vec::new();
         let mut live_ids = Vec::new();
         for handle in store.live_handles() {
             live_ids.push((handle.local_id, handle.sid.as_str().to_string()));
@@ -6661,6 +6890,11 @@ impl crate::App {
                 });
             }
             session_ids.push((handle.local_id, handle.sid.as_str().to_string()));
+            pane_sources.push(crate::vitals_host::memory::PaneSource {
+                local: handle.local_id,
+                sid: handle.sid.clone(),
+                nonce: handle.nonce,
+            });
         }
         drop(store);
         for root in &mut tabs[windowless..] {
@@ -6712,6 +6946,7 @@ impl crate::App {
             inputs,
             layout,
             session_ids,
+            pane_sources,
             live_ids,
             cadence_ms: duration_ms(period),
             machine_only,
@@ -6857,3 +7092,7 @@ mod lanes_tests;
 #[cfg(all(test, unix))]
 #[path = "vitals_host_attended_tests.rs"]
 mod attended_tests;
+
+#[cfg(test)]
+#[path = "one_engine_processes_tests.rs"]
+mod one_engine_processes_tests;

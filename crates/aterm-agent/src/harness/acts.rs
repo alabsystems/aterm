@@ -416,7 +416,9 @@ pub const RESTARTING_LABEL: &str = "restarting";
 /// The harness's label once it typed its resume after a full disk.
 pub const DISK_RESUME_LABEL: &str = "resuming after disk";
 
-/// The harness's label once it typed its carry-on after a usage wall.
+/// The harness's label once it typed its carry-on after a usage wall: any resume of
+/// [`RULE_LIMIT_RESUME`], the one past a limit an account or login move left included (the
+/// turn stopped at that limit, and resumes after it on another account).
 pub const LIMIT_RESUME_LABEL: &str = "resuming after limit";
 
 const UPGRADING_LABEL: &str = "upgrading";

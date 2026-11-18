@@ -30,12 +30,21 @@ fn actual_native_system_command_holds_original_image_without_an_sdk() {
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o555)).unwrap();
         let mut retained = aterm_uds::deadline::KeptUntilRan::new(temp.keep());
         let mut command = aterm_uds::spawnfd::command(&executable);
-        command.args(["--exact", NAME, "--nocapture"]).env(ACTOR, "1");
-        let output = aterm_uds::deadline::output_within(&mut command, Duration::from_secs(60)).unwrap();
-        if String::from_utf8_lossy(&output.stdout).lines().any(|line| line.ends_with(STARTED)) {
+        command
+            .args(["--exact", NAME, "--nocapture"])
+            .env(ACTOR, "1");
+        let output =
+            aterm_uds::deadline::output_within(&mut command, Duration::from_secs(60)).unwrap();
+        if String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.ends_with(STARTED))
+        {
             retained.ran();
         }
-        assert!(output.status.success(), "actual native command actor failed: {output:?}");
+        assert!(
+            output.status.success(),
+            "actual native command actor failed: {output:?}"
+        );
         assert!(
             String::from_utf8_lossy(&output.stdout)
                 .contains("native-system-command-original-checked")
@@ -45,19 +54,32 @@ fn actual_native_system_command_holds_original_image_without_an_sdk() {
     use std::io::Write as _;
     println!("{STARTED}");
     std::io::stdout().flush().unwrap();
-    assert!(aterm_uds::test_binary::is_test_binary(&std::env::current_exe().unwrap()), "native actor must retain Cargo test isolation");
+    assert!(
+        aterm_uds::test_binary::is_test_binary(&std::env::current_exe().unwrap()),
+        "native actor must retain Cargo test isolation"
+    );
     let original = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
     let held = HeldSystemCommand::open(&original, deadline()).unwrap();
     assert!(held.observation().runtime.is_empty());
     assert!(held.observation().loader_paths.is_empty());
-    assert_eq!(held.observation().policy, "native-command/macho-arm64-system-only-v1");
-    held.validate_loaded(process::read_identity(std::process::id()).unwrap(), deadline()).unwrap();
+    assert_eq!(
+        held.observation().policy,
+        "native-command/macho-arm64-system-only-all-slices-v2"
+    );
+    held.validate_loaded(
+        process::read_identity(std::process::id()).unwrap(),
+        deadline(),
+    )
+    .unwrap();
     // An actual change to this selected directory still invalidates the held
     // input. Isolation does not turn unrelated selected-root writes into reuse.
     std::fs::create_dir(original.parent().unwrap().join("actual-directory-change")).unwrap();
     let error = held.validate(deadline()).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-    assert_eq!(error.to_string(), "original native runtime directory changed");
+    assert_eq!(
+        error.to_string(),
+        "original native runtime directory changed"
+    );
     println!("native-system-command-original-checked");
 }
 
@@ -98,4 +120,29 @@ fn unknown_script_and_expired_input_refuse() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert!(HeldSystemCommand::open(&path, deadline()).is_err());
     assert!(HeldSystemCommand::open(&std::env::current_exe().unwrap(), Instant::now()).is_err());
+}
+
+#[test]
+fn actual_canonical_system_loader_holds_its_whole_universal_original() {
+    // Canonical validate_seed selects this actual system image on the host.
+    // Input custody is the sole scope: this does not claim that the shim can
+    // run under NoFork, select its search inputs, close a query or issue a Seed.
+    let path = Path::new("/usr/bin/otool");
+    let held = HeldSystemCommand::open(path, deadline()).unwrap();
+    assert_eq!(held.program(), path);
+    assert_eq!(held.program_input(deadline()).unwrap().program(), path);
+    assert!(held.observation().loader_paths.is_empty());
+    assert!(held.observation().runtime.is_empty());
+    assert!(
+        held.observation()
+            .system_dependencies
+            .iter()
+            .all(|load| macho::system(load))
+    );
+    assert_eq!(
+        held.observation().executable.bytes,
+        std::fs::metadata(path).unwrap().len()
+    );
+    assert!(held.program_input(Instant::now()).is_err());
+    held.validate(deadline()).unwrap();
 }

@@ -12,7 +12,7 @@ use super::super::config::SupervisorConfig;
 use super::notice::{self, Notice, NoticeText};
 use super::outlook::ExceptionKind;
 use super::turn_end::{
-    Composer, ContextFill, Diversion, RULE_LOGIN, RosterWord, TurnEndAction, TurnEndReading,
+    Composer, ContextFill, Diversion, RULE_LOGIN, Ready, RosterWord, TurnEndAction, TurnEndReading,
     TurnEndState, Unmade, bucket_model, decide_turn_end, decide_turn_end_traced, login_wall_moves,
     login_wall_waits, renewed_draft_holds, sign_in_how, waited_login,
 };
@@ -773,6 +773,20 @@ fn limit_switch(
 /// A notice a usage limit's tab is told ([`limit_roster_step`]).
 type LimitStep<'a> = (&'static NoticeText, Option<&'a str>, Option<&'static str>);
 
+/// [`notice::LIMIT_USE`] for the row `ready`, held off it by `why`: its `{label}` is the word
+/// that names the row's account ([`Ready::word`]), so the pin its step runs is one `accounts use`
+/// takes, never the row's label, which names nothing. A ready row with no address has no word,
+/// so no pin can be asked for: no other account can take over by a step of the person's, and
+/// the tab is told so ([`notice::LIMIT_ROSTER`], or [`notice::LIMIT_ROSTER_KEPT`] where nothing
+/// resumes it at the reset), whose step lists an account `accounts use` can pin.
+fn limit_use<'a>(ready: &'a Ready, why: &'static str, resumes: bool) -> LimitStep<'a> {
+    match &ready.word {
+        Some(word) => (&notice::LIMIT_USE, Some(word.as_str()), Some(why)),
+        None if resumes => (&notice::LIMIT_ROSTER, None, None),
+        None => (&notice::LIMIT_ROSTER_KEPT, None, None),
+    }
+}
+
 /// Notice for a usage-limit tab on a roster row ([`claude_limit_login`], [`RosterWord::Unlisted`]).
 fn limit_roster_step<'a>(
     word: Option<&'a RosterWord>,
@@ -826,16 +840,8 @@ fn limit_roster_step<'a>(
                 Some(ready.label.as_str()),
                 Some(notice::WHY_USE_UNMADE),
             )),
-            (Some(held), _) => Some((
-                &notice::LIMIT_USE,
-                Some(ready.label.as_str()),
-                Some(held.why()),
-            )),
-            (None, Some(Unmade::Again)) => Some((
-                &notice::LIMIT_USE,
-                Some(ready.label.as_str()),
-                Some(notice::WHY_USE_UNMADE),
-            )),
+            (Some(held), _) => Some(limit_use(ready, held.why(), resumes)),
+            (None, Some(Unmade::Again)) => Some(limit_use(ready, notice::WHY_USE_UNMADE, resumes)),
             (None, None) => draft.map(|composer| {
                 let text = match composer {
                     Composer::Own => &notice::LIMIT_DRAFT_OWN,

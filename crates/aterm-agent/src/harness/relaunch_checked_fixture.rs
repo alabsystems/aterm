@@ -4,6 +4,7 @@
 //! Private-world source observations for the real checked relaunch producer.
 //! The caller supplies the actual GUI authorizer and native operation endpoint.
 
+use super::super::accounts::InheritNoLogin as _;
 use super::super::native_act::{Binding, Prepare, Process, Reply, Request};
 use super::*;
 use std::io::{BufRead as _, Write as _};
@@ -159,12 +160,13 @@ impl World {
         let executable =
             std::fs::canonicalize(aterm_uds::deadline::stand_in(Path::new("/bin/cat")))
                 .map_err(|error| error.to_string())?;
+        // The source process runs on its stored login whatever shell the caller's test runs
+        // from: no login or route variable of this process reaches it.
         let mut child = aterm_uds::spawnfd::command(&executable)
+            .inherit_no_login()
             .process_group(0)
             .env("HOME", &home)
             .env("ATERM_PARENT_SESSION_ID", tab)
-            .env_remove(accounts::LOGIN_ENV)
-            .env_remove(accounts::HOME_ENV)
             .stdin(aterm_uds::spawnfd::Stdio::piped())
             .stdout(aterm_uds::spawnfd::Stdio::piped())
             .stderr(aterm_uds::spawnfd::Stdio::null())

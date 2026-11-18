@@ -42,10 +42,12 @@ enum Event {
     Read(u64),
     Removing(PathBuf, Option<Tier>),
     /// The real primitive took every lock of a profile (`Stage::Locked`):
-    /// the row, the profile.
+    /// the row, the profile (of a whole removal, every profile's: the row,
+    /// the build directory).
     Locked(PathBuf, PathBuf),
     /// What it takes sits in a stage of its own, the locks still held
-    /// (`Stage::Staged`): the removal, as the model has it.
+    /// (`Stage::Staged`): the removal, as the model has it. The row, the
+    /// folder it takes from.
     Staged(PathBuf, PathBuf),
     /// It let the profile's locks go (`Stage::Released`).
     Released(PathBuf, PathBuf),
@@ -297,8 +299,13 @@ fn project(m: &Model, s: &mut S, plan: &[Planned], events: &[Event]) -> Result<(
             }
             Event::Staged(_, profile) => {
                 // What a profile gives up leaves it under its own locks: that
-                // move is the removal, the first one the unit's.
-                if !held.contains(&profile) {
+                // move is the removal, the first one the unit's. A lock is told
+                // for the folder it guards (a profile, or a whole removal's
+                // build directory: every profile's in it), and what sits in that
+                // folder is under it; a whole removal on Windows stages in each
+                // folder it leaves where it is (the directory, each profile and
+                // each folder between), all of it under the directory's.
+                if !held.iter().any(|lock| profile.starts_with(lock)) {
                     return Err(format!(
                         "{} is staged without its locks held",
                         profile.display()
@@ -409,6 +416,17 @@ enum Whole {
     /// NEGATIVE CONTROL: a profile's locks taken and let go, then its contents
     /// deleted where they are, nothing staged; the real primitive after.
     DeletesInPlaceAfterRelease,
+    /// NEGATIVE CONTROL: a profile's locks taken and let go, then what it
+    /// gives up staged (told, nothing moved); the real primitive after.
+    StagesAfterRelease,
+    /// NEGATIVE CONTROL: one profile's locks taken and, while they are held,
+    /// the other profile beside it staged (told, nothing moved); then let go,
+    /// the real primitive after.
+    StagesBesideItsLock,
+    /// NEGATIVE CONTROL: one profile's locks taken and, while they are held,
+    /// the build directory that holds it staged (told, nothing moved); then
+    /// let go, the real primitive after.
+    StagesAboveItsLock,
 }
 
 fn run(rep: &Report, script: &[u64]) -> (Option<Applied>, Vec<Event>) {
@@ -460,6 +478,25 @@ fn run_with(rep: &Report, script: &[u64], whole: Whole) -> (Option<Applied>, Vec
                             Event::Deleting(row.path.clone(), first.clone()),
                         ]);
                         std::fs::remove_dir_all(first.join("deps")).expect("deleted in place");
+                    }
+                    Whole::StagesAfterRelease => {
+                        events.borrow_mut().extend([
+                            Event::Locked(row.path.clone(), first.clone()),
+                            Event::Released(row.path.clone(), first.clone()),
+                            Event::Staged(row.path.clone(), first.clone()),
+                        ]);
+                    }
+                    Whole::StagesBesideItsLock | Whole::StagesAboveItsLock => {
+                        let outside = if whole == Whole::StagesBesideItsLock {
+                            dir.join("release")
+                        } else {
+                            dir.clone()
+                        };
+                        events.borrow_mut().extend([
+                            Event::Locked(row.path.clone(), first.clone()),
+                            Event::Staged(row.path.clone(), outside),
+                            Event::Released(row.path.clone(), first.clone()),
+                        ]);
                     }
                 }
                 let mut hook = |stage: disk::target::Stage, at: &Path| {
@@ -1075,20 +1112,22 @@ fn a_whole_removal_that_deletes_before_it_locks_is_rejected() {
     );
 }
 
-/// After a removal lets its locks go it deletes only what it staged under them.
+/// After a removal lets its locks go it stages nothing more and deletes only what it staged
+/// under them. What it stages it stages under the lock told for the folder it takes from, or for
+/// a folder holding that one: a whole removal tells one, for its build directory, and stages
+/// there (on Windows also in each profile and each folder between, which it leaves in place).
 ///
-/// NEGATIVE CONTROL: a whole removal that takes a profile's locks, lets them go and then deletes
-/// that profile's contents where they are is rejected, where the real removals of the same plan
-/// conform (staging, on unix, what they delete after their locks).
+/// NEGATIVE CONTROLS: a whole removal that takes a profile's locks, lets them go and then
+/// deletes that profile's contents where they are, or stages them, is rejected, where the real
+/// removals of the same plan conform (staging what they delete after their locks).
 #[test]
-fn a_removal_that_lets_go_and_then_deletes_in_place_is_rejected() {
+fn a_removal_that_lets_go_and_then_deletes_in_place_or_stages_is_rejected() {
     let m = disk_reclaim_pass_model();
     let (measure, free) = levels()[2];
     let rep = report_at(free, None);
     let plan = disk::pass_plan(&rep).expect("short admits tiers 1-4");
     let script: &[u64] = &[3 * GIB_BYTES];
     let (_, events) = run(&rep, script);
-    #[cfg(unix)]
     assert!(
         events.iter().any(|e| matches!(e, Event::Staged(..))),
         "the real primitives staged what they took: {events:#?}"
@@ -1096,11 +1135,54 @@ fn a_removal_that_lets_go_and_then_deletes_in_place_is_rejected() {
     let mut s = looked(&m, measure, false).expect("the look");
     project(&m, &mut s, &plan, &events)
         .unwrap_or_else(|why| panic!("the real removals conform: {why}\n{events:#?}"));
-    let (_, events) = run_with(&rep, script, Whole::DeletesInPlaceAfterRelease);
-    let mut s = looked(&m, measure, false).expect("the look");
-    let caught = project(&m, &mut s, &plan, &events)
-        .expect_err("the checker must reject a delete in place after the locks are let go");
-    assert!(caught.contains("without its locks"), "{caught}");
+    for (whole, refused) in [
+        (
+            Whole::DeletesInPlaceAfterRelease,
+            "is deleted without its locks held",
+        ),
+        (
+            Whole::StagesAfterRelease,
+            "is staged without its locks held",
+        ),
+    ] {
+        let (_, events) = run_with(&rep, script, whole);
+        let mut s = looked(&m, measure, false).expect("the look");
+        let caught = project(&m, &mut s, &plan, &events)
+            .expect_err("the checker must reject what a removal does after its locks are let go");
+        assert!(caught.contains(refused), "{caught}");
+    }
+}
+
+/// A lock held stands for the folder it is told for and what sits in it, nothing more: a removal
+/// that holds one profile's locks and stages the other profile beside it, or the build directory
+/// above it, is rejected at that stage, while that lock is still held, where the real removals of
+/// the same plan conform (the other test). NEGATIVE CONTROLS: a checker that takes any lock held
+/// for every folder (`!held.is_empty()`) passes the stage beside it; one that reads a lock as
+/// guarding the folders above it (`lock.starts_with(profile)`) passes the stage above it.
+#[test]
+fn a_stage_outside_the_one_lock_held_is_rejected() {
+    const REFUSED: &str = " is staged without its locks held";
+    let m = disk_reclaim_pass_model();
+    let (measure, free) = levels()[2];
+    let rep = report_at(free, None);
+    let plan = disk::pass_plan(&rep).expect("short admits tiers 1-4");
+    let script: &[u64] = &[3 * GIB_BYTES];
+    for (whole, outside) in [
+        (Whole::StagesBesideItsLock, "release"),
+        (Whole::StagesAboveItsLock, "target"),
+    ] {
+        let (_, events) = run_with(&rep, script, whole);
+        let mut s = looked(&m, measure, false).expect("the look");
+        let caught = project(&m, &mut s, &plan, &events)
+            .expect_err("the checker must reject a stage outside the one lock held");
+        // Rejected at the stage outside the lock, not at a later step of the real removal.
+        let staged = caught.strip_suffix(REFUSED).map(Path::new);
+        assert_eq!(
+            staged.and_then(Path::file_name),
+            Some(std::ffi::OsStr::new(outside)),
+            "{caught}"
+        );
+    }
 }
 
 #[test]

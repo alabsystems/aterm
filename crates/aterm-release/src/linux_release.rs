@@ -59,7 +59,8 @@ pub struct Artifact {
 /// that architecture. The signed appcast carries its name, digest and size
 /// ([`Handoff::stamp`]), which no client reads: they are what binds the pin to the release
 /// signer when it is read back from the public release ([`from_release`]). It is built by
-/// upstream stable, static (the STOCK EXCEPTION, `buildplan::build_static`).
+/// the stock release the commit's trust.lock names, static (the STOCK EXCEPTION,
+/// `buildplan::build_static`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifierArtifact {
     pub schema: u32,
@@ -71,7 +72,7 @@ pub struct VerifierArtifact {
     pub sha256: String,
     pub size: u64,
     pub source_fingerprint: String,
-    /// Stable's `rustc -vV`, the compiler that built it.
+    /// The stock release's `rustc -vV`, the compiler that built it.
     pub compiler_version: String,
 }
 
@@ -109,7 +110,7 @@ fn names_no_interpreter(elf: &[u8]) -> bool {
 
 impl VerifierArtifact {
     /// The receipt is this cut's: its version, build and commit, its architecture's asset
-    /// name, a size install.sh downloads, and stable's identity for its host.
+    /// name, a size install.sh downloads, and the stock compiler's identity for its host.
     pub fn validate(&self, version: &str, build: u64, commit: &str) -> Result<(), String> {
         check_identity(version, build, commit)?;
         let target = target(&self.target)?;
@@ -1423,7 +1424,7 @@ pub fn run_worker(
             .lines()
             .any(|line| line == format!("host: {}", native.triple()))
     {
-        return Err("Linux worker requires a native Trust compiler, not upstream stable or a cross override".into());
+        return Err("Linux worker requires a native Trust compiler, not an upstream stock one or a cross override".into());
     }
     let compiler_hash = sha256_file(&compiler)?;
     let driver_hash = sha256_file(&driver)?;
@@ -1542,7 +1543,7 @@ pub fn run_worker(
         out.join(&name).display()
     );
     // The static bootstrap verifier beside it, from the same take. Soft: a host that
-    // cannot build it (no stable, no static C library) leaves this architecture's release
+    // cannot build it (no stock release, no static C library) leaves this architecture's release
     // without one, and install.sh keeps its embedded verifier there.
     match build_bootstrap_verifier(&plan, &take, native, out, version, build, commit) {
         Ok(path) => println!(
@@ -1570,9 +1571,9 @@ fn write_receipt(path: &Path, text: &str) -> Result<(), String> {
 }
 
 /// Build this host's static bootstrap verifier from `take` and put its pair in `out`:
-/// upstream stable, static (the STOCK EXCEPTION, `buildplan::build_static`), held to what
-/// install.sh runs: this architecture's static ELF, which refuses an invocation it cannot
-/// read in install.sh's words.
+/// the stock release the take's trust.lock names, static (the STOCK EXCEPTION,
+/// `buildplan::build_static`), held to what install.sh runs: this architecture's static ELF,
+/// which refuses an invocation it cannot read in install.sh's words.
 fn build_bootstrap_verifier(
     plan: &super::BuildPlan,
     take: &super::Take,
@@ -1622,7 +1623,7 @@ fn build_bootstrap_verifier(
         sha256,
         size,
         source_fingerprint: take.snapshot.digest.clone(),
-        compiler_version: super::stable_rustc_version()?,
+        compiler_version: super::stock_rustc_version_in(take.stock_context()?)?,
     };
     verifier.validate(version, build, commit)?;
     verifier.verify_file(&binary)?;

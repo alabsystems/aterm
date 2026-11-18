@@ -10,7 +10,7 @@
 
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use super::login_tests::{Desk, NOW, upkeep_effects};
@@ -63,6 +63,7 @@ fn signed_out_row(desk: &Desk) -> Roster {
                     account: "work".into(),
                     at: NOW,
                     held: None,
+                    owner: None,
                 },
             );
             state.accounts.insert(
@@ -106,7 +107,7 @@ fn a_renewal_reads_the_machine_only_through_its_guard() {
         count.fetch_add(1, Ordering::SeqCst);
         Ok(())
     };
-    let renew = |guard: &Arc<Mutex<AutoRenewGuard>>| {
+    let renew = |guard: &Arc<Watched<AutoRenewGuard>>| {
         spawn_row_renewal(
             Cli::Claude,
             &desk.home,
@@ -127,20 +128,21 @@ fn a_renewal_reads_the_machine_only_through_its_guard() {
             &mut None,
         )
     };
-    let inert = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let inert = AutoRenewGuard::default().shared();
     assert_eq!(
         renew(&inert),
         RenewalDispatch::Failed,
         "no mailbox, profile or browser in the scratch home, whatever this process's env holds"
     );
     assert_eq!(spawned.load(Ordering::SeqCst), 0);
-    let named = Arc::new(Mutex::new(AutoRenewGuard {
+    let named = AutoRenewGuard {
         reads: MachineReads {
             var: mailbox_named_by_env,
             ..MachineReads::default()
         },
         ..AutoRenewGuard::default()
-    }));
+    }
+    .shared();
     assert_eq!(
         renew(&named),
         RenewalDispatch::Started,
@@ -197,6 +199,75 @@ fn a_sign_ins_own_marks_never_end_its_cooldown() {
     );
 }
 
+/// EACH HOLD A CLAIM MEETS RECORDS WHEN IT ENDS. Under a trace scope, a claim the key's permit
+/// cooldown refuses records the cooldown's end as the scope's monotonic deadline, and one a park
+/// (a run that stopped for a person) refuses records that hold's end; a claim admitted at a
+/// hold's end records none, since no later instant answers otherwise. A claim refused while
+/// another renewal is in flight records no deadline either: that renewal's end moves the guard's
+/// generation instead. So does one a bot check this process has not recorded refuses: that hold
+/// stands on no clock, until its record is written or a login ends it, each of which moves the
+/// guard's generation.
+///
+/// NEGATIVE CONTROL (2026-11-15): `AutoRenewPermit::claim_with_context` judging its holds raw
+/// (`now.saturating_duration_since(*since) < span` in place of the `Since` judgment), the one
+/// mutation of its mutant build that reached this test: `a cooldown records when it ends`
+/// failed, left `None`, right the cooldown's end; restored, the file touched.
+/// NEGATIVE CONTROL (2026-11-16, at the merge of main's clockless bot hold): the unrecorded
+/// check's hold judged as a park from the claim's instant (`stands(..., PERSON_BACKOFF)`) failed
+/// `a bot check is no clock's to end`, left `Some(Instant { .. })` (that park's end), right
+/// `None`; restored, the file touched.
+#[test]
+fn each_hold_a_claim_meets_records_when_it_ends() {
+    use crate::harness::cli::Renewal;
+    let guard = AutoRenewGuard::default().shared();
+    let first = Instant::now();
+    let soon = first + Duration::from_secs(60);
+    let claim = |key: &str, at: Instant| {
+        let (permit, read) = trace::scope(|| AutoRenewPermit::claim(&guard, key, at, false));
+        (permit, read.mono_deadline())
+    };
+
+    drop(AutoRenewPermit::claim(&guard, "cool", first, false).expect("the first attempt"));
+    let (permit, asked) = claim("cool", soon);
+    assert!(permit.is_none(), "the cooldown holds");
+    assert_eq!(
+        asked,
+        Some(first + PERMIT_COOLDOWN),
+        "a cooldown records when it ends"
+    );
+    let (permit, asked) = claim("cool", first + PERMIT_COOLDOWN);
+    assert!(permit.is_some(), "the cooldown ends at its end");
+    assert_eq!(asked, None, "a hold over records nothing");
+    let (busy, asked) = claim("other", soon);
+    assert!(busy.is_none(), "one renewal at a time");
+    assert_eq!(asked, None, "a renewal in flight is no clock's to end");
+    drop(permit);
+
+    note_background_end(&guard, "parked", Renewal::NeedsPerson, first);
+    let (permit, asked) = claim("parked", soon);
+    assert!(permit.is_none(), "the park holds");
+    assert_eq!(
+        asked,
+        Some(first + PERSON_BACKOFF),
+        "the park records when it ends"
+    );
+    let (permit, asked) = claim("parked", first + PERSON_BACKOFF);
+    assert!(permit.is_some(), "the park ends at its end");
+    assert_eq!(asked, None, "a park over records nothing");
+    drop(permit);
+
+    note_background_end(&guard, "bot", Renewal::BotCheck, first);
+    guard.lock().unwrap().unrecorded_checks.insert(
+        "bot".into(),
+        super::login_activity_tests::a_check_met("bot"),
+    );
+    for at in [soon, first + PERSON_BACKOFF] {
+        let (permit, asked) = claim("bot", at);
+        assert!(permit.is_none(), "a bot check holds");
+        assert_eq!(asked, None, "a bot check is no clock's to end");
+    }
+}
+
 /// A message dated after this read cannot clear a renewal's existing retry hold. Its
 /// timestamp becomes usable at the inclusive read boundary, without a timer or another write.
 #[test]
@@ -211,7 +282,7 @@ fn future_mail_does_not_clear_an_account_retry_hold() {
     fs::write(&message, "To: work@example.test\r\n\r\nhello\r\n").unwrap();
     set_mtime(&message, future);
 
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let clock = Instant::now();
     drop(AutoRenewPermit::claim(&guard, "work", clock, false).expect("first attempt"));
     let observed = latest_mailbox_mtime_at(&|_| None, None, &store, at);
@@ -246,7 +317,7 @@ fn future_mail_does_not_hide_a_valid_new_input_from_the_retry_guard() {
     set_mtime(&message, future);
 
     // Exercise recovery of the old reader's raw maximum, through the actual permit.
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let clock = Instant::now();
     drop(
         AutoRenewPermit::claim_with_mailbox(&guard, "work", clock, false, Some(future))
@@ -280,7 +351,7 @@ fn future_mail_does_not_hide_a_valid_new_input_from_the_retry_guard() {
 
 #[test]
 fn mailbox_admission_keeps_distinct_retry_inputs_independent() {
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let clock = Instant::now();
     let left = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
     let right = left + Duration::from_secs(1);
@@ -301,7 +372,7 @@ fn mailbox_admission_keeps_distinct_retry_inputs_independent() {
 #[test]
 fn mailbox_admission_refusal_preserves_attempt_history() {
     for hold in ["busy", "person", "bot"] {
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         let clock = Instant::now();
         let before = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
         let changed = before + Duration::from_secs(1);
@@ -356,7 +427,7 @@ fn mailbox_admission_refusal_preserves_attempt_history() {
 
 #[test]
 fn mailbox_admission_each_row_consumes_a_common_change_once() {
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let clock = Instant::now();
     let before = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
     let changed = before + Duration::from_secs(1);
@@ -380,7 +451,7 @@ fn mailbox_admission_each_row_consumes_a_common_change_once() {
 
 #[test]
 fn mailbox_admission_does_not_rearm_non_mailbox_preparations() {
-    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let clock = Instant::now();
     let before = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
     let changed = before + Duration::from_secs(1);
@@ -399,7 +470,7 @@ fn mailbox_admission_does_not_rearm_non_mailbox_preparations() {
 }
 
 struct MailboxAdmission {
-    guard: Arc<Mutex<AutoRenewGuard>>,
+    guard: Arc<Watched<AutoRenewGuard>>,
     clock: Instant,
     input: SystemTime,
     calls: [i64; 2],
@@ -409,7 +480,7 @@ impl MailboxAdmission {
     const KEYS: [&str; 2] = ["work", "codex:work"];
 
     fn new() -> Self {
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = AutoRenewGuard::default().shared();
         let clock = Instant::now();
         let input = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
         for key in Self::KEYS {
@@ -682,9 +753,9 @@ fn an_auto_rotate_click_obeys_the_configs_switches() {
             Ok(())
         };
         let fetch = |_: &Env, _: &str| -> Result<String, String> { panic!("no fetch") };
-        let cooldown = Mutex::new(None);
-        let rediscovery = Mutex::new(Rediscovery::default());
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let cooldown = Watched::new("accounts_sync/sync_cooldown", None);
+        let rediscovery = Watched::new("accounts_sync/rediscovery", Rediscovery::default());
+        let guard = AutoRenewGuard::default().shared();
         let lifetime = crate::harness::account_work::Lifetime::default();
         let mut fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
         fx.scope = lifetime.enter();

@@ -128,7 +128,7 @@ pub fn resident_options(durability: Durability) -> LogOptions {
 
 /// Fixed resource bounds for one immutable generation. Retention is deliberately
 /// unavailable: dropping an old record could erase authorization or liabilities.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub records: usize,
     pub bytes: usize,
@@ -188,7 +188,7 @@ impl Layout {
     }
 }
 
-/// One exclusive private writer. Drop before performing network I/O. Only
+/// One exclusive private writer. Drop or park ([`Log::park`]) before performing network I/O. Only
 /// append, bounded replay and immutable observations are exposed; astream's
 /// retention and sidecar mutation APIs cannot bypass the acknowledged prefix.
 /// A caller that only reads takes no lock at all: [`read_committed`] reads the
@@ -203,8 +203,107 @@ pub struct Log {
     anchor: Vec<u8>,
     identity: FileIdentity,
     writer_identity: FileIdentity,
+    /// The astream file's stamp as this writer last left it, while every change it showed was
+    /// this writer's own: none once a change no write of this writer made reached the file in
+    /// its hold, which then parks nothing ([`Self::park`]).
+    witness: Option<Stamp>,
+    /// Resumes in a row since this journal's prefix was last hashed whole ([`RESUMES`]).
+    resumes: u32,
+    /// The lowest offset this handle serves: a resumed handle hashed none of the prefix, so it
+    /// serves no record below the last one it parked ([`Self::resume`]).
+    floor: u64,
     _writer: WriterLock,
 }
+
+/// Resumes of a parked journal in a row ([`Log::resume`]); the next hashes its whole prefix again.
+pub const RESUMES: u32 = 64;
+
+/// How [`Log::resume`] admitted a journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reopened {
+    /// From the parked state: nothing of the prefix was hashed again.
+    Resumed,
+    /// As [`Log::open`] admits it: the whole prefix was hashed.
+    Opened,
+}
+
+/// What an open of the astream file says of the last change made to it through the file system:
+/// which file it is and its length, and on Unix its mode, owner, and modification and
+/// status-change times to the nanosecond. On Windows, which has no status-change time and
+/// whose modification time a writer may set back, it stands for nothing a resume skips: a
+/// writer there parks nothing ([`Log::park`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stamp {
+    identity: FileIdentity,
+    len: u64,
+    #[cfg(unix)]
+    changed: (u32, u32, (i64, i64), (i64, i64)),
+}
+impl Stamp {
+    /// The stamp of `file`, whose metadata is `metadata`.
+    fn of(file: &File, metadata: &std::fs::Metadata) -> io::Result<Self> {
+        let seen = seen(file, metadata)?;
+        Ok(Self {
+            identity: seen.identity,
+            len: seen.len,
+            #[cfg(unix)]
+            changed: (
+                metadata.mode(),
+                metadata.uid(),
+                (metadata.mtime(), metadata.mtime_nsec()),
+                (metadata.ctime(), metadata.ctime_nsec()),
+            ),
+        })
+    }
+}
+
+/// A writer let go between its holds ([`Log::park`]): no descriptor and no lock, only what a
+/// [`Log::resume`] needs to stand for an open's whole-prefix hash where the journal stands as
+/// this writer left it.
+///
+/// [`Log::resume`] admits an established journal as [`Log::open`] does, with every check an open
+/// makes, except that both of an open's whole-prefix hashes (its recovery's, under the physical
+/// lock, and astream's prepare's, under astream's) start from the parked SHA-256 state, and each
+/// does so only where, under the lock it runs under, the checkpoint holds exactly the 40 bytes
+/// this writer last saved, the astream file's stamp ([`Stamp`]) is the one this writer left it
+/// with, the writer lock is the parked one's, and fewer than [`RESUMES`] resumes followed the
+/// last whole hash. Any other journal is hashed from offset zero in the same admission, and that
+/// verdict is the answer.
+///
+/// What a resume does not prove again is that the bytes below the parked length still hash to the
+/// checkpoint. In place of that read stands the stamp: no change made through the file system has
+/// reached the astream file since those bytes were last hashed, compared at each append of the
+/// hold that parked it, at the park, and under each lock of the resume. A change the stamp cannot
+/// show (one within the instant of this writer's own write, within one timestamp tick, or made
+/// below the file system: the medium, a raw device) is refused where it breaks a frame's CRC,
+/// which astream's open checks on every resume; is never served, since a resumed handle serves
+/// no record below the last one it parked, which its caller judges against its own copy; is never
+/// attested, since later checkpoints extend the parked state, so the next whole hash refuses the
+/// journal; and is found within [`RESUMES`] resumes, at another process's or writer's open, and at
+/// any lock-free read. Like an open, this protects against accidental partial loss, not an actor
+/// who rewrites the checkpoint and the prefix together.
+pub struct Parked {
+    dir: PathBuf,
+    name: String,
+    limits: Limits,
+    anchor: Vec<u8>,
+    checkpoint: Checkpoint,
+    astream: Stamp,
+    writer_identity: FileIdentity,
+    /// The records the journal held at the park.
+    records: u64,
+    resumes: u32,
+}
+
+impl Parked {
+    /// The checkpoint a whole-prefix load of this journal starts from: the parked one, where the
+    /// checkpoint holds exactly its `bytes` and the astream file shows the parked stamp.
+    fn seed(&self, bytes: &[u8], astream: Stamp) -> Option<Checkpoint> {
+        (bytes == self.checkpoint.bytes() && astream == self.astream)
+            .then(|| self.checkpoint.clone())
+    }
+}
+
 impl Log {
     /// Local directory supplied when this exclusive journal was opened. This
     /// identifies its custody tree; it grants no authority over another tree.
@@ -294,6 +393,90 @@ impl Log {
         let layout = Layout::new(name, anchor, limits)?;
         let (lock, writer_identity) = lock(dir, &layout, deadline)
             .map_err(|error| stage_error(&layout, "writer admission", error))?;
+        Self::admit(
+            dir,
+            layout,
+            anchor,
+            established,
+            lock,
+            writer_identity,
+            None,
+        )
+        .map(|(log, _)| log)
+    }
+
+    /// Let this writer go between holds, keeping what a [`Self::resume`] needs: both locks are
+    /// released when it returns. `None` where nothing may be resumed: the handle is fenced, its
+    /// open unfinished, its files not intact, a change no write of this writer made reached the
+    /// astream file in its hold, or the platform is Windows ([`Stamp`]).
+    #[must_use]
+    pub fn park(self) -> Option<Parked> {
+        if cfg!(windows) || self.poisoned || self.pending_anchor.is_some() {
+            return None;
+        }
+        // Stamped while both locks are held: astream's drop only unlocks.
+        let astream = self.intact().ok()?;
+        if self.witness != Some(astream) || astream.len != self.checkpoint.length {
+            return None;
+        }
+        Some(Parked {
+            dir: self.dir.clone(),
+            name: self.layout.name.clone(),
+            limits: self.layout.limits,
+            anchor: self.anchor.clone(),
+            checkpoint: self.checkpoint.clone(),
+            astream,
+            writer_identity: self.writer_identity,
+            records: self.log.stats().head.0,
+            resumes: self.resumes,
+        })
+    }
+
+    /// [`Self::open`] of an established journal, resuming `parked` ([`Parked`] says what that
+    /// stands for); with none, exactly [`Self::open`].
+    /// # Errors
+    /// As [`Self::open`].
+    pub fn resume(
+        parked: Option<Parked>,
+        dir: &Path,
+        name: &str,
+        anchor: &[u8],
+        limits: Limits,
+    ) -> io::Result<(Self, Reopened)> {
+        let layout = Layout::new(name, anchor, limits)?;
+        let (lock, writer_identity) = lock(dir, &layout, Instant::now())
+            .map_err(|error| stage_error(&layout, "writer admission", error))?;
+        let parked = parked.filter(|parked| {
+            parked.dir == dir
+                && parked.name == layout.name
+                && parked.limits == limits
+                && parked.anchor == anchor
+                && parked.writer_identity == writer_identity
+                && parked.resumes < RESUMES
+        });
+        Self::admit(
+            dir,
+            layout,
+            anchor,
+            true,
+            lock,
+            writer_identity,
+            parked.as_ref(),
+        )
+    }
+
+    /// Admit the journal under `lock`, the writer lock just taken: an open, whose whole-prefix
+    /// loads start from `parked` where each finds the journal as it was parked ([`Parked`]).
+    fn admit(
+        dir: &Path,
+        layout: Layout,
+        anchor: &[u8],
+        established: bool,
+        lock: WriterLock,
+        writer_identity: FileIdentity,
+        parked: Option<&Parked>,
+    ) -> io::Result<(Self, Reopened)> {
+        let limits = layout.limits;
         let judged = private_file::JudgedDir::judge(dir)
             .map_err(|_| io::Error::other("journal anchor is not private"))?;
         let fresh = match judged.read(&layout.anchor, 4096) {
@@ -312,18 +495,19 @@ impl Log {
             }
             Err(_) => return Err(io::Error::other("journal is not a private regular file")),
         }
-        let identity = recover_uncommitted(dir, &layout, fresh)
+        let (identity, recovered_seeded) = recover_uncommitted(dir, &layout, fresh, parked)
             .map_err(|error| stage_error(&layout, "recovery", error))?;
         #[cfg(unix)]
         let mut checkpoint = None;
         let log = BrokerLog::open_opts(dir.join(&layout.astream), log_options(), || {
             #[cfg(unix)]
             {
-                let (checked, present, seen) = Checkpoint::load(dir, &layout, fresh)?;
+                let (checked, present, seen, seeded) =
+                    Checkpoint::load(dir, &layout, fresh, parked)?;
                 if seen.len != checked.length || seen.identity != identity {
                     return Err(io::Error::other("journal changed between its writer locks"));
                 }
-                checkpoint = Some((checked, present));
+                checkpoint = Some((checked, present, seeded));
             }
             // Under astream's lock, which refuses every read but its own handle's here: only
             // the length and the file are checked before astream's recovery may look at it.
@@ -341,16 +525,17 @@ impl Log {
         .map_err(|error| stage_error(&layout, "astream open", error))?;
         #[cfg(windows)]
         let checkpoint = {
-            let (checked, present, seen) =
-                Checkpoint::load_through(dir, &layout, fresh, Through::Log(&log))
+            let (checked, present, seen, seeded) =
+                Checkpoint::load_through(dir, &layout, fresh, parked, Through::Log(&log))
                     .map_err(|error| stage_error(&layout, "astream open", error))?;
             if seen.len != checked.length || seen.identity != identity {
                 return Err(io::Error::other("journal changed between its writer locks"));
             }
-            Some((checked, present))
+            Some((checked, present, seeded))
         };
-        let (checkpoint, present) =
+        let (checkpoint, present, prepared_seeded) =
             checkpoint.ok_or_else(|| io::Error::other("journal was not prepared"))?;
+        let resumed = parked.filter(|_| recovered_seeded && prepared_seeded);
         let stats = log.stats();
         if stats.retained_bytes > limits.bytes
             || stats.retained_records > limits.records
@@ -407,7 +592,7 @@ impl Log {
         if astream.identity != identity {
             return Err(io::Error::other("journal inode changed during open"));
         }
-        let opened = Self {
+        let mut opened = Self {
             log,
             checkpoint,
             dir: dir.into(),
@@ -417,10 +602,18 @@ impl Log {
             anchor: anchor.to_vec(),
             identity,
             writer_identity,
+            witness: None,
+            resumes: resumed.map_or(0, |parked| parked.resumes + 1),
+            floor: resumed.map_or(0, |parked| parked.records.saturating_sub(1)),
             _writer: lock,
         };
-        opened.intact()?;
-        Ok(opened)
+        opened.witness = Some(opened.intact()?);
+        let reopened = if resumed.is_some() {
+            Reopened::Resumed
+        } else {
+            Reopened::Opened
+        };
+        Ok((opened, reopened))
     }
     /// Finish opening only after the caller has authenticated all replayed
     /// records against its independent anchor. A failed replay must not pin a
@@ -439,7 +632,8 @@ impl Log {
     pub fn is_poisoned(&self) -> bool {
         self.poisoned || self.intact().is_err()
     }
-    fn intact(&self) -> io::Result<()> {
+    /// The files are this writer's, as it left them: the astream file's stamp ([`Stamp`]).
+    fn intact(&self) -> io::Result<Stamp> {
         // One directory verdict for the four files, each still opened and judged on its
         // descriptor: every access calls this, and open(2) is the cost.
         let dir = private_file::JudgedDir::judge(&self.dir)
@@ -447,7 +641,7 @@ impl Log {
         let astream = dir
             .open(&self.layout.astream)
             .map_err(|_| io::Error::other("journal lost its private inode"))
-            .and_then(|(file, metadata)| seen(&file, &metadata))?;
+            .and_then(|(file, metadata)| Stamp::of(&file, &metadata))?;
         let lock = dir
             .open(&self.layout.lock)
             .map_err(|_| io::Error::other("journal lost its writer lease"))
@@ -466,7 +660,7 @@ impl Log {
         {
             return Err(io::Error::other("journal or writer lease was replaced"));
         }
-        Ok(())
+        Ok(astream)
     }
     pub fn bytes(&self) -> usize {
         self.log.stats().retained_bytes
@@ -493,6 +687,12 @@ impl Log {
     pub fn read_range(&self, offset: Offset, count: usize) -> io::Result<Vec<Arc<BrokerRecord>>> {
         if self.is_poisoned() {
             return Err(io::Error::other("uncertain journal: reopen"));
+        }
+        if offset.0 < self.floor {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a resumed journal serves no record below the last one it parked",
+            ));
         }
         let stats = self.log.stats();
         let available = stats.head.0.saturating_sub(offset.0.max(stats.base.0));
@@ -578,7 +778,7 @@ impl Log {
     /// # Errors
     /// As the pre-publication checks of [`Self::append_many_then`].
     pub fn check_append_many(&self, records: &[(&str, Vec<u8>)]) -> io::Result<Offset> {
-        self.check_group(records).map(Offset)
+        self.check_group(records).map(|(head, _)| Offset(head))
     }
 
     #[cfg_attr(
@@ -686,12 +886,12 @@ impl Log {
         self.append_group_inner(&mut [(subject, body)], then)
     }
 
-    fn check_group(&self, records: &[(&str, Vec<u8>)]) -> io::Result<u64> {
-        if self.is_poisoned() {
-            return Err(io::Error::other(
-                "uncertain journal: reopen and retry exact bytes",
-            ));
+    fn check_group(&self, records: &[(&str, Vec<u8>)]) -> io::Result<(u64, Stamp)> {
+        let uncertain = || io::Error::other("uncertain journal: reopen and retry exact bytes");
+        if self.poisoned {
+            return Err(uncertain());
         }
+        let astream = self.intact().map_err(|_| uncertain())?;
         if self.pending_anchor.is_some() {
             return Err(io::Error::other(
                 "authenticate replay and finish opening before append",
@@ -731,7 +931,7 @@ impl Log {
         let head = stats.head.0;
         head.checked_add(records.len() as u64)
             .ok_or_else(|| io::Error::other("journal sequence exhausted"))?;
-        Ok(head)
+        Ok((head, astream))
     }
 
     fn append_group_inner(
@@ -739,7 +939,12 @@ impl Log {
         records: &mut [(&str, Vec<u8>)],
         then: Option<(&Path, impl FnOnce(Offset, Flush) -> io::Result<()>)>,
     ) -> io::Result<Offset> {
-        let head = self.check_group(records)?;
+        let (head, before) = self.check_group(records)?;
+        // A change no write of this writer made reached the file in its hold: it parks nothing.
+        if self.witness != Some(before) {
+            self.witness = None;
+        }
+        let mut after = before;
         for (index, (subject, body)) in records.iter_mut().enumerate() {
             match self.log.publish_checked(
                 1,
@@ -761,9 +966,12 @@ impl Log {
                     ));
                 }
             }
-            if self.intact().is_err() {
-                self.poisoned = true;
-                return Err(io::Error::other("journal changed during append; reopen"));
+            match self.intact() {
+                Ok(stamp) => after = stamp,
+                Err(_) => {
+                    self.poisoned = true;
+                    return Err(io::Error::other("journal changed during append; reopen"));
+                }
             }
             #[cfg(test)]
             tests::append_step(tests::Step::Published, self.log.flush_counts());
@@ -790,6 +998,9 @@ impl Log {
                 path: self.dir.join(&self.layout.checkpoint),
                 error,
             }));
+        }
+        if self.witness.is_some() {
+            self.witness = Some(after);
         }
         #[cfg(test)]
         tests::append_step(tests::Step::Checkpointed, self.log.flush_counts());
@@ -1538,6 +1749,7 @@ impl std::error::Error for CheckpointFailure {
 
 /// Digest of the exact acknowledged physical prefix. Kept incrementally in
 /// memory, but reconstructed and checked before astream can repair any tail.
+#[derive(Clone)]
 struct Checkpoint {
     length: u64,
     hash: aterm_digest::Sha256,
@@ -1595,8 +1807,13 @@ impl Checkpoint {
     /// the astream file's name; whether it was there (a fresh journal's may not be); and what
     /// that open saw.
     #[cfg(unix)]
-    fn load(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<(Self, bool, Seen)> {
-        Self::load_with(dir, layout, fresh, |checkpoint, judged, length| {
+    fn load(
+        dir: &Path,
+        layout: &Layout,
+        fresh: bool,
+        parked: Option<&Parked>,
+    ) -> io::Result<(Self, bool, Seen, bool)> {
+        Self::load_with(dir, layout, fresh, parked, |checkpoint, judged, length| {
             checkpoint.extend_in(dir, judged, layout, length)
         })
     }
@@ -1608,9 +1825,10 @@ impl Checkpoint {
         dir: &Path,
         layout: &Layout,
         fresh: bool,
+        parked: Option<&Parked>,
         through: Through<'_>,
-    ) -> io::Result<(Self, bool, Seen)> {
-        Self::load_with(dir, layout, fresh, |checkpoint, judged, length| {
+    ) -> io::Result<(Self, bool, Seen, bool)> {
+        Self::load_with(dir, layout, fresh, parked, |checkpoint, judged, length| {
             checkpoint.extend_through(dir, judged, layout, length, through)
         })
     }
@@ -1642,15 +1860,17 @@ impl Checkpoint {
         Ok((length.unwrap_or(0), seen))
     }
 
-    /// The checkpoint `dir` holds, its prefix hashed by `extend`; whether it was there; and
-    /// what `extend`'s open of the astream file saw (a fresh journal's own open, where there
-    /// is none).
+    /// The checkpoint `dir` holds, its prefix hashed by `extend`; whether it was there; what
+    /// `extend`'s open of the astream file saw (a fresh journal's own open, where there is none);
+    /// and whether the hash started from `parked`'s state, which it does where the journal
+    /// stands as it was parked ([`Parked::seed`]), and from offset zero otherwise.
     fn load_with(
         dir: &Path,
         layout: &Layout,
         fresh: bool,
+        parked: Option<&Parked>,
         extend: impl FnOnce(&mut Self, &private_file::JudgedDir<'_>, u64) -> io::Result<Seen>,
-    ) -> io::Result<(Self, bool, Seen)> {
+    ) -> io::Result<(Self, bool, Seen, bool)> {
         let mut checkpoint = Self {
             length: 0,
             hash: aterm_digest::Sha256::new(),
@@ -1664,13 +1884,27 @@ impl Checkpoint {
                         .try_into()
                         .map_err(|_| io::Error::other("invalid journal checkpoint"))?,
                 );
+                let seed = match parked {
+                    Some(parked) => {
+                        let astream = judged
+                            .open(&layout.astream)
+                            .map_err(|_| io::Error::other("journal is not private"))
+                            .and_then(|(file, metadata)| Stamp::of(&file, &metadata))?;
+                        parked.seed(&bytes, astream)
+                    }
+                    None => None,
+                };
+                let seeded = seed.is_some();
+                if let Some(seed) = seed {
+                    checkpoint = seed;
+                }
                 let seen = extend(&mut checkpoint, &judged, length)?;
                 if checkpoint.hash.clone().finalize() != bytes[8..] {
                     return Err(io::Error::other(
                         "acknowledged journal history changed; preserve it for authenticated repair",
                     ));
                 }
-                Ok((checkpoint, true, seen))
+                Ok((checkpoint, true, seen, seeded))
             }
             Err(PrivateFileError::Missing) if fresh => {
                 let seen = judged
@@ -1682,7 +1916,7 @@ impl Checkpoint {
                         "nonempty journal has no acknowledgement checkpoint",
                     ));
                 }
-                Ok((checkpoint, false, seen))
+                Ok((checkpoint, false, seen, false))
             }
             _ => Err(io::Error::other(
                 "journal checkpoint is malformed or not private",
@@ -1840,6 +2074,8 @@ impl Checkpoint {
                 )
             })?;
             self.hash.update(&buffer[..count]);
+            #[cfg(test)]
+            tests::hashed(count);
             remaining -= count as u64;
         }
         self.length = length;
@@ -1863,7 +2099,12 @@ impl Checkpoint {
 /// writer and the physical file are both locked while this happens; astream's
 /// prepare callback rechecks the prefix after taking over the physical lock (on Windows its
 /// length and file, and the open log's own descriptor its bytes: [`Through`]).
-fn recover_uncommitted(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<FileIdentity> {
+fn recover_uncommitted(
+    dir: &Path,
+    layout: &Layout,
+    fresh: bool,
+    parked: Option<&Parked>,
+) -> io::Result<(FileIdentity, bool)> {
     let (file, opened) = open_for_recovery(dir, layout)?;
     #[expect(
         clippy::disallowed_methods,
@@ -1874,10 +2115,10 @@ fn recover_uncommitted(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<F
         .map_err(|error| stage_error(layout, "physical recovery lock", error))?;
     let mut held = WriterLock(file);
     #[cfg(unix)]
-    let (checkpoint, _, checked) = Checkpoint::load(dir, layout, fresh)?;
+    let (checkpoint, _, checked, seeded) = Checkpoint::load(dir, layout, fresh, parked)?;
     #[cfg(windows)]
-    let (checkpoint, _, checked) =
-        Checkpoint::load_through(dir, layout, fresh, Through::Held(&held.0))?;
+    let (checkpoint, _, checked, seeded) =
+        Checkpoint::load_through(dir, layout, fresh, parked, Through::Held(&held.0))?;
     if checked.identity != opened {
         return Err(io::Error::other(
             "journal changed while its prefix was checked",
@@ -1897,7 +2138,7 @@ fn recover_uncommitted(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<F
         .checked_sub(checkpoint.length)
         .ok_or_else(|| io::Error::other("journal lost acknowledged bytes"))?;
     if tail_len == 0 {
-        return Ok(opened);
+        return Ok((opened, seeded));
     }
     let mut tail = vec![
         0;
@@ -1956,7 +2197,8 @@ fn recover_uncommitted(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<F
     aterm_durable::durable_dir(dir)?;
     held.0.set_len(checkpoint.length)?;
     aterm_durable::durable(&held.0)?;
-    Ok(opened)
+    // A cut tail is a change the parked stamp did not show: the length moved.
+    Ok((opened, false))
 }
 
 /// The astream file opened to read and write for recovery, never through a link, and checked
@@ -2015,5 +2257,7 @@ mod append_tests;
 mod group_tests;
 #[cfg(test)]
 mod open_tests;
+#[cfg(all(test, unix))]
+mod resume_tests;
 #[cfg(test)]
 mod tests;

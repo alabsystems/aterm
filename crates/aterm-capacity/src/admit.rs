@@ -82,7 +82,8 @@
 //! as much again as it claims), lacks memory no claim holds; one whose shortfall only such
 //! unseen use may bring keeps its place and spares nothing until those claims end. One whose own
 //! look admits it ALONE once the claims ahead end keeps its place and spares nothing: those ends
-//! do start it. So does a critical waiter's retained lead, which owns what its sponsors pledged.
+//! do start it. So does a critical waiter's retained lead where those ends and its ended
+//! sponsors' eligible memory (REMAINS) cover its shortfall.
 //! Every other such waiter is STUCK ([`Spared::Stuck`]: a need with a margin, such as a
 //! release's slice budget, or one at or above what can ever be available): no claim's end can
 //! start it, so it reserves no memory against the claims behind it and each that fits the room
@@ -957,7 +958,8 @@ pub fn reserved(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Spared {
     /// It keeps its place: the ends of the claims ahead can start it (or it is a critical
-    /// waiter's retained lead, which owns what its sponsors pledged), and a claim behind it may
+    /// waiter's retained lead whose shortfall those ends and eligible sponsor memory cover),
+    /// and a claim behind it may
     /// take this many bytes at most and go first without delaying its turn by any of them (`0`:
     /// none may).
     Within(u64),
@@ -1585,7 +1587,8 @@ fn alone_once_clear(need: &Need, reach: Option<u64>) -> bool {
             && reach.is_none_or(|reach| need.mem.saturating_add(need.margin) < reach))
 }
 
-/// What a waiter of `need` asks of the room to start: its peak, its margin and its holdback.
+/// What a turn protects before virtual admission or positive backfill: the need's peak, margin
+/// and holdback. Actual admission (`decide`) asks only the peak and margin.
 fn protected_wanted(need: &Need) -> u64 {
     need.mem
         .saturating_add(need.margin)
@@ -1700,10 +1703,11 @@ impl MemoryTurn {
     /// the rule): `None` where it starts now, else what it leaves the claims behind it. The one
     /// reckoning each waiter is stood by, over what its own look counts (OWN LOOK), and a look
     /// names its own wait by ([`Short::Memory`]'s `stuck`). It is reckoned on its whole
-    /// need, as its own look asks it ([`decide`]'s `wanted`): what its holder's tree holds
+    /// need, as its own look asks it ([`decide`]'s `wanted`), with `remains` the ended-sponsor
+    /// memory the ledger snapshot qualifies ([`remains`]): what its holder's tree holds
     /// already lowers what it reserves against the claims behind it ([`reservations`]), which is
     /// what it takes from the room once it starts, never what it asks of the room to start.
-    pub(crate) fn standing(&self, need: &Need) -> Option<Spared> {
+    pub(crate) fn standing(&self, need: &Need, remains: u64) -> Option<Spared> {
         let holdback = holdback(need);
         let protected_wanted = protected_wanted(need);
         let room = self.room;
@@ -1737,14 +1741,24 @@ impl MemoryTurn {
             ));
         }
         let gives: Vec<[u64; 2]> = self.releases.iter().map(|end| end.gives).collect();
+        // Holdback bounds positive backfill above; it is not part of the lead's real admission
+        // demand. Requiring its sponsors to fund it again can discard a valid retained turn.
+        let real_short = self
+            .blocked
+            .saturating_add(need.mem.saturating_add(need.margin))
+            .saturating_sub(room);
         Some(match spare(&gives, short) {
             Some(most) => Spared::Within(most),
-            // A retained critical wait owns each byte its terminal sponsors pledged; a sponsor's
-            // processes may still hold those bytes after its record has gone (the fit's REMAINS,
-            // `sure_leads`), and no later claim may refill that room. A known release may still
-            // leave a bounded overshoot, which is safe backfill by the same subset-sum proof as
-            // CAP3.
-            None if need.critical && need.lead_reservation.is_some() => Spared::Within(0),
+            // An ended sponsor's eligible memory may fund what the claims' ends alone cannot
+            // (REMAINS, `remains`). Protect that room only where it and those ends cover the
+            // shortfall. Unpledged memory, and a sponsor's tree with a claimant under it, may
+            // wait for the very claimant this arm would otherwise hold behind the lead.
+            None if need.critical
+                && need.lead_reservation.is_some()
+                && may_bring(&self.releases, real_short.saturating_sub(remains)) =>
+            {
+                Spared::Within(0)
+            }
             // No set of ends brings what it lacks, yet the ends of the claims ahead do start
             // it: its own look admits it ALONE once none of them holds memory or waits for it,
             // a stuck waiter aside. It lacks room beside the reservations ahead, so first in,
@@ -1849,9 +1863,10 @@ fn may_bring(ends: &[End], short: u64) -> bool {
 /// once the claims ahead of it end (`alone_once_clear`, the test [`decide`] applies: it asks no
 /// margin and its need is below `reach`): those ends do start it, and a stream of claims that
 /// went first would keep it from ever being alone. The other is a critical waiter's retained
-/// lead ([`Need::lead_reservation`]): it owns each byte its sponsors pledged; a sponsor's
-/// processes may still hold those bytes after its record has gone (the fit's REMAINS,
-/// [`sure_leads`]), and no later claim may refill that room. Every
+/// lead ([`Need::lead_reservation`]) whose shortfall those ends and its ended sponsors' eligible
+/// memory (REMAINS, [`remains`]) cover: no later claim may refill that room. A sponsor's tree
+/// with a claimant under it is ineligible, since that claimant may have to run before the
+/// sponsor frees its pages. Every
 /// other such waiter is STUCK ([`Spared::Stuck`]): one that asks a margin (a release's slice
 /// budget, a VM's boot), which is never admitted alone, and one at or above `reach`. A stuck
 /// waiter reserves no memory against the claims behind it, as a waiter whose disk need is
@@ -1973,6 +1988,7 @@ pub(crate) fn memory_turn(
     let mut walked_at: Vec<usize> = Vec::with_capacity(waiting.len());
     for (i, (o, reserve)) in waiting {
         let need = &o.record.need;
+        let remains = known_remains(o, sweep);
         // OWN LOOK: as every look reckons it, else by its own look over this turn's claims.
         let standing = match o.reckoned {
             Some(known) => known.standing,
@@ -1980,9 +1996,9 @@ pub(crate) fn memory_turn(
                 let own = if held.iter().all(|(h, _)| own_look_counts(o, h))
                     && walked.iter().all(|(w, _, _)| own_look_counts(o, w))
                 {
-                    turn.standing(need)
+                    turn.standing(need, remains)
                 } else {
-                    own_standing(o, &held, &walked, available, reach)
+                    own_standing(o, &held, &walked, available, reach, remains)
                 };
                 match own {
                     Some(Spared::Within(spares)) => Some(Spared::Within(once_started(
@@ -2042,6 +2058,15 @@ pub(crate) struct Sweep<'s> {
     pub(crate) reckoned: &'s HashMap<Order, Reckoned>,
 }
 
+/// A waiter's REMAINS from the ledger snapshot, also while its turn is first being reckoned
+/// and `Other::reckoned` has not yet been filled. Starting a waiter does not change that figure
+/// in `once_started`: it was already a claimant in the snapshot.
+fn known_remains(o: &Other<'_>, sweep: Option<Sweep<'_>>) -> u64 {
+    o.reckoned
+        .or_else(|| sweep.and_then(|sweep| sweep.reckoned.get(&o.record.order()).copied()))
+        .map_or(0, |known| known.remains)
+}
+
 /// OWN LOOK: how `o`, a waiter, stands in its own look beside `held`, the held claims of a turn,
 /// and `walked`, the waiters ahead of it with how each stands: in a turn of the claims its own
 /// look counts ([`own_look_counts`]), each waiter at its standing.
@@ -2051,6 +2076,7 @@ fn own_standing(
     walked: &[Walked<'_, '_>],
     available: u64,
     reach: Option<u64>,
+    remains: u64,
 ) -> Option<Spared> {
     let mut own = MemoryTurn::new(0, available, reach);
     for (h, r) in held.iter().filter(|(h, _)| own_look_counts(o, h)) {
@@ -2059,7 +2085,7 @@ fn own_standing(
     for (w, r, s) in walked.iter().filter(|(w, _, _)| own_look_counts(o, w)) {
         own.take((w, *r), *s);
     }
-    own.standing(&o.record.need)
+    own.standing(&o.record.need, remains)
 }
 
 /// The most waiters that start now ahead of a waiter whose sets [`once_started`] reckons it beside:
@@ -2247,16 +2273,18 @@ fn once_started(
             let standing = if starts(k) {
                 None
             } else {
-                look(w, k, &stood).standing(&w.record.need)
+                look(w, k, &stood).standing(&w.record.need, known_remains(w, sweep))
             };
             stood.push(standing);
         }
         let turn = look(o, walked.len(), &stood);
-        least = least.min(match turn.standing(&o.record.need) {
-            Some(Spared::Within(then)) => then,
-            Some(Spared::Stuck) => continue,
-            None => turn.leaves(&o.record.need),
-        });
+        least = least.min(
+            match turn.standing(&o.record.need, known_remains(o, sweep)) {
+                Some(Spared::Within(then)) => then,
+                Some(Spared::Stuck) => continue,
+                None => turn.leaves(&o.record.need),
+            },
+        );
     }
     least
 }
@@ -2268,6 +2296,14 @@ mod detached_accounting_tests;
 #[cfg(test)]
 #[path = "admit_stuck_tests.rs"]
 mod stuck_tests;
+
+#[cfg(test)]
+#[path = "admit_retained_tests.rs"]
+mod retained_tests;
+
+#[cfg(test)]
+#[path = "admit_parent_tests.rs"]
+mod parent_tests;
 
 /// Whether `other` is a scratch claim ([`Need::scratch`]) held on `volume` by a process other
 /// than `pid` (the waiter's): one whose end may give back what it wrote there, which a look that
@@ -2483,14 +2519,15 @@ pub fn covering_disk(
 /// [`decide`] puts ahead of it; every other look counts the same for it ([`inside_of`],
 /// [`own_counts`], [`memory_turn`]'s OWN LOOK). A sure lead fits once every held claim but the
 /// PARENTS has ended, a parent being a held claim that may end only once a waiter under it has run
-/// (its holder is that waiter's process or an ancestor of it, or it credits one), and asks for
+/// (its holder is that waiter's process or an ancestor of it, or it credits one, directly or
+/// through another parent's holder or credited processes), and asks for
 /// nothing else a parent may hold: no disk, no quiet machine, not the machine alone, and cores only
 /// where the parents' leave it one; and no lead is of background rank, which would yield to a
 /// release parent ([`Need::leads`]). So counting it closes no cycle: the lead waits only for held
 /// claims, for the sure leads ahead of it and, a retained lead, for the processes of its ended
 /// sponsors under which no claimant is ([`remains`]), and none of them waits for the waiters that
-/// count it, but for one: a held claim that is no parent, whose holder may wait for a descendant's
-/// claim that credits such a waiter, closes one (ATERM-KI-1114-999). What is available is read as
+/// count it. Parents include the transitive dependencies through their holders and credited
+/// processes ([`parent_claims`]). What is available is read as
 /// it is, memory no claim holds left out of it, so that memory makes a lead unsure rather than
 /// holding the waiters that count it.
 ///
@@ -2603,7 +2640,9 @@ fn kin_of(r: &Record, pid: u32, ancestors: &[u32]) -> bool {
 /// none of its kin's for one its holder's tree keeps ([`Other::kin`]). A parent is a held claim
 /// whose holder is a waiting process (the asking waiter, `asker`, with its ancestors, among them)
 /// or one of its ancestors in `procs`, or one that credits a waiting process or an ancestor
-/// ([`credits`]), each its kin: it may end only once that waiter has run. That room is what
+/// ([`credits`]), each its kin, or a claim whose holder or credited processes are kin of such a
+/// parent's holder or credited processes, transitively ([`parent_claims`]): it may end only once
+/// that waiter has run. That room is what
 /// `reading` has available now, less what each parent reserves, plus what each other held claim's
 /// trees use of what it claims (what it claims less what it reserves), which its end gives back:
 /// each reservation as every look of the ledger reckons it (`reckoned`, [`Reckoned::reserve`]: over
@@ -2695,6 +2734,47 @@ fn sponsor_held(records: &[&Record], sponsor: &crate::LeadSponsor) -> bool {
     })
 }
 
+/// Every held claim with whether its end may wait for a waiting process in `lines`. Starting
+/// with those processes, close the dependency relation through each parent's holder and the
+/// processes it credits: their kin's held claims may end only after that parent too. Numeric
+/// holder identities of independently accounted claims establish no such dependency.
+fn parent_claims<'r>(
+    records: &[&'r Record],
+    lines: &HashMap<u32, Vec<u32>>,
+    procs: &Procs,
+) -> Vec<(&'r Record, bool)> {
+    let mut held: Vec<(&Record, bool)> = records
+        .iter()
+        .copied()
+        .filter(|r| r.held.is_some())
+        .map(|r| (r, false))
+        .collect();
+    let mut seen: HashSet<u32> = lines.keys().copied().collect();
+    let mut frontier: Vec<(u32, Vec<u32>)> = lines
+        .iter()
+        .map(|(pid, line)| (*pid, line.clone()))
+        .collect();
+    while let Some((pid, line)) = frontier.pop() {
+        for (record, parent) in &mut held {
+            if *parent
+                || record.accounting != crate::Accounting::Holder
+                || !(record.pid == pid || kin_of(record, pid, &line))
+            {
+                continue;
+            }
+            *parent = true;
+            for dependent in std::iter::once(record.pid)
+                .chain(record.credit.iter().copied().filter(|pid| *pid > 1))
+            {
+                if seen.insert(dependent) {
+                    frontier.push((dependent, procs.ancestors(dependent)));
+                }
+            }
+        }
+    }
+    held
+}
+
 /// The snapshot proof used by an ordinary lead, and by a critical lead before it retains terminal
 /// funding: it fits once every independent held claim its own look counts has ended (its kin's are
 /// none of them unless it is cohort-owned), beside every parent that may need the asking waiter to
@@ -2719,18 +2799,7 @@ fn lead_fits_after_independent_holders(
     for r in records.iter().filter(|r| r.held.is_none()) {
         lines.entry(r.pid).or_insert_with(|| procs.ancestors(r.pid));
     }
-    let is_parent = |r: &Record| {
-        r.accounting == crate::Accounting::Holder
-            && lines
-                .iter()
-                .any(|(pid, line)| r.pid == *pid || kin_of(r, *pid, line))
-    };
-    let held: Vec<(&Record, bool)> = records
-        .iter()
-        .copied()
-        .filter(|r| r.held.is_some())
-        .map(|r| (r, is_parent(r)))
-        .collect();
+    let held = parent_claims(records, &lines, procs);
     // The held claims its own look counts: every one but its kin's, and its kin's too for a
     // cohort-owned lead ([`look_read`]).
     let line = lines.get(&lead.pid).map_or(&[][..], Vec::as_slice);
@@ -3044,7 +3113,7 @@ pub(crate) fn decide(
     others: &[Other<'_>],
     now: u64,
 ) -> Result<Grant, Shortfall> {
-    decide_with(need, mine, reading, others, now, DiskRule::Reserved)
+    decide_with(need, mine, reading, others, now, DiskRule::Reserved, None)
 }
 
 /// How a look judges a disk need ([`decide_with`]): a waiter's looks take these in this order
@@ -3083,7 +3152,9 @@ impl DiskRule {
     }
 }
 
-/// [`decide`], its disk need judged by `rule`.
+/// [`decide`], its disk need judged by `rule`, with its own memory standing from the same
+/// ledger snapshot where supplied. `None` reckons that standing from the supplied claims,
+/// with no eligible ended-sponsor memory known.
 pub(crate) fn decide_with(
     need: &Need,
     mine: (u64, u32, u64),
@@ -3091,6 +3162,7 @@ pub(crate) fn decide_with(
     others: &[Other<'_>],
     now: u64,
     rule: DiskRule,
+    own: Option<Reckoned>,
 ) -> Result<Grant, Shortfall> {
     let ahead: Vec<&Other<'_>> = others
         .iter()
@@ -3186,7 +3258,8 @@ pub(crate) fn decide_with(
                         reserved,
                         passes: turn.may(),
                         stuck_ahead: turn.stuck,
-                        stuck: turn.standing(need) == Some(Spared::Stuck),
+                        stuck: own.map_or_else(|| turn.standing(need, 0), |known| known.standing)
+                            == Some(Spared::Stuck),
                     }
                 });
             }
@@ -5242,7 +5315,15 @@ impl Waiter {
                         < (!need.leads, need.priority(), mine)
             });
         let others = others(&records, used.claimants, &used.trees, &used.lines, &wide);
-        let mut decided = decide_with(&need, mine, &reading, &others, now, self.disk_rule);
+        let mut decided = decide_with(
+            &need,
+            mine,
+            &reading,
+            &others,
+            now,
+            self.disk_rule,
+            wide.reckoned.get(&mine).copied(),
+        );
         let mut loaded = None;
         if measured {
             use crate::TimingIssue;

@@ -684,3 +684,67 @@ fn a_due_wait_polls_at_once_and_a_short_one_never_spins() {
     assert_eq!(millis(Some(Duration::from_micros(80_001))), 81);
     assert_eq!(millis(Some(Duration::MAX)), u32::MAX - 1);
 }
+
+/// A FILE'S STAMP MOVES WHERE ITS BYTES DO, WHATEVER ITS LENGTH AND MODIFICATION TIME SAY
+/// ([`super::stamp`]): a rewrite in place at the same length, its modification time put back,
+/// moves it by its change time, and a replace by rename with the same length and the same
+/// modification and change times moves it by its file id. An untouched file's stamp stands. Each
+/// version's times are set an hour back first (`aterm_dirfd::seam::set_change_time` for the
+/// change time, which nothing else sets), so no write lands in the tick of the one before it.
+///
+/// NEGATIVE CONTROLS (run 2026-11-16): with [`super::stamp`]'s change time read as 0, the test
+/// fails at "the rewrite moved its change time"; with its file id read as 0, at "the replace
+/// moved its file id".
+#[test]
+fn a_stamp_moves_for_a_same_length_rewrite_and_a_replace_by_rename() {
+    use super::super::FileStamp;
+    let dir = scratch("stamp");
+    let path = dir.path().join("state.json");
+    let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+    let ticks = |at: std::time::SystemTime| {
+        let since = at.duration_since(std::time::UNIX_EPOCH).unwrap();
+        i64::try_from(since.as_nanos() / 100).unwrap() + 116_444_736_000_000_000
+    };
+    // `path`'s modification time put back to an hour ago, then its change time too where
+    // `changed`.
+    let aged = |path: &Path, changed: bool| {
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(hour_ago).unwrap();
+        if changed {
+            aterm_dirfd::seam::set_change_time(&file, ticks(hour_ago)).unwrap();
+        }
+    };
+    std::fs::write(&path, b"one\n").unwrap();
+    aged(&path, true);
+    let first = FileStamp::of(&path).expect("a stamp");
+    assert_eq!(
+        FileStamp::of(&path),
+        Some(first),
+        "an untouched file's stamp stands"
+    );
+
+    std::fs::write(&path, b"two\n").unwrap();
+    aged(&path, false);
+    let meta = std::fs::metadata(&path).unwrap();
+    assert_eq!(
+        (meta.len(), meta.modified().unwrap()),
+        (4, hour_ago),
+        "the same length and modification time"
+    );
+    let rewritten = FileStamp::of(&path).expect("a stamp");
+    assert_ne!(rewritten, first, "the rewrite moved its change time");
+
+    aged(&path, true);
+    let before = FileStamp::of(&path).expect("a stamp");
+    let temporary = dir.path().join(".state.json.new");
+    std::fs::write(&temporary, b"two\n").unwrap();
+    std::fs::rename(&temporary, &path).unwrap();
+    aged(&path, true);
+    let replaced = FileStamp::of(&path).expect("a stamp");
+    assert_eq!(
+        (replaced.len, replaced.modified_ns, replaced.changed_ns),
+        (before.len, before.modified_ns, before.changed_ns),
+        "the same length, modification and change times"
+    );
+    assert_ne!(replaced, before, "the replace moved its file id");
+}

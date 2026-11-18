@@ -113,7 +113,7 @@ fn shared_run(env: &Env, host: &Host<'_>, request: u8) -> ExitCode {
     shared_renewal::run(
         env,
         host,
-        "shared",
+        MAIL,
         [request; 16],
         host.approval,
         &mut Vec::new(),
@@ -153,7 +153,7 @@ fn a_shared_grant_is_consumed_once_and_ordinary_renewal_cannot_bypass_its_pin() 
     assert_ne!(shared_run(&env, &host, 2), ExitCode::SUCCESS);
     assert_eq!(login_homes(&env), homes);
     let form = AccountsCmd::Renew {
-        labels: vec!["shared".into()],
+        accounts: vec![MAIL.into()],
         due: false,
         on: Some(vec![]),
     };
@@ -185,6 +185,149 @@ fn a_shared_grant_is_consumed_once_and_ordinary_renewal_cannot_bypass_its_pin() 
     assert_ne!(shared_run(&env, &host, 4), ExitCode::SUCCESS);
     assert_eq!(host.calls.get(), 2);
     assert_eq!(login_homes(&env), homes);
+}
+
+/// `shared_renewal::run` naming the row by `word`, its grant's request `request`: its exit and
+/// what it said on stderr.
+fn shared_run_named(env: &Env, host: &Host<'_>, word: &str, request: u8) -> (ExitCode, String) {
+    let mut err = Vec::new();
+    let code = shared_renewal::run(
+        env,
+        host,
+        word,
+        [request; 16],
+        host.approval,
+        &mut Vec::new(),
+        &mut err,
+    );
+    (code, String::from_utf8_lossy(&err).into_owned())
+}
+
+/// The account key of the fixture's row, made independently of the harness's names.
+fn shared_key() -> String {
+    aterm_db::typed::keys::account_pk("claude", MAIL).expect("a key")
+}
+
+/// `shared-renew` names the row by its account: its key, its provider word and address (the two
+/// argv words joined into one, as its parse joins them), `claude:<address>`, its address alone,
+/// and, under a lab that slugs the account, its slug. Each reaches the row and renews it under a
+/// fresh grant. The row's label names nothing, since the row has an address: it is refused with
+/// the resolver's words before any grant is read, any staging is made or any provider runs.
+/// NEGATIVE CONTROL: with `run` looking the word up as a roster label first
+/// (`records.roster.row(word)`), the label renews the row and this fails on the label's exit
+/// (2026-11-16, by hand, then restored).
+#[cfg(unix)]
+#[test]
+fn shared_renew_takes_each_account_word_and_refuses_the_rows_label() {
+    let (_tmp, env) = fixture("shared-renew-words");
+    let approval = Approval {
+        live: Cell::new(true),
+        generation: Cell::new(1),
+    };
+    let host = Host {
+        approval: &approval,
+        calls: Cell::new(0),
+        stop: false,
+        uuid: "provider-uuid",
+    };
+    let (code, err) = shared_run_named(&env, &host, "shared", 1);
+    assert_eq!(code, ExitCode::from(1), "{err}");
+    assert_eq!(
+        err,
+        format!("shared renewal: {}\n", aterm_file::no_account("shared")),
+        "the label of a row with an address names nothing"
+    );
+    assert_eq!(host.calls.get(), 0, "no provider ran for the label");
+    assert!(login_homes(&env).is_empty(), "no staging for the label");
+    let key = shared_key();
+    let colon = format!("claude:{MAIL}");
+    let spaced = format!("claude {MAIL}");
+    for (at, word) in [key.as_str(), spaced.as_str(), colon.as_str(), MAIL]
+        .into_iter()
+        .enumerate()
+    {
+        let generation = u8::try_from(at).expect("a few") + 1;
+        approval.generation.set(u64::from(generation));
+        let (code, err) = shared_run_named(&env, &host, word, generation);
+        assert_eq!(code, ExitCode::SUCCESS, "`{word}`: {err}");
+        assert_eq!(host.calls.get(), at + 1, "`{word}` renewed the row");
+    }
+    let lab = crate::harness::alab_roster::Lab {
+        names: [(
+            key.clone(),
+            aterm_file::AccountNames {
+                realm: "claude".to_owned(),
+                slug: "claude-owner-e".to_owned(),
+                name: Some(format!("claude {MAIL}")),
+                email: Some(MAIL.to_owned()),
+                login: Some(MAIL.to_owned()),
+                live: true,
+            },
+        )]
+        .into(),
+        ..crate::harness::alab_roster::Lab::default()
+    };
+    approval.generation.set(9);
+    let (code, err) = crate::harness::alab_roster::with_lab(lab, || {
+        shared_run_named(&env, &host, "claude-owner-e", 9)
+    });
+    assert_eq!(code, ExitCode::SUCCESS, "the slug: {err}");
+    assert_eq!(host.calls.get(), 5, "the slug renewed the row");
+}
+
+/// A ROW IN SHARED CUSTODY IS OFFERED ITS SHARED RENEWAL BY ITS ACCOUNT'S WORD, WHICH
+/// `shared-renew` TAKES: once a root's grant renewed the row, `accounts use` of it while it is
+/// recorded signed out names `accounts shared-renew <key>` (no lab slugs it here), never the row's
+/// label, which the verb refuses for a row with an address; and that word, given to
+/// `shared-renew`, renews the row under a fresh grant.
+/// NEGATIVE CONTROL: with `shared_custody_words` typing `row.label` again, the step is
+/// `shared-renew shared` and this fails on its word (2026-11-16, by hand, then restored).
+#[cfg(unix)]
+#[test]
+fn a_shared_custody_step_names_the_account_by_the_word_shared_renew_takes() {
+    let (_tmp, env) = fixture("shared-custody-word");
+    let approval = Approval {
+        live: Cell::new(true),
+        generation: Cell::new(1),
+    };
+    let host = Host {
+        approval: &approval,
+        calls: Cell::new(0),
+        stop: false,
+        uuid: "provider-uuid",
+    };
+    assert_eq!(shared_run(&env, &host, 1), ExitCode::SUCCESS);
+    env.accounts_store()
+        .transact(env.now, &mut None, |state| {
+            let _ = accounts::note_auth(state, "shared", accounts::Auth::SignedOut, env.now);
+            Ok(Vec::new())
+        })
+        .expect("the records");
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = run_accounts(
+        &AccountsCmd::Use {
+            account: MAIL.to_owned(),
+        },
+        &env,
+        &host,
+        &mut out,
+        &mut err,
+    );
+    let (out, err) = (
+        String::from_utf8_lossy(&out).into_owned(),
+        String::from_utf8_lossy(&err).into_owned(),
+    );
+    assert_ne!(code, ExitCode::SUCCESS, "{out}{err}");
+    let word = err
+        .split_once("`aterm harness accounts shared-renew ")
+        .and_then(|(_, rest)| rest.split_once('`'))
+        .map(|(word, _)| word.to_owned())
+        .unwrap_or_else(|| panic!("no shared renewal step: {err}"));
+    assert_eq!(word, shared_key(), "{err}");
+    approval.generation.set(2);
+    let (code, said) = shared_run_named(&env, &host, &word, 2);
+    assert_eq!(code, ExitCode::SUCCESS, "the step's word: {said}");
+    assert_eq!(host.calls.get(), 2, "the step's word renewed the row");
 }
 
 #[cfg(unix)]
@@ -314,7 +457,7 @@ fn a_changed_approved_uuid_is_refused_before_staging_or_provider_entry() {
         shared_renewal::run(
             &env,
             &host,
-            "shared",
+            MAIL,
             [2; 16],
             &incompatible,
             &mut Vec::new(),
@@ -347,7 +490,7 @@ fn explicit_bootstrap_can_learn_the_provider_uuid_from_a_successful_login() {
         shared_renewal::run(
             &env,
             &host,
-            "shared",
+            MAIL,
             [1; 16],
             &authority,
             &mut Vec::new(),
@@ -492,7 +635,7 @@ pub(crate) fn transition(
         shared_renewal::run(
             &env,
             &host,
-            "shared",
+            MAIL,
             [1; 16],
             &authority,
             &mut Vec::new(),
@@ -515,7 +658,7 @@ pub(crate) fn transition(
             let _ = shared_renewal::run(
                 &env,
                 &host,
-                "shared",
+                MAIL,
                 [2; 16],
                 &authority,
                 &mut Vec::new(),
@@ -1207,7 +1350,7 @@ fn checkpoint_case(prior: bool, after_checkpoint: bool) -> [[(&'static str, i64)
         shared_renewal::run(
             &env,
             &host,
-            "shared",
+            MAIL,
             [1; 16],
             &approval,
             &mut Vec::new(),
@@ -1346,7 +1489,7 @@ fn checkpoint_case(prior: bool, after_checkpoint: bool) -> [[(&'static str, i64)
         shared_renewal::run(
             &env,
             &host,
-            "shared",
+            MAIL,
             [2; 16],
             &approval,
             &mut Vec::new(),
@@ -1360,7 +1503,7 @@ fn checkpoint_case(prior: bool, after_checkpoint: bool) -> [[(&'static str, i64)
         shared_renewal::run(
             &env,
             &host,
-            "shared",
+            MAIL,
             [3; 16],
             &approval,
             &mut Vec::new(),

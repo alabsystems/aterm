@@ -3581,13 +3581,15 @@ fn a_profiles_incremental_is_never_scanned_before_it_is_staged() {
         for folder in [INCREMENTAL, "deps"] {
             let tmp = Tmp::new("stage-scan-inc");
             let t = synthetic_target(&tmp, "target");
-            let now = now_after_write(STALE + 1);
-            let seen = assessed(&t, now).profiles[0].last_used.unwrap();
             let many = t.join("debug").join(folder).join("many");
             std::fs::create_dir_all(&many).expect("many");
             for n in 0..100 {
                 std::fs::write(many.join(format!("e{n}")), b"x").expect("entry");
             }
+            // The survey sees the entries: surveyed before them, a `deps/` written in a later
+            // second reads as written into since the survey and refuses the removal.
+            let now = now_after_write(STALE + 1);
+            let seen = assessed(&t, now).profiles[0].last_used.unwrap();
             let mut order = Vec::new();
             fd::inject_scan_budget(Some(bounded));
             let result = ordinary_method(method, &t, now, seen, &mut |stage, _| {

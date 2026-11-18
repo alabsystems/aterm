@@ -36,7 +36,25 @@ impl Home {
         #[cfg(not(unix))]
         std::fs::create_dir_all(&dir).expect("cache folder");
         std::fs::write(dir.join("blob"), vec![7u8; len]).expect("cache file");
+        if rel.starts_with(".cargo/") {
+            self.cargo_protocol();
+        }
         dir
+    }
+
+    fn cargo_protocol(&self) {
+        for name in [".package-cache-mutate", ".package-cache"] {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            options
+                .open(self.path.join(".cargo").join(name))
+                .expect("Cargo protocol lock");
+        }
     }
 
     /// [`Home::cache`], the folder `rel`'s first two components name (`.cache/<name>`) tagged a
@@ -69,6 +87,209 @@ fn short_home() -> Home {
 
 fn nobody(_: &[PathBuf], _: &[u32]) -> std::io::Result<PathScan> {
     Ok(PathScan::default())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn cargo_reader_with_no_open_crate_file_prevents_cleanup_until_its_guard_releases() {
+    let home = Home::new();
+    let dir = home.cache(".cargo/registry/src", 1024);
+    let mounts = whole();
+    let w = world(&home, &nobody, &mounts);
+    let reader =
+        aterm_toolchain::cargo_cache::SourceCacheGuard::try_acquire(&home.path.join(".cargo"))
+            .unwrap();
+    let (busy, rows) = free(std::slice::from_ref(&dir), false, &w);
+    assert!(refusal(&busy[0]).contains("Cargo source-cache reclamation custody"));
+    assert!(dir.join("blob").is_file());
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row["action"] == Value::from("removing"))
+    );
+    let (preview, _) = free(std::slice::from_ref(&dir), true, &w);
+    assert!(refusal(&preview[0]).contains("Cargo source-cache reclamation custody"));
+    drop(reader);
+    let mut held_during_removal = false;
+    let removed = run(std::slice::from_ref(&dir), false, &w, &mut |row| {
+        let row: Value = aterm_json::from_str(row).unwrap();
+        if row["action"] == Value::from("removing") {
+            held_during_removal = aterm_toolchain::cargo_cache::SourceCacheGuard::try_acquire(
+                &home.path.join(".cargo"),
+            )
+            .is_err();
+        }
+        true
+    });
+    assert!(
+        held_during_removal,
+        "intent cannot precede real reader exclusion"
+    );
+    assert!(matches!(&removed[0].verdict, Verdict::Removed { .. }));
+    assert!(!dir.exists());
+    drop(
+        aterm_toolchain::cargo_cache::SourceCacheGuard::try_acquire(&home.path.join(".cargo"))
+            .unwrap(),
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn canonical_cargo_targets_keep_their_locks_through_home_and_registry_aliases() {
+    for overlap in [false, true] {
+        let home = Home::new();
+        // Initialize the real existing Cargo lock protocol without an alias.
+        home.cache(".cargo/git/checkouts", 0);
+        let target = home.cache(
+            if overlap {
+                ".cache/real-registry/src"
+            } else {
+                "real-registry/src"
+            },
+            1024,
+        );
+        std::os::unix::fs::symlink(target.parent().unwrap(), home.path.join(".cargo/registry"))
+            .unwrap();
+        let alias_parent = aterm_tempfile::tempdir().unwrap();
+        let alias = alias_parent.path().join("home");
+        std::os::unix::fs::symlink(&home.path, &alias).unwrap();
+        let mounts = whole();
+        let mut w = world(&home, &nobody, &mounts);
+        w.home = &alias;
+        let admitted = judge(&target, &w).unwrap();
+        assert_eq!(
+            admitted.cargo_home.as_deref(),
+            Some(home.path.join(".cargo").as_path())
+        );
+        let reader =
+            aterm_toolchain::cargo_cache::SourceCacheGuard::try_acquire(&home.path.join(".cargo"))
+                .unwrap();
+        let (outcomes, _) = free(std::slice::from_ref(&target), false, &w);
+        assert!(refusal(&outcomes[0]).contains("Cargo source-cache reclamation custody"));
+        assert!(target.join("blob").is_file());
+        drop(reader);
+        let (outcomes, _) = free(std::slice::from_ref(&target), false, &w);
+        assert!(matches!(&outcomes[0].verdict, Verdict::Removed { .. }));
+        assert!(!target.exists());
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn an_earlier_cache_root_does_not_admit_an_aliased_cargo_root_or_its_ancestor() {
+    let home = Home::new();
+    home.cache(".cargo/git/checkouts", 0);
+    let source = home.cache(".cache/container/registry/src", 1024);
+    let registry = source.parent().unwrap();
+    std::os::unix::fs::symlink(registry, home.path.join(".cargo/registry")).unwrap();
+    let mounts = whole();
+    let w = world(&home, &nobody, &mounts);
+    for target in [registry.to_path_buf(), home.path.join(".cache/container")] {
+        let (outcomes, rows) = free(&[target], false, &w);
+        assert!(refusal(&outcomes[0]).contains("contains a Cargo cache root"));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row["action"] == Value::from("removing"))
+        );
+        assert!(source.join("blob").is_file());
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_automatic_pass_keeps_cargo_readers_before_staging_an_aliased_cache() {
+    let home = Home::new();
+    home.cache(".cargo/git/checkouts", 0);
+    let cache = home.tagged(".cache/compiler-inputs", BIG);
+    std::os::unix::fs::symlink(home.path.join(".cache"), home.path.join(".cargo/registry"))
+        .unwrap();
+    let mounts = whole();
+    let now = clock() + 9 * DAY;
+    let reader =
+        aterm_toolchain::cargo_cache::SourceCacheGuard::try_acquire(&home.path.join(".cargo"))
+            .unwrap();
+    let (busy, rows) = swept(&at(&home, &nobody, &mounts, now), &in_place(), &mut || {
+        SHORT
+    });
+    assert!(gone(&busy).is_empty());
+    assert!(cache.join("blob").is_file());
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row["action"] == Value::from("removing"))
+    );
+    assert!(busy.outcomes.iter().any(|outcome| {
+        outcome.path == cache
+            && matches!(&outcome.verdict, Verdict::Refused(why) if why.contains("Cargo source-cache reclamation custody"))
+    }));
+    drop(reader);
+    let (done, _) = swept(
+        &at(&home, &nobody, &mounts, now + 7200),
+        &in_place(),
+        &mut || SHORT,
+    );
+    assert_eq!(gone(&done), [cache.clone()]);
+    assert!(!cache.exists());
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn finishing_an_aliased_staged_cache_keeps_cargo_custody_through_completion() {
+    let home = Home::new();
+    home.cache(".cargo/git/checkouts", 0);
+    let cache = home.cache(".cache/old-inputs", 1024);
+    std::os::unix::fs::symlink(home.path.join(".cache"), home.path.join(".cargo/registry"))
+        .unwrap();
+    let id = aterm_sysprobe::volumes::file_id(&cache, false).unwrap();
+    let staged = cache
+        .parent()
+        .unwrap()
+        .join(staged_name(&cache, id).unwrap());
+    std::fs::rename(&cache, &staged).unwrap();
+    let mounts = whole();
+    let w = world(&home, &nobody, &mounts);
+    let reader =
+        aterm_toolchain::cargo_cache::SourceCacheGuard::try_acquire(&home.path.join(".cargo"))
+            .unwrap();
+    let busy = finish_staged(&w, &mut |_| true);
+    assert!(refusal(&busy[0]).contains("Cargo source-cache reclamation custody"));
+    assert!(staged.join("blob").is_file());
+    drop(reader);
+    let mut held = false;
+    let done = finish_staged(&w, &mut |line| {
+        let row: Value = aterm_json::from_str(line).unwrap();
+        if row["action"] == Value::from("removed") {
+            held = aterm_toolchain::cargo_cache::SourceCacheGuard::try_acquire(
+                &home.path.join(".cargo"),
+            )
+            .is_err();
+        }
+        true
+    });
+    assert!(held, "Cargo custody must cover the completion journal");
+    assert!(matches!(done[0].verdict, Verdict::Removed { .. }));
+    assert!(!staged.exists());
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_staged_whole_cargo_alias_with_a_broken_original_name_is_not_reclaimed() {
+    let home = Home::new();
+    home.cache(".cargo/git/checkouts", 0);
+    let cache = home.cache(".cache/registry", 1024);
+    std::os::unix::fs::symlink(&cache, home.path.join(".cargo/registry")).unwrap();
+    let id = aterm_sysprobe::volumes::file_id(&cache, false).unwrap();
+    let staged = cache
+        .parent()
+        .unwrap()
+        .join(staged_name(&cache, id).unwrap());
+    std::fs::rename(&cache, &staged).unwrap();
+    let mounts = whole();
+    let w = world(&home, &nobody, &mounts);
+    let outcomes = finish_staged(&w, &mut |_| true);
+    assert!(refusal(&outcomes[0]).contains("Cargo cache root cannot be resolved"));
+    assert!(staged.join("blob").is_file());
 }
 
 fn whole() -> Table {
@@ -549,6 +770,7 @@ fn a_root_reached_through_a_link_or_resolving_outside_home_is_refused() {
 
     let inside = home.cache("real-registry/index", 1024);
     std::fs::create_dir_all(home.path.join(".cargo")).expect(".cargo");
+    home.cargo_protocol();
     atpkg::platform::atomic_symlink(
         &home.path.join("real-registry"),
         &home.path.join(".cargo/registry"),
@@ -561,10 +783,16 @@ fn a_root_reached_through_a_link_or_resolving_outside_home_is_refused() {
     );
     assert!(inside.join("blob").is_file());
     let (outcomes, _) = free(std::slice::from_ref(&inside), false, &w);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     assert!(
         matches!(outcomes[0].verdict, Verdict::Removed { .. }),
         "the root's real path is the root: {outcomes:?}"
     );
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        assert!(refusal(&outcomes[0]).contains("Cargo source-cache reclamation custody"));
+        assert!(inside.join("blob").is_file());
+    }
 }
 
 #[test]
@@ -811,7 +1039,7 @@ fn a_mount_under_it_or_a_mount_table_not_read_whole_refuses() {
 fn with_the_grant_off_everything_is_refused_but_a_dry_run_still_says_what_would_go() {
     let home = Home::new();
     let mounts = whole();
-    let dir = home.cache(".cargo/registry/cache", 32 * 1024);
+    let dir = home.cache(".cache/tool", 32 * 1024);
     let kept = home.cache("Library/Caches/com.apple.x", 1024);
     let w = World {
         config: Config {

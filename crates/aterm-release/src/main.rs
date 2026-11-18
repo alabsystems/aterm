@@ -2,109 +2,186 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm-release`: the release cutter behind the `targo --unverified ship` alias.
+//!
+//! The cutter is Unix's (a cut runs on the release Mac), so each of its modules is
+//! `cfg(unix)` and on Windows the bin only says so.
 
+#[cfg(unix)]
 mod accepted_measure;
+#[cfg(unix)]
 mod allowance;
+#[cfg(unix)]
 mod apple;
 
+#[cfg(unix)]
 mod artifact;
+#[cfg(unix)]
 mod build_inputs;
+#[cfg(unix)]
 mod buildplan;
+#[cfg(unix)]
 mod bump_claim;
+#[cfg(unix)]
 mod bundle;
+#[cfg(unix)]
 mod changelog;
+#[cfg(unix)]
 mod check_content;
+#[cfg(unix)]
 mod check_record;
+#[cfg(unix)]
 mod checkout_bin;
+#[cfg(unix)]
 mod input_record;
+#[cfg(unix)]
 mod postlink;
 
+#[cfg(unix)]
 mod channel;
 
+#[cfg(unix)]
 mod clean;
+#[cfg(unix)]
 mod cli;
 
+#[cfg(unix)]
 mod credential_wait;
 
+#[cfg(unix)]
 mod cut_timing;
+#[cfg(unix)]
 mod cutter;
 
+#[cfg(unix)]
 mod dev_app;
 
+#[cfg(unix)]
 mod dev_identity;
+#[cfg(unix)]
 mod dmg;
 
+#[cfg(unix)]
 mod durable;
 
+#[cfg(unix)]
 mod fixtures;
+#[cfg(unix)]
 mod gates;
 
+#[cfg(unix)]
 mod harness_versions;
 
+#[cfg(unix)]
 mod github;
+#[cfg(unix)]
 mod github_remote;
 
+#[cfg(unix)]
 mod hook;
+#[cfg(unix)]
 mod host_fit;
 
+#[cfg(unix)]
 mod interrupt;
+#[cfg(unix)]
 mod ledger;
+#[cfg(unix)]
 mod line;
+#[cfg(unix)]
 mod line_claim;
 
+#[cfg(unix)]
 mod machines;
+#[cfg(unix)]
 mod manifest_out;
+#[cfg(unix)]
 mod service_qualification;
 
+#[cfg(unix)]
 mod profile_pilot;
+#[cfg(unix)]
 mod provision;
+#[cfg(unix)]
 mod publish;
+#[cfg(unix)]
 mod qualify_pilot;
+#[cfg(unix)]
 mod qualify_replay;
 
+#[cfg(unix)]
 mod cutter_inputs;
+#[cfg(unix)]
 mod release;
+#[cfg(unix)]
 mod release_disk;
+#[cfg(unix)]
 mod release_keychain;
+#[cfg(unix)]
 mod release_leftovers;
+#[cfg(unix)]
 mod release_pump;
+#[cfg(unix)]
 mod release_status;
+#[cfg(unix)]
 mod release_steps;
+#[cfg(unix)]
 mod release_target;
+#[cfg(unix)]
 mod release_timeline;
+#[cfg(unix)]
 mod release_tools;
 
+#[cfg(unix)]
 mod managed_prerequisites;
+#[cfg(unix)]
 mod sign;
+#[cfg(unix)]
 mod source_signing;
+#[cfg(unix)]
 mod stage_local;
 
+#[cfg(unix)]
 mod site;
+#[cfg(unix)]
 mod slice_units;
 
+#[cfg(unix)]
 mod tap;
 
+#[cfg(unix)]
 mod snapshot;
 
+#[cfg(unix)]
 mod transforms;
 
+#[cfg(unix)]
 mod trust_credit;
+#[cfg(unix)]
 mod trust_facts;
 
+#[cfg(unix)]
 mod trust_lane;
 
-/// The candidate's `trust.lock` and the prover it names (A14's release seam).
-#[expect(
-    dead_code,
-    reason = "the release chain's prover() and checks() adopt it (release.rs, release_steps.rs)"
-)]
+/// The candidate's `trust.lock`: the stock release its STOCK EXCEPTION slices build with, and the
+/// prover it names (A14's release seam).
+#[cfg(unix)]
 mod trust_lock;
 
+#[cfg(unix)]
 mod trust_oblig;
+#[cfg(unix)]
 mod verify;
+#[cfg(unix)]
 mod windows_pin;
 
+#[cfg(unix)]
 fn main() -> std::process::ExitCode {
+    #[cfg(unix)]
+    // SAFETY: the first operation in this fresh image, before any helper, proof or reader.
+    if let Err(why) = unsafe { release_steps::capture_exec_handoff_environment() } {
+        eprintln!("release startup handover: {why}");
+        return std::process::ExitCode::from(2);
+    }
     if let Err(error) = agh::git::HelperHost::Subcommand.record() {
         eprintln!("{error}");
         return std::process::ExitCode::FAILURE;
@@ -184,20 +261,28 @@ fn main() -> std::process::ExitCode {
     std::process::exit(code);
 }
 
+/// Off Unix there is no cutter: a cut runs on the release Mac, and a Windows host hands its
+/// build to one (`aterm-winship release-build`, read here by `--windows-artifacts`).
+#[cfg(not(unix))]
+fn main() -> std::process::ExitCode {
+    eprintln!(
+        "aterm-release: the release cutter runs on the release Mac (and its Unix workers), never \
+         on Windows: a Windows host hands its build to a cut with `aterm-winship release-build`"
+    );
+    std::process::ExitCode::from(2)
+}
+
 #[cfg(all(test, unix))]
 #[path = "test_vault_tests.rs"]
 mod test_vault;
 
 /// Create a short `.noindex` temporary directory for unit tests in this crate.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn test_scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
     let short = &tag[..tag.floor_char_boundary(8)];
-    let builder = aterm_tempfile::Builder::new()
+    aterm_tempfile::Builder::new()
         .prefix(&format!("arl-{short}-"))
-        .suffix(".noindex");
-    #[cfg(unix)]
-    let made = builder.tempdir_in("/tmp");
-    #[cfg(not(unix))]
-    let made = builder.tempdir();
-    made.expect("test scratch dir")
+        .suffix(".noindex")
+        .tempdir_in("/tmp")
+        .expect("test scratch dir")
 }

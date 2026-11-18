@@ -257,14 +257,14 @@ fn fixture(tag: &str, renewal: bool) -> (Tmp, Env, AccountsCmd) {
         )
         .unwrap();
         AccountsCmd::Renew {
-            labels: vec!["main".to_owned()],
+            accounts: vec!["owner@example.test".to_owned()],
             due: false,
             on: None,
         }
     } else {
         three_accounts(&tmp, &env);
         AccountsCmd::Login {
-            label: "work-2".to_owned(),
+            account: "work-2".to_owned(),
         }
     };
     (tmp, env, form)
@@ -316,9 +316,10 @@ fn manual_fifo_waiting_is_independent_of_terminal_and_agent_markers() {
             let held = host.peer.signin_now().unwrap().unwrap();
             host.running.replace(Some(held));
             let mut out = Vec::new();
-            let (turn, waited) = signin_lock(&env.accounts_store(), &host, "work-2", &mut out)
-                .unwrap()
-                .unwrap();
+            let (turn, waited) =
+                signin_lock(&env.accounts_store(), &host, ("work-2", "work-2"), &mut out)
+                    .unwrap()
+                    .unwrap();
             assert!(waited);
             assert_eq!(
                 *host.positions.borrow(),
@@ -349,7 +350,7 @@ fn closing_the_actual_scope_at_queue_observation_starts_no_provider() {
         signin_guard(
             &env.accounts_store(),
             &host,
-            "work-2",
+            ("work-2", "work-2"),
             "login",
             &mut out,
             &mut err
@@ -483,6 +484,8 @@ fn an_unopenable_signin_lock_starts_no_claude_flow() {
 struct Published<'a> {
     host: &'a LockHost,
     store: accounts::Store,
+    /// The line the renewal prints once its login is published (`<account>: renewed;`).
+    renewed: String,
     seen: bool,
     bytes: Vec<u8>,
 }
@@ -491,7 +494,7 @@ struct Published<'a> {
 impl Write for Published<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.bytes.extend_from_slice(bytes);
-        if !self.seen && String::from_utf8_lossy(&self.bytes).contains("main: renewed;") {
+        if !self.seen && String::from_utf8_lossy(&self.bytes).contains(&self.renewed) {
             self.host.held();
             assert!(
                 self.store
@@ -527,6 +530,10 @@ fn a_claude_fallback_keeps_the_lock_until_the_new_binding_is_published() {
     let mut out = Published {
         host: &host,
         store,
+        renewed: format!(
+            "{}: renewed;",
+            crate::harness::account_names::tests::row_name_of(Cli::Claude, &env, "main").shown
+        ),
         seen: false,
         bytes: Vec::new(),
     };

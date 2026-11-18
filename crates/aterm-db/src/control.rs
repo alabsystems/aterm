@@ -842,7 +842,7 @@ pub struct Endpoint {
 #[cfg(not(test))]
 const EXCHANGE: Duration = crate::network::WITHIN;
 #[cfg(test)]
-const EXCHANGE: Duration = Duration::from_secs(60);
+pub(crate) const EXCHANGE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Protocol {

@@ -1179,7 +1179,7 @@ fn a_renewal_made_under_a_wall_is_followed_at_once() {
     let r = roster();
     let enrolled = every(&r);
     let until = NOW + 5 * DAY;
-    for window in ["seven_day_opus", "five_hour"] {
+    for window in ["seven_day", "five_hour"] {
         let walled = |state: &mut State| {
             assert!(!note_wall(state, "main", window, Some(until), NOW - HOUR, NOW).is_empty());
         };

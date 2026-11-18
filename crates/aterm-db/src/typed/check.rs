@@ -656,8 +656,10 @@ fn naming<'a>(
 /// count one. The refusal names the referrer's collection, row and column, and the target's
 /// collection and key, never a value.
 pub fn names_not_live(table: &Table, rows: &[Vec<Change>], cells: &Cells) -> Option<Refused> {
+    /// The columns (and set members) a write writes, by the collection and key of their row.
+    type Written<'a> = BTreeMap<(&'static str, &'a str), Vec<(&'a str, Option<&'a str>)>>;
     // Each cells row the write touches, with the columns (and set members) it writes.
-    let mut written: BTreeMap<(&'static str, &str), Vec<(&str, Option<&str>)>> = BTreeMap::new();
+    let mut written: Written<'_> = BTreeMap::new();
     for change in rows.iter().flatten() {
         let Some(schema) = table
             .collection(&change.collection)

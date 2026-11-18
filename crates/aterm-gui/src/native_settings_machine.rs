@@ -504,8 +504,7 @@ pub(super) mod edit {
     use super::super::lab_page::styled_button;
     use super::*;
     use crate::machine_rename_sheet::{Field, Line, RenameTo, request, sentence, verdict};
-    use crate::machine_title::page::PageSnapshot;
-    use aterm_agent::machine_name::file::NO_HISTORY;
+    use crate::machine_title::page::{PageHistory, PageSnapshot};
     use aterm_types::machine_name::{Nickname, Number, Refusal};
 
     /// The primary's words where Authorize & Sync is what Save would ask, in an instance that
@@ -610,7 +609,7 @@ pub(super) mod edit {
     /// Whether Undo Last Rename is available over `read`: the read offers an undo
     /// ([`crate::machine_title::page::undo_offer`]) and no page write is out.
     pub(crate) const fn undoes(machine: &MachinePageState, read: &PageSnapshot) -> bool {
-        read.undo.seen.is_some() && !machine.busy
+        read.undo.undo.is_some() && !machine.busy
     }
 
     /// What press `action` asks of the host, where the page offers it now; `None` for a press
@@ -859,15 +858,18 @@ pub(super) mod edit {
         ));
         if let Some(history) = &read.history {
             // Keyed by place, newest first: two changes in one second share their words.
-            let rows = if history.is_empty() {
+            let none = |said: &str| {
                 vec![words(
                     "name/history/none",
-                    &sentence(NO_HISTORY),
+                    &sentence(said),
                     StyleRef::Quiet,
                     inner,
                 )]
-            } else {
-                history
+            };
+            let rows = match history {
+                PageHistory::Empty(said) => none(said),
+                PageHistory::Unread(why) => none(&format!("History was not read ({why})")),
+                PageHistory::Rows(lines) => lines
                     .iter()
                     .enumerate()
                     .map(|(at, line)| {
@@ -878,7 +880,7 @@ pub(super) mod edit {
                             inner,
                         )
                     })
-                    .collect()
+                    .collect(),
             };
             cards.extend(row_cards(
                 "name/history",

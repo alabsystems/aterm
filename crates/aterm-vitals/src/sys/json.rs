@@ -237,6 +237,16 @@ fn walk(v: &Jv, path: &str, out: &mut Vec<String>) {
                         ));
                     }
                 }
+                if k == "spotlight" && matches!(child, Jv::Obj(_)) && child.get("why").is_none() {
+                    let state_ok = matches!(child.get("state"), Some(Jv::Str(w))
+                        if crate::spotlight::State::WORDS.contains(&w.as_str()));
+                    if !state_ok {
+                        out.push(format!(
+                            "{child_path}: a spotlight block's state is one of {:?}",
+                            crate::spotlight::State::WORDS
+                        ));
+                    }
+                }
                 walk(child, &child_path, out);
             }
         }

@@ -294,6 +294,9 @@ aterm-agent = { workspace = true }
 # The Tables page reads the registry and writes the owner's edits through its save
 # (`tables_store`). Already linked via aterm-agent.
 aterm-db = { workspace = true }
+# An account's names as the lab gives them (`aterm_file::AccountNames`, the harness lab's
+# `names`): the Stats deck's rows print each account's slug. Already linked via aterm-agent.
+aterm-file = { workspace = true }
 # The control client's one token reader (no-follow, regular file, bounded) and its
 # connect-then-read order, for dials to a sibling instance. Already linked via
 # aterm-agent.

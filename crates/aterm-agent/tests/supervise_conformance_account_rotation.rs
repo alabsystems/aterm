@@ -24,8 +24,8 @@ use aterm_agent::harness::relaunch;
 use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::policy::turn_end::{
     ACCOUNT_MOVES_PER_WINDOW, AccountAdvice, AccountAnswer, AccountAt, AccountBad, AccountMove,
-    AccountPoint, Cleared, Clearing, Composer, RULE_ACCOUNT, RULE_LIMIT_RESUME, Restart,
-    TurnEndAction, TurnEndReading, TurnEndState, cleared_text, decide_turn_end,
+    AccountPoint, Cleared, Clearing, Composer, MOVED_TEXT, RULE_ACCOUNT, RULE_LIMIT_RESUME,
+    Restart, TurnEndAction, TurnEndReading, TurnEndState, cleared_text, decide_turn_end,
 };
 use aterm_models_harness::supervisor_account_rotation_model;
 use aterm_spec::derive::Model;
@@ -1174,6 +1174,7 @@ fn a_move_made(
     let at = clock.at(now);
     let mut te = d.te.clone();
     te.restarted(why, true, &d.round.reading, at);
+    te.account_made_at(now);
     let made = AccountMove {
         to: to.clone(),
         at,
@@ -1195,6 +1196,7 @@ fn a_move_made(
     if te.account_answer(&prompt).is_some() {
         return Err("the host is told before any turn ran".to_string());
     }
+    let relaunched = te.clone();
     te.observe(&prompt, at);
     if te.account_point(&prompt, cfg).is_some() {
         return Err("the host is asked before any turn ran".to_string());
@@ -1221,6 +1223,14 @@ fn a_move_made(
         return Err(format!(
             "at the relaunched prompt (moved at a wall: {at_a_wall}): {owed:?}"
         ));
+    }
+    if at_a_wall {
+        if !matches!(&owed, TurnEndAction::Type { text, .. } if text == MOVED_TEXT) {
+            return Err(format!(
+                "the move's continuation does not say the session moved: {owed:?}"
+            ));
+        }
+        the_limit_it_left(&relaunched, &d.round.reading, &owed, (at, now), cfg)?;
     }
     if !at_a_wall {
         let mut unmoved = d.te.clone();
@@ -1262,6 +1272,49 @@ fn a_move_made(
             "made and served, it asks {got:?}, the model {want:?}"
         ))
     }
+}
+
+/// THE LIMIT A MOVE MADE AT A WALL LEFT, drawn again on the resumed screen: the wall `walled`
+/// read, its notice written seven seconds before the move was booked at `made` (the 2026-11-16
+/// live sequence). It is no wall of the session's: no answer of the move's, no point the host is
+/// asked about, no track, and the relaunched prompt's own continuation `owed` typed past it,
+/// whatever process start the host names (one later than the notice here).
+fn the_limit_it_left(
+    te: &TurnEndState,
+    walled: &TurnEndReading,
+    owed: &TurnEndAction,
+    (at, made): (Instant, i64),
+    cfg: &SupervisorConfig,
+) -> Result<(), String> {
+    let mut te = te.clone();
+    te.agent_started_unix(made + MIN);
+    te.notice_written_at(Some(made - 7));
+    let replayed = TurnEndReading {
+        worked: None,
+        ..unadvised(walled)
+    };
+    if replayed.wall.is_none() || !te.limit_left(&replayed) {
+        return Err(format!(
+            "the wall the move left is not read as left: {replayed:?}"
+        ));
+    }
+    if te.account_answer(&replayed).is_some() || te.account_answer_unseen(&replayed, at).is_some() {
+        return Err("the left account's limit answers the move".to_string());
+    }
+    te.observe(&replayed, at);
+    if te.account_point(&replayed, cfg).is_some()
+        || te.wall_standing()
+        || te.wall_attempts(WallKind::UsageSession).is_some()
+    {
+        return Err("the left account's limit stands for the policy".to_string());
+    }
+    let past = decide_turn_end(&te, &replayed, cfg, at);
+    if past != *owed {
+        return Err(format!(
+            "past the limit it left the move types {past:?}, at its prompt {owed:?}"
+        ));
+    }
+    Ok(())
 }
 
 /// The owner lifted the wall session `i` stands at (the model's `Use…` of its
@@ -3544,6 +3597,7 @@ impl Carried {
         assert_eq!(self.h.st[SESSIONS[i]], to, "{action}");
         let at = self.at();
         self.te[i].restarted(why, true, &r.reading, at);
+        self.te[i].account_made_at(self.h.now);
         self.screen[i] = None;
         self.worked[i] = None;
     }
@@ -3749,4 +3803,73 @@ fn the_first_turn_under_the_new_login_is_the_models_served_or_its_strike() {
     assert_eq!(c.turn_ends(1, None), Some(AccountAnswer::Served));
     assert_eq!(c.h.real.sessions_on("pool-a"), SIDS);
     assert_eq!((c.h.st["s1"], c.h.st["s2"], c.h.st["act"]), (3, 3, 3));
+}
+
+/// THE LIVE SEQUENCE OF 2026-11-16 (Claude Code 2.1.323): the turn ended on the account's limit,
+/// the move relaunched the conversation under another account (`done:resumed`: the relaunch
+/// typed nothing), and the resumed screen drew the left account's limit again, its notice written
+/// seven seconds before the moved-to process started. The left limit asks the host nothing,
+/// answers nothing and opens no track; exactly one continuation is typed past it, in the move's
+/// words (never that the limit cleared); and that continuation's served turn is the model's
+/// `Served`, which proves the moved-to account.
+#[test]
+fn a_move_at_a_wall_continues_once_past_the_limit_it_left_and_its_turn_proves_the_account() {
+    let mut c = Carried::begin(4 * HOUR);
+    c.wall("WallPref1", &[0, 1]);
+    let old = c.screen[0];
+    let asked = c.ask(0);
+    let Asked::Move { to, ahead: false } = c.said(&asked) else {
+        panic!("no move at the wall: {:?}", asked.action);
+    };
+    let label = c.h.w.named(to);
+    assert!(
+        relaunch::carried_quietly(&format!("account:{label}"), false),
+        "done:resumed: the relaunch types nothing"
+    );
+    c.make(0, &asked, "Move1");
+    let made = c.h.now;
+    let held = c.ask(1);
+    assert_eq!((c.said(&held), c.model(1)), (Asked::Waits, Asked::Waits));
+    c.h.step("Wait2");
+    c.te[0].agent_started_unix(c.h.now);
+    c.screen[0] = old;
+    c.te[0].notice_written_at(Some(made - 7));
+    let replayed = c.shows(0, None);
+    assert!(c.te[0].limit_left(&replayed), "the left account's limit");
+
+    let first = c.ask(0);
+    assert_eq!(
+        first.point, None,
+        "the host is asked nothing at the left limit"
+    );
+    assert!(!c.te[0].wall_standing(), "no track of the left limit");
+    assert_eq!(
+        first.action,
+        TurnEndAction::Type {
+            text: MOVED_TEXT.to_string(),
+            rule_id: RULE_LIMIT_RESUME,
+        },
+        "the move's own continuation"
+    );
+    assert_ne!(
+        first.action,
+        TurnEndAction::Type {
+            text: cleared_text(Cleared::UsageLimit, Clearing::Measured).to_string(),
+            rule_id: RULE_LIMIT_RESUME,
+        }
+    );
+    c.typed(0, &first.action);
+    assert!(!c.te[0].account_resume_owed());
+    let again = c.ask(0);
+    assert!(
+        !matches!(again.action, TurnEndAction::Type { .. }),
+        "typed once: {:?}",
+        again.action
+    );
+
+    c.screen[0] = None;
+    assert_eq!(c.turn_ends(0, None), Some(AccountAnswer::Served));
+    c.h.step("Served");
+    assert!(c.h.real.proven, "the moved-to account is proven");
+    assert!(c.te[0].account_move().is_none());
 }

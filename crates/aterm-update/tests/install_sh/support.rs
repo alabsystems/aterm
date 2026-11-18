@@ -447,10 +447,15 @@ impl Run {
     }
 }
 
-/// `cmd` run to completion under [`HANG`].
+/// `cmd` run to complete output while its process tree progresses within [`HANG`].
 pub fn run(cmd: &mut Command) -> Run {
-    let out = aterm_uds::deadline::output_until(cmd, Instant::now() + HANG)
-        .unwrap_or_else(|e| panic!("{:?} {e}", cmd.get_program()));
+    let out = aterm_uds::deadline::output_while_process_progressing_complete_with_limit(
+        cmd,
+        HANG,
+        "the installer test's child",
+        aterm_uds::deadline::OUTPUT_KEEP,
+    )
+    .unwrap_or_else(|e| panic!("{:?} {e}", cmd.get_program()));
     ran(&out)
 }
 

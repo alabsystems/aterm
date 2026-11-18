@@ -2,16 +2,19 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm file`'s verbs that need no typed table (docs/DESIGN-shared-files-2026-11-11.md §3):
-//! `ls`, `cat`, `path`, `status`, `get`, `rows`, `watch`, `history` and `outbox`. Each reads
-//! local files through [`File::read`] and nothing else, so none can open custody and none has
-//! an answer that is an error about the replica: every answer carries the state word instead.
-//! `outbox drop` changes only this Mac's own queue.
+//! `ls`, `cat`, `path`, `schema`, `status`, `get`, `rows`, `watch`, `history`, `outbox` and
+//! `restore`. Each reads local files through [`File::read`] and nothing else, so none can open
+//! custody and none has an answer that is an error about the replica: every answer carries the
+//! state word instead. `outbox drop` changes only this Mac's own queue, and `restore` only the
+//! face.
 //!
-//! The verbs that open custody (`refresh`) and the ones that write through the typed table
-//! (`set`, `add`, `rm`, `revert`, `resolve`) live in aterm-db, beside the materializer and the
+//! The verbs that open custody (`refresh`), the ones that write through the typed table (`set`,
+//! `add`, `rm`, `revert`, `resolve`, and `commit`, which reads the face) and the ones that open
+//! the face in an Editor tab (`open`, `edit`) live in aterm-db, beside the materializer and the
 //! publisher, and hand every other word here.
 
-use crate::{Dropped, File, Intent, Name, OwnerAct, Read, Root, Row, Status, exit, snapshot::PK};
+use crate::snapshot::{Column, PK, Source};
+use crate::{Dropped, File, Intent, Name, OwnerAct, Read, Root, Row, Status, exit};
 use aterm_json::{Map, Value};
 use std::time::{Duration, Instant};
 
@@ -48,6 +51,8 @@ usage: aterm file <verb> [--json]
   cat <name> [--published]               the table as TSV, this Mac's queued writes over it
                                          (--published: the snapshot alone); the state on stderr
   path <name>                            where its face is
+  schema <name>                          its columns: type, may be empty, source, the file a
+                                         column's cells name rows of; the key and its handles
   status [<name>]                        state, why, revision, rows, face=written|edited|missing
   get <name> <row> [<column>]            one row or one cell; <row> is its key or its name
   rows <name> [--where col=val]... [--join <ref column>]
@@ -64,6 +69,16 @@ usage: aterm file <verb> [--json]
   resolve <name> <id> mine|theirs        a held write: queue mine again, or keep theirs
   outbox [<name>]                        this Mac's queued and held writes, without values
   outbox drop <id>                       drop one of them
+  open <name>                            open its face in an Editor tab; a save there commits it
+  edit <name>                            open its face, wait for the tab to close, commit it
+  commit <name>                          queue what the face's changed cells say
+  restore <name>                         rewrite the face from the snapshot, keeping edits no
+                                         commit took as <leaf>.rejected.<ext>
+A face is a TSV whose last header cell is =pk@<rev>, the revision it was written at. Nothing
+reads a face but a commit: a saved face changes nothing until `commit` (or a save in an Editor
+tab) by name, only cells whose text differs from that revision's become writes, and a row left
+out of the face changes nothing (`rm` retires a row). A face with problems queues nothing and
+says where in <leaf>.problems beside it.
 A name is <set>/<leaf>: ai/accounts, ai/links, lab/machines. A row is named exactly by its key
 or a name: an account by its slug, its provider word and address (`oai ada@x.example` or
 `oai:ada@x.example`) or an address that names one account; a machine by its label or nickname.
@@ -280,13 +295,147 @@ fn cat(file: &File, published: bool, json: bool) -> Answer {
     }
 }
 
+/// One column of `schema`: its name, the type as the schema spells it (`time`,
+/// `{"text":64}`), whether a row may leave it empty, where its cells come from, and the file
+/// whose rows its cells name. A member the snapshot does not state is null in JSON and empty
+/// in the table: the key, a derived or unknown column, and every column of a snapshot written
+/// by a build that stated no types.
+fn column_json(column: &Column) -> Value {
+    let mut object = Map::new();
+    object.insert("name".to_owned(), Value::from(column.name.as_str()));
+    object.insert("type".to_owned(), column.ty.clone().unwrap_or(Value::Null));
+    object.insert("null".to_owned(), Value::from(column.null));
+    object.insert("source".to_owned(), Value::from(column.source.as_str()));
+    object.insert("read_only".to_owned(), Value::from(column.read_only));
+    object.insert("ref".to_owned(), Value::from(column.refers.as_deref()));
+    Value::Object(object)
+}
+
+/// A column's name as one cell of `schema`'s table: as it is, or as its JSON string where it
+/// holds a control character, a quote or a backslash. A compiled column's name holds none; an
+/// unknown column's name is whatever member name another machine's row carried, and written
+/// raw a tab or a line end in it would read as more cells or as another column's line.
+fn name_cell(name: &str) -> String {
+    if name
+        .chars()
+        .any(|c| c.is_control() || c == '"' || c == '\\')
+    {
+        Value::from(name).to_string()
+    } else {
+        name.to_owned()
+    }
+}
+
+/// The type word as one cell: a bare word as it is (`time`), a parameterised one as its JSON
+/// (`{"text":64}`).
+fn type_cell(ty: Option<&Value>) -> String {
+    match ty {
+        None => String::new(),
+        Some(Value::String(word)) => word.clone(),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// `schema <name>`: what each column of the file is, read from the published snapshot alone,
+/// so it answers whatever this machine's custody is doing and names no queued write's column.
+fn schema(file: &File, json: bool) -> Answer {
+    let read = file.published();
+    let columns = read.columns();
+    if json {
+        let mut object = match status_json(file, &read.status) {
+            Value::Object(object) => object,
+            _ => Map::new(),
+        };
+        let snapshot = read.snapshot.as_ref();
+        object.insert(
+            "kind".to_owned(),
+            Value::from(snapshot.map(|snapshot| snapshot.kind.as_str())),
+        );
+        // `key` is the status's (the projection's key), so the column that names each row is
+        // `primary_key`, the Table Schema word for it.
+        object.insert("primary_key".to_owned(), Value::from(PK));
+        object.insert(
+            "handles".to_owned(),
+            Value::Array(
+                snapshot
+                    .map(|snapshot| snapshot.handles.as_slice())
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|handle| Value::from(handle.as_str()))
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "columns".to_owned(),
+            Value::Array(columns.iter().map(column_json).collect()),
+        );
+        return Answer {
+            out: pretty(&Value::Object(object)),
+            err: String::new(),
+            code: exit::OK,
+        };
+    }
+    let mut err = format!("{}\n", status_line(file, &read.status));
+    let Some(snapshot) = &read.snapshot else {
+        return Answer {
+            out: String::new(),
+            err,
+            code: exit::OK,
+        };
+    };
+    let header: Vec<String> = ["column", "type", "null", "source", "ref"]
+        .map(str::to_owned)
+        .to_vec();
+    let rows: Vec<Vec<String>> = columns
+        .iter()
+        .map(|column| {
+            vec![
+                name_cell(&column.name),
+                type_cell(column.ty.as_ref()),
+                match column.null {
+                    Some(true) => "yes".to_owned(),
+                    Some(false) => "no".to_owned(),
+                    None => String::new(),
+                },
+                column.source.as_str().to_owned(),
+                column.refers.clone().unwrap_or_default(),
+            ]
+        })
+        .collect();
+    err.push_str(&format!("primary key: {PK}"));
+    if !snapshot.handles.is_empty() {
+        err.push_str(&format!(
+            " · a row is also named by: {}",
+            snapshot.handles.join(", ")
+        ));
+    }
+    err.push('\n');
+    if columns
+        .iter()
+        .all(|column| column.source != Source::Schema || column.ty.is_none())
+        && columns.iter().any(|column| column.source == Source::Schema)
+    {
+        err.push_str(
+            "types: not stated (an earlier build wrote this snapshot; a pass of this build \
+             that reads the store states them)\n",
+        );
+    }
+    // Plain tab-separated lines, unquoted, so a type's JSON reads as written
+    // (`{"ref":"account"}`): compact JSON, a file's name and the fixed words hold no tab or
+    // line end, and `name_cell` keeps them out of a name.
+    let out = std::iter::once(&header)
+        .chain(&rows)
+        .map(|line| line.join("\t") + "\n")
+        .collect();
+    Answer {
+        out,
+        err,
+        code: exit::OK,
+    }
+}
+
 fn path(root: &Root, file: &File, json: bool) -> Answer {
-    let ext = file
-        .state()
-        .map(|state| state.ext)
-        .filter(|ext| !ext.is_empty())
-        .unwrap_or_else(|| "tsv".to_owned());
-    let face = root.face(file.name(), &ext);
+    let face = file.face_path();
     let out = if json {
         let mut object = Map::new();
         object.insert("file".to_owned(), Value::from(file.name().to_string()));
@@ -308,6 +457,63 @@ fn path(root: &Root, file: &File, json: bool) -> Answer {
         err: String::new(),
         code: exit::OK,
     }
+}
+
+#[cfg(any(unix, windows))]
+fn restore(file: &File, json: bool) -> Answer {
+    let restored = match file.restore() {
+        Ok(restored) => restored,
+        Err(error) => {
+            return Answer {
+                out: String::new(),
+                err: format!("aterm file: {}: not restored: {error}\n", file.name()),
+                code: exit::PROBLEMS,
+            };
+        }
+    };
+    let (word, kept) = match &restored {
+        crate::Restored::Rewritten { kept } => ("restored", kept.as_deref()),
+        crate::Restored::Already => ("unchanged", None),
+        crate::Restored::Nothing => ("nothing", None),
+    };
+    let out = if json {
+        let mut object = Map::new();
+        object.insert("file".to_owned(), Value::from(file.name().to_string()));
+        object.insert("state".to_owned(), Value::from(word));
+        object.insert(
+            "kept".to_owned(),
+            Value::from(kept.map(|kept| kept.to_string_lossy().into_owned())),
+        );
+        object.insert("face".to_owned(), Value::from(file.face().as_str()));
+        pretty(&Value::Object(object))
+    } else {
+        match &restored {
+            crate::Restored::Rewritten { kept: Some(kept) } => format!(
+                "restored {}: the edits no commit took are kept at {}\n",
+                file.name(),
+                kept.display()
+            ),
+            crate::Restored::Rewritten { kept: None } => format!("restored {}\n", file.name()),
+            crate::Restored::Already => {
+                format!("unchanged: {}'s face is the snapshot's\n", file.name())
+            }
+            crate::Restored::Nothing => format!(
+                "nothing to restore: no pass has recorded {} here (`aterm file refresh {}`)\n",
+                file.name(),
+                file.name()
+            ),
+        }
+    };
+    Answer {
+        out,
+        err: String::new(),
+        code: exit::OK,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn restore(_: &File, _: bool) -> Answer {
+    Answer::usage("restore: no face on this platform")
 }
 
 fn status(root: &Root, known: &[Known], word: Option<&str>, json: bool) -> Answer {
@@ -800,6 +1006,14 @@ pub fn run(root: &Root, known: &[Known], input: &[String]) -> Run {
         "path" => match (file(rest), only_name(rest, "path")) {
             (Err(answer), _) | (Ok(_), Some(answer)) => answer,
             (Ok(file), None) => path(root, &file, json),
+        },
+        "restore" => match (file(rest), only_name(rest, "restore")) {
+            (Err(answer), _) | (Ok(_), Some(answer)) => answer,
+            (Ok(file), None) => restore(&file, json),
+        },
+        "schema" => match (file(rest), only_name(rest, "schema")) {
+            (Err(answer), _) | (Ok(_), Some(answer)) => answer,
+            (Ok(file), None) => schema(&file, json),
         },
         "status" if rest.len() <= 1 => status(root, known, rest.first().copied(), json),
         "status" => Answer::usage("status [<name>]"),

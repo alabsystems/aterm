@@ -760,7 +760,9 @@ impl Item for LanBroker {
 
     fn revert(&self) -> Option<String> {
         Some(format!(
-            "{} bootout system/{}; /bin/rm -f {}; /bin/rm -rf {}",
+            "{} disable system/{} && ({} bootout system/{}; /bin/rm -f {}; /bin/rm -rf {})",
+            super::sharing::LAUNCHCTL,
+            lan::LABEL,
             super::sharing::LAUNCHCTL,
             lan::LABEL,
             crate::port::shell_word(lan::PLIST_PATH),

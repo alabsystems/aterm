@@ -665,9 +665,22 @@ fn a_later_wake_never_replaces_the_fires_record() {
 #[test]
 fn a_fleet_setter_is_named_by_its_mac() {
     let node = "87be5228aaaaaaaaaaaaaaaaaaaaaaaa";
-    // An ID whose shown prefix no other test's ID shares: `tab_ids` holds every ID this
-    // process has known, and shows one longer where two share their first five characters.
+    // A tab ID is shown at five characters, longer where another ID this process knows shares
+    // them (`tab_ids::shown`). That set is the whole test binary's, and other tests mint IDs at
+    // random, so the session is held to a shown form of its ID (five characters or more, a prefix
+    // of it), which is what this words owns; how long the shown form is stays `tab_ids`' to pin.
     let sid = "t7k2m9w4q8r";
+    let session = |said: &str, head: &str| {
+        let shown = said
+            .strip_prefix(head)
+            .and_then(|rest| rest.strip_prefix(" (session "))
+            .and_then(|rest| rest.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("{said:?} names the session after {head:?}"));
+        assert!(
+            shown.len() >= 5 && sid.starts_with(shown),
+            "the session is named by its shown ID: {said:?}"
+        );
+    };
     let words = |actor: Actor, name: Option<&str>| {
         SetByWords::of(
             Some(AutopilotSetBy {
@@ -685,18 +698,18 @@ fn a_fleet_setter_is_named_by_its_mac() {
         .expect("a setter")
         .by
     };
-    assert_eq!(
-        words(Actor::fleet_drive(node, Some(sid)), Some("m9")),
-        "over the fleet from m9 (session t7k2m)"
+    session(
+        &words(Actor::fleet_drive(node, Some(sid)), Some("m9")),
+        "over the fleet from m9",
     );
     assert_eq!(
         words(Actor::fleet_drive(node, None), Some("m9")),
         "over the fleet from m9"
     );
-    assert_eq!(
-        words(Actor::fleet_drive(node, Some(sid)), None),
-        "over the fleet from node 87be5228 (session t7k2m)",
-        "CONTROL"
+    // CONTROL: a node no fleet read names.
+    session(
+        &words(Actor::fleet_drive(node, Some(sid)), None),
+        "over the fleet from node 87be5228",
     );
     assert_eq!(
         words(

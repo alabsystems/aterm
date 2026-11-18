@@ -2,12 +2,14 @@
 // Copyright 2026 Andrew Yates
 
 //! A contact sheet of the setup screen's rainbow road ([`aterm_effects::rainbow_road`]) for a
-//! person to judge: the run's moments on the dark and the light ground at 2x, then every pose
-//! at 2.4x. Dev only; the page's own frames come from `lab system-state-gallery`.
+//! person to judge: the run's moments on the dark and the light ground at 2x, the done moment on
+//! the least road too, then every pose at 2.4x. Dev only; the page's own frames come from `lab system-state-gallery`.
 //!
 //! `targo --unverified run -p aterm-effects --example rainbow_road_sheet -- <out.png>`
 
-use aterm_effects::rainbow_road::{CAT_FEET, CAT_H, CatArt, CatPose, ROAD_H, ROAD_X, RoadArt};
+use aterm_effects::rainbow_road::{
+    CAT_FEET, CAT_H, CatArt, CatPose, LEAST_LENGTH, ROAD_H, ROAD_X, RoadArt,
+};
 use aterm_scene::Tile;
 
 /// The page grounds the default dark theme and "GitHub Light" paint.
@@ -69,12 +71,14 @@ fn main() {
     let out = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "target/rainbow_road_sheet.png".to_owned());
-    let moments: [(u16, bool, CatPose); 5] = [
-        (0, false, CatPose::Sit),
-        (400, false, CatPose::Walk),
-        (600, false, CatPose::LookUp),
-        (300, false, CatPose::Worried),
-        (1000, true, CatPose::Loaf),
+    let least = LEAST_LENGTH as u16;
+    let moments: [(u16, u16, bool, CatPose); 6] = [
+        (LENGTH, 0, false, CatPose::Sit),
+        (LENGTH, 400, false, CatPose::Walk),
+        (LENGTH, 600, false, CatPose::LookUp),
+        (LENGTH, 300, false, CatPose::Worried),
+        (LENGTH, 1000, true, CatPose::Loaf),
+        (least, 1000, true, CatPose::Loaf),
     ];
     let road_h = (ROAD_H * UNIT) as u32;
     let lane_w = ((ROAD_X + f32::from(LENGTH)) * UNIT) as u32;
@@ -87,10 +91,10 @@ fn main() {
     for (column, (dark, ground)) in grounds.into_iter().enumerate() {
         let x0 = lane_w * column as u32;
         sheet.rect(x0, 0, lane_w, h, ground);
-        for (row, (permille, done, pose)) in moments.into_iter().enumerate() {
+        for (row, (length, permille, done, pose)) in moments.into_iter().enumerate() {
             let y0 = road_h * row as u32;
             let art = RoadArt {
-                length: LENGTH,
+                length,
                 permille,
                 done,
                 dark,

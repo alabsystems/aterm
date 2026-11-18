@@ -19,7 +19,7 @@ pub(super) fn a_check_met(key: &str) -> PendingCheck {
 
 #[test]
 fn no_route_backoff_has_a_deadline_without_an_active_worker() {
-    let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let store = accounts::Store::at(Path::new("/synthetic/activity-a"));
     let clock = Instant::now();
     {
@@ -45,7 +45,7 @@ fn no_route_backoff_has_a_deadline_without_an_active_worker() {
 }
 
 fn observed(
-    guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    guard: &std::sync::Arc<Watched<AutoRenewGuard>>,
     store: &accounts::Store,
     cli: Cli,
     clock: Instant,
@@ -55,7 +55,7 @@ fn observed(
 
 #[test]
 fn queued_and_failed_spawns_are_not_active_routes() {
-    let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let store = accounts::Store::at(Path::new("/synthetic/activity-a"));
     let clock = Instant::now();
     let permit = AutoRenewPermit::claim(&guard, "row", clock, false).unwrap();
@@ -119,7 +119,7 @@ fn queued_and_failed_spawns_are_not_active_routes() {
 
 #[test]
 fn activity_is_scoped_to_the_attributed_store_and_cli_and_expires() {
-    let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let a = accounts::Store::at(Path::new("/synthetic/activity-a"));
     let b = accounts::Store::at(Path::new("/synthetic/activity-b"));
     let clock = Instant::now();
@@ -186,7 +186,7 @@ fn published_login_clears_only_its_attributed_holds() {
                 route: Some("profile".into()),
                 token: token.clone(),
             });
-            let guard = std::sync::Arc::new(std::sync::Mutex::new(state));
+            let guard = state.shared();
             let claims = LoginClaims::capture(&guard);
             let heard = HEARD.with(std::cell::Cell::get);
             note_published_login(&guard, &claims, &store, Cli::Claude, "row");
@@ -250,7 +250,7 @@ fn a_new_claim_survives_an_older_publication_at_the_same_wall_time() {
                 "row".into(),
                 LoginOwner::new(&store, Cli::Claude, "row", 5000),
             );
-            let guard = std::sync::Arc::new(std::sync::Mutex::new(state));
+            let guard = state.shared();
             let claims = LoginClaims::capture(&guard);
             {
                 let mut state = guard.lock().unwrap();
@@ -278,7 +278,7 @@ fn a_new_claim_survives_an_older_publication_at_the_same_wall_time() {
 #[test]
 fn a_new_permit_keeps_its_retry_before_its_owner_is_attached() {
     let store = accounts::Store::at(Path::new("/synthetic/permit-replacement"));
-    let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let clock = Instant::now();
     let first = AutoRenewPermit::claim(&guard, "key", clock, true).unwrap();
     first.attribute(
@@ -323,7 +323,7 @@ fn publication_resets_an_expired_but_retained_retry_step() {
         "row".into(),
         LoginOwner::new(&store, Cli::Claude, "row", 900),
     );
-    let guard = std::sync::Arc::new(std::sync::Mutex::new(state));
+    let guard = state.shared();
     let claims = LoginClaims::capture(&guard);
     note_published_login(&guard, &claims, &store, Cli::Claude, "row");
     let mut state = guard.lock().unwrap();
@@ -336,7 +336,7 @@ fn a_sign_in_that_begins_or_ends_is_heard_and_one_another_took_over_ends_unheard
     // The watch runs on the thread that moved the activity, so this thread's count is its own.
     hear_activity();
     let heard = || HEARD.with(std::cell::Cell::get);
-    let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let store = accounts::Store::at(Path::new("/synthetic/activity-heard"));
     let first = LoginActivityGuard::begin(&guard, &store, Cli::Claude, "row", None);
     assert_eq!(heard(), 1, "a sign-in that began is heard");

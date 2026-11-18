@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The release's one build (`artifact.rs` keeps what it makes).
-// STOCK EXCEPTION: the compat slice builds with `RUSTUP_TOOLCHAIN=stable`, because Trust has no x86_64-apple-darwin std in the aarch64 sysroot (`targo --unverified check --target x86_64-apple-darwin -p aterm` fails with E0463).
+// STOCK EXCEPTION: the compat slice builds with `RUSTUP_TOOLCHAIN` naming the candidate's trust.lock `[stock] toolchain` ([`Stock`], `trust_lock::stock_toolchain`), because Trust has no x86_64-apple-darwin std in the aarch64 sysroot (`targo --unverified check --target x86_64-apple-darwin -p aterm` fails with E0463).
 use aterm_uds::spawnfd::{Command, command};
 use std::ffi::OsString;
 use std::fs::File;
@@ -72,6 +72,8 @@ pub struct BuildOutput {
     pub app: PathBuf,
     /// The snapshot digest the bytes were built from ([`snapshot::Snapshot::digest`]).
     pub snapshot_digest: String,
+    /// The original seal of the Take that supplied every compiler command. None off macOS.
+    pub(crate) inputs: Option<String>,
     /// Each slice's build ([`SliceBuild`]): its triple, its wall seconds, the sampled peak physical footprint, CPU and core wait of its build's descendants, and its units.
     pub slices: Vec<SliceBuild>,
     /// `lipo -archs` of the shipped `aterm` (such as "x86_64 arm64"), for the cut transcript.
@@ -375,6 +377,80 @@ fn validate_release_rustup_shim_dir(
     Err("release rustup shim validation requires Unix ownership and mode semantics".into())
 }
 
+/// What a STOCK EXCEPTION child runs under: rustup's home, and by name the stock release a
+/// `trust.lock` names ([`crate::trust_lock::stock_toolchain`]), never rustup's `stable`. Every
+/// stock child the release starts takes its rustup environment from here ([`Stock::env`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Stock {
+    home: OsString,
+    rustup_home: OsString,
+    toolchain: String,
+    // A native-only take need not have rustup installed; stock use surfaces this captured error.
+    shim: Result<PathBuf, String>,
+}
+
+impl Stock {
+    /// `toolchain` under the release's rustup home for `home` ([`release_rustup_home`]).
+    ///
+    /// # Errors
+    /// What [`release_rustup_home`] refuses.
+    pub(crate) fn under(home: &std::ffi::OsStr, toolchain: &str) -> Result<Self, String> {
+        Ok(Self {
+            home: home.to_owned(),
+            rustup_home: release_rustup_home(home)?,
+            toolchain: toolchain.to_owned(),
+            shim: release_rustup_shim_dir(),
+        })
+    }
+
+    pub(crate) fn shim(&self) -> Result<&Path, String> {
+        self.shim.as_deref().map_err(Clone::clone)
+    }
+
+    pub(crate) fn home(&self) -> &std::ffi::OsStr {
+        &self.home
+    }
+
+    pub(crate) fn rustup_home(&self) -> &std::ffi::OsStr {
+        &self.rustup_home
+    }
+
+    pub(crate) fn toolchain(&self) -> &str {
+        &self.toolchain
+    }
+
+    pub(crate) fn command(&self, program: &str) -> Result<Command, String> {
+        let shim = self.shim()?;
+        let mut command = command(shim.join(program));
+        command
+            .env_clear()
+            .env("HOME", &self.home)
+            .env("PATH", release_tool_path(shim)?)
+            .envs(self.env())
+            .current_dir("/");
+        Ok(command)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unavailable_for_test(home: &Path, toolchain: &str) -> Self {
+        Self {
+            home: home.as_os_str().to_owned(),
+            rustup_home: home.join("unavailable-stock").into_os_string(),
+            toolchain: toolchain.to_owned(),
+            shim: Err("the fixture's stock tools are unavailable".into()),
+        }
+    }
+
+    /// `RUSTUP_HOME` and `RUSTUP_TOOLCHAIN`: what selects the stock compiler behind the rustup
+    /// shim.
+    pub(crate) fn env(&self) -> [(&'static str, OsString); 2] {
+        [
+            ("RUSTUP_HOME", self.rustup_home.clone()),
+            ("RUSTUP_TOOLCHAIN", OsString::from(&self.toolchain)),
+        ]
+    }
+}
+
 fn release_rustup_home(home: &std::ffi::OsStr) -> Result<OsString, String> {
     let value = atpkg::seam::rustup_home_with(
         std::env::var_os("RUSTUP_HOME").as_deref(),
@@ -400,10 +476,60 @@ fn checked_output(command: &mut Command, what: &str) -> Result<Output, String> {
     Ok(output)
 }
 
+/// The compiler and SDK captured before production materialization. A snapshot-only test
+/// fixture has no producer seal and cannot publish a macOS artifact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TakePurpose {
+    Native,
+    Universal,
+    #[cfg(test)]
+    Snapshot,
+}
+
+impl TakePurpose {
+    pub(crate) fn producer_inputs(self, identity: Option<String>) -> Option<String> {
+        if self == Self::Universal {
+            identity
+        } else {
+            None
+        }
+    }
+    pub(crate) fn identity(
+        self,
+        compiler: Option<&crate::trust_lock::CompilerInputs>,
+        sdk: &crate::build_inputs::AppleSdk,
+    ) -> Result<Option<String>, String> {
+        if !cfg!(target_os = "macos") {
+            return Ok(None);
+        }
+        match self {
+            Self::Universal => compiler
+                .map(|compiler| crate::build_inputs::current_for_with_sdk(compiler, sdk))
+                .transpose(),
+            Self::Native => crate::build_inputs::current_native_with_sdk(compiler, sdk).map(Some),
+            #[cfg(test)]
+            Self::Snapshot => Ok(None),
+        }
+    }
+}
+
+struct TakeInputs {
+    purpose: TakePurpose,
+    home: OsString,
+    compiler: Option<crate::trust_lock::CompilerInputs>,
+    sdk: crate::build_inputs::AppleSdk,
+    seal: Option<String>,
+}
+
 /// What a release build reads and writes.
 pub(crate) struct Take {
     /// Commit C's tree and its vendored dependencies, sealed and digested.
     pub(crate) snapshot: snapshot::Snapshot,
+    pub(crate) compiler: Option<crate::trust_lock::CompilerInputs>,
+    sdk: crate::build_inputs::AppleSdk,
+    purpose: TakePurpose,
+    home: OsString,
+    inputs: Option<String>,
     /// The workspace's own Cargo config, as C has it (`<src>/.cargo/config.toml`).
     workspace_config: PathBuf,
     /// The warm target root: one `CARGO_TARGET_DIR` per slice under it
@@ -421,6 +547,10 @@ pub(crate) struct Take {
     /// `git rev-parse --short=12 C` — pinned as the commit of the binary's identity record and
     /// stamped as the bundle's `ATermGitCommit`, so binary and plist name C alike.
     short_commit: String,
+    /// The stock release C's `trust.lock` names for its STOCK EXCEPTION slices
+    /// ([`crate::trust_lock::stock_toolchain_at`]), or why C names none: only a stock slice
+    /// asks for it ([`Take::stock`]), so a native build of a lockless C is not refused by it.
+    stock: Result<String, String>,
     /// The cache, this take's alone until the take drops (declared last, so it is let
     /// go of last).
     _hold: snapshot::CacheHold,
@@ -429,12 +559,103 @@ pub(crate) struct Take {
 impl Take {
     /// Hold the clone's cache, materialize `commit` of `repo_root` into it and lay the build's directories beside it.
     pub(crate) fn prepare(repo_root: &Path, commit: &str) -> Result<Self, String> {
+        Self::prepare_for(repo_root, commit, TakePurpose::Universal)
+    }
+
+    pub(crate) fn prepare_for(
+        repo_root: &Path,
+        commit: &str,
+        purpose: TakePurpose,
+    ) -> Result<Self, String> {
+        let git = crate::ledger::GitCli::new(repo_root);
+        let source = crate::ledger::GitRunner::git_original(
+            &git,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{commit}^{{commit}}"),
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        if !source.success() {
+            return Err("the build source could not be read as an original commit".into());
+        }
+        let selected =
+            String::from_utf8(source.stdout).map_err(|_| "the selected source is not UTF-8")?;
+        let selected = selected.trim();
+        if !agh::path::is_sha(selected) {
+            return Err("the build source is not an exact original commit".into());
+        }
+        let commit = selected;
+        let compiler = if crate::trust_lock::lock_at(&git, commit)?.is_some() {
+            Some(crate::trust_lock::inputs_at(&git, commit)?)
+        } else {
+            None
+        };
+        let home = compiler
+            .as_ref()
+            .and_then(|compiler| compiler.stock.as_ref().ok())
+            .map(|stock| stock.home.clone())
+            .or_else(|| std::env::var_os("HOME"))
+            .ok_or("the build take requires HOME")?;
+        let sdk = crate::build_inputs::AppleSdk::capture()?;
+        let seal = purpose.identity(compiler.as_ref(), &sdk)?;
+        let targo = match &compiler {
+            Some(compiler) => compiler.bin.clone(),
+            None => crate::gates::trust_stage2_bin().map_err(|e| e.to_string())?,
+        }
+        .join("targo");
         let hold = snapshot::CacheRoot::for_repo(repo_root)?.hold()?;
+        Self::prepare_inputs(
+            repo_root,
+            commit,
+            hold,
+            &|| Ok(targo.clone()),
+            TakeInputs {
+                purpose,
+                home,
+                compiler,
+                sdk,
+                seal,
+            },
+        )
+    }
+
+    /// Materialize a snapshot and its slice environments with an explicit fixture vendor.
+    /// No producer seal or compiler authority is issued by this test-only boundary.
+    #[cfg(test)]
+    pub(crate) fn prepare_in(
+        repo_root: &Path,
+        commit: &str,
+        hold: snapshot::CacheHold,
+        targo: &dyn Fn() -> Result<PathBuf, String>,
+    ) -> Result<Self, String> {
+        Self::prepare_inputs(
+            repo_root,
+            commit,
+            hold,
+            targo,
+            TakeInputs {
+                purpose: TakePurpose::Snapshot,
+                home: std::env::var_os("HOME").ok_or("the snapshot fixture requires HOME")?,
+                compiler: None,
+                sdk: crate::build_inputs::AppleSdk::capture()?,
+                seal: None,
+            },
+        )
+    }
+
+    fn prepare_inputs(
+        repo_root: &Path,
+        commit: &str,
+        hold: snapshot::CacheHold,
+        targo: &dyn Fn() -> Result<PathBuf, String>,
+        inputs: TakeInputs,
+    ) -> Result<Self, String> {
         let cache = hold.cache();
         refuse_held_stage(&cache.stage())?;
-        let targo = crate::gates::trust_stage2_bin()
-            .map_err(|e| e.to_string())?
-            .join("targo");
+        let targo = targo()?;
         let snapshot = snapshot::materialize(repo_root, commit, &hold, &targo)?;
         let workspace_config = snapshot.src.join(".cargo/config.toml");
         let metadata = std::fs::symlink_metadata(&workspace_config)
@@ -472,7 +693,21 @@ impl Take {
                 snapshot.commit
             ));
         }
+        let stock = inputs.compiler.as_ref().map_or_else(
+            || {
+                crate::trust_lock::stock_toolchain_at(
+                    &crate::ledger::GitCli::new(repo_root),
+                    &snapshot.commit,
+                )
+            },
+            |compiler| Ok(compiler.pin.stock_toolchain.clone()),
+        );
         Ok(Self {
+            compiler: inputs.compiler,
+            purpose: inputs.purpose,
+            home: inputs.home,
+            sdk: inputs.sdk,
+            inputs: inputs.seal,
             snapshot,
             workspace_config,
             target_root,
@@ -481,12 +716,78 @@ impl Take {
             stage,
             release_uid,
             short_commit,
+            stock,
             _hold: hold,
         })
     }
 }
 
 impl Take {
+    /// The stock release C's `trust.lock` names, which its STOCK EXCEPTION slices build with.
+    ///
+    /// # Errors
+    /// C carries no lock, or one that does not parse ([`crate::trust_lock::stock_toolchain_at`]).
+    pub(crate) fn stock(&self) -> Result<&str, String> {
+        self.stock.as_deref().map_err(Clone::clone)
+    }
+
+    pub(crate) fn stock_context(&self) -> Result<&Stock, String> {
+        self.stock()?;
+        if self.purpose != TakePurpose::Universal {
+            return Err("a native take has no universal stock compiler authority".into());
+        }
+        self.compiler
+            .as_ref()
+            .ok_or("a universal take has no selected stock compiler context")?
+            .stock()
+    }
+
+    /// What slice `run` of this take builds under ([`release_env`]), its lane's tool `path`
+    /// first: a target slice runs by name the stock release C's lock names ([`Take::stock`]),
+    /// never the checkout's, under `home`'s rustup home ([`Stock`]); the native slice runs none.
+    ///
+    /// # Errors
+    /// A target slice of a C that names no stock release, and what [`Stock::under`] refuses.
+    fn slice_env<'a>(
+        &'a self,
+        run: &SliceRun<'a>,
+        path: OsString,
+        wrapper: Option<&'a Path>,
+    ) -> Result<ReleaseEnv<'a>, String> {
+        let stock = match run.target {
+            Some(_) => match &self.compiler {
+                Some(compiler) if self.purpose == TakePurpose::Universal => {
+                    Some(compiler.stock()?.clone())
+                }
+                #[cfg(test)]
+                None if self.purpose == TakePurpose::Snapshot => {
+                    Some(Stock::under(&self.home, self.stock()?)?)
+                }
+                _ => {
+                    return Err("this native take has no universal stock compiler authority".into());
+                }
+            },
+            None => None,
+        };
+        Ok(ReleaseEnv {
+            sdk: &self.sdk,
+            path,
+            home: &self.home,
+            tmp: &self.temporary_dir,
+            cargo_home: self.slice_cargo_home(run.target),
+            build_number: run.build_number,
+            short_commit: &self.short_commit,
+            commit: &self.snapshot.commit,
+            target_dir: run.target_dir.clone(),
+            stock,
+            index_hint: run.index_hint,
+            units: run
+                .units
+                .zip(wrapper)
+                .map(|(units, wrapper)| (units, wrapper, self.snapshot.src.as_path())),
+        })
+    }
+
     /// The slice's own `CARGO_TARGET_DIR`.
     pub(crate) fn slice_target(&self, target: Option<&str>) -> PathBuf {
         self.target_root.join(target.unwrap_or(NATIVE_SLICE))
@@ -500,6 +801,7 @@ impl Take {
     pub(crate) fn verify(&self) -> Result<(), String> {
         self.snapshot
             .verify()
+            .and_then(|()| self.verify_inputs())
             .map_err(|error| match std::fs::remove_dir_all(&self.target_root) {
                 Ok(()) => format!("{error}; the build target it fed was removed"),
                 Err(clear) => format!(
@@ -507,6 +809,28 @@ impl Take {
                     self.target_root.display()
                 ),
             })
+    }
+
+    pub(crate) fn input_identity(&self) -> Option<String> {
+        self.inputs.clone()
+    }
+
+    pub(crate) fn recheck_inputs(&self) -> Result<(), String> {
+        self.verify_inputs()
+    }
+
+    fn verify_inputs(&self) -> Result<(), String> {
+        self.sdk.verify()?;
+        if let Some(expected) = &self.inputs {
+            let current = self
+                .purpose
+                .identity(self.compiler.as_ref(), &self.sdk)?
+                .ok_or("the sealed take has no producer input identity")?;
+            if current != *expected {
+                return Err("compiler or captured SDK inputs changed during the build take".into());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1096,7 +1420,7 @@ fn build_slices(
 ) -> Result<(Vec<PathBuf>, Vec<SliceBuild>), String> {
     crate::interrupt::install();
     // The x86_64 compat slice is the STOCK EXCEPTION (see the note at the file's head).
-    require_rustup_target(X86_64)?;
+    require_rustup_target_in(take.stock_context()?, X86_64)?;
     let slice_pool = slice_pool(aterm_capacity::Jobserver::inherited(), || {
         own_slice_pool(&take.temporary_dir)
     })?;
@@ -1116,7 +1440,7 @@ fn build_slices(
         (
             X86_64,
             Some(X86_64),
-            "upstream stable (+r): --target compat slice",
+            "upstream stock (+r): --target compat slice",
         ),
     ];
     // Exact or same-metric prior final-link records give both slices one global parent and one
@@ -1522,6 +1846,7 @@ fn finish_build(
     Ok(BuildOutput {
         app,
         snapshot_digest: take.snapshot.digest.clone(),
+        inputs: take.purpose.producer_inputs(take.inputs.clone()),
         slices: slice_builds,
         archs,
         compiler_line,
@@ -1616,6 +1941,7 @@ fn pilot_profile_args(
 }
 
 struct ReleaseEnv<'a> {
+    sdk: &'a crate::build_inputs::AppleSdk,
     /// The lane's toolchain directory first ([`release_tool_path`]).
     path: OsString,
     home: &'a std::ffi::OsStr,
@@ -1625,8 +1951,8 @@ struct ReleaseEnv<'a> {
     short_commit: &'a str,
     commit: &'a str,
     target_dir: PathBuf,
-    /// The compat slice's rustup home; `None` on the native (Trust) slice.
-    rustup_home: Option<OsString>,
+    /// The compat or static slice's stock rustup ([`Stock`]); `None` on the native (Trust) slice.
+    stock: Option<Stock>,
     /// [`BuildPlan::index_hint`].
     index_hint: Option<&'a str>,
     /// A release slice's units, this executable (their compilers' wrapper) and the slice's
@@ -1690,9 +2016,11 @@ fn release_env(e: &ReleaseEnv<'_>) -> Vec<(&'static str, OsString)> {
             env.push((input::INDEX_HINT, hint.into()));
         }
     }
-    if let Some(rustup_home) = &e.rustup_home {
-        env.push(("RUSTUP_HOME", rustup_home.clone()));
-        env.push(("RUSTUP_TOOLCHAIN", "stable".into()));
+    if let Some((name, value)) = e.sdk.environment() {
+        env.push((name, value.to_owned()));
+    }
+    if let Some(stock) = &e.stock {
+        env.extend(stock.env());
     }
     if cfg!(target_os = "linux") {
         env.push(("CARGO_BUILD_JOBS", "4".into()));
@@ -1760,9 +2088,11 @@ pub(crate) fn contention_plan(
     full: bool,
 ) -> Result<BuildPlan, String> {
     if full {
-        crate::gates::universal_gate(crate::gates::x86_target_probe, || {
-            crate::gates::rosetta_runs(&mut |command| command.output())
-        })
+        let stock = take.stock_context()?;
+        crate::gates::universal_gate(
+            || require_rustup_target_in(stock, X86_64).map_err(crate::ledger::Error::new),
+            || crate::gates::rosetta_runs(&mut |command| command.output()),
+        )
         .map_err(|error| error.to_string())?;
         crate::gates::disk_gate(root).map_err(|error| error.to_string())?;
     }
@@ -1825,10 +2155,16 @@ pub(crate) fn finish_contention_build(
             .collect(),
     )?;
     take.verify()?;
+    crate::artifact::validate_build_result(
+        &output,
+        compilers,
+        &crate::artifact::compilers_for(
+            take.compiler
+                .as_ref()
+                .ok_or("the universal diagnostic has no selected compiler")?,
+        )?,
+    )?;
     let output = publish_verified_output(output, &plan.out_dir, take.release_uid)?;
-    if &crate::artifact::compilers()? != compilers {
-        return Err("compiler or SDK inputs changed during the diagnostic build".into());
-    }
     let macho_sha256 = crate::artifact::macho_sha256(&output.app)?;
     let bundle_digest = crate::artifact::bundle_digest(&output.app)?;
     let content_digest = crate::artifact::content_digest(&output.app)?;
@@ -1866,7 +2202,7 @@ pub(crate) fn contention_slices(
     warm: bool,
     ready: Option<std::sync::mpsc::Sender<aterm_json::Value>>,
 ) -> Result<ContentionBuild, String> {
-    require_rustup_target(X86_64)?;
+    require_rustup_target_in(take.stock_context()?, X86_64)?;
     let budget_ledger = root.join("slice-memory-budget");
     snapshot::private_dir(&budget_ledger, "contention slice memory budget ledger")?;
     let units = crate::slice_units::Units::live(&[ARM64, X86_64], 2, &budget_ledger);
@@ -2217,8 +2553,11 @@ pub(crate) fn pilot_host_checks(
     build_number: u64,
     index_hint: Option<&str>,
 ) -> Result<(), String> {
-    let stage2 = crate::gates::trust_stage2_bin().map_err(|e| e.to_string())?;
-    let home = std::env::var_os("HOME").ok_or("profile-pilot requires HOME")?;
+    let stage2 = match &take.compiler {
+        Some(compiler) => compiler.bin.clone(),
+        None => crate::gates::trust_stage2_bin().map_err(|e| e.to_string())?,
+    };
+    let home = &take.home;
     let claim = aterm_capacity::admit(
         aterm_capacity::Need::new("profile-pilot host instruments")
             .mem_gib(26)
@@ -2253,8 +2592,9 @@ pub(crate) fn pilot_host_checks(
             &stage2.join("targo"),
             args,
             &ReleaseEnv {
+                sdk: &take.sdk,
                 path: release_tool_path(&stage2)?,
-                home: &home,
+                home,
                 tmp: &take.temporary_dir,
                 cargo_home: take.slice_cargo_home(None),
                 build_number,
@@ -2264,7 +2604,7 @@ pub(crate) fn pilot_host_checks(
                     .parent()
                     .ok_or("pilot checks have no parent")?
                     .join("instruments.noindex"),
-                rustup_home: None,
+                stock: None,
                 index_hint,
                 units: None,
             },
@@ -2349,9 +2689,9 @@ fn build_one(
     run_slice(take, &run, log)
 }
 
-/// One static `cargo build --release --target <triple> -p <pkg>` on upstream stable (the STOCK EXCEPTION: the static bootstrap verifier, whose C library is linked in so it runs with no dynamic loader), in that triple's own target directory, and where its `bin` landed.
+/// One static `cargo build --release --target <triple> -p <pkg>` on the stock release the take's trust.lock names (the STOCK EXCEPTION: the static bootstrap verifier, whose C library is linked in so it runs with no dynamic loader), in that triple's own target directory, and where its `bin` landed.
 /// # Errors
-/// No stable std for `triple`, and a build that fails.
+/// A take whose commit names no stock release ([`Take::stock`]), no std of that release for `triple`, and a build that fails.
 pub(crate) fn build_static(
     plan: &BuildPlan,
     take: &Take,
@@ -2360,7 +2700,7 @@ pub(crate) fn build_static(
     triple: &str,
     log: Option<&Path>,
 ) -> Result<PathBuf, String> {
-    require_rustup_target(triple)?;
+    require_rustup_target_in(take.stock_context()?, triple)?;
     let target_dir = take.slice_target(Some(triple));
     let run = SliceRun {
         verb: "build",
@@ -2376,15 +2716,17 @@ pub(crate) fn build_static(
     Ok(target_bin(&target_dir, triple, bin))
 }
 
-/// The stable `cargo check` of the x86_64 compat slice's snapshot of `commit`, its output into `log`.
-/// The slice builds with stable (the STOCK EXCEPTION), whose std refuses what Trust's allows (a
-/// `const fn` calling a method stable does not make const), so `ship check --compat` runs this to
-/// find such a tree without building a bundle.
+/// The stock `cargo check` of the x86_64 compat slice's snapshot of `commit`, its output into `log`.
+/// The slice builds with the stock release `commit`'s trust.lock names (the STOCK EXCEPTION),
+/// whose std refuses what Trust's allows (a `const fn` calling a method that release does not
+/// make const), so `ship check --compat` runs this to find such a tree without building a bundle.
 /// # Errors
-/// What [`Take::prepare`] refuses, no stable x86_64 std, and a check that fails (the tail of its log).
+/// What [`Take::prepare`] refuses, a commit that names no stock release ([`Take::stock`]), no
+/// x86_64 std of that release, and a check that fails (the tail of its log).
 pub(crate) fn compat_check(repo_root: &Path, commit: &str, log: &Path) -> Result<String, String> {
-    compat_available()?;
     let take = Take::prepare(repo_root, commit)?;
+    let stock = take.stock()?;
+    require_rustup_target_in(take.stock_context()?, X86_64)?;
     let target_dir = take.target_root.join(COMPAT_CHECK_SLICE);
     snapshot::private_dir(&target_dir, "release compat check target")?;
     let t = Instant::now();
@@ -2400,21 +2742,23 @@ pub(crate) fn compat_check(repo_root: &Path, commit: &str, log: &Path) -> Result
     };
     run_slice(&take, &run, Some(log)).map_err(|error| format!("{error}\n{}", log_tail(log, 40)))?;
     Ok(format!(
-        "stable compiles the x86_64 compat slice of {} (cargo check, {})",
+        "the stock toolchain {stock} compiles the x86_64 compat slice of {} (cargo check, {})",
         take.short_commit,
         fmt_elapsed(t)
     ))
 }
 
-/// The read-only compat lane's infrastructure prerequisite, distinct from a source failure.
-pub(crate) fn compat_available() -> Result<(), String> {
-    require_rustup_target(X86_64)
+/// The read-only compat lane's infrastructure prerequisite, distinct from a source failure: the
+/// stock release `toolchain` (the checked commit's, [`crate::trust_lock::stock_toolchain_at`])
+/// with its x86_64 std.
+pub(crate) fn compat_available(toolchain: &str) -> Result<(), String> {
+    require_rustup_target(toolchain, X86_64)
 }
 
 struct SliceRun<'a> {
     verb: &'static str,
     pkg: &'a str,
-    /// `None` for the native Trust slice, the triple for the stable compat slice.
+    /// `None` for the native Trust slice, the triple for the stock compat slice.
     target: Option<&'a str>,
     target_dir: PathBuf,
     build_number: u64,
@@ -2454,20 +2798,23 @@ fn run_slice_profile(
     let &SliceRun {
         verb, pkg, target, ..
     } = run;
+    take.verify_inputs()?;
     snapshot::refuse_root_cargo_config()?;
     // The build driver, per lane. Native: `targo` from the Trust stage2 tool dir, never a
-    // PATH `cargo`. Compat: stable's `cargo` via the rustup shim (STOCK EXCEPTION, see the
-    // note at the file's head).
-    let home = std::env::var_os("HOME").ok_or("release build requires HOME")?;
+    // PATH `cargo`. Compat: the candidate's stock release's `cargo` via the rustup shim (STOCK
+    // EXCEPTION, see the note at the file's head).
     let compat_shim = if target.is_some() {
-        Some(release_rustup_shim_dir()?)
+        Some(take.stock_context()?.shim()?.to_path_buf())
     } else {
         None
     };
     let driver: (PathBuf, &'static str) = if let Some(shim) = &compat_shim {
         (shim.join("cargo"), "cargo")
     } else {
-        let stage2 = crate::gates::trust_stage2_bin().map_err(|e| e.to_string())?;
+        let stage2 = match &take.compiler {
+            Some(compiler) => compiler.bin.clone(),
+            None => crate::gates::trust_stage2_bin().map_err(|e| e.to_string())?,
+        };
         (stage2.join("targo"), "targo")
     };
     let (driver_path, driver_name) = driver;
@@ -2479,10 +2826,6 @@ fn run_slice_profile(
             .ok_or("Trust build driver has no parent directory")?
     };
     let path = release_tool_path(tool_dir)?;
-    let rustup_home = match target {
-        Some(_) => Some(release_rustup_home(&home)?),
-        None => None,
-    };
     let mut args = cargo_build_args(
         verb,
         &take.workspace_config,
@@ -2508,22 +2851,7 @@ fn run_slice_profile(
     let mut cmd = release_build_command(
         &program,
         prefix.into_iter().chain(args).collect(),
-        &ReleaseEnv {
-            path,
-            home: &home,
-            tmp: &take.temporary_dir,
-            cargo_home: take.slice_cargo_home(target),
-            build_number: run.build_number,
-            short_commit: &take.short_commit,
-            commit: &take.snapshot.commit,
-            target_dir: run.target_dir.clone(),
-            rustup_home,
-            index_hint: run.index_hint,
-            units: run
-                .units
-                .zip(wrapper.as_deref())
-                .map(|(units, wrapper)| (units, wrapper, take.snapshot.src.as_path())),
-        },
+        &take.slice_env(run, path, wrapper.as_deref())?,
     );
     if let Some((trial, cores)) = trial {
         let crate::profile_pilot::Trial { arm, anatomy, .. } = trial;
@@ -2534,7 +2862,7 @@ fn run_slice_profile(
             cmd.arg("-Zsection-timings");
             if target.is_some() {
                 // This enables only rustc's unstable JSON timing diagnostic in the pilot's
-                // existing stable compat compiler. A release never gets it; section identity
+                // existing stock compat compiler. A release never gets it; section identity
                 // against a regular take decides whether this instrument preserves code.
                 cmd.env("RUSTC_BOOTSTRAP", "1");
             }
@@ -2567,9 +2895,9 @@ fn run_slice_profile(
         None => None,
     };
     let lane = if run.static_crt {
-        "upstream stable (+r) static"
+        "upstream stock (+r) static"
     } else if target.is_some() {
-        "upstream stable (+r) compat"
+        "upstream stock (+r) compat"
     } else {
         "Trust (+t)"
     };
@@ -2611,6 +2939,7 @@ fn run_slice_profile(
     let child = spawned.map_err(|e| format!("spawn {driver_name} for {pkg}: {e}"))?;
     let (status, mut usage) =
         wait_with_peak(child).map_err(|e| format!("wait for {driver_name} for {pkg}: {e}"))?;
+    take.verify_inputs()?;
     let wall = started.elapsed();
     usage.units = crate::durable::open_regular_file(&messages)
         .and_then(units_of)
@@ -2877,24 +3206,30 @@ fn wait_with_peak(
     ))
 }
 
-fn require_rustup_target(triple: &str) -> Result<(), String> {
+/// That the stock release `toolchain` carries `triple`'s std, asked of the release's rustup shim
+/// under [`Stock`]'s environment.
+///
+/// # Errors
+/// No HOME or rustup shim, a rustup that does not answer (the release not installed among it),
+/// and a release without that std; each names `verify provision`'s rustup row, which puts the
+/// release in place with it.
+pub(crate) fn require_rustup_target(toolchain: &str, triple: &str) -> Result<(), String> {
     let home = std::env::var_os("HOME").ok_or("compat target probe requires HOME")?;
-    let rustup_home = release_rustup_home(&home)?;
-    let shim = release_rustup_shim_dir()?;
-    let rustup = shim.join("rustup");
-    let out = command(&rustup)
-        .env_clear()
-        .env("HOME", &home)
-        .env("PATH", release_tool_path(&shim)?)
-        .env("RUSTUP_HOME", rustup_home)
-        .env("RUSTUP_TOOLCHAIN", "stable")
+    require_rustup_target_in(&Stock::under(&home, toolchain)?, triple)
+}
+
+pub(crate) fn require_rustup_target_in(stock: &Stock, triple: &str) -> Result<(), String> {
+    let toolchain = stock.toolchain();
+    let out = stock
+        .command("rustup")?
         .args(["target", "list", "--installed"])
-        .current_dir("/")
         .output()
         .map_err(|e| format!("rustup not runnable ({e}) — install rustup"))?;
     if !out.status.success() {
         return Err(format!(
-            "rustup target list failed: {}",
+            "rustup target list on the stock toolchain {toolchain} failed: {} — run `targo \
+             --unverified verify provision rustup`, which puts the release trust.lock names in \
+             place",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
@@ -2903,55 +3238,40 @@ fn require_rustup_target(triple: &str) -> Result<(), String> {
         .any(|l| l.trim() == triple)
     {
         return Err(format!(
-            "rust std for {triple} is not installed on stable — run \
-             `targo --unverified verify provision rustup`, which puts the release chain's stable \
-             in place with it (the release is universal)"
+            "rust std for {triple} is not installed on the stock toolchain {toolchain} — run \
+             `targo --unverified verify provision rustup`, which puts the release trust.lock \
+             names in place with it (the release is universal)"
         ));
     }
     Ok(())
 }
 
-/// The whole `-vV` answer of the Trust `trustc` the native slice builds with
-/// ([`crate::gates::trust_stage2_bin`]).
+/// The whole `-vV` answer of the stock release `toolchain`'s `rustc` behind the release's rustup
+/// shim ([`Stock`]): the identity a stock slice records.
 /// # Errors
-/// No Trust toolchain, or a `trustc` that does not answer `-vV`.
-pub(crate) fn trust_rustc_version() -> Result<String, String> {
-    let trustc = crate::gates::trust_stage2_bin()
-        .map_err(|e| e.to_string())?
-        .join("trustc");
-    let out = checked_output(
-        command(&trustc).arg("-vV"),
-        &format!("ask {} -vV", trustc.display()),
-    )?;
-    String::from_utf8(out.stdout).map_err(|e| format!("{} -vV is not UTF-8: {e}", trustc.display()))
+/// No rustup shim, or a `rustc` of that release that does not answer `-vV`.
+#[cfg(test)]
+pub(crate) fn stock_rustc_version(toolchain: &str) -> Result<String, String> {
+    let home = std::env::var_os("HOME").ok_or("the stock compiler probe requires HOME")?;
+    stock_rustc_version_in(&Stock::under(&home, toolchain)?)
 }
 
-/// The whole `-vV` answer of stable's `rustc`: the identity a static build records.
-/// # Errors
-/// No rustup shim, or a stable `rustc` that does not answer `-vV`.
-pub(crate) fn stable_rustc_version() -> Result<String, String> {
-    let home = std::env::var_os("HOME").ok_or("the stable compiler probe requires HOME")?;
-    let shim = release_rustup_shim_dir()?;
+pub(crate) fn stock_rustc_version_in(stock: &Stock) -> Result<String, String> {
+    let toolchain = stock.toolchain();
     let out = checked_output(
-        command(shim.join("rustc"))
-            .env_clear()
-            .env("HOME", &home)
-            .env("PATH", release_tool_path(&shim)?)
-            .env("RUSTUP_HOME", release_rustup_home(&home)?)
-            .env("RUSTUP_TOOLCHAIN", "stable")
-            .arg("-vV")
-            .current_dir("/"),
-        "ask stable's rustc -vV",
+        stock.command("rustc")?.arg("-vV"),
+        &format!("ask the stock toolchain {toolchain}'s rustc -vV"),
     )?;
-    String::from_utf8(out.stdout).map_err(|e| format!("stable's rustc -vV is not UTF-8: {e}"))
+    String::from_utf8(out.stdout)
+        .map_err(|e| format!("the stock toolchain {toolchain}'s rustc -vV is not UTF-8: {e}"))
 }
 
-/// The `commit-hash` stable's `rustc -vV` answers.
+/// The `commit-hash` the captured stock compiler's `rustc -vV` answers.
 /// # Errors
-/// No rustup shim, or a stable `rustc` that does not answer `-vV` with a commit.
-pub(crate) fn stable_rustc_commit() -> Result<String, String> {
-    commit_hash_of(&stable_rustc_version()?)
-        .ok_or_else(|| "stable's rustc -vV names no commit-hash".to_string())
+/// No rustup shim, or a `rustc` of that release that does not answer `-vV` with a commit.
+pub(crate) fn stock_rustc_commit_in(stock: &Stock) -> Result<String, String> {
+    commit_hash_of(&stock_rustc_version_in(stock)?)
+        .ok_or_else(|| "the captured stock compiler names no commit-hash".into())
 }
 
 /// The `commit-hash:` line of a `rustc -vV` answer.
@@ -3882,3 +4202,11 @@ mod crash_tests;
 #[cfg(test)]
 #[path = "buildplan_tests.rs"]
 mod tests;
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[path = "buildplan_jobserver_tests.rs"]
+mod jobserver_tests;
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[path = "buildplan_sdk_tests.rs"]
+mod sdk_tests;

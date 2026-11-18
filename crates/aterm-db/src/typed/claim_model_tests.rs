@@ -353,6 +353,7 @@ fn evaluate(input: &State, drop_provenance: bool) -> State {
         cells: raw.clone(),
         inert: Default::default(),
         owned: Default::default(),
+        logs: Default::default(),
         complete: mode != 5,
         awaiting: if mode == 5 {
             crate::typed::Awaiting {

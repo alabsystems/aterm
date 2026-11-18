@@ -393,11 +393,29 @@ THE OVERVIEW'S LINES
   tab <n>  this tab's program, reported CPU counter growth and live footprint
   reported_cpu  independent app, tab, other-process and service counter rates. Updates can
            arrive late: these readings do not partition machine CPU usage
+  spotlight  Spotlight's family over the last split by coalition: indexing at or over either
+           bar of `await sys spotlight`, else off where every local volume reads indexing
+           disabled, else idle; its reported CPU counter growth in cores' worth, its reads a
+           second and its footprint (≥ where a member's was not read); then each local
+           volume's indexing (on, off, unknown) as `mdutil -s -a` read it, no root, at most
+           once a minute (`volumes unavailable(unread)` until it has, or where it failed).
+           `sys`, `sys why`, a Deck on screen and a spotlight wait each run the split. It reads
+           unavailable(unread) before the first split and once the last is over a minute old,
+           and unavailable(lane_off:coalitions) with that lane off; it is not printed where
+           there is no coalition lane (Linux, Windows). `sys global` prints it too; --json
+           carries it as "global"."spotlight"
+           ({"state","cpu_mc","cpu_basis","cpu_execution_window","read_bps","footprint_bytes",
+           "members":[{"signing_id","lead_pid",…}],"volumes":[{"path","indexing"}],
+           "volumes_read_ms_ago"})
   more=    the other views, and where this help is
   A footprint is the sum of what macOS charges each process: shares, not a split of RAM, so
   aterm's or a tab's can pass the machine's used memory (`sys mem` names the processes).
-  `sys tab` heads its lines `tab <n> <sid> · window <id>`: the window's id is `aterm ctl
+  `sys tab` heads its lines `tab <n> sid=<sid> · window <id>`: the window's id is `aterm ctl
   sessions`' window=, not a place.
+  Tab-bearing records include sid= beside the tab number. The session's stable identity
+  follows its original local key through tab reordering. Missing or ambiguous identities
+  read unavailable(not_sampled); a current tab in the same numbered place is no substitute.
+  Records covering several sessions keep their sids separately.
 
 FIGURES
   ≥ and ≤ (JSON {"v","bound":"at_least|at_most","cause"}) mark a bound: unread counters or
@@ -469,6 +487,9 @@ const WAIT_BODY: &str = r#"  aterm ctl @self await sys <condition> [for=<n>(ms|s
   24 h). scope=aterm (owner) reads every tab for the tab, tab.mem and jobs.* terms. An armed
   wait reads once a second.
 
+EXAMPLE
+  aterm ctl @self await sys spotlight!=indexing for=60s timeout=600000   wait for Spotlight to rest
+
 TERMS — <metric><op><value>, <op> one of < <= > >= = !=
   cpu                 the machine's CPU busy: <n>% or <n>c (cores' worth)
   cpu.l<n>, cpu.<cluster>   one cluster's busy percent, as `sys cores` names it: <n>%
@@ -483,11 +504,18 @@ TERMS — <metric><op><value>, <op> one of < <= > >= = !=
   swap                swap traffic: <size>[/s]
   decompress          decompressions: <n>[/s]
   thrash              yes|no
+  spotlight           idle|indexing|off: Spotlight's family (the nine members the why help
+                      names) is indexing at or over 200 millicores of reported CPU counter
+                      growth or 5 MB/s of reads, whatever the volumes read; else off where
+                      every local volume reads indexing disabled; else idle.
+                      spotlight!=indexing waits for it under both bars on any Mac. Unread until
+                      a split by coalition has run, which the wait (await sys, or await wake on
+                      a wake naming it) itself asks for
   thermal             the OS's level nominal|fair|serious|critical; Linux's estimate
                       none|light|heavy|severe ranks alike
   jobs.stuck, jobs.quiet, jobs.running   how many of this tab's jobs: <n>
   slots               Trust `build-slot` slots proven free, less those an orphaned build fills: <n>
-  mem, thermal and thrash take = and != with a comma list; mem and thermal also take one
+  mem, thermal, thrash and spotlight take = and != with a comma list; mem and thermal also take one
   level with < <= > >=. <size> is <n> with B, KB, MB, GB, TB (decimal) or KiB, MiB, GiB,
   TiB (binary). eta, growth and walk are not measured: ERR unavailable <m> why=not_sampled.
 
@@ -660,15 +688,22 @@ LINES
            fp_bytes, never an additive share of physical RAM
   owners   (mem) fp_bytes= coalitions= live_only=1: the ranked coalitions' footprint summed
            over their live processes, and their count
-  who      a coalition, busiest first (memory: by footprint), named by its lead process, which
-           is often a shell (a tab's coalition leads with its shell; `sys mem` and `sys procs`
-           name the processes in it): pid=, birth_ms=, exe=, voucher= (apple, app_store,
+  who      a coalition, busiest first (memory: by footprint), labeled by its oldest live
+           process, often a shell: pid=, birth_ms=, exe=, voucher= (apple, app_store,
            development, enterprise, developer_id, ad_hoc, unsigned, unknown), team= (its
            signing team, where it has one); scope=aterm for aterm's own, else uid= (the lead's
            user) and part=others|services; then (cpu) cpu_mc= [delegated_mc=] [read_bps=
            deferred_pm=] [finished_included=1: work of members now gone is counted] cause=<id|->,
-           or (mem) fp_bytes= live=<n> (its live processes). `more` and `withheld` sum the rows
-           left out. ownership=mixed marks a coalition shared by proved app and outside work:
+           or (mem) fp_bytes= live=<n> fp_bytes_scope=coalition. Memory also lists up to three
+           largest observed readable process charges as members=<pid>:<exe>:<fp_bytes>[,...],
+           in descending charge order. members_coverage=complete|partial, members_readable,
+           members_unread and members_missing describe that sample's coverage; a partial
+           census cannot prove these are the coalition's largest holders. JSON's members.top
+           retains each process's original start, exec version, birth and read time, with
+           unavailable fields explicit. These member charges are separate from the kernel's
+           coalition total; neither is an additive share of physical RAM.
+           `more` and `withheld` sum the coalition rows left out.
+           ownership=mixed marks a coalition shared by proved app and outside work:
            cpu_mc is its whole counter growth, delegated_mc its app-member process counter growth,
            outside_reported_mc its independently observed outside counter rate. Such rows do not
            form an owner partition. Memory uses current ownership proofs independently of CPU
@@ -688,8 +723,11 @@ LINES
   CPU hardware: …  the sample, as in `sys cores`, or `not in this reading` where it took none
            (`sys cores` or `sys why fresh=0` takes one)
 
-  spotlight is the work of Apple-signed com.apple.mds, com.apple.mds_stores,
-  com.apple.mdworker_shared and com.apple.corespotlightd, mostly deferred. service-memory names
+  spotlight (the activity, and sys's spotlight line) is the work of the coalitions led by
+  Apple-signed com.apple.mds, com.apple.mds_stores, com.apple.mdworker,
+  com.apple.mdworker_shared, com.apple.corespotlightd, com.apple.managedcorespotlightd and
+  com.apple.spotlightknowledged.graph, .importer and .updater, mostly deferred; a member inside
+  another lead's coalition counts with that lead. service-memory names
   one of macOS's services that holds past its bar (`status service_mem=`); bare why shows it
   only past the huge bar.
   A caller that is not owner-class sees only the coalitions wholly in its target's tab, never

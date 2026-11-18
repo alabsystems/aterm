@@ -288,6 +288,76 @@ fn processes_trouble() -> Snapshot {
 }
 
 #[test]
+fn zombies_light_the_well_machine_wide() {
+    let delivered = |tab, count| JobsView {
+        rows: vec![job("fine", Verdict::Fine)],
+        findings: Findings {
+            zombies: vec![ZombieParent {
+                ppid: 900,
+                name: "server".into(),
+                count,
+                per_min_deci: 0,
+                tab,
+            }],
+            ..Findings::default()
+        },
+        ..JobsView::default()
+    };
+    let mut s = snap();
+    for tab in [None, Some(2)] {
+        let view = delivered(tab, 14);
+        assert_eq!(State::of_jobs(&view), Some(State::Zombies));
+        s.set_jobs(Some(Arc::new(view)));
+        assert_eq!(s.jobs.as_ref().unwrap().rows[0].verdict, Verdict::Fine);
+        assert_eq!(
+            s.resources[Resource::Processes.index()].state,
+            Some(State::Zombies)
+        );
+        assert_eq!(
+            well(
+                Resource::Processes,
+                &s.resources[Resource::Processes.index()]
+            ),
+            Some((Mark::Zombie, InkKind::Warn))
+        );
+        let words = state(Resource::Processes, &s, &MAC).expect("machine pile state");
+        assert_eq!(
+            (words.state, words.mark, words.ink),
+            (State::Zombies, Mark::Zombie, InkKind::Warn)
+        );
+        assert_eq!(words.clauses, strings(&["14 zombies"]));
+        let details = processes_details(&s);
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].forms, strings(&["14 zombies"]));
+        assert_eq!(details[0].mark, Some(Mark::Zombie));
+        assert_eq!(details[0].ink, InkKind::Warn);
+    }
+
+    for view in [
+        Some(delivered(None, 0)),
+        Some(delivered(Some(2), 0)),
+        Some(JobsView {
+            rows: vec![job("fine", Verdict::Fine)],
+            ..JobsView::default()
+        }),
+        None,
+    ] {
+        s.set_jobs(view.map(Arc::new));
+        assert_eq!(s.resources[Resource::Processes.index()].state, None);
+        assert_eq!(
+            well(
+                Resource::Processes,
+                &s.resources[Resource::Processes.index()]
+            ),
+            None
+        );
+        assert_eq!(state(Resource::Processes, &s, &MAC), None);
+        assert!(job_marks(&s).is_empty());
+        assert!(processes_details(&s).is_empty());
+    }
+}
+
+#[test]
 fn job_summaries_qualify_local_stalls_without_hiding_independent_ones() {
     for verdict in [Verdict::Quiet, Verdict::Stuck] {
         let mut wrapper = job("wrapper", verdict);

@@ -172,6 +172,7 @@ pub(crate) type Gathers = [usize; aterm_agent::harness::looks::Input::ALL.len()]
 pub(crate) const NO_GATHERS: Gathers = [0; aterm_agent::harness::looks::Input::ALL.len()];
 
 /// `gathers` with one gather of each of `inputs`.
+#[cfg(unix)]
 pub(crate) fn gathers_of(inputs: &[aterm_agent::harness::looks::Input]) -> Gathers {
     let mut gathers = NO_GATHERS;
     for input in inputs {

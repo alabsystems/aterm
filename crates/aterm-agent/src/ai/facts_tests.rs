@@ -1501,6 +1501,7 @@ fn a_codex_review_on_a_build_that_ignores_codex_auth_path_signs_in_only_the_defa
     let sign_in = "aterm ai login codex";
     let signed_out = DefaultRow::SignedOut {
         label: "main".into(),
+        word: None,
         stored: true,
     };
 
@@ -1546,6 +1547,7 @@ fn a_codex_review_on_a_build_that_ignores_codex_auth_path_signs_in_only_the_defa
     std::fs::remove_file(b.home.join(".codex/auth.json")).expect("drop the default login");
     let none_here = DefaultRow::SignedOut {
         label: "main".into(),
+        word: None,
         stored: false,
     };
     let f = gather(&m, &CODEX);
@@ -1663,6 +1665,7 @@ fn a_codex_pool_judges_the_program_a_launch_runs_not_the_managed_copy() {
         pool.default_row,
         Some(DefaultRow::SignedOut {
             label: "main".into(),
+            word: None,
             stored: true
         })
     );
@@ -1856,10 +1859,11 @@ fn a_pin_that_refuses_every_codex_launch_is_the_doctors_warning_and_the_logins_r
     );
     assert_eq!(row.fix, None);
     let mend = row.mend.clone().expect("a person's step");
-    assert!(
-        mend.contains("`aterm harness accounts use main --cli codex`"),
-        "{mend}"
+    let main_pin = format!(
+        "`{}`",
+        crate::harness::codex_alab::unread_fix(Some(&codex_word("main@example.com")))
     );
+    assert!(mend.contains(&main_pin), "{mend}");
     let needs = health(std::slice::from_ref(&row))
         .needs_you()
         .expect("a NEEDS YOU line");
@@ -1887,8 +1891,7 @@ fn a_pin_that_refuses_every_codex_launch_is_the_doctors_warning_and_the_logins_r
     assert_eq!(row.fix, None, "{}", row.fact);
     assert!(
         row.mend.as_deref().is_some_and(|mend| {
-            mend.contains("`aterm ai login codex`")
-                && mend.contains("`aterm harness accounts use main --cli codex`")
+            mend.contains("`aterm ai login codex`") && mend.contains(&main_pin)
         }),
         "{:?}",
         row.mend
@@ -1939,7 +1942,8 @@ fn a_pin_that_refuses_every_codex_launch_is_the_doctors_warning_and_the_logins_r
     assert_eq!(verdict.needs_you(), None, "{verdict:?}");
     assert_eq!(verdict.by_aterm, vec!["codex"]);
     assert_eq!(
-        crate::ai::login::pool_target(crate::harness::accounts::Cli::Codex, p),
+        crate::ai::login::pool_target(crate::harness::accounts::Cli::Codex, p)
+            .map(|target| (target.label, target.verb)),
         Ok(("work", "renew")),
         "the sign-in signs in the pinned row"
     );
@@ -1980,7 +1984,7 @@ fn under_a_pin_on_a_row_of_its_own_a_walled_default_row_is_told_its_pin() {
     use crate::harness::codex_alab::{DefaultRow, unread_fix};
     let pool = DoctorPool::new(false, None);
     pool.wall_main();
-    let pin = unread_fix(Some("main"));
+    let pin = unread_fix(Some(&codex_word("main@example.com")));
     let ends = |p: &crate::ai::facts::CliAccounts| match &p.default_row {
         Some(DefaultRow::Walled { until, .. }) => crate::harness::usage::rfc3339_utc(*until),
         other => panic!("`main` is walled: {other:?}"),
@@ -2024,14 +2028,19 @@ fn under_a_pin_on_a_row_of_its_own_a_walled_default_row_is_told_its_pin() {
 fn with_no_row_on_this_machines_own_login_the_step_lists_it_and_then_pins_it() {
     use crate::ai::state::assess;
     let adopt = crate::harness::codex_alab::unread_fix(None);
-    let pin = crate::harness::codex_alab::unread_fix(Some("<label>"));
+    let pin = crate::harness::codex_alab::unread_fix(Some(
+        &crate::harness::account_names::Word::chosen(),
+    ));
     let pool = DoctorPool::new(false, None);
     pool.pin("work");
     let mend = assess(&pool.facts(), true, DoctorPool::NOW)
         .mend
         .expect("CONTROL: a person's step");
     assert!(
-        mend.contains("`aterm harness accounts use main --cli codex`") && !mend.contains(&adopt),
+        mend.contains(&format!(
+            "`{}`",
+            crate::harness::codex_alab::unread_fix(Some(&codex_word("main@example.com")))
+        )) && !mend.contains(&adopt),
         "CONTROL: {mend}"
     );
     let roster = std::fs::read_to_string(&pool.roster).expect("roster");
@@ -2510,18 +2519,31 @@ fn the_next_sign_in_is_never_another_macs_account() {
 #[test]
 fn another_macs_refusal_names_each_clis_own_sign_in() {
     use crate::harness::accounts::Cli;
-    let words = |cli| another_macs_refusal(cli, "row", Some("m22")).expect("a refusal");
+    // A row with an address, named by the key its address makes (no lab slugs it here), never
+    // by its label, which the sign-in verbs refuse for such a row.
+    let listed = crate::harness::accounts::Row {
+        label: "row".to_owned(),
+        email: Some("row@x.example".to_owned()),
+        ..crate::harness::accounts::Row::default()
+    };
+    let row = |cli| crate::harness::account_names::sign_in_word(cli, &listed, &[], None);
+    let key =
+        |realm: &str| aterm_db::typed::keys::account_pk(realm, "row@x.example").expect("a key");
+    let words = |cli| another_macs_refusal(cli, row(cli), Some("m22")).expect("a refusal");
     assert!(
-        words(Cli::Grok).contains("accounts login row"),
+        words(Cli::Grok).contains(&format!("accounts login {} --cli grok", key("grok"))),
         "{}",
         words(Cli::Grok)
     );
     assert!(
-        words(Cli::Codex).contains("accounts renew row"),
+        words(Cli::Codex).contains(&format!("accounts renew {} --cli codex", key("codex"))),
         "{}",
         words(Cli::Codex)
     );
-    assert_eq!(another_macs_refusal(Cli::Codex, "row", None), None);
+    assert_eq!(
+        another_macs_refusal(Cli::Codex, row(Cli::Codex), None),
+        None
+    );
 }
 
 /// `aterm ai login`'S FALLBACK IS NOT ANOTHER MAC'S EITHER: a roster with no row on the default
@@ -2592,7 +2614,16 @@ fn a_serving_row_of_another_macs_is_refused_unless_a_person_pinned_it() {
     assert_eq!(target, None);
     let refused = refused.expect("a refusal");
     assert!(
-        refused.contains("gives it to m22") && refused.contains("accounts renew other"),
+        refused.contains("gives it to m22")
+            && refused.contains(&format!(
+                "accounts renew {}",
+                crate::harness::account_names::tests::row_name(
+                    crate::harness::accounts::Cli::Claude,
+                    &roster_path,
+                    "other",
+                )
+                .word
+            )),
         "{refused}"
     );
     let mut note = None;
@@ -2636,7 +2667,16 @@ fn a_serving_row_of_another_macs_is_refused_unless_a_person_pinned_it() {
     assert_eq!(target, None);
     let refused = refused.expect("a refusal");
     assert!(
-        refused.contains("gives it to m22") && refused.contains("accounts renew other"),
+        refused.contains("gives it to m22")
+            && refused.contains(&format!(
+                "accounts renew {}",
+                crate::harness::account_names::tests::row_name(
+                    crate::harness::accounts::Cli::Codex,
+                    &pool.roster,
+                    "other",
+                )
+                .word
+            )),
         "{refused}"
     );
     pool.state(|state| {
@@ -2646,4 +2686,14 @@ fn a_serving_row_of_another_macs_is_refused_unless_a_person_pinned_it() {
     let (target, refused) = view("m22");
     assert_eq!(target.as_deref(), Some("other"), "a person pinned it");
     assert_eq!(refused, None, "a person pinned it");
+}
+
+/// The word the pin of the Codex account `email` types where no lab names it: its account key.
+fn codex_word(email: &str) -> crate::harness::account_names::Word {
+    crate::harness::account_names::Named {
+        pk: aterm_db::typed::keys::account_pk("codex", email).expect("an account key"),
+        row: None,
+        names: aterm_file::AccountNames::default(),
+    }
+    .word()
 }

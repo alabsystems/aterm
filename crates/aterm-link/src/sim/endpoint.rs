@@ -22,6 +22,11 @@ pub(crate) struct EpRules {
     pub(crate) forgets: bool,
     /// A session holding a generation of the fork's chain AFTER `was` keeps below the fork too.
     pub(crate) chain: bool,
+    /// Across a proved move from another log, a session holding a generation of `was`'s own
+    /// log after `was` (told by an attach whose witness never moved off it, so it holds only
+    /// offsets below that move's cut) keeps below the fork too, as aterm's
+    /// `LogClock::keep_below` does.
+    pub(crate) proved_chain: bool,
     /// A replaced log (`forgot=1`) forgets every session log's mirror cursor.
     pub(crate) mirror_forgets: bool,
     /// A session's exit moves the count `sessions bridge` and `outbox` name (`roster=`).
@@ -40,6 +45,7 @@ impl Default for EpRules {
             lane: aterm_types::control_verbs::BRIDGE_LANE,
             forgets: true,
             chain: true,
+            proved_chain: true,
             mirror_forgets: true,
             exit_moves_roster: true,
             names_roster: true,
@@ -259,6 +265,13 @@ pub(crate) struct EpState {
     pub(crate) deliveries_pipelined: u64,
     /// The `outbox sent` lines that came in one write with another (`Bridge::retire_on_the_lane`).
     pub(crate) retires_pipelined: u64,
+    /// The `link log … proved=1` lines taken: logs of another id a bridge proved to continue the
+    /// one before by the records it told (ATERM-KI-1116-7314).
+    pub(crate) proved_logs: u64,
+    /// The ids (`link log`'s text before the `.`) a session forgot what it held across, told
+    /// with no proved step from a log of another id: the world's remints among them are ones
+    /// the model tap no longer follows a slot across ([`super::conform::View::forgot_remints`]).
+    pub(crate) forgot_across: BTreeSet<String>,
     /// The node mirrors its sessions' logs.
     pub(crate) mirror: bool,
     /// How many torn state files the bridges said they set aside (`link set-aside files=<n>`).
@@ -1323,9 +1336,13 @@ impl EpState {
             if !lawful {
                 return "ERR usage: link log\n".to_string();
             }
+            if proved {
+                self.proved_logs += 1;
+            }
         }
         let forgets = self.rules.forgets;
         let chain = self.rules.chain;
+        let proved_chain = self.rules.proved_chain;
         let mut changed = self.log.as_ref().is_some_and(|was| *was != ident);
         for session in self.sessions.values_mut() {
             if session.bus_log.as_deref() == Some(ident.as_str()) {
@@ -1336,11 +1353,23 @@ impl EpState {
                 Some(was) => was != ident,
             };
             if forget && forgets {
+                let id_of = |log: &str| log.split_once('.').map(|(id, _)| id.to_string());
+                if continues.is_none()
+                    && !session.dedup.is_empty()
+                    && session
+                        .bus_log
+                        .as_deref()
+                        .is_some_and(|held| id_of(held) != id_of(&ident))
+                {
+                    self.forgot_across.extend(id_of(&ident));
+                }
                 let keep_below = continues
                     .as_ref()
                     .filter(|(_, was)| {
                         session.bus_log.as_deref().is_some_and(|held| {
-                            held == was.as_str() || (chain && in_chain(was, held, &ident))
+                            held == was.as_str()
+                                || (chain && in_chain(was, held, &ident))
+                                || (proved_chain && after_was_across_ids(was, held, &ident))
                         })
                     })
                     .map(|(f, _)| *f);
@@ -1365,6 +1394,19 @@ impl EpState {
     }
 }
 
+/// Whether `held` is a generation of `was`'s own log after `was`, across a move to `now`, a log
+/// of another id (only a proved move names one).
+fn after_was_across_ids(was: &str, held: &str, now: &str) -> bool {
+    let split = |s: &str| -> Option<(String, u64)> {
+        let (id, generation) = s.split_once('.')?;
+        Some((id.to_string(), crate::parse_uint(generation)?))
+    };
+    match (split(was), split(held), split(now)) {
+        (Some((a, w)), Some((b, h)), Some((c, _))) => a == b && b != c && w < h,
+        _ => false,
+    }
+}
+
 /// Whether a session holding `held` keeps below a fork a bridge names from `was` to `now`.
 fn in_chain(was: &str, held: &str, now: &str) -> bool {
     let split = |s: &str| -> Option<(String, u64)> {
@@ -1375,7 +1417,7 @@ fn in_chain(was: &str, held: &str, now: &str) -> bool {
         return true;
     }
     match (split(was), split(held), split(now)) {
-        (Some((a, w)), Some((b, h)), Some((c, n))) => a == b && b == c && w < h && h < n,
+        (Some((a, w)), Some((b, h)), Some((c, n))) => b == c && h < n && (a != b || w < h),
         _ => false,
     }
 }

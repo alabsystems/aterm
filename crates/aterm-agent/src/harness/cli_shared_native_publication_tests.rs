@@ -81,6 +81,7 @@ impl shared_provider::Provider for NativeProvider {
             cli: Cli::Codex,
             route,
             row,
+            word: None,
             staging,
             store: context.store,
             hosts: route.hosts.of(row.vendor.region).unwrap(),

@@ -109,10 +109,10 @@ fn the_setup_resync_counts_a_move_it_made_with_nothing_to_read() {
         |_: &Env, source: &str| -> Result<String, String> { Err(format!("no fetch: {source}")) };
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
     let (cooldown, rediscovery) = (
-        std::sync::Mutex::new(None),
-        std::sync::Mutex::new(Rediscovery::default()),
+        Watched::new("accounts_sync/sync_cooldown", None),
+        Watched::new("accounts_sync/rediscovery", Rediscovery::default()),
     );
-    let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+    let guard = AutoRenewGuard::default().shared();
     let fx =
         super::super::login_tests::upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
     let resync = resync_with(&world.home, &world.state, (&claude, NOW, false), &fx);
@@ -121,8 +121,7 @@ fn the_setup_resync_counts_a_move_it_made_with_nothing_to_read() {
     assert!(resync.changed, "{:?}", resync.failed);
 }
 
-/// UPKEEP CARRIES A REFUSED MOVE AS A FAILURE, AND A MOVE WITH NOTHING TO READ WAKES THE POOL. A
-/// no-source sync reports what it did as unsettled, so the next upkeep looks again.
+/// UPKEEP CARRIES A REFUSED MOVE AS A FAILURE, AND A MOVE WITH NOTHING TO READ WAKES THE POOL.
 #[test]
 fn upkeep_carries_a_refused_move_and_a_move_with_nothing_to_read_wakes_the_pool() {
     let fetch =
@@ -159,8 +158,6 @@ fn upkeep_carries_a_refused_move_and_a_move_with_nothing_to_read_wakes_the_pool(
     ));
     assert_eq!(world.rows().row_for_login(None).unwrap().label, "b");
     assert!(wake.exists(), "the pool woke: {synced:?}");
-    let synced = synced.map_err(SyncError::from);
-    assert!(!default_sync_settled(&synced), "{synced:?}");
 }
 
 /// A SESSION ON THE DIRECTORY THE NEW DEFAULT ROW LEFT: the bound row carries what it left, and
@@ -199,7 +196,12 @@ fn a_move_leaves_the_row_what_it_left_and_the_receipt_names_it() {
         );
         let doc: aterm_json::Value = aterm_json::from_str(String::from_utf8_lossy(&out).trim())
             .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&err)));
-        assert_eq!(doc["own_row"], aterm_json::Value::from("b"), "{doc}");
+        // The row is named by its account's key, never by its label.
+        let b = crate::harness::account_names::names_of_login(Cli::Codex, None, B, None)
+            .expect("b's account")
+            .0;
+        assert_eq!(doc["own_row"]["ac"], aterm_json::Value::from(b), "{doc}");
+        assert!(doc["own_row"].get("label").is_none(), "{doc}");
 
         let logins = store.load_logins(NOW).unwrap().0;
         let bound = accounts::bound(&world.rows(), &logins);

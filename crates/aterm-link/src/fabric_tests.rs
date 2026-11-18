@@ -3028,14 +3028,27 @@ fn the_report_names_the_node_service_where_it_hosts_bus_log() {
         row(&r, "holds")
     );
     r.broker.own_build = false;
+    let scratch = crate::test_scratch_dir("host");
+    let there = scratch.path().join("aterm");
+    std::fs::write(&there, b"a new build").expect("a file at the path");
+    let gone = scratch.path().join("removed/aterm");
+    for (exe, now) in [
+        (&there, "is another file now"),
+        (&gone, "names no file now"),
+    ] {
+        let exe = exe.to_string_lossy().into_owned();
+        r.broker.program = Some(exe.clone());
+        r.broker.replaced = Some(exe.clone());
+        assert!(
+            row(&r, "host").is_some_and(|h| h.ends_with(&format!(
+                "at ordered, program {exe} — A REPLACED BUILD: that path {now}"
+            ))),
+            "{:?}",
+            row(&r, "host")
+        );
+    }
+    r.broker.program = Some(program.to_string());
     r.broker.replaced = Some(program.to_string());
-    assert!(
-        row(&r, "host").is_some_and(|h| h.ends_with(&format!(
-            "at ordered, program {program} — A REPLACED BUILD: that path is another file now"
-        ))),
-        "{:?}",
-        row(&r, "host")
-    );
     assert!(render_json(&r).contains("\"build\":null"));
     let replaced: Vec<Warning> = warned_items(&r)
         .into_iter()
@@ -3542,6 +3555,9 @@ fn a_process_whose_executable_was_replaced_is_named() {
     let after = replaced_build(child.id(), &shown);
     let after_via = replaced_build(linked.id(), &via);
     let relative = replaced_build(child.id(), "slp");
+    std::fs::remove_file(&exe).expect("remove the build at its path");
+    let gone = replaced_build(child.id(), &shown);
+    let gone_via = replaced_build(linked.id(), &via);
     #[cfg(target_os = "macos")]
     let read =
         [child.id(), linked.id()].map(|pid| (running_image_inode(pid), lsof_image_inode(pid)));
@@ -3567,6 +3583,16 @@ fn a_process_whose_executable_was_replaced_is_named() {
         "{running_via:?} vs the link's {own}"
     );
     assert_eq!(relative, None, "a relative argv names no file");
+    assert_eq!(
+        gone.as_deref(),
+        Some(shown.as_str()),
+        "no file is at its path"
+    );
+    assert_eq!(
+        gone_via.as_deref(),
+        Some(via.as_str()),
+        "its link names no file"
+    );
     #[cfg(target_os = "macos")]
     for (ours, lsof) in read {
         assert!(ours.is_some(), "an image read");
@@ -3575,6 +3601,62 @@ fn a_process_whose_executable_was_replaced_is_named() {
     let lsof = "p57558\nftxt\ni366658160\nn/x/slp\nftxt\ni1152921500312609216\nn/usr/lib/dyld\n";
     assert_eq!(lsof_first_inode(lsof), Some(366_658_160));
     assert_eq!(lsof_first_inode(""), None);
+}
+
+/// A broker's argv0 that names no regular file reads replaced: gone, a dangling link, a path
+/// under a file, a directory. Its job cannot start it from there again, so the renewal must not
+/// read it current. A relative argv0, an image that could not be read, the same file, and a
+/// path that cannot be read for another reason (a link loop) read `None`, since what cannot be
+/// read is no evidence the build changed; another file reads replaced, as before. The lines that
+/// name a replaced build say which it is, by the same reading as the renewal's.
+/// NEGATIVE CONTROLS: the check before this (`metadata(exe).ok()?`) read every gone path as
+/// `None`, so the renewal reported the broker on a deleted build as current; one that reads a
+/// directory as another file says "is another file now" of a path the renewal moves as naming
+/// none.
+#[test]
+fn a_gone_path_reads_replaced_and_one_that_cannot_be_read_does_not() {
+    use std::os::unix::fs::MetadataExt as _;
+    let scratch = crate::test_scratch_dir("exe");
+    let dir = scratch.path();
+    let exe = dir.join("aterm");
+    std::fs::write(&exe, b"a build").expect("a build");
+    let ino = std::fs::metadata(&exe).expect("its inode").ino();
+    let dangling = dir.join("dangling");
+    std::os::unix::fs::symlink(dir.join("removed"), &dangling).expect("a dangling link");
+    let looped = dir.join("loop-a");
+    std::os::unix::fs::symlink(dir.join("loop-b"), &looped).expect("a loop");
+    std::os::unix::fs::symlink(&looped, dir.join("loop-b")).expect("a loop");
+    let gone = dir.join("removed/aterm");
+    let under_a_file = exe.join("aterm");
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+    assert_eq!(replaced_from(&s(&exe), || Some(ino)), None, "the same file");
+    assert_eq!(
+        replaced_from(&s(&exe), || Some(ino + 1)),
+        Some(s(&exe)),
+        "another file"
+    );
+    for named in [&gone, &dangling, &under_a_file, &dir.to_path_buf()] {
+        assert_eq!(
+            replaced_from(&s(named), || Some(ino)),
+            Some(s(named)),
+            "{} names no file",
+            named.display()
+        );
+        assert_eq!(
+            replaced_from(&s(named), || None),
+            None,
+            "{}: an image not read",
+            named.display()
+        );
+        assert_eq!(replaced_now(&s(named)), "names no file now");
+    }
+    assert_eq!(replaced_from(&s(&looped), || Some(ino)), None, "unread");
+    assert_eq!(
+        replaced_from("aterm", || panic!("a relative argv0 asks for no image")),
+        None
+    );
+    assert_eq!(replaced_now(&s(&exe)), "is another file now");
+    assert_eq!(replaced_now(&s(&looped)), "is another file now", "unread");
 }
 
 #[test]

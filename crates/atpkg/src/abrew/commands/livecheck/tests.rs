@@ -34,6 +34,23 @@ fn plist_fields_and_item_versions() {
             ("CFBundleVersion".to_string(), "250".to_string()),
         ]
     );
+    // r454: a dict ending in self-closing values
+    // (`<true/>`) still terminates the walk (the skip
+    // arm continues past the old loop-end check).
+    let xml_tail = br#"<plist version="1.0">
+<dict>
+	<key>CFBundleVersion</key>
+	<string>0.1</string>
+	<key>CFBundleAllowMixedLocalizations</key>
+	<true/>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+</dict>
+</plist>"#;
+    assert_eq!(
+        plist_string_fields(xml_tail).unwrap(),
+        vec![("CFBundleVersion".to_string(), "0.1".to_string())]
+    );
     // Hand-built bplist00: {A: "1.2", B: "12", N: {x: "y"}}.
     let bin: &[u8] = &[
         98, 112, 108, 105, 115, 116, 48, 48, 211, 1, 2, 3, 4, 5, 6, 81, 65, 81, 66, 81, 78, 83, 49,
@@ -77,6 +94,17 @@ fn plist_fields_and_item_versions() {
         Some("2.5.0,250")
     );
     assert_eq!(item(Some("4.0"), Some("4.0")).as_deref(), Some("4.0"));
+    // r454 `nice_parts`: a build number already
+    // dotted into the short version is dropped, a
+    // bundle version extending the short one wins,
+    // and a trailing `(version)` is stripped first.
+    assert_eq!(item(Some("9.2.2"), Some("2")).as_deref(), Some("9.2.2"));
+    assert_eq!(item(Some("1.2"), Some("1.2.3")).as_deref(), Some("1.2.3"));
+    assert_eq!(item(Some("1.2.3"), Some("1.2")).as_deref(), Some("1.2.3"));
+    assert_eq!(
+        item(Some("5.0 (123)"), Some("123")).as_deref(),
+        Some("5.0,123")
+    );
     assert_eq!(item(Some("3.1"), None).as_deref(), Some("3.1"));
     assert_eq!(item(None, Some("777")).as_deref(), Some("777"));
     assert_eq!(item(None, None), None);
@@ -736,7 +764,7 @@ fn private_latest_release_uses_the_repository_routed_identity() {
     let client = bind_latest_routing(&base, Some(&dirs)).unwrap();
     let re = lc_regex(r"v(\d+\.\d+)", "").unwrap();
     assert!(matches!(
-        github_latest_versions_with("https://github.com/livecheck-private/pkg", &re, |slug| client.releases(slug).latest()),
+        github_latest_versions_with("https://github.com/livecheck-private/pkg", &re, None, |slug| client.releases(slug).latest()),
         Found::Versions(versions, _) if versions == ["3.2"]
     ));
     let reads = fake
@@ -783,7 +811,7 @@ fn github_latest_reads_the_routed_repository_and_refuses_nonstable_releases() {
     let re = lc_regex(r"v(\d+(?:\.\d+)+)", "").unwrap();
     for reject in [None, Some("draft"), Some("prerelease")] {
         let found =
-            github_latest_versions_with("https://github.com/sample/tool.git", &re, |slug| {
+            github_latest_versions_with("https://github.com/sample/tool.git", &re, None, |slug| {
                 assert_eq!(slug.to_string(), "sample/tool");
                 let mut release = github.releases(slug).latest()?;
                 release.draft = reject == Some("draft");
@@ -803,13 +831,13 @@ fn github_latest_reads_the_routed_repository_and_refuses_nonstable_releases() {
         );
     }
     assert!(matches!(
-        github_latest_versions_with("https://github.com/sample/private", &re, |slug| {
+        github_latest_versions_with("https://github.com/sample/private", &re, None, |slug| {
             github.releases(slug).latest()
         }),
         Found::Raised(_)
     ));
     assert!(matches!(
-        github_latest_versions_with("https://github.com/sample/missing", &re, |slug| {
+        github_latest_versions_with("https://github.com/sample/missing", &re, None, |slug| {
             github.releases(slug).latest()
         }),
         Found::Raised(_)
@@ -1064,6 +1092,27 @@ fn date_ymd_mirrors_ruby_date_parse() {
     assert_eq!(date_ymd("Feb 29, 2023"), None);
     assert_eq!(date_ymd("Smarch 9, 2016"), None);
     assert_eq!(date_ymd("March 2016"), None);
+    // r436: all-numeric forms as the oracle's
+    // Date.parse reads them (probed): year-first,
+    // day-first with a trailing 4-digit year,
+    // two-digit-year-first with the 69 pivot, and
+    // the compact forms.
+    assert_eq!(date_ymd("2016-03-09").as_deref(), Some("20160309"));
+    assert_eq!(date_ymd("2016/3/9").as_deref(), Some("20160309"));
+    assert_eq!(date_ymd("09-03-2016").as_deref(), Some("20160309"));
+    assert_eq!(date_ymd("03/09/2016").as_deref(), Some("20160903"));
+    assert_eq!(date_ymd("97/11/13").as_deref(), Some("19971113"));
+    assert_eq!(date_ymd("68/01/02").as_deref(), Some("20680102"));
+    assert_eq!(date_ymd("69/01/02").as_deref(), Some("19690102"));
+    assert_eq!(date_ymd("20160309").as_deref(), Some("20160309"));
+    assert_eq!(date_ymd("970313").as_deref(), Some("19970313"));
+    assert_eq!(date_ymd("11/13/1997"), None);
+    assert_eq!(date_ymd("2024-13-01"), None);
+    // Regexp#inspect orders flags m, i, x.
+    assert_eq!(
+        regex_inspect(&lc_regex("a", "im").unwrap()),
+        "/a/mi".to_string()
+    );
 }
 
 /// r425: the gsub/sub/reject page shapes apply like
@@ -1121,9 +1170,15 @@ fn github_releases_block_applies() {
     let block = GhRelBlock {
         skip_draft: true,
         skip_prerelease: false,
+        require_prerelease: false,
+        tag_ne: None,
+        tag_prefix: None,
+        asset_any: None,
         name_skip: Some(("^api".into(), "i".into())),
         source: GhRelSource::TagName,
+        pre_capture: None,
         then: GhRelThen::Tr("-".into(), ".".into()),
+        fallback_tag: None,
     };
     let found = github_releases_versions_with(
         "https://github.com/sample/tool/releases/download/v1/tool.tgz",
@@ -1254,4 +1309,549 @@ fn uri_join_directory_forms() {
     );
     assert_eq!(version_patch_value("4.3.2"), 2);
     assert_eq!(version_patch_value("4.3"), 0);
+}
+
+/// r433: reduced `:git` block transforms over a tag
+/// capture (oracle `String#tr`/`#gsub` semantics).
+#[test]
+fn git_op_transforms() {
+    use super::super::super::formula::GitOp;
+    assert_eq!(git_op_apply(&GitOp::Identity, "1_2", None), "1_2");
+    assert_eq!(
+        git_op_apply(&GitOp::Tr("_-".into(), ".".into()), "1_2-3", None),
+        "1.2.3"
+    );
+    assert_eq!(
+        git_op_apply(&GitOp::GsubLit("8u".into(), "1.8.0+".into()), "8u432", None),
+        "1.8.0+432"
+    );
+    // libtrace: trailing `-1` stripped, other text kept.
+    let re = lc_regex("-1$", "").unwrap();
+    let op = GitOp::GsubRe("-1$".into(), String::new(), String::new());
+    assert_eq!(git_op_apply(&op, "4.0.1-1", Some(&re)), "4.0.1");
+    assert_eq!(git_op_apply(&op, "4.0.1", Some(&re)), "4.0.1");
+    // tmpwatch: every separator replaced.
+    let re = lc_regex("[_-]", "").unwrap();
+    let op = GitOp::GsubRe("[_-]".into(), String::new(), ".".into());
+    assert_eq!(git_op_apply(&op, "1_2-3_4", Some(&re)), "1.2.3.4");
+    // json_spirit: backreference regrouping.
+    let re = lc_regex(r"(\d+)\.(\d+)\.(\d+)", "").unwrap();
+    let op = GitOp::GsubRe(
+        r"(\d+)\.(\d+)\.(\d+)".into(),
+        String::new(),
+        r"\1.\2\3".into(),
+    );
+    assert_eq!(git_op_apply(&op, "4.0.8", Some(&re)), "4.08");
+    assert_eq!(git_op_apply(&op, "4.08", Some(&re)), "4.08");
+}
+
+/// r434: a reduced `:github_latest` block reads its
+/// field (no draft/prerelease filter), scans or
+/// captures, applies `tr`, and dedupes.
+#[test]
+fn github_latest_block_applies() {
+    use super::super::super::formula::{LatestBlock, LatestRender, LatestSource};
+    fn asset(name: &str) -> agh::model::AssetObject {
+        agh::model::AssetObject {
+            id: 1,
+            name: name.to_string(),
+            size: 0,
+            digest: None,
+            state: String::new(),
+            content_type: String::new(),
+            updated_at: String::new(),
+            browser_download_url: String::new(),
+            download_count: 0,
+            raw: aterm_json::Value::Null,
+        }
+    }
+    let release = agh::model::ReleaseObject {
+        id: 1,
+        tag_name: "R_2_7_1".to_string(),
+        name: Some("Tool 2.7 and 2.8".to_string()),
+        draft: true,
+        prerelease: true,
+        immutable: false,
+        target_commitish: String::new(),
+        created_at: String::new(),
+        published_at: Some("2026-11-03T00:00:00Z".to_string()),
+        html_url: String::new(),
+        body: None,
+        assets: vec![
+            asset("tool-3.0.tgz"),
+            asset("notes.txt"),
+            asset("tool-3.0.zip"),
+        ],
+        raw: aterm_json::Value::Null,
+    };
+    let base = LatestBlock {
+        needs_spec_regex: false,
+        source: LatestSource::TagName,
+        scan: false,
+        tr: None,
+        render: LatestRender::Capture,
+        two_b: None,
+        pre_capture: None,
+    };
+    // Scan + tr over tag_name (draft/prerelease kept:
+    // the block path has no filter).
+    let re = lc_regex(r"^R_(\d+(?:_\d+)+)$", "").unwrap();
+    let block = LatestBlock {
+        scan: true,
+        tr: Some(("_".into(), ".".into())),
+        ..base.clone()
+    };
+    assert_eq!(
+        latest_block_versions(&release, &re, &block),
+        vec!["2.7.1".to_string()]
+    );
+    // Scan over name finds every match.
+    let re = lc_regex(r"(\d+\.\d+)", "").unwrap();
+    let block = LatestBlock {
+        source: LatestSource::Name,
+        scan: true,
+        ..base.clone()
+    };
+    assert_eq!(
+        latest_block_versions(&release, &re, &block),
+        vec!["2.7".to_string(), "2.8".to_string()]
+    );
+    // First capture over published_at with deleting tr.
+    let re = lc_regex(r"^(\d{4}-\d{2}-\d{2})", "").unwrap();
+    let block = LatestBlock {
+        source: LatestSource::PublishedAt,
+        tr: Some(("-".into(), String::new())),
+        ..base.clone()
+    };
+    assert_eq!(
+        latest_block_versions(&release, &re, &block),
+        vec!["20261103".to_string()]
+    );
+    // Per-asset captures, deduplicated.
+    let re = lc_regex(r"^tool-(\d+(?:\.\d+)+)\.", "").unwrap();
+    let block = LatestBlock {
+        source: LatestSource::AssetName,
+        ..base.clone()
+    };
+    assert_eq!(
+        latest_block_versions(&release, &re, &block),
+        vec!["3.0".to_string()]
+    );
+    // A missing optional field yields nothing.
+    let block = LatestBlock {
+        source: LatestSource::Body,
+        ..base
+    };
+    assert!(latest_block_versions(&release, &re, &block).is_empty());
+}
+
+/// r435: the `none?` filename-match guard (go's
+/// stable-release filter) evaluates against the
+/// block regex as a search.
+#[test]
+fn json_none_match_guard() {
+    use super::super::super::formula::JsonCond;
+    let rp = RunPlan {
+        strat: Strat::Json,
+        url: String::new(),
+        re: Some(lc_regex(r"^go[._-]?v?(\d+(?:\.\d+)+)[._-]src\.t.+$", "i").unwrap()),
+        candidates: Vec::new(),
+        strategy_url: None,
+        ua: None,
+        ua_option: None,
+        ua_symbol: false,
+        gnome_filter: false,
+        json: None,
+        xml: None,
+        yaml: None,
+        page_block: None,
+        ghrel_block: None,
+        git: None,
+        sparkle_block: None,
+        header_block: None,
+        latest: None,
+        post_form: None,
+        post_json: None,
+        headers: Vec::new(),
+        major_minor: String::new(),
+        plist: None,
+        apps: Vec::new(),
+        uncompressed: false,
+    };
+    let cond = JsonCond::NoneMatch("files".into(), "filename".into());
+    let item = |json: &str| aterm_json::from_slice::<aterm_json::Value>(json.as_bytes()).unwrap();
+    // A src tarball among the files: not none.
+    assert!(!eval_json_cond(
+        &cond,
+        &item(
+            r#"{"files":[{"filename":"go1.27.4.darwin-arm64.tar.gz"},{"filename":"go1.27.4.src.tar.gz"}]}"#
+        ),
+        &rp
+    ));
+    // No src tarball: none match (the item is skipped).
+    assert!(eval_json_cond(
+        &cond,
+        &item(r#"{"files":[{"filename":"go1.27.4.darwin-arm64.tar.gz"}]}"#),
+        &rp
+    ));
+    // Missing/empty file list: none match.
+    assert!(eval_json_cond(&cond, &item(r#"{"files":[]}"#), &rp));
+    assert!(eval_json_cond(&cond, &item(r#"{}"#), &rp));
+}
+
+/// r437: `URI.encode_www_form` — alphanumerics and
+/// `*-._` pass, space is `+`, the rest percent-escapes
+/// (oracle-probed byte forms).
+#[test]
+fn www_form_encoding() {
+    let pairs = vec![
+        ("action".to_string(), "percona_downloads".to_string()),
+        ("product_id".to_string(), "Percona-Server-9.7".to_string()),
+    ];
+    assert_eq!(
+        www_form_encode(&pairs),
+        "action=percona_downloads&product_id=Percona-Server-9.7"
+    );
+    let pairs = vec![
+        ("a b".to_string(), "x+y&z".to_string()),
+        ("k".to_string(), "~ok*".to_string()),
+    ];
+    assert_eq!(www_form_encode(&pairs), "a+b=x%2By%26z&k=%7Eok*");
+}
+
+/// r438: document-order object keys at a dig path
+/// (the parsed map sorts; Ruby hashes do not).
+#[test]
+fn json_key_order_document() {
+    use super::super::super::formula::JsonKey;
+    let doc = r#"{"releases":{"3.4":{"children":[1,2]},"3.3":{"children":[]},"we\"ird":{}},"other":[true,null]}"#;
+    assert_eq!(
+        json_object_key_order(doc, &[JsonKey::Key("releases".into())]),
+        Some(vec![
+            "3.4".to_string(),
+            "3.3".to_string(),
+            "we\"ird".to_string()
+        ])
+    );
+    assert_eq!(
+        json_object_key_order(doc, &[]),
+        Some(vec!["releases".to_string(), "other".to_string()])
+    );
+    assert_eq!(
+        json_object_key_order(doc, &[JsonKey::Key("nope".into())]),
+        None
+    );
+    assert_eq!(
+        json_object_key_order("[1,2]", &[JsonKey::Key("a".into())]),
+        None
+    );
+}
+
+/// r441: a capture inside an alternation branch
+/// splits via the rebalanced prefix/suffix (the
+/// elfutils directory/tarball regex); the other
+/// branch's whole match yields no group 1.
+#[test]
+fn alternation_branch_group1_extracts() {
+    let re = lc_regex(
+        r#"href=(?:["']?v?(\d+(?:\.\d+)+)/?["' >]|.*?elfutils[._-]v?(\d+(?:\.\d+)+)\.t)"#,
+        "i",
+    )
+    .unwrap();
+    assert_eq!(re.group_count, 2);
+    assert_eq!(
+        search_group1(&re, "href=\"0.197/\"").as_deref(),
+        Some("0.197")
+    );
+    assert_eq!(search_group1(&re, "href=\"elfutils-0.197.tar.xz\""), None);
+}
+
+/// r442: Ruby pattern syntax translated for the
+/// engine — `{,n}` open-below quantifiers (gyb) and
+/// `x`-mode free whitespace/comments (neo4j).
+#[test]
+fn ruby_pattern_translations() {
+    let re = lc_regex(r"^v?(\d{,3}(?:\.\d+)+)$", "i").unwrap();
+    assert_eq!(search_group1(&re, "v12.345").as_deref(), Some("12.345"));
+    let re = lc_regex(
+        "href=.*?rel=v?(\\d+(?:\\.\\d+)+) # the release\n |other",
+        "ix",
+    )
+    .unwrap();
+    assert_eq!(
+        search_group1(&re, "href=xrel=1.2.3").as_deref(),
+        Some("1.2.3")
+    );
+}
+
+/// r443: reduced `:sparkle` blocks over an appcast
+/// — channel-nil find skips the newer beta item;
+/// a match template joins fields and captures.
+#[test]
+fn sparkle_block_versions_eval() {
+    use super::super::super::formula::{SpChannel, SpExpr, SpField, SpPart, SparkleBlock};
+    let appcast = "<rss><channel>\
+        <item><title>3.0</title><pubDate>Mon, 02 Nov 2026 09:34:27 +0000</pubDate>\
+        <sparkle:channel>beta</sparkle:channel>\
+        <enclosure url=\"https://example.com/v3-99.dmg\" sparkle:shortVersionString=\"3.0\" sparkle:version=\"300\"/></item>\
+        <item><title>2.0</title><pubDate>Sat, 15 Aug 2026 07:20:14 +0000</pubDate>\
+        <enclosure url=\"https://example.com/v2-42.dmg\" sparkle:shortVersionString=\"2.0\" sparkle:version=\"200\"/></item>\
+        </channel></rss>";
+    let find = SparkleBlock {
+        all: false,
+        find: false,
+        channel: Some(SpChannel::Nil),
+        match_guard: None,
+        present: Vec::new(),
+        needs_spec_regex: false,
+        expr: SpExpr::Field(SpField::Short),
+    };
+    assert_eq!(sparkle_block_versions(appcast, &find, None), vec!["2.0"]);
+    let tmpl = SparkleBlock {
+        all: false,
+        find: false,
+        channel: None,
+        match_guard: None,
+        present: Vec::new(),
+        needs_spec_regex: true,
+        expr: SpExpr::Template {
+            from: Some(SpField::Url),
+            local: None,
+            parts: vec![
+                SpPart::Field(SpField::Short),
+                SpPart::Lit(",".to_string()),
+                SpPart::Cap(1),
+            ],
+        },
+    };
+    let re = lc_regex(r"-(\d+)\.dmg", "").unwrap();
+    assert_eq!(
+        sparkle_block_versions(appcast, &tmpl, Some(&re)),
+        vec!["3.0,99"]
+    );
+}
+
+/// r444: scan captures index from 0 (bartender's
+/// `match[0].tr("-", ".")` over element-form
+/// appcast items).
+#[test]
+fn sparkle_scan_capture_zero_is_first_group() {
+    use super::super::super::formula::{SpExpr, SpField, SpPart, SparkleBlock};
+    let appcast = "<rss><channel><item><title>Version 7.2.0</title>        <sparkle:shortVersionString>7.2.0</sparkle:shortVersionString>        <pubDate>Thu, 05 Nov 2026 17:41:58 GMT</pubDate>        <enclosure url=\"https://example.com/updates/7-2-0/App%207.zip\" /></item></channel></rss>";
+    let block = SparkleBlock {
+        all: false,
+        find: false,
+        channel: None,
+        match_guard: None,
+        present: Vec::new(),
+        needs_spec_regex: true,
+        expr: SpExpr::Scan {
+            from: SpField::Url,
+            parts: vec![SpPart::CapTr(0, "-".into(), ".".into())],
+        },
+    };
+    let re = lc_regex(r"/v?(\d+(?:[.-]\d+)+)/App%207\.zip", "i").unwrap();
+    assert_eq!(
+        sparkle_block_versions(appcast, &block, Some(&re)),
+        vec!["7.2.0"]
+    );
+}
+
+/// r444: cask version chains substitute with
+/// `Cask::DSL::Version` semantics.
+#[test]
+fn cask_version_chain_substitution() {
+    assert_eq!(
+        substitute_version_tokens(
+            "v#{version.csv.first.major}/x#{version.no_dots}",
+            "2.10.1,406",
+            true
+        )
+        .as_deref(),
+        Some("v2/x2101,406")
+    );
+    assert_eq!(
+        substitute_version_tokens("#{version.major_minor}", "2.10.1,406", true).as_deref(),
+        Some("2.10")
+    );
+    assert_eq!(
+        substitute_version_tokens("#{version.csv.second}", "1.2", true).as_deref(),
+        Some("")
+    );
+    // Formula semantics reject cask-only chains.
+    assert_eq!(
+        substitute_version_tokens("#{version.no_dots}", "1.2.3", false),
+        None
+    );
+}
+
+/// r445: a json template body over items (locals,
+/// blank guards, CSV render), and a match template.
+#[test]
+fn json_template_eval() {
+    use super::super::super::formula::{JsonKey, JsonLocal, JsonPart, JsonRender, JsonTemplate};
+    let rp = RunPlan {
+        strat: Strat::Json,
+        url: String::new(),
+        re: Some(lc_regex(r"/v(\d+)-(\d+)", "").unwrap()),
+        candidates: Vec::new(),
+        strategy_url: None,
+        ua: None,
+        ua_option: None,
+        ua_symbol: false,
+        gnome_filter: false,
+        json: None,
+        xml: None,
+        yaml: None,
+        page_block: None,
+        ghrel_block: None,
+        git: None,
+        sparkle_block: None,
+        header_block: None,
+        latest: None,
+        post_form: None,
+        post_json: None,
+        headers: Vec::new(),
+        major_minor: String::new(),
+        plist: None,
+        apps: Vec::new(),
+        uncompressed: false,
+    };
+    let root = aterm_json::from_slice::<aterm_json::Value>(
+        br#"{"releases":[{"version":"1.2","build":34},{"version":"1.3"}],"url":"https://x/v9-8"}"#,
+    )
+    .unwrap();
+    let map_tmpl = JsonTemplate {
+        path: vec![JsonKey::Key("releases".into())],
+        map: true,
+        locals: vec![
+            JsonLocal::Dig(vec![JsonKey::Key("version".into())]),
+            JsonLocal::Dig(vec![JsonKey::Key("build".into())]),
+        ],
+        require: vec![0, 1],
+        match_src: None,
+        local_match_guard: None,
+        guards: Vec::new(),
+        render: JsonRender::Template(vec![
+            JsonPart::Local(0),
+            JsonPart::Lit(",".into()),
+            JsonPart::Local(1),
+        ]),
+    };
+    // Numeric build interpolates; the item without
+    // a build is skipped by the blank guard.
+    let Ok(versions) = json_template_versions(&map_tmpl, &root, &rp) else {
+        panic!("template eval failed");
+    };
+    assert_eq!(versions, vec!["1.2,34"]);
+    let match_tmpl = JsonTemplate {
+        path: Vec::new(),
+        map: false,
+        locals: Vec::new(),
+        require: Vec::new(),
+        match_src: Some(vec![JsonKey::Key("url".into())]),
+        local_match_guard: None,
+        guards: Vec::new(),
+        render: JsonRender::Template(vec![
+            JsonPart::Cap(2),
+            JsonPart::Lit(",".into()),
+            JsonPart::Cap(1),
+        ]),
+    };
+    let Ok(versions) = json_template_versions(&match_tmpl, &root, &rp) else {
+        panic!("template eval failed");
+    };
+    assert_eq!(versions, vec!["8,9"]);
+}
+
+/// r447: xml template evaluation over a mini DOM
+/// (plist key/next-element locals + CSV render;
+/// attr predicate map).
+#[test]
+fn xml_template_eval() {
+    use super::super::super::formula::{
+        XmlLocal, XmlMap, XmlPart, XmlPathQ, XmlPred, XmlProj, XmlRender, XmlStep, XmlTemplate,
+    };
+    let doc = "<plist><dict><key>version</key><string> 7.1 </string><key>build</key><string>99</string></dict></plist>";
+    let key = |v: &str| XmlLocal {
+        path: XmlPathQ {
+            absolute: false,
+            steps: vec![
+                XmlStep {
+                    tag: "dict".into(),
+                    pred: None,
+                },
+                XmlStep {
+                    tag: "key".into(),
+                    pred: Some(XmlPred::TextEq(v.into())),
+                },
+            ],
+        },
+        next: true,
+    };
+    let rp = RunPlan {
+        strat: Strat::Xml,
+        url: String::new(),
+        re: None,
+        candidates: Vec::new(),
+        strategy_url: None,
+        ua: None,
+        ua_option: None,
+        ua_symbol: false,
+        gnome_filter: false,
+        json: None,
+        xml: None,
+        yaml: None,
+        page_block: None,
+        ghrel_block: None,
+        git: None,
+        sparkle_block: None,
+        header_block: None,
+        latest: None,
+        post_form: None,
+        post_json: None,
+        headers: Vec::new(),
+        major_minor: String::new(),
+        plist: None,
+        apps: Vec::new(),
+        uncompressed: false,
+    };
+    let tmpl = XmlTemplate {
+        locals: vec![key("version"), key("build")],
+        require: vec![0, 1],
+        match_local: None,
+        map: None,
+        render: XmlRender::Template(vec![
+            XmlPart::LocalStrip(0),
+            XmlPart::Lit(",".into()),
+            XmlPart::LocalStrip(1),
+        ]),
+    };
+    assert_eq!(
+        xml_template_versions(&tmpl, doc, &rp).unwrap(),
+        vec!["7.1,99"]
+    );
+    let doc = "<feed><entry v=\"1.0\"/><entry v=\"2.0\"/></feed>";
+    let tmpl = XmlTemplate {
+        locals: Vec::new(),
+        require: Vec::new(),
+        match_local: None,
+        map: Some(XmlMap {
+            path: XmlPathQ {
+                absolute: false,
+                steps: vec![XmlStep {
+                    tag: "entry".into(),
+                    pred: None,
+                }],
+            },
+            proj: XmlProj::Attr("v".into()),
+            grep: false,
+            locals: Vec::new(),
+        }),
+        render: XmlRender::Projection,
+    };
+    assert_eq!(
+        xml_template_versions(&tmpl, doc, &rp).unwrap(),
+        vec!["1.0", "2.0"]
+    );
 }

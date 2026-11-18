@@ -10,5 +10,6 @@
 /// same release; [`crate::rustup::stock_pin`] holds it to the engine gate's wasm32 clause. No dev
 /// lane falls back to rustup's floating `stable`, whose release is whatever a machine last
 /// installed: one tree's verdict would then differ from one Mac to the next. (The release chain's
-/// own slices, and the lanes that rehearse them, still build on `stable`.)
+/// own slices, and the lanes that rehearse them, build on another pin: the `[stock] toolchain` of
+/// the checkout's `trust.lock`, never `stable` either.)
 pub const STOCK_PIN: &str = "1.97.1";

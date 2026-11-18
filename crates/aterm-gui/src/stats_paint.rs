@@ -366,13 +366,7 @@ pub(crate) fn marks_of(view: &aterm_vitals::jobs::JobsView) -> Vec<StatsMark> {
     let count = |v: Verdict| {
         u32::try_from(view.rows.iter().filter(|r| r.verdict == v).count()).unwrap_or(u32::MAX)
     };
-    let zombies: u32 = view
-        .findings
-        .zombies
-        .iter()
-        .filter(|z| z.tab.is_some())
-        .map(|z| z.count)
-        .sum();
+    let zombies: u32 = view.findings.zombies.iter().map(|z| z.count).sum();
     let quiet_frac = view
         .rows
         .iter()

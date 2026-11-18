@@ -139,8 +139,12 @@ fn fixture_row(
     }
 }
 
+/// A rustup that holds the stock pin with every cell's std, the release chain's toolchain
+/// `release` with its slice's std, and rustup's floating `stable` with that std too (which no
+/// row may take for the release chain's), and changes nothing.
 struct Provisioned {
     pin: String,
+    release: String,
 }
 
 impl stock::Rustup for Provisioned {
@@ -154,11 +158,18 @@ impl stock::Rustup for Provisioned {
         let a: Vec<&str> = args.iter().map(String::as_str).collect();
         let host = aterm_toolchain::rustup::NATIVE_TRIPLE;
         Ok(match (a.as_slice(), toolchain) {
-            (["toolchain", "list"], _) => format!("stable-{host}\n{}-{host}\n", self.pin),
+            (["toolchain", "list"], _) => {
+                format!(
+                    "stable-{host}\n{}-{host}\n{}-{host}\n",
+                    self.pin, self.release
+                )
+            }
             (["target", "list", "--installed"], Some(pin)) if pin == self.pin => {
                 CELL_TARGETS.join("\n")
             }
-            (["target", "list", "--installed"], Some(stock::RELEASE_TOOLCHAIN)) => {
+            (["target", "list", "--installed"], Some(held))
+                if held == self.release || held == "stable" =>
+            {
                 stock::RELEASE_TARGETS.join("\n")
             }
             (["target", "list", "--installed"], _) => String::new(),
@@ -255,6 +266,10 @@ impl Fake {
             zip_links: Vec::new(),
             rustup: Provisioned {
                 pin: stock::stock_pin(&repo()).expect("the tree's stock pin"),
+                release: stock::release_toolchain(&repo(), true)
+                    .ok()
+                    .flatten()
+                    .expect("the tree's locked release"),
             },
             bare: None,
         }
@@ -1753,9 +1768,9 @@ fn the_rustup_row_places_a_stamped_copy_and_never_self_installs() {
     let mut host = Fake::new().serve(&served, init.clone());
     host.bare = Some(Bare::default());
     let mut said = Vec::new();
-    assert_eq!(
-        provide(&row, &m, &host, &mut |l| said.push(l.to_string())),
-        State::Placed(copy.clone())
+    assert!(
+        matches!(provide(&row, &m, &host, &mut |l| said.push(l.to_string())), State::Failed(ref why) if why.contains("still missing")),
+        "placing the driver cannot make a no-op provider ready",
     );
     assert!(complete(&t), "the copy and its stamp");
     let stamp = place::read_stamp(&t.dir).unwrap();
@@ -1858,9 +1873,13 @@ fn rustup_init_is_pinned_for_every_host_rustup_serves() {
     assert_eq!(init.len(), 4);
 }
 
-/// A public snapshot (no `publish/`) rides the stock pin as the checkout does, so a machine that
-/// holds it finds the row in place; an engine gate that is refused, or that names another release,
-/// is named by the probe and fails a run, never read as naming no pin.
+/// A public snapshot (no `publish/`, no `trust.lock`) rides the stock pin as the checkout does
+/// and has no release-chain part, so a machine that holds the pin finds the row in place and a
+/// run says why it asked nothing of the release chain; a release host (`--release`) refuses that
+/// lockless checkout. An engine gate that is refused, or that names another release, is named by
+/// the probe and fails a run, never read as naming no pin. NEGATIVE CONTROL: a row that refuses
+/// every lockless checkout fails a public clone's `verify provision` for good, and the first
+/// assertion fails.
 #[test]
 fn a_tree_without_publish_rides_the_stock_pin_and_a_gate_that_disagrees_is_named() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -1873,7 +1892,32 @@ fn a_tree_without_publish_rides_the_stock_pin_and_a_gate_that_disagrees_is_named
     let host = Fake::new();
     let copy = target(row, &m).map(|t| t.dir.join(&t.exe)).unwrap();
     assert_eq!(check(row, &m, &host), State::Present(copy.clone()));
-    assert_eq!(provide(row, &m, &host, &mut |_| {}), State::Present(copy));
+    let mut said = Vec::new();
+    assert_eq!(
+        provide(row, &m, &host, &mut |l| said.push(l.to_string())),
+        State::Present(copy)
+    );
+    assert!(
+        said.iter()
+            .any(|l| l.starts_with("note: ") && l.contains("carries no trust.lock")),
+        "the run says it asked nothing of the release chain: {said:#?}"
+    );
+    let release = parse(&["--release".to_string()]).unwrap();
+    match check_for(row, &release, &m, &host) {
+        State::Missing(why) => assert!(
+            why.contains("carries no trust.lock") && why.contains("a release host builds them"),
+            "{why}"
+        ),
+        other => panic!("a release host refuses a lockless checkout: {other:?}"),
+    }
+    match provide_for(row, &release, &m, &host, &mut |_| {}) {
+        State::Failed(why) => assert!(
+            why.contains("the release chain's stock toolchain is not acquired")
+                && why.contains("carries no trust.lock"),
+            "{why}"
+        ),
+        other => panic!("a release host refuses a lockless checkout: {other:?}"),
+    }
 
     std::fs::create_dir_all(public.join("publish")).unwrap();
     for (gate, said) in [
@@ -1902,6 +1946,123 @@ fn a_tree_without_publish_rides_the_stock_pin_and_a_gate_that_disagrees_is_named
             ),
             other => panic!("{other:?}"),
         }
+    }
+}
+
+/// THE RELEASE CHAIN'S TOOLCHAIN IS THE RELEASE THE CHECKOUT'S LOCK NAMES: a checkout whose
+/// `trust.lock` names a release this rustup lacks gets that release planned for install by name,
+/// with the release's slice stds (named by the probe, asked by a run); one that names the release
+/// this rustup holds gets nothing; a lock with no `[stock] toolchain` is refused with what it
+/// lacks named; one that carries no lock has no release-chain part, so a run asks nothing of the
+/// release chain and nothing of rustup's `stable` for it, and a release host (`--release`)
+/// refuses it. NEGATIVE CONTROL: this rustup holds `stable` with the slice's std, so a row that
+/// took `stable` for the release chain's finds the absent release in place and the first
+/// assertion fails; one that fell back to `stable` without a lock passes the release host and
+/// the last ones fail.
+#[test]
+fn the_rustup_row_puts_the_locks_release_in_place_and_a_release_host_refuses_a_lockless_checkout() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let mut m = machine(home.path());
+    all_in_place(&m);
+    let row = super::row("rustup").unwrap();
+    let host = Fake::new();
+    let checkout = home.path().join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    m.repo = checkout.clone();
+    let lock = |release: &str| {
+        let mut lock = aterm_toolchain::trust_lock::read(&repo().join("trust.lock")).unwrap();
+        lock.stock_toolchain = release.to_string();
+        std::fs::write(
+            checkout.join("trust.lock"),
+            aterm_toolchain::trust_lock::render_body(&lock),
+        )
+        .unwrap();
+    };
+    let held = stock::release_toolchain(&repo(), true).unwrap().unwrap();
+    assert_ne!(held, "1.88.0");
+    lock("1.88.0");
+    assert_eq!(
+        stock::release_toolchain(&checkout, false),
+        Ok(Some("1.88.0".to_string()))
+    );
+    let install = format!(
+        "rustup toolchain install 1.88.0 --profile minimal {}--no-self-update",
+        stock::RELEASE_TARGETS
+            .iter()
+            .map(|t| format!("--target {t} "))
+            .collect::<String>()
+    );
+    match check(row, &m, &host) {
+        State::Missing(why) => assert!(
+            why.ends_with(&format!("a run would {install}")),
+            "only the lock's release is lacking: {why}"
+        ),
+        other => panic!("the lock's absent release is planned for install: {other:?}"),
+    }
+    match provide(row, &m, &host, &mut |_| {}) {
+        State::Failed(why) => assert!(
+            why.contains(&format!("/rustup {}` failed", &install["rustup ".len()..])),
+            "a run asks for the lock's release by name: {why}"
+        ),
+        other => panic!("{other:?}"),
+    }
+
+    lock(&held);
+    let copy = target(row, &m).map(|t| t.dir.join(&t.exe)).unwrap();
+    assert_eq!(check(row, &m, &host), State::Present(copy.clone()));
+    assert_eq!(
+        provide(row, &m, &host, &mut |_| {}),
+        State::Present(copy.clone())
+    );
+
+    let body = std::fs::read_to_string(checkout.join("trust.lock")).unwrap();
+    let without_stock = body.split("\n[stock]").next().unwrap();
+    assert_ne!(without_stock, body);
+    std::fs::write(checkout.join("trust.lock"), format!("{without_stock}\n")).unwrap();
+    match check(row, &m, &host) {
+        State::Missing(why) => assert!(
+            why.contains("the release chain's stock toolchain") && why.contains("stock.toolchain"),
+            "a lock that names no stock release is refused, never read as none: {why}"
+        ),
+        other => panic!("{other:?}"),
+    }
+
+    std::fs::remove_file(checkout.join("trust.lock")).unwrap();
+    assert_eq!(
+        stock::release_toolchain(&checkout, false),
+        Ok(None),
+        "a lockless checkout has no release-chain part"
+    );
+    assert_eq!(check(row, &m, &host), State::Present(copy.clone()));
+    let mut said = Vec::new();
+    assert_eq!(
+        provide(row, &m, &host, &mut |l| said.push(l.to_string())),
+        State::Present(copy)
+    );
+    assert!(
+        said.iter()
+            .any(|l| l.starts_with("note: ") && l.contains("carries no trust.lock")),
+        "{said:#?}"
+    );
+    assert!(!said.iter().any(|l| l.contains("stable")), "{said:#?}");
+    let release = parse(&["--release".to_string()]).unwrap();
+    match check_for(row, &release, &m, &host) {
+        State::Missing(why) => assert!(
+            why.contains("the release chain's stock toolchain")
+                && why.contains("carries no trust.lock"),
+            "{why}"
+        ),
+        other => {
+            panic!("a release host refuses a lockless checkout, never read as stable: {other:?}")
+        }
+    }
+    match provide_for(row, &release, &m, &host, &mut |_| {}) {
+        State::Failed(why) => assert!(
+            why.contains("the release chain's stock toolchain is not acquired")
+                && why.contains("carries no trust.lock"),
+            "{why}"
+        ),
+        other => panic!("{other:?}"),
     }
 }
 
@@ -2667,5 +2828,24 @@ fn the_kernel_rows_stamp_is_the_one_the_lane_holds_it_to() {
             aterm_vz::pins::RELEASE
         ),
         aterm_vz::pins::kernel_stamp_sha256()
+    );
+}
+
+/// Successful child exits cannot establish requirements that the driver still lacks.
+#[test]
+fn cached_rustup_successful_noop_cannot_report_missing_requirements_ready() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let m = machine(home.path());
+    all_in_place(&m);
+    let mut host = Fake::new();
+    host.bare = Some(Bare::default());
+    let state = provide(super::row("rustup").unwrap(), &m, &host, &mut |_| {});
+    assert!(
+        matches!(state, State::Failed(ref why) if why.contains("still missing")),
+        "zero exits with unchanged empty listings are not readiness: {state:?}",
+    );
+    assert!(
+        host.fetched.borrow().is_empty(),
+        "the cached driver is not recopied",
     );
 }

@@ -11,7 +11,31 @@ use crate::{RestrictedNativeImage, readonly_image, restrict_current_to_readonly_
 
 const CENSUS_CAPACITY: usize = 1024;
 
+mod bootstrap_port;
 mod registered_ports;
+
+/// Revoke the current task's registered inheritance stash and bootstrap
+/// special-port slot/cache, including current local SEND references to those
+/// actual names. Overlap is retained until both kernel stashes are cleared.
+/// Blockable signals remain blocked. This is a local capability restriction,
+/// not a seal, owner, service-closure observation or execution permission.
+/// Other special/exception ports and ways to reacquire authority
+/// remain separate obligations; there is no general Mach capability claim.
+///
+/// # Safety
+/// Call only in a dedicated trusted sole-main-thread entry before untrusted
+/// code. Its bootstrap and registered references must be disposable, with no
+/// concurrent Mach mutator or Rust owner of them. Every error, including partial revocation,
+/// requires termination under the outside native owner; never retry, restore
+/// signals/ports, or fall back to an ordinary payload after failure.
+pub unsafe fn revoke_current_bootstrap_and_registered_ports() -> io::Result<()> {
+    single_main_thread()?;
+    block_signals()?;
+    let bootstrap = bootstrap_port::Captured::capture()?;
+    registered_ports::revoke_with_bootstrap(Some(&bootstrap))?;
+    bootstrap.revoke()?;
+    single_main_thread()
+}
 
 /// Retains exactly the one control endpoint and read-only loader image. This
 /// local guard authenticates neither the image bytes nor a complete runtime.
@@ -76,13 +100,18 @@ pub unsafe fn restrict_current_native_entry(
     }
     // SAFETY: read back flags on the same retained endpoint before census.
     if unsafe { libc::fcntl(control.as_raw_fd(), libc::F_GETFL) } != flags | libc::O_NONBLOCK {
-        return Err(invalid("native entry control nonblocking setup did not persist"));
+        return Err(invalid(
+            "native entry control nonblocking setup did not persist",
+        ));
     }
     let retained = [control.as_raw_fd(), image.as_raw_fd()];
     if retained[0] == retained[1] {
         return Err(invalid("native entry roles must have distinct descriptors"));
     }
-    let identities = [Identity::capture(retained[0])?, Identity::capture(retained[1])?];
+    let identities = [
+        Identity::capture(retained[0])?,
+        Identity::capture(retained[1])?,
+    ];
     block_signals()?;
     registered_ports::revoke()?;
     close_ambient(retained, identities)?;
@@ -104,7 +133,9 @@ fn close_ambient(retained: [RawFd; 2], identities: [Identity; 2]) -> io::Result<
     let before = census()?;
     for fd in retained {
         if !before.as_slice().contains(&fd) {
-            return Err(invalid("native entry retained descriptor absent from kernel census"));
+            return Err(invalid(
+                "native entry retained descriptor absent from kernel census",
+            ));
         }
     }
     for &fd in before.as_slice() {
@@ -121,13 +152,17 @@ fn close_ambient(retained: [RawFd; 2], identities: [Identity; 2]) -> io::Result<
     if after.len != retained.len() || after.as_slice().iter().any(|fd| !retained.contains(fd)) {
         return Err(invalid("native entry retained descriptor set changed"));
     }
-    if [Identity::capture(retained[0])?, Identity::capture(retained[1])?] != identities {
+    if [
+        Identity::capture(retained[0])?,
+        Identity::capture(retained[1])?,
+    ] != identities
+    {
         return Err(invalid("native entry retained descriptor identity changed"));
     }
     Ok(())
 }
 
-fn single_main_thread() -> io::Result<()> {
+pub(super) fn single_main_thread() -> io::Result<()> {
     let mut info = MaybeUninit::<libc::proc_taskinfo>::uninit();
     // SAFETY: query only our own task into complete native writable storage.
     let written = unsafe {
@@ -166,13 +201,21 @@ fn validate_control(control: &UnixStream, expected_parent: u32) -> io::Result<()
     let mut length = size_of::<i32>() as libc::socklen_t;
     // SAFETY: complete writable native integer and length, retained descriptor.
     if unsafe {
-        libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_TYPE, (&raw mut kind).cast(), &mut length)
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&raw mut kind).cast(),
+            &mut length,
+        )
     } != 0
     {
         return Err(io::Error::last_os_error());
     }
     if length as usize != size_of::<i32>() || kind != libc::SOCK_STREAM {
-        return Err(invalid("native entry control must be a connected Unix stream"));
+        return Err(invalid(
+            "native entry control must be a connected Unix stream",
+        ));
     }
     let mut address = MaybeUninit::<libc::sockaddr_un>::zeroed();
     let mut length = size_of::<libc::sockaddr_un>() as libc::socklen_t;
@@ -185,7 +228,9 @@ fn validate_control(control: &UnixStream, expected_parent: u32) -> io::Result<()
         || length as usize > size_of::<libc::sockaddr_un>()
         || unsafe { address.assume_init() }.sun_family != libc::AF_UNIX as libc::sa_family_t
     {
-        return Err(invalid("native entry control must be a connected Unix stream"));
+        return Err(invalid(
+            "native entry control must be a connected Unix stream",
+        ));
     }
     let mut peer = 0_i32;
     let mut length = size_of::<i32>() as libc::socklen_t;
@@ -203,7 +248,9 @@ fn validate_control(control: &UnixStream, expected_parent: u32) -> io::Result<()
         || unsafe { libc::getppid() } != expected
         || uid != unsafe { libc::geteuid() }
     {
-        return Err(invalid("native entry control does not belong to its expected parent/euid"));
+        return Err(invalid(
+            "native entry control does not belong to its expected parent/euid",
+        ));
     }
     Ok(())
 }
@@ -254,7 +301,10 @@ impl Census {
 }
 
 fn census() -> io::Result<Census> {
-    let mut entries = [libc::proc_fdinfo { proc_fd: 0, proc_fdtype: 0 }; CENSUS_CAPACITY];
+    let mut entries = [libc::proc_fdinfo {
+        proc_fd: 0,
+        proc_fdtype: 0,
+    }; CENSUS_CAPACITY];
     // SAFETY: bounded complete storage, own-process query only. A full or
     // malformed response is refused rather than interpreted as complete.
     let written = unsafe {
@@ -274,7 +324,10 @@ fn census() -> io::Result<Census> {
         .ok_or_else(|| {
             io::Error::other("native entry descriptor census unavailable or truncated")
         })?;
-    let mut census = Census { descriptors: [0; CENSUS_CAPACITY], len: 0 };
+    let mut census = Census {
+        descriptors: [0; CENSUS_CAPACITY],
+        len: 0,
+    };
     for entry in &entries[..written / size_of::<libc::proc_fdinfo>()] {
         if entry.proc_fd < 0 || census.as_slice().contains(&entry.proc_fd) {
             return Err(io::Error::other("native entry descriptor census malformed"));

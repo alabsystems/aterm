@@ -2,6 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! Autonomous headless browser OAuth authorizer over Chrome DevTools Protocol (CDP) pipes.
+//!
+//! Traced by the accounts keeper: what this file reads of the file system itself, it reads
+//! through `aterm_uds::trace::fs` (census `traced-reads`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -12,6 +15,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel}
 use std::time::{Duration, Instant};
 
 use aterm_json::{Value, json};
+use aterm_uds::trace;
 
 #[path = "google_mail_auth.rs"]
 mod google_mail_auth;
@@ -1933,14 +1937,14 @@ fn mailbox_aliases(
             });
         }
     };
-    for path in claude_rosters.iter().filter(|p| p.is_file()) {
+    for path in claude_rosters.iter().filter(|p| trace::fs::is_file(p)) {
         if let Ok(roster) = super::accounts::Roster::load(path) {
             for row in &roster.rows {
                 note(true, &row.label, row.email.as_deref());
             }
         }
     }
-    for (cli, path) in cli_rosters.iter().filter(|(_, p)| p.is_file()) {
+    for (cli, path) in cli_rosters.iter().filter(|(_, p)| trace::fs::is_file(p)) {
         if let Ok(roster) = super::accounts::Roster::load_for(*cli, path) {
             for row in &roster.rows {
                 note(false, &row.label, row.email.as_deref());
@@ -2198,7 +2202,10 @@ fn discover_mailbox_config_sources(
         merge_vault_mailbox_secrets(h, &mut cfg);
     }
     if cfg.dir.is_none() {
-        cfg.dir = files.default_dirs.into_iter().find(|dir| dir.is_dir());
+        cfg.dir = files
+            .default_dirs
+            .into_iter()
+            .find(|dir| trace::fs::is_dir(dir));
     }
     if cfg.seen_file.is_none() {
         cfg.seen_file = store_dir
@@ -2489,7 +2496,7 @@ fn apply_mailbox_aliases(cfg: &mut MailboxConfig, aliases: &[MailboxAlias]) {
 }
 
 fn default_seen_file_for_path(path: &Path) -> PathBuf {
-    if path.is_file()
+    if trace::fs::is_file(path)
         && let Some(parent) = path.parent()
         && let Some(name) = path.file_name()
     {
@@ -2776,10 +2783,10 @@ pub(super) fn browser_cache_roots_with(
 /// `chrome-headless-shell-*` directory (by name) that holds one, the browser lane's
 /// (`verify provision`) or the harness's own ([`super::headless_fetch`]).
 pub(super) fn shell_in(root: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(root).ok()?;
+    let entries = trace::fs::read_dir(root).ok()?;
     let mut dirs: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
-        .map(|e| e.path())
+        .iter()
+        .map(std::fs::DirEntry::path)
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
@@ -2797,7 +2804,7 @@ pub(super) fn shell_in(root: &Path) -> Option<PathBuf> {
     for dir in dirs {
         for sub in &subs {
             let candidate = dir.join(sub);
-            if candidate.is_file() {
+            if trace::fs::is_file(&candidate) {
                 return Some(candidate);
             }
         }
@@ -2822,7 +2829,7 @@ pub(super) fn find_headless_browser_with(
 ) -> Option<HeadlessBrowser> {
     if let Some(named) = env(BROWSER_BIN_ENV).filter(|v| !v.is_empty()) {
         let path = PathBuf::from(named);
-        if path.is_file() {
+        if trace::fs::is_file(&path) {
             return Some(HeadlessBrowser {
                 is_headless_shell: is_shell_binary(&path),
                 path,
@@ -2845,7 +2852,7 @@ pub(super) fn find_headless_browser_with(
         ];
         for app in apps {
             let sys = Path::new("/Applications").join(app);
-            if system && sys.is_file() {
+            if system && trace::fs::is_file(&sys) {
                 return Some(HeadlessBrowser {
                     path: sys,
                     is_headless_shell: false,
@@ -2853,7 +2860,7 @@ pub(super) fn find_headless_browser_with(
             }
             if let Some(h) = home {
                 let usr = h.join("Applications").join(app);
-                if usr.is_file() {
+                if trace::fs::is_file(&usr) {
                     return Some(HeadlessBrowser {
                         path: usr,
                         is_headless_shell: false,
@@ -2871,7 +2878,7 @@ pub(super) fn find_headless_browser_with(
                 "google-chrome-stable",
             ] {
                 let candidate = dir.join(name);
-                if candidate.is_file() {
+                if trace::fs::is_file(&candidate) {
                     return Some(HeadlessBrowser {
                         is_headless_shell: is_shell_binary(&candidate),
                         path: candidate,
@@ -2945,8 +2952,8 @@ fn exact_email_profile_dir(store_dir: &Path, email: &str) -> PathBuf {
 #[must_use]
 pub fn has_browser_profile(store_dir: &Path, label: &str, email: Option<&str>) -> bool {
     let dir = resolve_browser_profile_dir(store_dir, Some(label), email);
-    dir.is_dir()
-        && std::fs::symlink_metadata(dir.join(PROFILE_UNPROVEN_MARK))
+    trace::fs::is_dir(&dir)
+        && trace::fs::symlink_metadata(dir.join(PROFILE_UNPROVEN_MARK))
             .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 
@@ -2979,12 +2986,12 @@ pub fn resolve_browser_profile_dir(
     let base_email = email.and_then(strip_email_subaddress);
     if let Some(em) = email {
         let exact_dir = exact_email_profile_dir(store_dir, em);
-        if exact_dir.is_dir() {
+        if trace::fs::is_dir(&exact_dir) {
             return exact_dir;
         }
         if let Some(base) = base_email.as_deref() {
             let base_dir = browser_profile_dir(store_dir, Some(base));
-            if base_dir.is_dir() {
+            if trace::fs::is_dir(&base_dir) {
                 return base_dir;
             }
         }
@@ -2992,7 +2999,7 @@ pub fn resolve_browser_profile_dir(
     if let Some(lbl) = label {
         for candidate in [lbl.to_owned(), lbl.replace('_', "-"), lbl.replace('-', "_")] {
             let dir = browser_profile_dir(store_dir, Some(&candidate));
-            if dir.is_dir() {
+            if trace::fs::is_dir(&dir) {
                 return dir;
             }
         }
@@ -3001,7 +3008,7 @@ pub fn resolve_browser_profile_dir(
         && let Some(derived) = derive_account_label_from_email(em)
     {
         let dir = browser_profile_dir(store_dir, Some(&derived));
-        if dir.is_dir() {
+        if trace::fs::is_dir(&dir) {
             return dir;
         }
     }
@@ -3040,7 +3047,7 @@ pub fn vendor_profile_dir(store_dir: &Path, label_key: &str, email: Option<&str>
     };
     let own = vendors.join(&key);
     let claudes = store_dir.join(BROWSER_PROFILES_DIR).join(&key);
-    if exact && !own.is_dir() && claudes.is_dir() {
+    if exact && !trace::fs::is_dir(&own) && trace::fs::is_dir(&claudes) {
         claudes
     } else {
         own
@@ -3170,7 +3177,7 @@ fn prepare_browser_profile_with(
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "profile has no parent")
     })?;
     aterm_types::fs_restricted::ensure_private_dir(parent)?;
-    match std::fs::metadata(dir) {
+    match trace::fs::metadata(dir) {
         Ok(metadata) if metadata.is_dir() => {
             return aterm_types::fs_restricted::ensure_private_dir(dir);
         }
@@ -3190,7 +3197,7 @@ fn prepare_browser_profile_with(
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            if !std::fs::metadata(dir)?.is_dir() {
+            if !trace::fs::metadata(dir)?.is_dir() {
                 return Err(e);
             }
             aterm_types::fs_restricted::ensure_private_dir(dir)
@@ -5807,7 +5814,7 @@ fn maildir_base(name: &str) -> &str {
 fn clicked_marker_for(mailbox_dir: &Path, path: &Path) -> Option<PathBuf> {
     let name = path.file_name()?.to_string_lossy();
     let parent = path.parent().unwrap_or(mailbox_dir);
-    if mailbox_dir.is_file() || parent == mailbox_dir {
+    if trace::fs::is_file(mailbox_dir) || parent == mailbox_dir {
         return Some(parent.join(format!("{name}.clicked")));
     }
     let base_name = maildir_base(&name);
@@ -5852,8 +5859,8 @@ fn scan_maildir_once_by(
 ) -> Option<MailboxCredential> {
     auth_budget_ready(deadline)?;
     let mut candidates: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
-    if mailbox_dir.is_file()
-        && let Ok(meta) = mailbox_dir.metadata()
+    if trace::fs::is_file(mailbox_dir)
+        && let Ok(meta) = trace::fs::metadata(mailbox_dir)
         && meta.len() > 0
     {
         let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
@@ -5866,7 +5873,7 @@ fn scan_maildir_once_by(
             "{}.clicked",
             path.file_name().unwrap_or_default().to_string_lossy()
         ));
-        if (is_mbox_ext || !clicked_marker.exists())
+        if (is_mbox_ext || !trace::fs::exists(&clicked_marker))
             && !tried.contains(&(path.clone(), meta.len(), mtime))
         {
             candidates.push((mtime, meta.len(), path));
@@ -5878,10 +5885,10 @@ fn scan_maildir_once_by(
         mailbox_dir.join("cur"),
     ];
     for dir in &dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else {
+        let Ok(entries) = trace::fs::read_dir(dir) else {
             continue;
         };
-        candidates.extend(entries.filter_map(Result::ok).filter_map(|e| {
+        candidates.extend(entries.into_iter().filter_map(|e| {
             let path = e.path();
             let name = e.file_name();
             let name_str = name.to_string_lossy();
@@ -5896,10 +5903,12 @@ fn scan_maildir_once_by(
             let base_name = maildir_base(&name_str);
             let clicked_marker = dir.join(format!("{name_str}.clicked"));
             let base_marker = mailbox_dir.join(format!("{base_name}.clicked"));
-            if !is_mbox_ext && (clicked_marker.exists() || base_marker.exists()) {
+            if !is_mbox_ext
+                && (trace::fs::exists(&clicked_marker) || trace::fs::exists(&base_marker))
+            {
                 return None;
             }
-            let meta = e.metadata().ok()?;
+            let meta = trace::fs::symlink_metadata(&path).ok()?;
             if !meta.is_file() || meta.len() == 0 {
                 return None;
             }
@@ -5910,7 +5919,8 @@ fn scan_maildir_once_by(
             Some((mtime, meta.len(), path))
         }));
     }
-    if candidates.is_empty() && !mailbox_dir.is_dir() && !mailbox_dir.is_file() {
+    if candidates.is_empty() && !trace::fs::is_dir(mailbox_dir) && !trace::fs::is_file(mailbox_dir)
+    {
         return None;
     }
     candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
@@ -7669,10 +7679,7 @@ fn poll_webmail_until(
             if deadline.expired() {
                 return Err("timed out waiting for verification email in webmail inbox");
             }
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            let now_secs = aterm_time::unix_secs().unwrap_or_default();
             let totp_code = totp_secret
                 .as_deref()
                 .and_then(|s| generate_totp_at(s, now_secs));
@@ -8916,10 +8923,8 @@ fn drive_cdp_oauth_flow_until(
                         }
                         return Err("Google requires an unavailable authenticator code");
                     };
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_err(|_| "System time is unavailable for Google authentication")?
-                        .as_secs();
+                    let now = aterm_time::unix_secs()
+                        .ok_or("System time is unavailable for Google authentication")?;
                     otp_code = Some(
                         generate_totp_at(secret.expose(), now)
                             .ok_or("Stored Google authenticator configuration is invalid")?,
@@ -11342,8 +11347,12 @@ pub struct VendorApprover {
     pub shared_dir: PathBuf,
     /// The profile's key where the row names no email.
     pub label_key: String,
-    /// `aterm harness accounts browser <label> --cli <id>`, which a stop on the vendor's sign-in
-    /// page names; none where a renewal cannot approve the CLI's page headlessly
+    /// `aterm harness accounts browser <account> --cli <id>`, which a stop on the vendor's sign-in
+    /// page names, the account named by the word its caller names the row by among the roster
+    /// ([`super::login_drive::Request::word`]), else by its key
+    /// ([`super::account_names::key_word_of_row`]: a caller with no roster, and a key names its
+    /// account whatever another row here is labelled); none where a renewal cannot approve the
+    /// CLI's page headlessly
     /// ([`crate::ai::connector::Cli::renews_headlessly`]: Grok Build's), since signing the
     /// profile in does not get it past the vendor's block page.
     pub sign_in_once: Option<String>,
@@ -11436,15 +11445,18 @@ impl VendorApprover {
         }
     }
 
-    /// The approver for `label` (of `cli`'s pool) with `email`, under `shared_dir`.
+    /// The approver for `cli`'s roster row `row` (its label and its email), under `shared_dir`,
+    /// whose stop names the row by `word`, the word its caller's lines name it by among the
+    /// roster ([`super::login_drive::Request::word`]), else (`None`: a caller with no roster) by
+    /// its account's key ([`super::account_names::key_word_of_row`]).
     #[must_use]
     pub fn new(
         cli: super::accounts::Cli,
-        label: &str,
-        email: Option<&str>,
+        (row, word): (&super::accounts::Row, Option<&super::account_names::Word>),
         shared_dir: &Path,
         home: Option<&Path>,
     ) -> VendorApprover {
+        let (label, email) = (row.label.as_str(), row.email.as_deref());
         let label_key = vendor_label_key(cli, label);
         let senders = cli.accounts().mail_senders;
         let found = discover_mailbox_config(home, Some(shared_dir)).map(|mut cfg| {
@@ -11474,9 +11486,14 @@ impl VendorApprover {
             google_account: (cli, label.to_owned()),
             shared_dir: shared_dir.to_path_buf(),
             label_key,
-            sign_in_once: cli
-                .renews_headlessly()
-                .then(|| super::accounts_step::Step::Browser(cli, label.to_owned()).to_string()),
+            sign_in_once: cli.renews_headlessly().then(|| {
+                super::accounts_step::Step::Browser(
+                    cli,
+                    word.cloned()
+                        .unwrap_or_else(|| super::account_names::key_word_of_row(cli, row)),
+                )
+                .to_string()
+            }),
             mailbox,
             mailbox_source,
             mailbox_unready,

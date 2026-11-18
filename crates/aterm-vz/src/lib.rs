@@ -42,7 +42,11 @@
 //! whose actions the core, the client, the run files and the layers carry as anchors in test
 //! and debug builds, bound by `tests/conformance_lifecycle.rs`; `fault` holds its negative
 //! controls' planted defects, and `lifecycle` the steps that are the world's or the lab's.
+//!
+//! It is Unix's, as its guest agent's library ([`aterm_vz_agent`]) is: every dependent takes
+//! it on Unix only (the lab on macOS, `verify provision --linux`), and on Windows it is empty.
 
+#![cfg(unix)]
 #![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
 #[cfg(unix)]

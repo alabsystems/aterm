@@ -508,146 +508,170 @@ fn run_one(
 ) -> (ItemReport, bool) {
     let mut row = blank(item);
     let mut last = item.probe();
-    match last.clone() {
-        Probe::Ok { now } => {
-            row.to = Some(now.clone());
-            let recorded = if mode == Mode::Apply && hold.is_none() && item.refresh_changes() {
-                journal
-                    .before_change(&row.id, &now, &now, item.revert().as_deref())
-                    .map_err(|why| format!("not refreshed: the journal refused the record ({why})"))
-            } else {
-                Ok(())
-            };
-            if let Err(why) = recorded {
-                row.outcome = Outcome::Failed;
-                last = Probe::Blocked { why: why.clone() };
-                row.why = Some(why);
-            } else if mode == Mode::Apply
-                && hold.is_none()
-                && let Some(refreshed) = item.refresh()
-            {
-                match refreshed {
-                    Err(why) => {
-                        row.outcome = Outcome::Failed;
-                        last = Probe::Unusable { why: why.clone() };
-                        row.why = Some(why);
-                    }
-                    // A refresh that stood aside did not run: blocked with its kind, as a
-                    // stood-aside apply is, and not read back.
-                    Ok(()) if let Some(aside) = item.stood_aside() => {
-                        row.outcome = Outcome::Blocked;
-                        row.why = Some(aside.why().to_owned());
-                        row.stood_aside = Some(aside);
-                    }
-                    Ok(()) => {
-                        let back = item.probe();
-                        match &back {
-                            Probe::Ok { now } => row.to = Some(now.clone()),
-                            Probe::Change { from, .. } => {
-                                row.outcome = Outcome::Failed;
-                                row.why = Some(format!("refreshed, but it still reads {from}"));
-                            }
-                            Probe::Unusable { why }
-                            | Probe::Blocked { why }
-                            | Probe::Waits { why, .. }
-                            | Probe::NotApplicable { why }
-                            | Probe::Deferred { why }
-                            | Probe::Person { how: why, .. } => {
-                                row.outcome = Outcome::Failed;
-                                row.why = Some(format!("refreshed, but the read-back says: {why}"));
-                            }
-                        }
-                        last = back;
-                    }
-                }
-            }
-        }
-        Probe::Person { step, how } => {
-            row.outcome = Outcome::Person;
-            row.to = Some(step);
-            row.why = Some(how);
-        }
-        Probe::Blocked { why } => {
-            row.outcome = Outcome::Blocked;
-            row.why = Some(why);
-        }
-        Probe::Waits { on, why } => {
-            let planned = earlier
-                .iter()
-                .any(|r| r.id == on && r.outcome == Outcome::Planned);
-            if mode == Mode::Plan && planned {
-                row.outcome = Outcome::Planned;
-                row.why = Some(format!(
-                    "read after {on}, which this plan changes first ({why})"
-                ));
-            } else {
-                row.outcome = Outcome::Blocked;
-                row.why = Some(why);
-            }
-        }
-        Probe::NotApplicable { why } => {
-            row.outcome = Outcome::NotApplicable;
-            row.why = Some(why);
-        }
-        Probe::Deferred { why } => {
-            row.outcome = Outcome::Deferred;
-            row.why = Some(why);
-        }
-        Probe::Unusable { why } => match item.read_aside() {
-            Some(aside) => {
-                row.outcome = Outcome::Blocked;
-                row.why = Some(aside.why().to_owned());
-                row.stood_aside = Some(aside);
-            }
-            None => {
-                row.outcome = Outcome::Unknown;
-                row.why = Some(why);
-            }
-        },
-        Probe::Change { from, to } => {
-            row.from = Some(from.clone());
-            row.to = Some(to.clone());
-            row.revert = item.revert();
-            if let Some(why) = hold {
-                row.outcome = Outcome::Blocked;
-                last = Probe::Blocked {
-                    why: why.to_owned(),
+    let mut observation_done = false;
+    // A completed observation plans once more. Admission belongs to each proposal, so an
+    // item without an observation keeps its original single guard check.
+    loop {
+        match last.clone() {
+            Probe::Ok { now } => {
+                row.to = Some(now.clone());
+                let recorded = if mode == Mode::Apply && hold.is_none() && item.refresh_changes() {
+                    journal
+                        .before_change(&row.id, &now, &now, item.revert().as_deref())
+                        .map_err(|why| {
+                            format!("not refreshed: the journal refused the record ({why})")
+                        })
+                } else {
+                    Ok(())
                 };
-                row.why = Some(why.to_owned());
-            } else if mode == Mode::Plan {
-                row.outcome = Outcome::Planned;
-            } else if let Some(aside) = item.stands_aside() {
-                row.outcome = Outcome::Blocked;
-                row.why = Some(aside.why().to_owned());
-                row.stood_aside = Some(aside);
-            } else if let Err(why) =
-                journal.before_change(&row.id, &from, &to, row.revert.as_deref())
-            {
-                let why = format!("not applied: the journal refused the record ({why})");
-                row.outcome = Outcome::Failed;
-                last = Probe::Blocked { why: why.clone() };
-                row.why = Some(why);
-            } else {
-                match item.apply() {
-                    Err(why) => {
-                        row.outcome = Outcome::Failed;
-                        row.why = Some(why);
-                    }
-                    Ok(()) => {
-                        if let Some(aside) = item.stood_aside() {
+                if let Err(why) = recorded {
+                    row.outcome = Outcome::Failed;
+                    last = Probe::Blocked { why: why.clone() };
+                    row.why = Some(why);
+                } else if mode == Mode::Apply
+                    && hold.is_none()
+                    && let Some(refreshed) = item.refresh()
+                {
+                    match refreshed {
+                        Err(why) => {
+                            row.outcome = Outcome::Failed;
+                            last = Probe::Unusable { why: why.clone() };
+                            row.why = Some(why);
+                        }
+                        // A refresh that stood aside did not run: blocked with its kind, as a
+                        // stood-aside apply is, and not read back.
+                        Ok(()) if let Some(aside) = item.stood_aside() => {
                             row.outcome = Outcome::Blocked;
                             row.why = Some(aside.why().to_owned());
                             row.stood_aside = Some(aside);
-                        } else if activated {
-                            row.outcome = Outcome::Changed;
-                            return (row, true);
-                        } else {
-                            last = read_back(item, &mut row);
+                        }
+                        Ok(()) => {
+                            let back = item.probe();
+                            match &back {
+                                Probe::Ok { now } => row.to = Some(now.clone()),
+                                Probe::Change { from, .. } => {
+                                    row.outcome = Outcome::Failed;
+                                    row.why = Some(format!("refreshed, but it still reads {from}"));
+                                }
+                                Probe::Unusable { why }
+                                | Probe::Blocked { why }
+                                | Probe::Waits { why, .. }
+                                | Probe::NotApplicable { why }
+                                | Probe::Deferred { why }
+                                | Probe::Person { how: why, .. } => {
+                                    row.outcome = Outcome::Failed;
+                                    row.why =
+                                        Some(format!("refreshed, but the read-back says: {why}"));
+                                }
+                            }
+                            last = back;
+                        }
+                    }
+                }
+            }
+            Probe::Person { step, how } => {
+                row.outcome = Outcome::Person;
+                row.to = Some(step);
+                row.why = Some(how);
+            }
+            Probe::Blocked { why } => {
+                row.outcome = Outcome::Blocked;
+                row.why = Some(why);
+            }
+            Probe::Waits { on, why } => {
+                let planned = earlier
+                    .iter()
+                    .any(|r| r.id == on && r.outcome == Outcome::Planned);
+                if mode == Mode::Plan && planned {
+                    row.outcome = Outcome::Planned;
+                    row.why = Some(format!(
+                        "read after {on}, which this plan changes first ({why})"
+                    ));
+                } else {
+                    row.outcome = Outcome::Blocked;
+                    row.why = Some(why);
+                }
+            }
+            Probe::NotApplicable { why } => {
+                row.outcome = Outcome::NotApplicable;
+                row.why = Some(why);
+            }
+            Probe::Deferred { why } => {
+                row.outcome = Outcome::Deferred;
+                row.why = Some(why);
+                row.stood_aside = item.read_aside();
+            }
+            Probe::Unusable { why } => match item.read_aside() {
+                Some(aside) => {
+                    row.outcome = Outcome::Blocked;
+                    row.why = Some(aside.why().to_owned());
+                    row.stood_aside = Some(aside);
+                }
+                None => {
+                    row.outcome = Outcome::Unknown;
+                    row.why = Some(why);
+                }
+            },
+            Probe::Change { from, to } => {
+                row.from = Some(from.clone());
+                row.to = Some(to.clone());
+                row.revert = item.revert();
+                if let Some(why) = hold {
+                    row.outcome = Outcome::Blocked;
+                    last = Probe::Blocked {
+                        why: why.to_owned(),
+                    };
+                    row.why = Some(why.to_owned());
+                } else if mode == Mode::Plan {
+                    row.outcome = Outcome::Planned;
+                } else if let Some(aside) = item.stands_aside() {
+                    row.outcome = Outcome::Blocked;
+                    row.why = Some(aside.why().to_owned());
+                    row.stood_aside = Some(aside);
+                } else if !observation_done && let Some(observed) = item.observe() {
+                    observation_done = true;
+                    match observed {
+                        Ok(()) => {
+                            row = blank(item);
+                            last = item.probe();
+                            continue;
+                        }
+                        Err(why) => {
+                            row.outcome = Outcome::Failed;
+                            last = Probe::Unusable { why: why.clone() };
+                            row.why = Some(why);
+                        }
+                    }
+                } else if let Err(why) =
+                    journal.before_change(&row.id, &from, &to, row.revert.as_deref())
+                {
+                    let why = format!("not applied: the journal refused the record ({why})");
+                    row.outcome = Outcome::Failed;
+                    last = Probe::Blocked { why: why.clone() };
+                    row.why = Some(why);
+                } else {
+                    match item.apply() {
+                        Err(why) => {
+                            row.outcome = Outcome::Failed;
+                            row.why = Some(why);
+                        }
+                        Ok(()) => {
+                            if let Some(aside) = item.stood_aside() {
+                                row.outcome = Outcome::Blocked;
+                                row.why = Some(aside.why().to_owned());
+                                row.stood_aside = Some(aside);
+                            } else if activated {
+                                row.outcome = Outcome::Changed;
+                                return (row, true);
+                            } else {
+                                last = read_back(item, &mut row);
+                            }
                         }
                     }
                 }
             }
         }
+        break;
     }
     finish(item, &mut row, &last);
     (row, false)

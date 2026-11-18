@@ -968,6 +968,54 @@ fn only_the_owners_dismiss_reads_as_a_decline_for_its_span() {
     assert!(!answered.dismissed_quiet(&key, Resurface::CHOICE, stamp(10_000)));
 }
 
+/// `quiet_until` names the very instant a person's filing stops keeping a re-post quiet: a
+/// re-post a millisecond before it is suppressed, and one at it is new again. An entry open and
+/// not filed, and a key never posted, are kept quiet by nothing.
+///
+/// NEGATIVE CONTROL (2026-11-16): `quiet_until` answering the filing's own time instead of its
+/// end failed with left `Some(1790000005000)`, right `Some(1792592005000)`. Restored, the file
+/// touched.
+#[test]
+fn quiet_until_names_the_instant_a_re_post_is_taken_again() {
+    assert_eq!(fda().resurface(), Some(Resurface::CHOICE));
+    assert_eq!(own_work("tab 1").resurface(), Some(Resurface::WAIT));
+    assert_eq!(
+        Message::new(tags::HARNESS, Severity::Info, "a record").resurface(),
+        None,
+        "a message no person takes later"
+    );
+    let now = t0();
+    let mut c = fresh(now);
+    c.post(fda(), stamp(0), now);
+    let entry = c.digest().entries[0].clone();
+    let key = entry.key.clone();
+    assert_eq!(
+        c.quiet_until(&key, Resurface::CHOICE, stamp(1)),
+        None,
+        "open, not filed"
+    );
+    assert!(c.file_digest_one(entry.id, stamp(5_000), now));
+    let until = 5_000 + Resurface::CHOICE.backed_off(1);
+    assert_eq!(
+        c.quiet_until(&key, Resurface::CHOICE, stamp(10_000)),
+        Some(stamp(until).unix_ms)
+    );
+    assert_eq!(
+        c.quiet_until(&key, Resurface::CHOICE, stamp(until)),
+        None,
+        "nothing keeps it quiet from its end"
+    );
+    assert_eq!(
+        c.post(fda(), stamp(until - 1), now).outcome,
+        PostOutcome::Suppressed
+    );
+    assert_eq!(c.post(fda(), stamp(until), now).outcome, PostOutcome::New);
+    assert_eq!(
+        c.quiet_until("privacy.other", Resurface::CHOICE, stamp(10_000)),
+        None
+    );
+}
+
 #[test]
 fn the_exceptions_report_ranks_warnings_first_and_drops_a_fixed_entrys_action() {
     let now = t0();

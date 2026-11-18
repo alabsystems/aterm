@@ -1156,7 +1156,8 @@ fn phrase_of(words: &Words<'_>, verdict: &Verdict, carrier: bool) -> Option<Phra
 struct Words<'a> {
     out: &'a Outlook,
     /// The words are the glass's, which name each account by its email ([`Outlook::name_of`]);
-    /// the CLI's ([`Outlook::verdict_phrase`]) name its roster label.
+    /// the CLI's ([`Outlook::verdict_phrase`]) name each row as the report does
+    /// ([`Outlook::names`]).
     glass: bool,
     tab: &'a str,
     tab_reset: Option<i64>,
@@ -1169,12 +1170,16 @@ struct Words<'a> {
 }
 
 impl Words<'_> {
-    /// The row `label`'s name as the view's lead lays it in `form` ([`Laid`]); cut alone,
-    /// whole, where the words are no view's (the CLI names a roster label).
+    /// The row `label`'s name as the view's lead lays it in `form` ([`Laid`]); cut alone where
+    /// the words are a glass that lays no names, and whole where they are the CLI's, whose line
+    /// has room for the account's whole name ([`Self::name`]).
     fn laid(&self, label: &str, form: Names) -> String {
         let name = self.name(label);
-        self.names
-            .map_or_else(|| cut(name), |names| names.of_label(label, name, form))
+        match self.names {
+            Some(names) => names.of_label(label, &name, form),
+            None if self.glass => cut(&name),
+            None => name.into_owned(),
+        }
     }
 
     /// Whether `verdict` is the replay's refusal for want of the reading this view's lead holds
@@ -1193,12 +1198,13 @@ impl Words<'_> {
         spoken_when(t, self.out.as_of, &self.out.offsets)
     }
 
-    /// How these words name the row `label`: the glass by its email, the CLI by the label.
-    fn name<'b>(&'b self, label: &'b str) -> &'b str {
+    /// How these words name the row `label`: the glass by its email, the CLI as the report names
+    /// its row ([`outlook::Outlook::names`]: by its account, else by its label).
+    fn name<'b>(&'b self, label: &'b str) -> std::borrow::Cow<'b, str> {
         if self.glass {
-            self.out.name_of(label)
+            std::borrow::Cow::Borrowed(self.out.name_of(label))
         } else {
-            label
+            self.out.names.shown(label)
         }
     }
 
@@ -1374,7 +1380,7 @@ impl Words<'_> {
             let name = self.name(&link.label);
             if moves.is_empty() {
                 moves = if clauses.is_empty() {
-                    name.to_owned()
+                    name.into_owned()
                 } else {
                     format!("then {name}")
                 };

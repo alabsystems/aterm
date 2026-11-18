@@ -3,6 +3,9 @@
 
 //! Reader and canonical TOML representation for the vault entry `ai-pool.toml`, read in place
 //! from this Mac's store (`docs/DESIGN-alab-swarm-2026-10-27.md` §4.1, §6.3, §6.5, §12.3 C14).
+//!
+//! Traced by the accounts keeper: what this file reads of the file system itself, it reads
+//! through `aterm_uds::trace::fs` (census `traced-reads`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -379,8 +382,14 @@ pub(super) fn test_without_roster_wait<R>(read: impl FnOnce() -> R) -> R {
     read()
 }
 
+/// The bytes of the regular file at `path`, where it holds at most `max_bytes`. With a trace
+/// scope armed it records the file's stamp before its open (`aterm_uds::trace::fs::opening`),
+/// and a retry where the open, the look at the opened file or the read failed for a reason no
+/// stamp decides.
 pub(crate) fn read_bounded_bytes(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
     use std::io::Read as _;
+    aterm_uds::trace::fs::opening(path);
+    let failed = |error: std::io::Error| aterm_uds::trace::fs::failed(path, &error);
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -388,11 +397,12 @@ pub(crate) fn read_bounded_bytes(path: &Path, max_bytes: u64) -> Option<Vec<u8>>
             .read(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path)
+            .map_err(failed)
             .ok()?
     };
     #[cfg(not(unix))]
-    let file = std::fs::File::open(path).ok()?;
-    let meta = file.metadata().ok()?;
+    let file = std::fs::File::open(path).map_err(failed).ok()?;
+    let meta = file.metadata().map_err(failed).ok()?;
     if !meta.is_file() || meta.len() > max_bytes {
         return None;
     }
@@ -405,6 +415,7 @@ pub(crate) fn read_bounded_bytes(path: &Path, max_bytes: u64) -> Option<Vec<u8>>
     );
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
+        .map_err(failed)
         .ok()?;
     (bytes.len() <= cap).then_some(bytes)
 }

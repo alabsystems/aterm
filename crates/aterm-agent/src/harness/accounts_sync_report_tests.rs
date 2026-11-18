@@ -6,6 +6,22 @@ use super::*;
 const NOW: i64 = 1_790_000_000;
 const CSV: &str = "email,computer,claude\none@example.test,m1,1\ntwo@example.test,m1,1\nthree@example.test,m2,1\n";
 
+/// The receipt `out` says no label of the fixture's rows, each of which has an address (`m1`,
+/// `m1-2`), as a word of its own: each row is named by its account. Its first line names this
+/// machine, `m1` too, as the machine the sync was for.
+fn assert_no_row_label(out: &str) {
+    let rest = out
+        .lines()
+        .filter(|line| !line.starts_with("synced machine `m1`"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        crate::harness::account_names::tests::labels_said(&rest, &["m1", "m1-2"]),
+        Vec::<&str>::new(),
+        "{out}"
+    );
+}
+
 struct Bed {
     _root: aterm_tempfile::TempDir,
     env: Env,
@@ -399,9 +415,10 @@ fn a_used_row_whose_login_went_is_told_aterm_signs_it_in() {
             ExitCode::SUCCESS
         );
         let out = String::from_utf8(out).unwrap();
+        assert_no_row_label(&out);
         out.lines()
-            .find(|line| line.starts_with("not signed in yet: m1"))
-            .unwrap_or_else(|| panic!("no line for m1: {out}"))
+            .find(|line| line.starts_with("not signed in yet: claude one@example.test"))
+            .unwrap_or_else(|| panic!("no line for m1's account: {out}"))
             .to_owned()
     };
     let said = |now: i64| said_with(now, Some(BTreeSet::new()));
@@ -447,9 +464,10 @@ fn a_row_a_page_stopped_is_not_promised_a_sign_in_by_itself() {
             ExitCode::SUCCESS
         );
         let out = String::from_utf8(out).unwrap();
+        assert_no_row_label(&out);
         out.lines()
-            .find(|line| line.starts_with("not signed in yet: m1"))
-            .unwrap_or_else(|| panic!("no line for m1: {out}"))
+            .find(|line| line.starts_with("not signed in yet: claude one@example.test"))
+            .unwrap_or_else(|| panic!("no line for m1's account: {out}"))
             .to_owned()
     };
     let waiting = said();
@@ -471,7 +489,11 @@ fn a_row_a_page_stopped_is_not_promised_a_sign_in_by_itself() {
     let stopped = said();
     assert!(!stopped.contains("by itself"), "{stopped}");
     assert!(stopped.contains("a page stopped"), "{stopped}");
-    assert!(stopped.contains("accounts renew m1"), "{stopped}");
+    let word = crate::harness::account_names::tests::row_name(Cli::Claude, &bed.path, "m1").word;
+    assert!(
+        stopped.contains(&format!("accounts renew {word}")),
+        "{stopped}"
+    );
 }
 
 #[test]

@@ -126,7 +126,8 @@ pub(super) struct Proven {
 impl Proven {
     /// Whether `receipt` is this folder's adoption, as [`begin`] records it, which [`finish`]
     /// may complete: an ordinary disposable receipt of this path and this identity, with
-    /// known owners and nothing pending, kept or being created.
+    /// a nonempty owner roster and nothing pending, kept or being created. Unknown owners
+    /// forbid retirement, not recovery of the same custody.
     pub(super) fn resumes(&self, receipt: &Receipt) -> bool {
         receipt.schema == 1
             && !receipt.retained
@@ -134,7 +135,6 @@ impl Proven {
             && receipt.pending.is_none()
             && receipt.creating.is_none()
             && receipt.package.is_none()
-            && !receipt.owners_unknown
             && !receipt.owners.is_empty()
             && receipt.root == self.root
             && receipt.identity.names(&self.identity)

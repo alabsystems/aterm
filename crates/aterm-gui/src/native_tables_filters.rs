@@ -408,22 +408,11 @@ fn held<'a>(column: &SheetColumn, row: &'a SheetRow) -> Vec<Cow<'a, str>> {
     members
 }
 
-/// The key of `value`'s line in a column's list: [`VALUE`], then the value with each whitespace
-/// or control character and each `%` written as its bytes, `%XX`, so the key is one word a
-/// driver can name (`aterm ctl act`, whose keys hold no whitespace): `rack a` is
+/// The key of `value`'s line in a column's list: [`VALUE`], then the value as one word of a key
+/// ([`crate::native_ui::key_word`]), so a driver can name it: `rack a` is
 /// `tables/filter/value/rack%20a`.
 pub(crate) fn value_key(value: &str) -> String {
-    let mut key = String::from(VALUE);
-    for ch in value.chars() {
-        if ch.is_whitespace() || ch.is_control() || ch == '%' {
-            for byte in ch.encode_utf8(&mut [0; 4]).bytes() {
-                key.push_str(&format!("%{byte:02X}"));
-            }
-        } else {
-            key.push(ch);
-        }
-    }
-    key
+    format!("{VALUE}{}", crate::native_ui::key_word(value))
 }
 
 /// The value whose line's key is `key` ([`value_key`]); `None` for any other key.

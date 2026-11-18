@@ -22,17 +22,26 @@ impl HeldSystemCommand {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             canonical(program)?;
-            let root = program.parent().ok_or_else(|| refused("native command has no parent"))?;
+            let root = program
+                .parent()
+                .ok_or_else(|| refused("native command has no parent"))?;
             let mut directories = BTreeMap::new();
             let (executable, header) = file(&mut directories, program, true, root, deadline)?;
-            let commands = macho::commands(&header, true)?;
+            let commands = macho::system_command_commands(
+                &executable.file,
+                &header,
+                executable.before.len(),
+                deadline,
+            )?;
             if !commands.rpaths.is_empty() || commands.loads.iter().any(|load| !macho::system(load))
             {
-                return Err(refused("native command requires a non-system runtime search"));
+                return Err(refused(
+                    "native command requires a non-system runtime search",
+                ));
             }
             let (host, boot) = process::host_boot()?;
             let observation = ProgramObservation {
-                policy: "native-command/macho-arm64-system-only-v1",
+                policy: "native-command/macho-arm64-system-only-all-slices-v2",
                 scope: INPUT_SCOPE,
                 executable: executable.observation.clone(),
                 runtime: Vec::new(),
@@ -60,6 +69,12 @@ impl HeldSystemCommand {
 
     pub fn program(&self) -> &Path {
         self.original.program()
+    }
+    /// Borrow the SAME held original for the existing native child owner. This
+    /// neither selects argv nor creates SDK, source, GO or closure authority.
+    pub fn program_input(&self, deadline: Instant) -> io::Result<&HeldProgram> {
+        self.validate(deadline)?;
+        Ok(&self.original)
     }
     pub fn observation(&self) -> &ProgramObservation {
         self.original.observation()

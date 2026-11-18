@@ -200,7 +200,7 @@ fn completed_cli_signins_recover_all_records_without_another_provider_login() {
             run_accounts_renew(
                 &env,
                 &host,
-                (&["main".into()], false, None),
+                (&[OWNER.into()], false, None),
                 &mut out,
                 &mut err,
             )
@@ -209,7 +209,7 @@ fn completed_cli_signins_recover_all_records_without_another_provider_login() {
                 cli,
                 &env,
                 &host,
-                (&["main".into()], false, None),
+                (&[OWNER.into()], false, None),
                 &mut out,
                 &mut err,
             )
@@ -396,17 +396,24 @@ pub(crate) fn attempt_transition(
             };
             let mut out = Vec::new();
             let mut err = Vec::new();
+            // The row is named by its account's address; a Claude Code row `login` signs in
+            // has none, and is named by its label.
+            let word = if cli == Cli::Claude && state["mode"] == 2 {
+                "main"
+            } else {
+                OWNER
+            };
             let _exit = if state["mode"] == 2 {
                 if cli == Cli::Claude {
-                    run_accounts_login(&env, &host, "main", &mut out, &mut err)
+                    run_accounts_login(&env, &host, word, &mut out, &mut err)
                 } else {
-                    run_accounts_login_for(cli, &env, &host, "main", &mut out, &mut err)
+                    run_accounts_login_for(cli, &env, &host, word, &mut out, &mut err)
                 }
             } else if cli == Cli::Claude {
                 run_accounts_renew(
                     &env,
                     &host,
-                    (&["main".into()], false, None),
+                    (&[word.into()], false, None),
                     &mut out,
                     &mut err,
                 )
@@ -415,7 +422,7 @@ pub(crate) fn attempt_transition(
                     cli,
                     &env,
                     &host,
-                    (&["main".into()], false, None),
+                    (&[word.into()], false, None),
                     &mut out,
                     &mut err,
                 )

@@ -256,11 +256,78 @@ mod mac {
     use std::{
         fs,
         path::{Path, PathBuf},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     fn io<T, E: std::fmt::Display>(value: Result<T, E>) -> Result<T, String> {
         value.map_err(|e| e.to_string())
+    }
+
+    /// Phase wall time only: the build includes its ordinary capacity-admission waits.
+    /// An early return leaves an incomplete phase and preserves the original failure path.
+    struct Phase<'a> {
+        events: Option<&'a crate::event_log::EventLog>,
+        check: &'static str,
+        placement: Placement,
+        phase: &'static str,
+        started: Instant,
+        outcome: &'static str,
+        counts: std::collections::BTreeMap<&'static str, usize>,
+    }
+
+    impl<'a> Phase<'a> {
+        fn new(
+            events: Option<&'a crate::event_log::EventLog>,
+            check: &'static str,
+            placement: Placement,
+            phase: &'static str,
+        ) -> Self {
+            let timer = Self {
+                events,
+                check,
+                placement,
+                phase,
+                started: Instant::now(),
+                outcome: "incomplete",
+                counts: std::collections::BTreeMap::new(),
+            };
+            crate::event_log::emit(
+                events,
+                &format!(
+                    "verify-event: {}",
+                    aterm_json::json!({
+                        "schema":1, "event":"bootstrap-phase-started", "check":check,
+                        "placement":placement.name(), "phase":phase,
+                    })
+                ),
+            );
+            timer
+        }
+
+        fn count(&mut self, name: &'static str, count: usize) {
+            self.counts.insert(name, count);
+        }
+
+        fn finish(mut self, outcome: &'static str) {
+            self.outcome = outcome;
+        }
+    }
+
+    impl Drop for Phase<'_> {
+        fn drop(&mut self) {
+            crate::event_log::emit(
+                self.events,
+                &format!(
+                    "verify-event: {}",
+                    aterm_json::json!({
+                        "schema":1, "event":"bootstrap-phase-finished", "check":self.check,
+                        "placement":self.placement.name(), "phase":self.phase,
+                        "seconds":self.started.elapsed().as_secs_f64(),
+                        "outcome":self.outcome, "counts":&self.counts,
+                    })
+                ),
+            );
+        }
     }
 
     /// `MAJOR.MINOR.0` of a public release's version or `v`-tag; `None` for anything else.
@@ -924,18 +991,37 @@ mod mac {
 
         pub(super) fn sandbox(&self) -> Result<aterm_uds::spawnfd::Command, String> {
             let ledger = aterm_capacity::build_cpu::capacity_dir().map_err(|e| e.to_string())?;
+            let pool = crate::compile_width::current_pool();
+            let fifo = pool
+                .as_ref()
+                .map(|pool| pool.fifo_path())
+                .transpose()
+                .map_err(|error| format!("sandbox jobserver custody: {error}"))?;
+            let mut profile = "(version 1)(allow default)(deny network*)(allow network-bind network-inbound network-outbound (subpath (param \"SCRATCH\")))(deny file-write*)(allow file-write* (subpath (param \"SCRATCH\")) (subpath (param \"LEDGER\")) (literal \"/dev/null\"))".to_owned();
+            if fifo.is_some() {
+                profile.push_str("(allow file-write-data (literal (param \"JOBSERVER_FIFO\")))");
+            }
             let mut cmd = aterm_uds::spawnfd::command("/usr/bin/sandbox-exec");
             cmd.env_clear()
-                .env("HOME", &self.home).env("PWD", &self.tree)
-                .env("CARGO_HOME", &self.cargo).env("RUSTUP_HOME", &self.rustup)
-                .env("TMPDIR", &self.home).env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                .env("HOME", &self.home)
+                .env("PWD", &self.tree)
+                .env("CARGO_HOME", &self.cargo)
+                .env("RUSTUP_HOME", &self.rustup)
+                .env("TMPDIR", &self.home)
+                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
                 .current_dir(&self.tree)
-                // No network, and no write outside the home and the capacity ledger. A socket
-                // whose path is in the home is the build's own (the toolchain's job server):
-                // it reaches nothing outside this rig.
-                .args(["-p", "(version 1)(allow default)(deny network*)(allow network-bind network-inbound network-outbound (subpath (param \"SCRATCH\")))(deny file-write*)(allow file-write* (subpath (param \"SCRATCH\")) (subpath (param \"LEDGER\")) (literal \"/dev/null\"))", "-D"])
+                // Keep ordinary outside writes and all external network access denied. A
+                // pooled stage already charged its implicit job; its children must use that
+                // exact held FIFO for additional jobs, without gaining writes beside it.
+                .args(["-p", &profile, "-D"])
                 .arg(format!("SCRATCH={}", self.home.display()))
-                .arg("-D").arg(format!("LEDGER={}", ledger.display()));
+                .arg("-D")
+                .arg(format!("LEDGER={}", ledger.display()));
+            if let Some(fifo) = fifo {
+                let mut parameter = std::ffi::OsString::from("JOBSERVER_FIFO=");
+                parameter.push(fifo);
+                cmd.arg("-D").arg(parameter);
+            }
             Ok(cmd)
         }
 
@@ -995,28 +1081,72 @@ mod mac {
             execution: exec::ExecEnv<'_>,
         ) -> Result<exec::MachineRun, String> {
             let result = (|| {
-                for path in git_files(root, env)? {
-                    let from = root.join(&path);
-                    // Deleted tracked inputs remain deleted in the candidate snapshot.
-                    if fs::symlink_metadata(&from).is_ok() {
-                        copy_file(&from, &self.tree.join(path))?;
-                    }
-                }
-                let output = self.build(execution)?;
-                if output.run.ok
-                    && !built_artifact(output.stdout.as_deref()?.as_bytes(), &self.home)
+                let files = {
+                    let mut phase =
+                        Phase::new(execution.events, self.check, self.placement, "tracked-list");
+                    let files = git_files(root, env)?;
+                    phase.count("listed_entries", files.len());
+                    phase.finish("complete");
+                    files
+                };
                 {
-                    return Err(format!(
-                        "{} exited successfully without an aterm-time library artifact",
-                        self.label
-                    ));
+                    let mut phase =
+                        Phase::new(execution.events, self.check, self.placement, "source-copy");
+                    let (mut copied, mut skipped) = (0, 0);
+                    for path in files {
+                        let from = root.join(&path);
+                        // Deleted tracked inputs remain deleted in the candidate snapshot.
+                        if fs::symlink_metadata(&from).is_ok() {
+                            copy_file(&from, &self.tree.join(path))?;
+                            copied += 1;
+                        } else {
+                            skipped += 1;
+                        }
+                    }
+                    phase.count("copied_entries", copied);
+                    phase.count("missing_or_unread_entries", skipped);
+                    phase.finish("complete");
+                }
+                let output = {
+                    let phase = Phase::new(
+                        execution.events,
+                        self.check,
+                        self.placement,
+                        "build-including-admission",
+                    );
+                    let output = self.build(execution)?;
+                    phase.finish("returned");
+                    output
+                };
+                {
+                    let phase = Phase::new(
+                        execution.events,
+                        self.check,
+                        self.placement,
+                        "artifact-validation",
+                    );
+                    if output.run.ok
+                        && !built_artifact(output.stdout.as_deref()?.as_bytes(), &self.home)
+                    {
+                        return Err(format!(
+                            "{} exited successfully without an aterm-time library artifact",
+                            self.label
+                        ));
+                    }
+                    phase.finish(if output.run.ok {
+                        "complete"
+                    } else {
+                        "not-required"
+                    });
                 }
                 Ok(output)
             })();
             let check = self.check;
+            let cleanup = Phase::new(execution.events, check, self.placement, "cleanup");
             match result {
                 Err(why) => {
                     let retained = self._scratch.keep();
+                    cleanup.finish("retained");
                     Err(format!(
                         "{why}; {check} failure inputs retained at {}",
                         retained.display()
@@ -1029,6 +1159,11 @@ mod mac {
                             "\n{check} failure inputs retained at {}\n",
                             retained.display()
                         ));
+                        cleanup.finish("retained");
+                    } else {
+                        // The same TempDir drop as before; its cleanup remains best effort.
+                        drop(self);
+                        cleanup.finish("drop-returned");
                     }
                     Ok(output)
                 }
@@ -1041,6 +1176,12 @@ mod mac {
         env: &EnvSnapshot,
         execution: exec::ExecEnv<'_>,
     ) -> Result<(Judging, exec::MachineRun), String> {
+        let mut selection = Phase::new(
+            execution.events,
+            "released-shim",
+            Placement::SharedCache,
+            "pair-selection",
+        );
         let manifest = io(fs::read_to_string(root.join("Cargo.toml")))?;
         let manifest: aterm_toml::Value =
             aterm_toml::from_str(&manifest).map_err(|e| e.to_string())?;
@@ -1055,6 +1196,14 @@ mod mac {
         let store = Store::read(env).map_err(|unready| unready.to_string())?;
         let installed = store.release().map_err(|unready| unready.to_string())?;
         let judging = judging_release(&installed, current, &tags)?;
+        selection.count("public_tags", tags.len());
+        selection.finish("complete");
+        let setup = Phase::new(
+            execution.events,
+            "released-shim",
+            Placement::SharedCache,
+            "rig-setup",
+        );
         let rig = Rig::new(
             env,
             &store,
@@ -1062,6 +1211,7 @@ mod mac {
             installed,
             Placement::SharedCache,
         )?;
+        setup.finish("complete");
         let output = rig.first_build(root, env, execution)?;
         Ok((judging, output))
     }
@@ -1077,7 +1227,15 @@ mod mac {
         placement: Placement,
         execution: exec::ExecEnv<'_>,
     ) -> Result<exec::MachineRun, String> {
+        let selection = Phase::new(
+            execution.events,
+            "candidate-shim",
+            placement,
+            "pair-selection",
+        );
         let store = Store::read(env).map_err(|unready| unready.to_string())?;
+        selection.finish("complete");
+        let setup = Phase::new(execution.events, "candidate-shim", placement, "rig-setup");
         let rig = Rig::new(
             env,
             &store,
@@ -1085,6 +1243,7 @@ mod mac {
             CANDIDATE.to_owned(),
             placement,
         )?;
+        setup.finish("complete");
         rig.first_build(root, env, execution)
     }
 

@@ -103,7 +103,9 @@ pub enum Install {
     /// is rustup's multi-call binary, so under that name it is rustup itself) with its `cargo`
     /// and `rustc` proxies and never run as an installer; then the checkout's stock pin with
     /// its components (`stock::PIN_COMPONENTS`: clippy, and off macOS llvm-tools) and every
-    /// cell's std, wasm32's among them, in rustup's own home (`STOCK EXCEPTION`).
+    /// cell's std, wasm32's among them, and the release chain's stock toolchain the checkout's
+    /// `trust.lock` names (`stock::release_toolchain`) with its slice's std, in rustup's own home
+    /// (`STOCK EXCEPTION`).
     Rustup {
         /// `rustup-init` binaries per host.
         init: &'static [Archive],

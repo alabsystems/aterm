@@ -589,13 +589,21 @@ pub fn rows(
         .collect()
 }
 
-/// The report's `journal` section: per row label, its account key, last use, sign-ins and
-/// windows, each time with its signed age at `now`, or null if that age cannot fit in an i64.
+/// The report's `journal` section: per row, by its account's key (`ac`, the key the journal
+/// holds it by) with its slug and name as the report names the row (`names`, each null where it
+/// has none), its last use, sign-ins and windows, each time with its signed age at `now`, or
+/// null if that age cannot fit in an i64. Only a row with a key is here ([`rows`]), so no roster
+/// label is.
 #[must_use]
-pub fn rows_json(rows: &[Reported], now: i64) -> aterm_json::Value {
+pub fn rows_json(
+    rows: &[Reported],
+    names: &super::account_names::Listing,
+    now: i64,
+) -> aterm_json::Value {
     use aterm_json::{Map, Value, json};
     let mut out = Map::new();
     for (label, pk, seen) in rows {
+        let account = names.names(label).map(|(_, names)| names);
         let windows: Vec<Value> = seen
             .windows
             .iter()
@@ -630,9 +638,11 @@ pub fn rows_json(rows: &[Reported], now: i64) -> aterm_json::Value {
             })
             .collect();
         out.insert(
-            label.clone(),
+            pk.clone(),
             json!({
                 "ac": pk,
+                "slug": account.map(|names| names.slug.clone()).filter(|slug| !slug.is_empty()),
+                "name": account.and_then(|names| names.name.clone()),
                 "last_use": seen.last_use.as_ref().map(|l| json!({
                     "by": l.by, "t": l.t, "age_s": now.checked_sub(l.t), "clock": "its",
                 })),
@@ -646,75 +656,41 @@ pub fn rows_json(rows: &[Reported], now: i64) -> aterm_json::Value {
     Value::Object(out)
 }
 
-/// The report's journal section as text, after the local report.
+/// The report's journal section as text, after the local report: each row as the report names
+/// it (`names`), by its account's name and slug.
 #[must_use]
-pub fn rows_text(rows: &[Reported], now: i64) -> String {
+pub fn rows_text(rows: &[Reported], names: &super::account_names::Listing, now: i64) -> String {
     let mut out = String::from("\nlab journal (what every Mac saw; no provider asked):\n");
     for (label, _, seen) in rows {
+        let shown = names.shown(label);
         for line in lines(seen, now) {
-            out.push_str(&format!("  {label}: {line}\n"));
+            out.push_str(&format!("  {shown}: {line}\n"));
         }
     }
     out
 }
 
-/// What `accounts history <name>` asks about: a row's label on this Mac and the account's key,
-/// either or both.
+/// What `accounts history` asks about: a row's label on this Mac and the account's key, either
+/// or both. The label is the local key the ledger's rows hold; nothing prints it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Asked {
     pub label: Option<String>,
     pub pk: Option<String>,
 }
 
-/// Which account `name` is: a row label here, an account key (`ac-…`), or a lab label or legacy
-/// label. An address is never a name. `None` where nothing goes by it.
-#[must_use]
-pub fn resolve(
-    cli: super::accounts::Cli,
-    name: &str,
-    roster: &super::accounts::Roster,
-    lab: Option<&super::alab_roster::Lab>,
-) -> Option<Asked> {
-    if name.contains('@') {
-        return None;
-    }
-    let explicit = name.starts_with("ac-") && super::journal::Key::new(name).is_some();
-    if !explicit && let Some(row) = roster.rows.iter().find(|row| row.label == name) {
-        return Some(Asked {
-            label: Some(row.label.clone()),
-            pk: row_key(cli, row),
-        });
-    }
-    // Explicit account keys retain their history independently of current roster labels.
-    let pk = if explicit {
-        Some(name.to_owned())
-    } else {
-        lab.and_then(|lab| {
-            lab.of(cli)
-                .find(|a| a.label == name || a.legacy_label.as_deref() == Some(name))
-                .map(|a| a.pk.clone())
-        })
-    }?;
-    let label = roster
-        .rows
-        .iter()
-        .find(|row| row_key(cli, row).as_deref() == Some(pk.as_str()))
-        .map(|row| row.label.clone());
-    Some(Asked {
-        label,
-        pk: Some(pk),
-    })
-}
-
 /// The history of `asked`, oldest first, each line with its instant: this Mac's ledger rows about
 /// it (by key, or by label for a row written before its key was learned), as `here`, and every
-/// Mac's journal events about it. A ledger row's free-text reason is never shown, only its kind
-/// and the other row's label.
+/// Mac's journal events about it. A ledger row holds its accounts by row label, the local key,
+/// and `name` names each as the line prints it: the label the row holds, for the account the
+/// row is about the account key it carried (`to=` carries none), and the row's instant, since a
+/// label may have named another account then. A ledger row's free-text reason is never shown,
+/// only its kind and its accounts' names.
 #[must_use]
 pub fn history(
     asked: &Asked,
     ledger: &[super::accounts::Event],
     journal: Option<&AccountSeen>,
+    name: &dyn Fn(&str, Option<&str>, i64) -> String,
 ) -> Vec<(i64, String)> {
     let mut out: Vec<(i64, u8, String)> = Vec::new();
     for event in ledger {
@@ -727,10 +703,10 @@ pub fn history(
             "{} here {} {}",
             super::usage::rfc3339_utc(event.t),
             event.kind.as_str(),
-            event.account
+            name(&event.account, event.pk.as_deref(), event.t)
         );
         if let Some(to) = &event.to {
-            line.push_str(&format!(" to={to}"));
+            line.push_str(&format!(" to={}", name(to, None, event.t)));
         }
         out.push((event.t, 0, line));
     }

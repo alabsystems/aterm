@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 const MAX_NAMES: usize = 16;
 
 /// Stable Commons context and shared account, independent of local labels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Source {
     pub network: [u8; 32],
     pub account: [u8; 32],

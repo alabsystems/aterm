@@ -18,7 +18,7 @@ use crate::{
         registry::{ACCOUNT, ACCOUNT_OBS, ADDRESS, MACHINE, PREFERENCE},
     },
     att, generation,
-    table::tests::{Lab, repair_commons_among},
+    table::tests::{Lab, repair_commons_among, repair_commons_among_first},
     typed::{grid, grid::tests::put, keys},
 };
 use aterm_file::{File, Name, Recorded, Root, Why, Word, cli};
@@ -48,6 +48,8 @@ pub(super) fn state_ring(lab: &Lab, n: usize, changes: Vec<crate::database::Chan
         .unwrap()
         .unwrap();
 }
+
+pub(crate) use super::fixture::declare;
 
 /// The Commons machine uuid (32 hex) Mac `n` of `lab` writes its own rows at.
 pub(super) fn uuid_of(lab: &Lab, n: usize) -> String {
@@ -182,6 +184,9 @@ impl Stand {
             changes.extend(account(&claude_bea, "anthropic", "claude", &bea));
         }
         registry.write(vec![changes]).unwrap();
+        // This Mac's program states one sample of a metric, a minute before the pass clock, and
+        // one note: every file has a row.
+        Stand::tracker_rows(&lab.paths[SEAT]);
         // This Mac's harness states its login, its reading and an event of the account in the
         // journal's week ring, as its flusher's record would.
         let me = uuid_of(&lab, SEAT);
@@ -261,6 +266,20 @@ impl Stand {
                 json!({"r": 1, "n": n, "e": [event.to_value()]}),
             ),
         ]
+    }
+
+    /// The Mac whose home is `paths` appends one sample of a metric, at `<uuid32>.1` of
+    /// `lab/measures`, and one note, at `<uuid32>.1` of `lab/notes`.
+    fn tracker_rows(paths: &Paths) {
+        use crate::lab::tracker::{MEASURE, NOTE};
+        let tracker = att::Handle::at(paths.clone(), &att::TRACKER);
+        tracker
+            .append_log(&MEASURE, &[metric("4", NOW - 60_000)])
+            .unwrap();
+        let note = json!({"about": "tk-05", "text": "a log outside the ring", "at": NOW});
+        tracker
+            .append_log(&NOTE, &[note.as_object().unwrap().clone()])
+            .unwrap();
     }
 
     pub(super) fn paths(&self) -> &Paths {
@@ -536,8 +555,17 @@ fn a_read_answers_from_the_snapshot_while_custody_refuses_every_way() {
     drop(held);
 
     // 3. AN EXCLUDED TABLE, then sharing turned off: `off`, with the last rows still read.
-    // The registry's table and the journal ring's window: every table a file is read from.
-    let mut tables = vec![aterm_codec::hex::encode_lower(&stand.table)];
+    // The registry's table, `lab/tracker`'s and the journal ring's window: every table a file
+    // is read from.
+    let tracker = att::TRACKER
+        .descriptor(stand.lab.bootstrap(SEAT).trust())
+        .unwrap()
+        .scope
+        .digest();
+    let mut tables = vec![
+        aterm_codec::hex::encode_lower(&stand.table),
+        aterm_codec::hex::encode_lower(&tracker),
+    ];
     tables.extend(ring_tables(&stand.lab, SEAT, NOW / 1000));
     let quoted: Vec<String> = tables.iter().map(|table| format!("\"{table}\"")).collect();
     stand.commons(&format!(
@@ -608,6 +636,214 @@ fn a_read_answers_from_the_snapshot_while_custody_refuses_every_way() {
         );
     }
     untouched(reads(&stand, Word::Held, Some(Why::Membership)));
+}
+
+/// SF-42's exit test: every file this build compiles says what its columns are in its own
+/// snapshot, and `aterm file schema` prints that with this machine's custody refusing.
+///
+/// After one live pass, each stored column of each snapshot states the type word and the
+/// nullability its compiled column has (the registry's files against the generation in use, a
+/// ring file's own rows against its collection, a log's members against the event's columns,
+/// with no nullability, since an event's schema says none), and the key, a derived column and
+/// an unknown one state neither. The unknown one is a member a later build's login row
+/// carries, named with a tab in it: `schema` prints that name as its JSON string, so its line
+/// is still one line of five cells. Sharing is then turned off, which a pass records as `off`,
+/// and `schema <name>` answers the same columns as a table and as JSON, with the custody seam
+/// at zero across every read. No file is a view with a stored column, so a view states none.
+///
+/// NEGATIVE CONTROLS, each observed: with the table pass stating no type for a schema column,
+/// `` ai/accounts.provider states no type ``; with `schema --json` printing `false` where the
+/// snapshot states no nullability, `` left: Some(false) right: None ``; with every event
+/// column stated as `time`, the panic names `ai/events.kind`; with `name_cell` returning the
+/// name as it is, that column's line has six cells: `` left: 6 right: 5 ``.
+#[test]
+fn every_compiled_files_snapshot_states_each_stored_columns_type_and_schema_prints_it_while_custody_refuses()
+ {
+    use aterm_file::snapshot::Source;
+    // A member no build compiles, named with a tab in it.
+    const LATER: &str = "later\tmember";
+    let stand = Stand::new();
+    // A later build's login row at the same key: every member this build compiles, and that
+    // one.
+    state_ring(
+        &stand.lab,
+        SEAT,
+        vec![ring_row(
+            &crate::alab::journal::LOGIN,
+            &format!("{}.{}", stand.claude_ada, uuid_of(&stand.lab, SEAT)),
+            json!({
+                "r": 1, "n": 2, "account": stand.claude_ada, "cli": "claude", "place": "default",
+                "state": "signed-in", "proof": "status", "src": "profile", "use": "idle",
+                "tabs": 0, "held": "linked", "since": NOW, "at": NOW, "attempt": "none",
+                LATER: "said",
+            }),
+        )],
+        NOW / 1000,
+    );
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let compiled = Registry::at(stand.paths().clone()).generation();
+    stand.commons("[commons]\nenabled = false\n");
+    all(&stand, &stand.pass(true), Word::Off, Some(Why::Policy));
+
+    let quiet = seam::custody_opens();
+    let root = stand.root();
+    let (mut stored, mut unknown) = (0, 0);
+    for file in super::FILES {
+        let snapshot = stand.file(file).published().snapshot.expect("a snapshot");
+        // What the compiled schema says of each column, where this file projects one: a
+        // registry table's against the generation in use, another family's (`lab/tracker`'s
+        // logs) against its own, which its one generation compiles.
+        let collection = match file.store {
+            Store::Table { family, collection }
+                if family.table.role == att::REGISTRY.table.role =>
+            {
+                Some(compiled.collection(collection.name).unwrap())
+            }
+            Store::Table { collection, .. } | Store::Journal(collection) => Some(collection),
+            Store::View(_) => None,
+        };
+        // Only the journal ring's log states its members as an event's, with no nullability: a
+        // table's log states its own columns.
+        let says_null = collection.is_some_and(|collection| {
+            collection.kind != crate::typed::Kind::Log || matches!(file.store, Store::Table { .. })
+        });
+        for column in &snapshot.columns {
+            let at = format!("{}.{}", file.name, column.name);
+            if column.source != Source::Schema {
+                assert_eq!((&column.ty, column.null), (&None, None), "{at}");
+                unknown += usize::from(column.source == Source::Unknown);
+                continue;
+            }
+            stored += 1;
+            let ty = column
+                .ty
+                .as_ref()
+                .unwrap_or_else(|| panic!("{at} states no type"));
+            assert_eq!(column.null.is_some(), says_null, "{at}");
+            if says_null {
+                let compiled = collection
+                    .unwrap()
+                    .columns
+                    .iter()
+                    .find(|compiled| compiled.name == column.name)
+                    .unwrap_or_else(|| panic!("{at} is no compiled column"));
+                assert_eq!(
+                    (ty, column.null),
+                    (&compiled.ty.word(), Some(compiled.null)),
+                    "{at}"
+                );
+            } else {
+                let (_, _, event) = materialize::EVENT_COLUMNS
+                    .iter()
+                    .find(|(name, _, _)| *name == column.name)
+                    .unwrap_or_else(|| panic!("{at} is no event column"));
+                assert_eq!(ty, &event.word(), "{at}");
+            }
+        }
+
+        let answer: Value =
+            aterm_json::from_str(&verb(&root, &["schema", file.name, "--json"])).unwrap();
+        assert_eq!(answer["state"].as_str(), Some("off"), "{answer}");
+        assert_eq!(answer["primary_key"].as_str(), Some("pk"), "{answer}");
+        assert_eq!(
+            answer["key"].as_str(),
+            stand
+                .file(file)
+                .state()
+                .and_then(|state| state.key)
+                .as_deref(),
+            "the status's projection key stays the status's: {answer}"
+        );
+        assert_eq!(answer["kind"].as_str(), Some(file.kind()), "{answer}");
+        let handles: Vec<&str> = answer["handles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(handles, file.handles, "{answer}");
+        let printed = answer["columns"].as_array().unwrap();
+        assert_eq!(printed.len(), snapshot.columns.len(), "{answer}");
+        let table = verb(&root, &["schema", file.name]);
+        let lines: Vec<Vec<&str>> = table
+            .lines()
+            .map(|line| line.split('\t').collect())
+            .collect();
+        assert_eq!(lines[0], ["column", "type", "null", "source", "ref"]);
+        assert_eq!(lines.len(), snapshot.columns.len() + 1, "{table}");
+        for ((column, json), line) in snapshot.columns.iter().zip(printed).zip(&lines[1..]) {
+            assert_eq!(json["name"].as_str(), Some(column.name.as_str()));
+            assert_eq!(json["type"], column.ty.clone().unwrap_or(Value::Null));
+            assert_eq!(json["null"].as_bool(), column.null);
+            assert_eq!(json["ref"].as_str(), column.refers.as_deref());
+            assert_eq!(line.len(), 5, "{line:?}");
+            if column.name == LATER {
+                assert_eq!((line[0], line[3]), ("\"later\\tmember\"", "unknown"));
+            } else {
+                assert_eq!(line[0], column.name);
+            }
+            assert_eq!(line[1].is_empty(), column.ty.is_none(), "{line:?}");
+            assert_eq!(line[4], column.refers.as_deref().unwrap_or_default());
+        }
+    }
+    assert!(
+        stored > 40,
+        "the compiled files hold stored columns: {stored}"
+    );
+    assert_eq!(unknown, 1, "the later build's member is one unknown column");
+    // A bare word prints as itself and a parameterised one as its JSON.
+    let events = verb(&root, &["schema", "ai/events"]);
+    assert!(events.contains("at\ttime\t\tschema\t\n"), "{events}");
+    let links = verb(&root, &["schema", "ai/links"]);
+    assert!(
+        links.contains("account\t{\"ref\":\"account\"}\tno\tschema\tai/accounts\n"),
+        "{links}"
+    );
+    assert_eq!(
+        seam::custody_opens(),
+        quiet,
+        "a schema read of a shared file opened custody"
+    );
+}
+
+/// A snapshot put back at its revision without the types, as a copy an earlier build wrote
+/// would leave it, is projected again by the next unforced pass, which states the types at the
+/// same revision. The content digest leaves the types out (`Snapshot::content`), so the skip
+/// asks each stored column of the snapshot there for a type: this build's projection states
+/// one for each.
+///
+/// NEGATIVE CONTROL, observed 2026-11-16: with the skip's type check left out, the unforced
+/// pass records the untyped copy live, and `the types are stated again` fails with every stored
+/// column of `lab/machines` at `ty: None` against the pass's words (`"label"`, `{"set":"label"}`).
+#[test]
+fn a_snapshot_put_back_without_its_types_is_projected_again_at_its_revision() {
+    let stand = Stand::new();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let snap = stand.root().snapshot(&super::MACHINES.file());
+    let typed = aterm_file::Snapshot::decode(&std::fs::read(&snap).unwrap()).unwrap();
+    assert!(
+        typed.columns.iter().any(|column| column.ty.is_some()),
+        "CONTROL: the pass stated the types"
+    );
+    let mut untyped = typed.clone();
+    for column in &mut untyped.columns {
+        (column.ty, column.null) = (None, None);
+    }
+    std::fs::write(&snap, untyped.encode()).unwrap();
+    let read = stand.file(&super::MACHINES).published().snapshot.unwrap();
+    assert_eq!(
+        (
+            read.rev,
+            read.columns.iter().all(|column| column.ty.is_none())
+        ),
+        (typed.rev, true),
+        "CONTROL: the untyped copy reads, at its revision"
+    );
+
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let again = stand.file(&super::MACHINES).published().snapshot.unwrap();
+    assert_eq!(again.columns, typed.columns, "the types are stated again");
+    assert_eq!(again.rev, typed.rev, "at the same revision");
 }
 
 /// The vault's admin revokes the stand's Mac, and its next sync says so.
@@ -711,7 +947,8 @@ fn a_revoked_macs_strict_read_refuses_for_the_revocation_and_its_snapshot_still_
 /// Some("ada.fb@alpha.example") right: Some("claude ada.fb@alpha.example") ``.
 #[test]
 fn the_files_lab_view_names_each_account_as_the_registrys_does() {
-    use crate::alab::{account_names::Found, view::LabView};
+    use crate::alab::view::LabView;
+    use aterm_file::account::Found;
     let stand = Stand::new();
     all(&stand, &stand.pass(false), Word::Live, None);
     let view = Registry::at(stand.paths().clone()).view().unwrap();
@@ -755,9 +992,9 @@ fn the_face_is_the_grid_export_with_computed_columns_and_the_revision() {
     let compiled = registry.generation();
     let view = registry.view().unwrap();
     for file in super::FILES {
-        // A file of the journal ring or a view has no grid export; the exit test of SF-08
-        // reads their faces.
-        let Some((_, bound)) = file.table() else {
+        // A log, a file of the journal ring and a view have no grid export; the exit tests of
+        // SF-08 and TK-05 read their faces.
+        let Some((_, bound)) = file.edited() else {
             continue;
         };
         let collection = compiled.collection(bound.name).unwrap();
@@ -967,7 +1204,9 @@ fn a_files_class_fits_its_collection_and_takes_only_its_writers_intents() {
             Class::Mac,
             Class::Mac,
             Class::Mac,
-            Class::Derived
+            Class::Derived,
+            Class::Mac,
+            Class::Mac
         ]
     );
     assert_eq!(
@@ -975,7 +1214,9 @@ fn a_files_class_fits_its_collection_and_takes_only_its_writers_intents() {
             .iter()
             .map(|file| file.kind())
             .collect::<Vec<_>>(),
-        ["table", "table", "table", "table", "table", "log", "view"]
+        [
+            "table", "table", "table", "table", "table", "log", "view", "log", "log"
+        ]
     );
 
     let intent = |key: &str, revert: Option<String>| aterm_file::Intent {
@@ -1403,15 +1644,18 @@ fn files_left_by_another_replica_are_replaced_by_this_ones_read() {
     copy_tree(other.root().path(), stand.root().path());
     assert_eq!(stand.file(&super::ACCOUNTS).read().rows().len(), 4);
 
-    // The accounts are replaced, and so are the journal ring's files, whose rows each lab's Mac
-    // states at its own machine's key; the links and machines, and the limits folded from the
-    // one reading of the one account, the same rows at the same revision in both labs, keep
-    // their snapshot files, now vouched for by this replica's frontier.
+    // The accounts are replaced, and so are the journal ring's files and `lab/tracker`'s logs,
+    // whose rows each lab's Mac states at its own machine's key; the links and machines, and
+    // the limits folded from the one reading of the one account, the same rows at the same
+    // revision in both labs, keep their snapshot files, now vouched for by this replica's
+    // frontier.
     let replaced = [
         &super::ACCOUNTS,
         &super::LOGINS,
         &super::USAGE,
         &super::EVENTS,
+        &super::MEASURES,
+        &super::NOTES,
     ]
     .map(Type::file);
     let first = stand.pass(false);
@@ -1445,12 +1689,12 @@ fn files_left_by_another_replica_are_replaced_by_this_ones_read() {
 /// pass whose key moved projects again, while one whose key stands keeps it still. The files
 /// ahead are another copy of the lab's, projected from a registry record this Mac's replica
 /// lacks: the registry's files, and `ai/limits`, whose frontier is the registry's read it names
-/// accounts by, are behind them, while the journal ring's files, whose window holds the same
-/// records in both copies, are not, and their key stands. The projection too large is the
-/// status `aterm_file::File::record` leaves for one: the read's key as the one too large
-/// ([`aterm_file::State::kept_key`]), and the snapshot kept at an earlier read's key; a
-/// registry record moves the keys of the registry's files and the view's, and none of the
-/// journal ring's files'.
+/// accounts by, are behind them, while the journal ring's files and `lab/tracker`'s logs, whose
+/// window and table hold the same records in both copies, are not, and their key stands. The
+/// projection too large is the status `aterm_file::File::record` leaves for one: the read's key
+/// as the one too large ([`aterm_file::State::kept_key`]), and the snapshot kept at an earlier
+/// read's key; a registry record moves the keys of the registry's files and the view's, and
+/// none of the journal ring's files' or the tracker's logs'.
 ///
 /// NEGATIVE CONTROLS (2026-11-14, run again 2026-11-15 once main's journal ring files joined
 /// the pass): with `opened` judging no kept reason before it projects (`let kept = None;`), the
@@ -1481,6 +1725,15 @@ fn a_kept_snapshot_is_not_projected_again_until_its_key_moves() {
         }
     };
 
+    // The files a registry record leaves where they are: the journal ring's, and the logs of
+    // `lab/tracker`, another table family, whose read no record of the registry moves.
+    let apart = |file: &Type| {
+        matches!(file.store, Store::Journal(_))
+            || file
+                .table()
+                .is_some_and(|(family, _)| family.table.role != att::REGISTRY.table.role)
+    };
+
     let stand = Stand::new();
     all(&stand, &stand.pass(false), Word::Live, None);
     let fork = stand.lab.fork();
@@ -1505,7 +1758,7 @@ fn a_kept_snapshot_is_not_projected_again_until_its_key_moves() {
     assert_eq!(views(), before, "a read behind the snapshot makes no view");
     assert_eq!(behind.len(), super::FILES.len());
     for (file, outcome) in super::FILES.iter().zip(&behind) {
-        let expected = if matches!(file.store, Store::Journal(_)) {
+        let expected = if apart(file) {
             Recorded::Settled
         } else {
             Recorded::Kept(Kept::Behind)
@@ -1561,7 +1814,7 @@ fn a_kept_snapshot_is_not_projected_again_until_its_key_moves() {
     let outcomes = stand.pass(false);
     assert_eq!(outcomes.len(), super::FILES.len());
     for (file, outcome) in super::FILES.iter().zip(&outcomes) {
-        if matches!(file.store, Store::Journal(_)) {
+        if apart(file) {
             // Its key stands: the snapshot is kept still, and the pass writes nothing.
             assert_eq!(
                 (outcome.word, outcome.recorded),
@@ -1644,7 +1897,9 @@ fn refresh_runs_a_pass_and_reports_each_file() {
          ai/logins: live · snapshot written\n\
          ai/usage: live · snapshot written\n\
          ai/events: live · snapshot written\n\
-         ai/limits: live · snapshot written\n"
+         ai/limits: live · snapshot written\n\
+         lab/measures: live · snapshot written\n\
+         lab/notes: live · snapshot written\n"
     );
     // Again with nothing changed: the forced pass projects, finds what the files say, and
     // writes nothing.
@@ -1658,7 +1913,9 @@ fn refresh_runs_a_pass_and_reports_each_file() {
          ai/logins: live · nothing changed\n\
          ai/usage: live · nothing changed\n\
          ai/events: live · nothing changed\n\
-         ai/limits: live · nothing changed\n"
+         ai/limits: live · nothing changed\n\
+         lab/measures: live · nothing changed\n\
+         lab/notes: live · nothing changed\n"
     );
     stand.commons("[commons]\nenabled = false\n");
     let (text, code) = refresh(&["ai/links", "--json"]).unwrap();
@@ -1727,6 +1984,8 @@ fn env() -> write::Env<'static> {
         attempt: aterm_spec::wait::MUST_HAPPEN,
         json: false,
         stdin: None,
+        editor: &|_, _, _| Err("a test opens no editor".to_owned()),
+        say: &|_| {},
     }
 }
 
@@ -1866,6 +2125,7 @@ fn a_write_made_on_a_fenced_mac_is_kept_and_published_once_by_its_admitted_succe
     let config = original.home.join("config.toml");
     let machine = keys::machine_pk("m7");
     Registry::at(original.clone()).open().unwrap();
+    declare(&original, &att::TRACKER);
     Registry::at(original.clone())
         .write(vec![vec![
             put(&MACHINE, &machine, "label", json!("m7")),
@@ -3134,6 +3394,388 @@ fn a_spent_vault_wait_reads_an_unheld_vault_and_a_spent_pass_is_out_of_time_not_
     }
 }
 
+/// The face of `file` under `root`, as text.
+fn face_of(file: &File) -> String {
+    String::from_utf8(file.face_bytes().unwrap().expect("a face is there")).unwrap()
+}
+
+/// `face` with the cell of the row keyed `pk` under the header `column` set to `text`, and every
+/// row keyed one of `drop` left out, as a tool that rewrites the whole file writes it. The cells
+/// the test touches hold no tab and no line break, so a line is a row and a tab a cell.
+fn rewritten(face: &str, pk: &str, column: &str, text: &str, drop: &[&str]) -> String {
+    let mut lines = face.lines();
+    let header: Vec<&str> = lines.next().unwrap().split('\t').collect();
+    let at = header.iter().position(|cell| *cell == column).unwrap();
+    let mut out = format!("{}\n", header.join("\t"));
+    for line in lines {
+        let mut cells: Vec<String> = line.split('\t').map(str::to_owned).collect();
+        let key = cells.last().unwrap().clone();
+        if drop.contains(&key.as_str()) {
+            continue;
+        }
+        if key == pk {
+            cells[at] = text.to_owned();
+        }
+        out.push_str(&cells.join("\t"));
+        out.push('\n');
+    }
+    out
+}
+
+/// SF-06's exit test: an edited face changes nothing until a commit by name, and a row missing
+/// from a committed face retires nothing.
+///
+/// A stand-in lab materializes `lab/machines` with two machines, `m7` and `m9`. A tool rewrites
+/// the face whole: `m7`'s note changed and `m9`'s row left out. A materializer pass and a
+/// publisher pass, then another writer's record and the pass that projects it, change nothing
+/// of it: the table holds no new value, the outbox is empty, the snapshot moves on without the
+/// edit, the face is left as it was and `status` says `face=edited`. `aterm file commit` then
+/// queues and publishes exactly the one changed cell against the revision the face names (an
+/// older one than the snapshot's by then), and `m9` stays live in the table, in the snapshot and
+/// in the face the pass writes after. A face whose header lost `=pk@<rev>` and one naming a
+/// revision whose baseline is gone are refused: nothing queued, the bytes kept as
+/// `machines.rejected.tsv` and the face written again; a bad value queues nothing and names its
+/// line and column in `machines.problems`; `restore` writes the face again, keeping the edits.
+///
+/// NEGATIVE CONTROL, observed: with the commit reading a missing row as the grid export does
+/// (`Absent::Retires` in `face::plan`), the commit queues and publishes a second intent, `m9`'s
+/// retirement: `` one row changed, one intent: published 68aa…532f published ed82…94d0 ``.
+#[test]
+fn an_edited_face_changes_nothing_until_committed_and_a_missing_row_retires_nothing() {
+    let stand = Stand::new();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let (paths, config, root) = (stand.paths(), &stand.config, stand.root());
+    let m7 = stand.machine.clone();
+    let m9 = keys::machine_pk("m9");
+    let (added, _) = wrote(
+        paths,
+        config,
+        &["add", "lab/machines", "label=m9", "status=planned"],
+    );
+    op_of(&added);
+    let machines = stand.file(&super::MACHINES);
+    let status_line = || verb(&root, &["status", "lab/machines"]);
+    let note = stored(paths, &m7, "note");
+    let lifecycle = stored(paths, &m9, "row");
+    assert_eq!(lifecycle, Some(json!("live")));
+    let face = face_of(&machines);
+    let rev = machines.status().rev();
+    assert!(
+        face.lines()
+            .next()
+            .unwrap()
+            .ends_with(&format!("=pk@{rev}")),
+        "{face}"
+    );
+    assert!(face.contains(&m9), "{face}");
+    assert!(status_line().contains("face=written"), "{}", status_line());
+
+    // A tool rewrites the face whole: one cell changed, one row left out.
+    let edited = rewritten(&face, &m7, "note", "edited in the face", &[&m9]);
+    std::fs::write(machines.face_path(), &edited).unwrap();
+    assert!(status_line().contains("face=edited"), "{}", status_line());
+
+    // Nothing reads it: passes of the materializer and the publisher, and another writer's
+    // record with the pass that projects it, leave the table, the outbox and the face as they
+    // were, and the snapshot moves on without the edit.
+    all(&stand, &stand.pass(true), Word::Live, None);
+    publish_pass(paths, config);
+    Registry::at(paths.clone())
+        .write(vec![vec![put(
+            &MACHINE,
+            &m7,
+            "location",
+            json!("the shelf"),
+        )]])
+        .unwrap();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    publish_pass(paths, config);
+    assert_eq!(stored(paths, &m7, "note"), note, "no commit, no write");
+    assert_eq!(stored(paths, &m9, "row"), lifecycle);
+    let outbox = machines.outbox();
+    assert_eq!((outbox.queued.len(), outbox.held.len()), (0, 0));
+    assert_eq!(
+        face_of(&machines),
+        edited,
+        "a pass leaves an edited face alone"
+    );
+    assert!(machines.status().rev() > rev, "the snapshot moved on");
+    assert_eq!(shown(&root, &m7, "location"), "the shelf");
+    assert_ne!(shown(&root, &m7, "note"), "edited in the face");
+    assert!(status_line().contains("face=edited"), "{}", status_line());
+
+    // The commit by name: the one changed cell, against the revision the face names.
+    let (answer, code) = wrote(paths, config, &["commit", "lab/machines"]);
+    assert_eq!(code, aterm_file::exit::OK, "{answer}");
+    assert_eq!(
+        answer.lines().count(),
+        1,
+        "one row changed, one intent: {answer}"
+    );
+    op_of(&answer);
+    assert_eq!(
+        stored(paths, &m7, "note"),
+        Some(json!("edited in the face"))
+    );
+    // The row the face left out is as it was: live in the table, the snapshot and the face.
+    assert_eq!(stored(paths, &m9, "row"), lifecycle);
+    assert_eq!(shown(&root, &m9, "row"), "live");
+    // The other writer's cell, which the face showed as it was before, is theirs still.
+    assert_eq!(stored(paths, &m7, "location"), Some(json!("the shelf")));
+    let face = face_of(&machines);
+    assert!(
+        face.contains(&m9) && face.contains("edited in the face"),
+        "{face}"
+    );
+    assert!(status_line().contains("face=written"), "{}", status_line());
+    let (again, _) = wrote(paths, config, &["commit", "lab/machines"]);
+    assert!(again.starts_with("unchanged: "), "{again}");
+
+    // A face that cannot be read against a baseline is refused and kept, and the face written
+    // again; nothing is queued. Each refused face is kept at a path of its own, never over an
+    // earlier one.
+    let kept_at = |n| root.rejected_at(&super::MACHINES.file(), "tsv", n);
+    assert_eq!(kept_at(1), root.rejected(&super::MACHINES.file(), "tsv"));
+    let mut kept = Vec::new();
+    let rev = machines.status().rev();
+    let header_cell = format!("=pk@{rev}");
+    let fresh = face_of(&machines);
+    for (broken, why) in [
+        (fresh.replacen(&header_cell, "=pk", 1), "lost its last cell"),
+        (fresh.replacen(&header_cell, "=pk@999", 1), "no longer kept"),
+    ] {
+        let broken = broken.replacen("edited in the face", "refused", 1);
+        std::fs::write(machines.face_path(), &broken).unwrap();
+        match run_verb(paths, config, &["commit", "lab/machines"], &env()) {
+            Err(write::Refusal::Problem(said)) => assert!(said.contains(why), "{said}"),
+            other => panic!("{other:?}"),
+        }
+        kept.push(broken.clone());
+        for (n, bytes) in kept.iter().enumerate() {
+            let n = u32::try_from(n).unwrap() + 1;
+            assert_eq!(std::fs::read_to_string(kept_at(n)).unwrap(), *bytes);
+        }
+        assert_eq!(face_of(&machines), fresh, "the face is written again");
+        assert_eq!(machines.outbox().queued.len(), 0);
+        assert_eq!(
+            stored(paths, &m7, "note"),
+            Some(json!("edited in the face"))
+        );
+    }
+
+    // A bad value queues nothing and says where; restore writes the face again and keeps it.
+    let bad = rewritten(&fresh, &m9, "status", "not-a-status", &[]);
+    std::fs::write(machines.face_path(), &bad).unwrap();
+    match run_verb(paths, config, &["commit", "lab/machines"], &env()) {
+        Err(write::Refusal::Problem(said)) => assert!(said.contains("1 problem"), "{said}"),
+        other => panic!("{other:?}"),
+    }
+    let problems = std::fs::read_to_string(root.problems(&super::MACHINES.file())).unwrap();
+    let line = fresh.lines().position(|row| row.ends_with(&m9)).unwrap() + 1;
+    let column = fresh
+        .lines()
+        .next()
+        .unwrap()
+        .split('\t')
+        .position(|cell| cell == "status");
+    assert!(
+        problems.starts_with(&format!("{line}:{}: status: ", column.unwrap() + 1)),
+        "{problems}"
+    );
+    assert!(
+        !problems.contains("not-a-status"),
+        "never a value: {problems}"
+    );
+    assert_eq!(machines.outbox().queued.len(), 0);
+    assert_eq!(
+        face_of(&machines),
+        bad,
+        "a face with problems is left for its author"
+    );
+    let restored = verb(&root, &["restore", "lab/machines"]);
+    assert!(restored.contains("kept at"), "{restored}");
+    assert_eq!(std::fs::read_to_string(kept_at(3)).unwrap(), bad);
+    assert_eq!(std::fs::read_to_string(kept_at(1)).unwrap(), kept[0]);
+    assert_eq!(face_of(&machines), fresh);
+    assert_eq!(stored(paths, &m9, "status"), Some(json!("planned")));
+}
+
+/// A face saved again after its commit asks for nothing again: an Editor tab's buffer still
+/// holds what was committed, and a second save (or a commit run twice) must not repeat it. A new
+/// row the face added is not born twice, and a cell whose write was held (another Mac moved it
+/// since the face's revision) is not queued again beside the held write, though the read shows
+/// that cell `⚠ mine ‖ theirs`, never as the face's text.
+///
+/// NEGATIVE CONTROL, observed: with a born row never checked against what this Mac already asked
+/// for (`asked` in `face::plan` skipped), the stale save's commit queues the row again: `` a
+/// stale save asks for nothing: published: the table already says what 2d34…6c10d writes ``.
+#[test]
+fn a_face_saved_again_after_its_commit_asks_for_nothing_again() {
+    let stand = Stand::new();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let (paths, config, root) = (stand.paths(), &stand.config, stand.root());
+    let m7 = stand.machine.clone();
+    let machines = stand.file(&super::MACHINES);
+    let face = face_of(&machines);
+    let header: Vec<&str> = face.lines().next().unwrap().split('\t').collect();
+    let mut row = vec![""; header.len()];
+    row[header.iter().position(|cell| *cell == "label").unwrap()] = "m10";
+    row[header.iter().position(|cell| *cell == "status").unwrap()] = "planned";
+    let stale = format!(
+        "{}{}\n",
+        rewritten(&face, &m7, "note", "noted in the face", &[]),
+        row.join("\t")
+    );
+    std::fs::write(machines.face_path(), &stale).unwrap();
+    let (answer, code) = wrote(paths, config, &["commit", "lab/machines"]);
+    assert_eq!(code, aterm_file::exit::OK, "{answer}");
+    assert_eq!(
+        answer.lines().count(),
+        2,
+        "a new row and a changed cell: {answer}"
+    );
+    let m10 = keys::machine_pk("m10");
+    assert_eq!(stored(paths, &m10, "status"), Some(json!("planned")));
+    assert_ne!(
+        face_of(&machines),
+        stale,
+        "the commit writes the face again"
+    );
+
+    // The tab's buffer, saved again as it was.
+    std::fs::write(machines.face_path(), &stale).unwrap();
+    let (again, code) = wrote(paths, config, &["commit", "lab/machines"]);
+    assert_eq!(code, aterm_file::exit::OK, "{again}");
+    assert!(
+        again.starts_with("unchanged: "),
+        "a stale save asks for nothing: {again}"
+    );
+    let outbox = machines.outbox();
+    assert_eq!((outbox.waiting().count(), outbox.held.len()), (0, 0));
+
+    // A held cell: the face moves `location`, another Mac moved it first.
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let fresh = face_of(&machines);
+    let moved = rewritten(&fresh, &m7, "location", "the desk", &[]);
+    Registry::at(paths.clone())
+        .write(vec![vec![put(
+            &MACHINE,
+            &m7,
+            "location",
+            json!("the bench"),
+        )]])
+        .unwrap();
+    std::fs::write(machines.face_path(), &moved).unwrap();
+    let (held, code) = wrote(paths, config, &["commit", "lab/machines"]);
+    assert_eq!(code, aterm_file::exit::CONFLICT, "{held}");
+    assert_eq!(machines.outbox().held.len(), 1, "{held}");
+    assert!(shown(&root, &m7, "location").starts_with(aterm_file::outbox::CONFLICT));
+    std::fs::write(machines.face_path(), &moved).unwrap();
+    let (again, _) = wrote(paths, config, &["commit", "lab/machines"]);
+    assert!(
+        again.starts_with("unchanged: "),
+        "a held cell is not asked for twice: {again}"
+    );
+    let outbox = machines.outbox();
+    assert_eq!((outbox.waiting().count(), outbox.held.len()), (0, 1));
+    assert_eq!(stored(paths, &m7, "location"), Some(json!("the bench")));
+}
+
+/// `aterm file edit`: the face opens, and once its tab closes it is committed; a face with
+/// problems is said and opened again at the first problem's line until a commit takes it. In an
+/// aterm window a save in the tab has committed already, so the commit after the tab closes
+/// finds nothing left and says what the tab's commit did: committed, or refused with the copy of
+/// the face it kept.
+#[test]
+fn edit_reopens_a_face_at_its_problem_and_says_what_the_tabs_own_commit_did() {
+    use std::cell::RefCell;
+    let stand = Stand::new();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let (paths, config) = (stand.paths(), &stand.config);
+    let m7 = stand.machine.clone();
+    let machines = stand.file(&super::MACHINES);
+    let fresh = face_of(&machines);
+    let line = fresh.lines().position(|row| row.ends_with(&m7)).unwrap() + 1;
+
+    // Round one leaves a bad value, round two the good one.
+    let rounds = [
+        rewritten(&fresh, &m7, "status", "not-a-status", &[]),
+        rewritten(&fresh, &m7, "status", "planned", &[]),
+    ];
+    let opened = RefCell::new(Vec::new());
+    let said = RefCell::new(Vec::new());
+    let editor = |face: &std::path::Path, at: usize, wait: bool| {
+        assert!(wait);
+        let round = opened.borrow().len();
+        opened.borrow_mut().push(at);
+        std::fs::write(face, &rounds[round]).map_err(|error| error.to_string())
+    };
+    let say = |text: &str| said.borrow_mut().push(text.to_owned());
+    let mut person = env();
+    person.editor = &editor;
+    person.say = &say;
+    let (answer, code) = run_verb(paths, config, &["edit", "lab/machines"], &person).unwrap();
+    assert_eq!(code, aterm_file::exit::OK, "{answer}");
+    op_of(&answer);
+    assert_eq!(
+        *opened.borrow(),
+        [1, line],
+        "opened again at the problem's line"
+    );
+    assert_eq!(said.borrow().len(), 1, "{:?}", said.borrow());
+    assert!(
+        said.borrow()[0].contains("1 problem"),
+        "{:?}",
+        said.borrow()
+    );
+    assert_eq!(stored(paths, &m7, "status"), Some(json!("planned")));
+
+    // The tab's own commit took the save: edit says so.
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let fresh = face_of(&machines);
+    let tab = |face: &std::path::Path, _: usize, _: bool| {
+        let noted = rewritten(&fresh, &m7, "note", "noted in the tab", &[]);
+        std::fs::write(face, noted).map_err(|error| error.to_string())?;
+        run_verb(paths, config, &["commit", "lab/machines"], &env())
+            .map(|_| ())
+            .map_err(|refusal| format!("{refusal:?}"))
+    };
+    let mut window = env();
+    window.editor = &tab;
+    let (answer, code) = run_verb(paths, config, &["edit", "lab/machines"], &window).unwrap();
+    assert_eq!(code, aterm_file::exit::OK, "{answer}");
+    assert!(
+        answer.contains("the Editor tab's save committed it"),
+        "{answer}"
+    );
+    assert_eq!(stored(paths, &m7, "note"), Some(json!("noted in the tab")));
+
+    // The tab's own commit refused the save: edit names the copy it kept.
+    let fresh = face_of(&machines);
+    let rev = machines.status().rev();
+    let lost = fresh.replacen(&format!("=pk@{rev}"), "=pk", 1);
+    let refused = |face: &std::path::Path, _: usize, _: bool| {
+        std::fs::write(face, &lost).map_err(|error| error.to_string())?;
+        let _ = run_verb(paths, config, &["commit", "lab/machines"], &env());
+        Ok(())
+    };
+    window.editor = &refused;
+    match run_verb(paths, config, &["edit", "lab/machines"], &window) {
+        Err(write::Refusal::Problem(why)) => {
+            assert!(
+                why.contains("the Editor tab's commit refused the face"),
+                "{why}"
+            );
+            let kept = machines.rejected_kept();
+            let (copy, _) = kept.last().unwrap();
+            assert!(why.contains(&copy.display().to_string()), "{why}");
+            assert_eq!(std::fs::read_to_string(copy).unwrap(), lost);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(face_of(&machines), fresh, "the face is written again");
+}
+
 /// Two Writers whose Commons the membership log backs, as every lab Mac's is now, their registry
 /// rolled to its second generation: m1 writes both machine rows and its own facts row, m2 its
 /// own, and m1's roll, once m2 has declared the second generation, carries each facts row into
@@ -3166,6 +3808,7 @@ fn carried_lab() -> Lab {
         Registry::at(lab.paths[1].clone()),
     );
     a.open().unwrap();
+    declare(&lab.paths[0], &att::TRACKER);
     a.write(vec![
         machine_row("m1"),
         machine_row("m2"),
@@ -3335,6 +3978,7 @@ fn unheld_carried_lab() -> (Lab, String, astream_wire::sync::Digest, Vec<u8>) {
     let lab = Lab::new(&[Role::Writer]);
     let registry = Registry::at(lab.paths[0].clone());
     registry.open().unwrap();
+    declare(&lab.paths[0], &att::TRACKER);
     registry
         .write(vec![
             machine_row("m1"),
@@ -4134,6 +4778,7 @@ fn remove_walk() -> Vec<Step> {
         Registry::at(lab.paths[1].clone()),
     );
     a.open().unwrap();
+    declare(&lab.paths[0], &att::TRACKER);
     a.write(vec![
         machine_row("m1"),
         machine_row("m2"),
@@ -4509,11 +5154,12 @@ fn a_peers_login_and_usage_rows_fold_into_its_files_two_readings_of_one_week_mer
     // The peer's record reaches this Mac through the older peer only. A pair's rounds take the
     // tables whose witnesses differ one a round, and a round leads ahead of them a table the
     // lists newly share, which one side took up once an earlier round brought its declaration
-    // (`crate::replica::Repair::lead`): the ring window that holds the peer's record may wait
-    // for the third round.
+    // (`crate::replica::Repair::lead`): this Mac declares two the older peer lacks, the
+    // registry and `lab/tracker`, so the ring window that holds the peer's record may wait for
+    // the fourth round, after the catalog's and each of theirs.
     let clocks = [t; 3];
     repair_commons_among(lab, 2, &[OLD, PEER], &clocks);
-    repair_commons_among(lab, 3, &[OLD, SEAT], &clocks);
+    repair_commons_among(lab, 4, &[OLD, SEAT], &clocks);
 
     // THE OLDER PEER reads the record as v0.201.0 does: every row of its collections, and
     // nothing of the new ones, exactly as if the record carried no new row.
@@ -4660,8 +5306,9 @@ fn a_peers_login_and_usage_rows_fold_into_its_files_two_readings_of_one_week_mer
         Stand::ring_rows(&ada, &peer, 30, RESET + 7 * 86_400_000, 3),
         t,
     );
-    // Three rounds, as above: the pair's first, whose second round may lead a newly shared table.
-    repair_commons_among(lab, 3, &[PEER, SEAT], &clocks);
+    // Four rounds, as above: the pair's first, whose rounds after the catalog's may lead the two
+    // tables the lists newly share.
+    repair_commons_among(lab, 4, &[PEER, SEAT], &clocks);
     all(&stand, &stand.pass(true), Word::Live, None);
     let next = limit(&stand);
     assert_eq!(next.values.get("w7d").and_then(Value::as_u64), Some(30));
@@ -4669,4 +5316,281 @@ fn a_peers_login_and_usage_rows_fold_into_its_files_two_readings_of_one_week_mer
         next.values.get("w7d_reset").and_then(Value::as_u64),
         Some(RESET + 7 * 86_400_000)
     );
+}
+
+/// A metric's sample as an agent states it: `value`, measured at `at` (Unix milliseconds) by
+/// `aterm db table ls`.
+fn metric(value: &str, at: u64) -> aterm_json::Map {
+    json!({
+        "metric": "a10-lab-objects",
+        "value": value,
+        "at": at,
+        "source": "aterm db table ls",
+    })
+    .as_object()
+    .unwrap()
+    .clone()
+}
+
+/// What two agents on the seat's Mac and one on its peer appended to `lab/tracker`'s `measure`
+/// log, each one metric stated in the same millisecond, and how the seat reads it back.
+struct Appended {
+    /// Each seat agent's key, and the peer's.
+    agents: [String; 2],
+    peer: String,
+    /// The typed read's entries (key, value, at) and the records it holds inert.
+    typed: Vec<(String, String, u64)>,
+    typed_inert: usize,
+    /// `lab/measures`' rows (key, value, at), its kind word and the records its status holds
+    /// inert.
+    rows: Vec<(String, String, u64)>,
+    kind: String,
+    inert: u64,
+}
+
+/// Two agents on the seat's Mac append one metric each at once, through the one writer path
+/// every program of a Mac takes (`att::Handle::append_log`), both stating the millisecond `NOW`;
+/// the peer Mac appends one stated in that millisecond too, and repair brings it over. Keyed by
+/// the clock (`by_clock`, [`att::log_seam`]) when the negative control asks.
+fn two_agents_and_a_peer_append(by_clock: bool) -> (Stand, Appended) {
+    use crate::lab::tracker::MEASURE;
+    const PEER: usize = 0;
+    let stand = Stand::new();
+    let lab = &stand.lab;
+    let append = |paths: &Paths, value: &str| {
+        let _clock = by_clock.then(att::log_seam::key_by_clock);
+        att::Handle::at(paths.clone(), &att::TRACKER)
+            .append_log(&MEASURE, &[metric(value, NOW)])
+            .unwrap()
+            .remove(0)
+    };
+    let start = std::sync::Barrier::new(2);
+    let agents: Vec<String> = std::thread::scope(|scope| {
+        let agents: Vec<_> = ["5", "6"]
+            .into_iter()
+            .map(|value| {
+                let (start, append, seat) = (&start, &append, stand.paths());
+                scope.spawn(move || {
+                    start.wait();
+                    append(seat, value)
+                })
+            })
+            .collect();
+        agents
+            .into_iter()
+            .map(|agent| agent.join().unwrap())
+            .collect()
+    });
+    let peer = append(&lab.paths[PEER], "7");
+    // Both Macs declared `lab/tracker` when they appended, and each round repairs it first, as
+    // the push of a write names its table: which table a regular scan would take first turns
+    // on the tables' digests, which are each lab's own.
+    let tracker = att::TRACKER
+        .descriptor(lab.bootstrap(SEAT).trust())
+        .unwrap()
+        .scope
+        .digest();
+    repair_commons_among_first(lab, 2, &[PEER, SEAT], &[NOW / 1000; 2], tracker);
+
+    let view = att::Handle::at(stand.paths().clone(), &att::TRACKER)
+        .view()
+        .unwrap();
+    let log = &view.logs[MEASURE.name];
+    let typed = log
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                crate::typed::owned::log_entry_key(&entry.machine, entry.n),
+                entry.value["value"].as_str().unwrap().to_owned(),
+                entry.value["at"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+
+    all(&stand, &stand.pass(true), Word::Live, None);
+    let read = stand.file(&super::MEASURES).read();
+    let rows = read
+        .rows()
+        .iter()
+        .map(|row| {
+            (
+                row.pk.clone(),
+                row.cell("value").to_owned(),
+                row.values.get("at").and_then(Value::as_u64).unwrap(),
+            )
+        })
+        .collect();
+    let kind = read.snapshot.as_ref().unwrap().kind.clone();
+    let inert = read.status.state.as_ref().unwrap().inert.unwrap();
+    let appended = Appended {
+        agents: [agents[0].clone(), agents[1].clone()],
+        peer,
+        typed,
+        typed_inert: log.inert,
+        rows,
+        kind,
+        inert,
+    };
+    (stand, appended)
+}
+
+/// TK-05's exit test (docs/DESIGN-lab-tracker-2026-11-14.md §6, finding 8 of §7): a log table
+/// outside the journal's ring, `lab/tracker`'s `measure`, read typed and through its shared
+/// file. Two agents on one Mac append one metric each at once, both stating the same
+/// millisecond, and a peer Mac appends one stated in it too. The keys are per writer: the
+/// signing Mac's uuid and its own counter, taken under the Mac's writer lock, so the two agents
+/// hold `<seat>.2` and `<seat>.3` (past the stand's own sample at `<seat>.1`) in whichever order
+/// the lock admitted them, and the peer `<peer>.1`, which the seat's own `.1` does not touch. Every entry reads back, with its value
+/// and its millisecond, through the typed read ([`att::View::logs`]) and through `lab/measures`'
+/// snapshot, where the file's kind is `log` and nothing is inert.
+///
+/// NEGATIVE CONTROL, observed: with each entry keyed by the millisecond its row states, as a
+/// writer that reads its keys off a clock would ([`att::log_seam::key_by_clock`] on both agents
+/// and the peer), this test fails at its first assertion: ``assertion `left != right` failed:
+/// two agents on one Mac hold two keys``, ``left: "<seat>.1800000000000"`` and ``right:
+/// "<seat>.1800000000000"`` (the second agent's key is the first's); past it, the typed read
+/// keeps one of the two agents' entries and counts the other inert, and so does the file.
+/// [`a_log_keyed_by_a_clock_loses_one_of_two_agents_metrics`] holds that loss as a test.
+#[test]
+fn two_agents_on_one_mac_append_one_metric_in_one_millisecond_and_both_rows_read_back() {
+    let (stand, appended) = two_agents_and_a_peer_append(false);
+    let seat = uuid_of(&stand.lab, SEAT);
+    let peer = uuid_of(&stand.lab, 0);
+    let [first, second] = &appended.agents;
+    assert_ne!(first, second, "two agents on one Mac hold two keys");
+    let mut agents = appended.agents.clone();
+    agents.sort();
+    // The stand's own sample holds `<seat>.1`: the agents' counters run on past it.
+    assert_eq!(agents, [format!("{seat}.2"), format!("{seat}.3")]);
+    assert_eq!(appended.peer, format!("{peer}.1"));
+
+    // Each agent's value at its own key, whichever the lock admitted first.
+    let value_of = |key: &str| if key == first { "5" } else { "6" };
+    let mut expected: Vec<(String, String, u64)> = [first, second]
+        .into_iter()
+        .map(|key| (key.clone(), value_of(key).to_owned(), NOW))
+        .chain([
+            (format!("{seat}.1"), "4".to_owned(), NOW - 60_000),
+            (appended.peer.clone(), "7".to_owned(), NOW),
+        ])
+        .collect();
+    expected.sort();
+    let sorted = |rows: &[(String, String, u64)]| {
+        let mut rows = rows.to_vec();
+        rows.sort();
+        rows
+    };
+    assert_eq!(sorted(&appended.typed), expected, "the typed read");
+    assert_eq!(appended.typed_inert, 0);
+    assert_eq!(sorted(&appended.rows), expected, "lab/measures");
+    assert_eq!(appended.kind, super::types::LOG);
+    assert_eq!(appended.inert, 0);
+}
+
+/// The exit test's negative control as a test of its own: two agents on one Mac whose log keys
+/// come from the clock both write `<seat>.<ms>` in one millisecond, and readers keep the first
+/// entry at a key (`typed::owned::read_log`), so one agent's metric is lost to the typed read
+/// and to `lab/measures`, counted inert in both. The peer's key, another Mac's uuid, survives.
+#[test]
+fn a_log_keyed_by_a_clock_loses_one_of_two_agents_metrics() {
+    let (stand, appended) = two_agents_and_a_peer_append(true);
+    let seat = uuid_of(&stand.lab, SEAT);
+    let peer = uuid_of(&stand.lab, 0);
+    let at_ms = format!("{seat}.{NOW}");
+    assert_eq!(appended.agents, [at_ms.clone(), at_ms.clone()]);
+    assert_eq!(appended.peer, format!("{peer}.{NOW}"));
+    for (read, rows, inert) in [
+        (
+            "typed",
+            &appended.typed,
+            u64::try_from(appended.typed_inert).unwrap(),
+        ),
+        ("file", &appended.rows, appended.inert),
+    ] {
+        let mut keys: Vec<&str> = rows.iter().map(|(key, _, _)| key.as_str()).collect();
+        keys.sort_unstable();
+        let mut expected = [format!("{seat}.1"), at_ms.clone(), format!("{peer}.{NOW}")];
+        expected.sort();
+        assert_eq!(keys, expected, "{read}: one of the agents' metrics is lost");
+        assert_eq!(inert, 1, "{read}");
+    }
+}
+
+/// A log of a catalog table shows a cell as its table's grid shows it: a value its column's type
+/// admits passed that type's own guard when it was appended (`typed::owned::log_row`), so a
+/// whole commit, a command that names a test, prose that cites a commit and a commit as evidence
+/// read back from `lab/measures` and `lab/notes` as the typed read holds them, with their typed
+/// values and nothing withheld. The guards every surface keeps for a text of no known type
+/// refuse any run of forty key characters, which every one of these holds.
+///
+/// NEGATIVE CONTROL, observed: with a log's cells held to those guards as a file of the journal
+/// ring's are (`Held::Ring` in `materialize::log_table`), `lab/measures` shows the refusal text
+/// in place of the commit: `` assertion `left == right` failed: lab/measures commit ``, `left:
+/// "(refused value: not shown)"`, `right: "0123456789abcdef0123456789abcdef01234567"`.
+#[test]
+fn a_logs_file_shows_a_commit_a_command_and_evidence_as_their_types_admit_them() {
+    use crate::lab::tracker::{MEASURE, NOTE};
+    use crate::typed::values::Evidence;
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    const SOURCE: &str = "targo --unverified test -p aterm-db --lib \
+        file::tests::two_agents_on_one_mac_append_one_metric_in_one_millisecond_and_both_rows_read_back";
+    let stand = Stand::new();
+    let tracker = att::Handle::at(stand.paths().clone(), &att::TRACKER);
+    let mut sample = metric("9", NOW);
+    sample.insert("source".to_owned(), json!(SOURCE));
+    sample.insert("commit".to_owned(), json!(COMMIT));
+    let measured = tracker
+        .append_log(&MEASURE, std::slice::from_ref(&sample))
+        .unwrap();
+    let evidence = Evidence::Commit {
+        repo: "aterm".to_owned(),
+        commit: COMMIT.to_owned(),
+    };
+    let note = json!({
+        "about": "tk-05",
+        "text": format!("landed at {COMMIT}"),
+        "evidence": [evidence.to_value()],
+        "at": NOW,
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let noted = tracker
+        .append_log(&NOTE, std::slice::from_ref(&note))
+        .unwrap();
+
+    all(&stand, &stand.pass(false), Word::Live, None);
+    for (file, collection, key, stated) in [
+        (&super::MEASURES, &MEASURE, &measured[0], &sample),
+        (&super::NOTES, &NOTE, &noted[0], &note),
+    ] {
+        let read = stand.file(file).read();
+        let row = read
+            .rows()
+            .iter()
+            .find(|row| row.pk == *key)
+            .unwrap_or_else(|| panic!("{}: no row {key}", file.name));
+        for (name, value) in stated {
+            let column = collection.column(name).unwrap();
+            assert_eq!(
+                row.cell(name),
+                grid::show(&column.ty, value),
+                "{} {name}",
+                file.name
+            );
+            assert_eq!(row.values.get(name), Some(value), "{} {name}", file.name);
+        }
+        assert_eq!(
+            read.status.state.as_ref().unwrap().withheld,
+            0,
+            "{}",
+            file.name
+        );
+    }
+    // The commit and the command are the texts a person reads, not a spelling of a refusal.
+    let measures = stand.file(&super::MEASURES).read();
+    let row = measures.rows().iter().find(|row| row.pk == measured[0]);
+    assert_eq!(row.unwrap().cell("commit"), COMMIT);
+    assert_eq!(row.unwrap().cell("source"), SOURCE);
 }

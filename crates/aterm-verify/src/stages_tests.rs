@@ -1155,7 +1155,11 @@ fn a_measuring_plan_builds_its_benches_once_and_before_the_quiet_machine() {
         ctx(Scope::workspace()).with_checks(&[Check::Test]),
     ];
     for c in &contexts {
-        let ids: Vec<StageId> = crate::plan::plan(c).iter().map(|s| s.id).collect();
+        let ids: Vec<StageId> = crate::plan::plan(c)
+            .expect("complete graph and plan")
+            .iter()
+            .map(|s| s.id)
+            .collect();
         let [compile, run] = test_cmds(c, false);
         let (compile, run) = (compile.argv(), run.argv());
         let folded = compile.iter().any(|a| a == "--bench");
@@ -3725,7 +3729,7 @@ fn a_locked_console_skips_native_drives_but_an_unlocked_one_keeps_findings() {
         c
     };
     let locked = base().with_screen_lock_source(|| true);
-    for spec in crate::plan::plan(&locked) {
+    for spec in crate::plan::plan(&locked).expect("complete graph and plan") {
         let result = run_stage(&locked, &spec);
         assert!(
             result
@@ -3743,6 +3747,7 @@ fn a_locked_console_skips_native_drives_but_an_unlocked_one_keeps_findings() {
     );
     let unlocked = base().with_screen_lock_source(|| false);
     let spec = crate::plan::plan(&unlocked)
+        .expect("complete graph and plan")
         .into_iter()
         .find(|spec| spec.id == StageId::RedrawConformance)
         .unwrap();
@@ -3755,7 +3760,7 @@ fn a_locked_console_skips_native_drives_but_an_unlocked_one_keeps_findings() {
     let headless = ctx(Scope::packages(&[]))
         .with_checks(&[Check::Test])
         .with_screen_lock_source(|| panic!("a headless stage must not probe the desktop"));
-    for spec in crate::plan::plan(&headless) {
+    for spec in crate::plan::plan(&headless).expect("complete graph and plan") {
         let _ = run_stage(&headless, &spec);
     }
 }
@@ -3771,8 +3776,12 @@ fn no_windows_skips_each_windowed_stage_by_name_and_nothing_else() {
     };
     let plain = base();
     let quiet = base().with_no_windows(true);
-    let planned = plan(&quiet);
-    assert_eq!(planned, plan(&plain), "the flag removes no stage");
+    let planned = plan(&quiet).expect("complete graph and plan");
+    assert_eq!(
+        planned,
+        plan(&plain).expect("complete graph and plan"),
+        "the flag removes no stage"
+    );
     let mut seen = Vec::new();
     for spec in &planned {
         let Some((_, name)) = WINDOWED.iter().find(|(id, _)| *id == spec.id) else {
@@ -4722,7 +4731,7 @@ fn the_codex_alab_proof_drives_the_main_targets_aterm() {
     };
     let every: Vec<crate::checks::Check> = crate::checks::CHECKS.iter().map(|s| s.check).collect();
     let c = ctx(Scope::workspace()).with_checks(&every);
-    let plan = crate::plan::plan(&c);
+    let plan = crate::plan::plan(&c).expect("complete graph and plan");
     let lane_of = |id: StageId| {
         let spec = plan
             .iter()

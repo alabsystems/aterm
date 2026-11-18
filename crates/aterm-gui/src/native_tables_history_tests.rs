@@ -830,6 +830,7 @@ fn as_of_from_a_line_asks_for_that_record_and_marks_the_one_shown() {
     tables.take(Reply::Read {
         read: Ok(past),
         moved: true,
+        revision: None,
     });
     let ui = render(&app);
     assert!(said(&ui, "tables/asof").unwrap().starts_with("As of m9 "));
@@ -3248,4 +3249,181 @@ fn a_read_moves_the_lists_keys_and_the_drawers_rest_leaves_them() {
         "Return writes nothing"
     );
     assert_eq!(standing(&mut app), 1, "Return pressed the office's line");
+}
+
+/// The drawer's Registry scope lists every record of the registry and opens one (LT-25's exit
+/// test). On a scratch registry of two Macs, read in pages of two: the first read lists the two
+/// newest records and no more, each line saying its writer, when, its count of cells, the table
+/// and row, and what changed; Read older records lists the rest, and the list is then every
+/// record the store holds, newest first in its causal order. The three consecutive records of one
+/// machine fold into a line that says it is a fold, and a press opens it. A selected record
+/// shows each cell it wrote as was and now, and what has written there since; that line leads
+/// to the cell in the grid.
+/// NEGATIVE CONTROLS, each run once and restored: with the store's page served oldest first
+/// (`newest_first: false` in `tables_store::history`), the first page is the oldest two and its
+/// first line the other Mac's: `` …, 4 cells, Machines · m9: Label → m9; Status → active; … ``;
+/// with `Registry::take_page` putting an older page in place of the list (`|| true`), Read older
+/// records drops the newest: `` every record, newest first `` (two listed of four); with since
+/// read the wrong way round in `Reader::beside` (`observes(operation, &other.id)`), `` left:
+/// Some("… written since rack a (…) / rack b (…); shows its row") right: Some("… written since
+/// rack d (…); shows its row") ``.
+#[test]
+fn the_drawers_registry_scope_lists_every_record_and_opens_one() {
+    use aterm_db::alab::Registry;
+    let lab = two_macs();
+    for place in ["rack b", "rack c", "rack d"] {
+        Registry::at(lab.paths[0].clone())
+            .write(vec![vec![super::super::native_tables_tests::put(
+                "location",
+                aterm_json::json!(place),
+            )]])
+            .unwrap();
+    }
+    let mut app = App::headless_for_test();
+    app.open_tables_tab_at(Some(lab.paths[0].clone())).unwrap();
+    settle(&mut app);
+    act(&mut app, "tables/sheet/machine", None);
+    act(&mut app, "tables/history/show", None);
+    app.native_runtime.tables_mut().unwrap().registry.page = 2;
+    act(&mut app, "tables/history/scope/registry", None);
+    app.native_runtime.tables_mut().unwrap().settle_registry();
+
+    // The first page: the two newest records, and the way to older ones.
+    let tables = app.native_runtime.tables().unwrap();
+    assert_eq!(
+        tables.registry.records.len(),
+        2,
+        "one page, never the whole registry"
+    );
+    let (newest, here) = (
+        tables.registry.records[0].operation,
+        tables.registry.records[0].by.who(),
+    );
+    let record_key = |operation: &[u8; 32]| {
+        format!(
+            "tables/history/record/{}",
+            aterm_codec::hex::encode_lower(operation)
+        )
+    };
+    let ui = render(&app);
+    let line = said(&ui, &record_key(&newest)).expect("the newest record's line");
+    assert!(
+        line.starts_with(&format!("{here} \u{b7} ")),
+        "its writer first, no kind word for an explicit write: {line}"
+    );
+    assert!(
+        line.ends_with(", 1 cell, Machines \u{b7} m9: Location \u{2192} rack d"),
+        "{line}"
+    );
+    assert_eq!(
+        said(&ui, "tables/history/more").as_deref(),
+        Some("Read older records")
+    );
+    assert!(said(&ui, "tables/history/count").is_some_and(|c| c.starts_with("Newest 2 records")));
+
+    // Older records: every record the store holds, newest first in its order.
+    act(&mut app, "tables/history/more", None);
+    app.native_runtime.tables_mut().unwrap().settle_registry();
+    let stored: Vec<[u8; 32]> =
+        aterm_db::att::Handle::at(lab.paths[0].clone(), &aterm_db::att::REGISTRY)
+            .history()
+            .unwrap()
+            .iter()
+            .rev()
+            .map(|entry| entry.operation)
+            .collect();
+    let listed: Vec<[u8; 32]> = app
+        .native_runtime
+        .tables()
+        .unwrap()
+        .registry
+        .records
+        .iter()
+        .map(|record| record.operation)
+        .collect();
+    assert_eq!(listed, stored, "every record, newest first");
+    assert_eq!(listed.len(), 4);
+    let lines = registry_lines(&app);
+    let Some(Line::Run {
+        records: 3,
+        open: false,
+        oldest,
+        ..
+    }) = lines.get(1)
+    else {
+        panic!("the three records of one machine fold: {lines:?}");
+    };
+    let run = format!(
+        "tables/history/run/{}",
+        aterm_codec::hex::encode_lower(oldest)
+    );
+    let ui = render(&app);
+    let fold = said(&ui, &run).unwrap();
+    assert!(
+        fold.starts_with(&format!("A fold of 3 records by {here}, ")) && fold.ends_with(", folded"),
+        "a fold, never one write: {fold}"
+    );
+    assert!(said(&ui, &record_key(&newest)).is_none(), "folded");
+    assert!(
+        matches!(lines.last(), Some(Line::Note(start)) if start == "Start of the registry\u{2019}s records")
+    );
+
+    // The fold opens; the middle record, selected, opens what it wrote.
+    act(&mut app, &run, None);
+    let middle = listed[1];
+    act(&mut app, &record_key(&middle), None);
+    app.native_runtime.tables_mut().unwrap().settle_registry();
+    let ui = render(&app);
+    let wrote = |part: &str| {
+        format!(
+            "tables/history/wrote/{}/0/{part}",
+            aterm_codec::hex::encode_lower(&middle)
+        )
+    };
+    assert_eq!(
+        said(&ui, &wrote("was")).as_deref(),
+        Some(
+            format!(
+                "Machines \u{b7} m9 \u{b7} Location: was rack b ({here}), now rack c; shows its row"
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(
+        said(&ui, &wrote("since")).as_deref(),
+        Some(
+            format!(
+                "Machines \u{b7} m9 \u{b7} Location: written since rack d ({here}); shows its row"
+            )
+            .as_str()
+        ),
+        "written since"
+    );
+    assert!(
+        said(&ui, &wrote("unseen")).is_none(),
+        "it saw every write before it"
+    );
+    assert!(
+        has_node(&tree(&app).root, &format!("{}/focus", record_key(&middle))),
+        "the selected record's line wears the ring"
+    );
+    // Its line leads to the cell.
+    act(&mut app, &wrote("was"), None);
+    assert_eq!(
+        selection(&app),
+        (
+            Some(super::super::native_tables_tests::MC.into()),
+            Some("location".into())
+        )
+    );
+}
+
+/// History's list at Registry scope as the page holds it now.
+fn registry_lines(app: &App) -> Vec<Line> {
+    let view = view_of(app);
+    registry::lines(
+        app.native_runtime.tables().unwrap(),
+        view,
+        &view.history.runs,
+    )
 }

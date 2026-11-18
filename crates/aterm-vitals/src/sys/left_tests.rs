@@ -133,12 +133,14 @@ fn world() -> World {
         },
         tabs: vec![
             TabFact {
+                sampled_nonce: None,
                 key: 7,
                 sid: "s-ab12".into(),
                 window: Some(1),
                 tab: Some(1),
             },
             TabFact {
+                sampled_nonce: None,
                 key: 8,
                 sid: "s-cd34".into(),
                 window: Some(1),
@@ -358,11 +360,13 @@ fn an_edge_on_one_session_sees_only_its_rows() {
     let s = snap(view_fixture());
     let c = ctx(&w, &s, Some(&[7]));
     let pids = |q: &str| -> Vec<u32> {
-        text(q, &c)
+        let mut found: Vec<u32> = text(q, &c)
             .iter()
             .filter_map(|l| l.strip_prefix("proc pid="))
             .filter_map(|l| l.split(' ').next()?.parse().ok())
-            .collect()
+            .collect();
+        found.sort_unstable();
+        found
     };
     assert_eq!(pids("left"), vec![4001, 4100]);
     assert_eq!(pids("left scope=pane"), vec![4001, 4100]);
@@ -381,16 +385,53 @@ fn an_edge_on_one_session_sees_only_its_rows() {
     };
     let c2 = ctx(&w2, &s, Some(&[8]));
     let lines = text("left", &c2);
-    let shown: Vec<&str> = lines
+    let mut shown: Vec<&str> = lines
         .iter()
         .filter(|l| l.starts_with("proc ") || l.starts_with("run "))
         .map(|l| l.split(' ').nth(1).unwrap_or(""))
         .collect();
+    shown.sort_unstable();
     assert_eq!(
         shown,
-        vec!["pid=4200", "pid=4300", "id=41983-1792163800331520"],
+        vec!["id=41983-1792163800331520", "pid=4200", "pid=4300"],
         "{lines:#?}"
     );
+}
+
+/// A full page of live orphans cannot hide the tokens the summary offers or other leftovers.
+#[test]
+fn a_bounded_page_keeps_endable_rows_and_leftovers_visible() {
+    let w = world();
+    let mut v = view_fixture();
+    let survivor = v.rows.remove(0);
+    v.rows = vec![row(
+        99,
+        State::Left,
+        Tier::Name,
+        Why::LauncherDead,
+        Source::Run("41983-1792163800331520".into()),
+    )];
+    v.rows.extend(
+        (100..170).map(|pid| row(pid, State::Orphaned, Tier::Never, Why::Live, Source::Tab(7))),
+    );
+    v.rows.push(survivor);
+    let s = snap(v);
+    let c = ctx(&w, &s, None);
+    let lines = text("left scope=aterm top=64", &c);
+    assert!(
+        proc_line(&lines, 2606).is_some_and(|line| line.contains(TOKEN)),
+        "the offered end token must be visible: {lines:#?}"
+    );
+    assert!(proc_line(&lines, 99).unwrap().ends_with(" end=-"));
+    let j = json("left scope=aterm top=64 --json", &c);
+    let Some(Jv::Arr(procs)) = j.get("procs") else {
+        panic!("{}", j.to_text());
+    };
+    assert_eq!(procs.len(), 64);
+    assert_eq!(procs[0].get("end"), Some(&Jv::s(TOKEN)));
+    assert_eq!(procs[1].get("pid"), Some(&Jv::u(99)));
+    assert_eq!(procs[1].get("end"), Some(&Jv::s("-")));
+    assert_eq!(j.get("more"), Some(&Jv::u(8)));
 }
 
 #[test]

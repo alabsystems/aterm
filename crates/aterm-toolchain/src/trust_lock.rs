@@ -91,6 +91,13 @@ pub struct TrustLock {
     pub stock_toolchain: String,
 }
 
+/// The upstream toolchain for STOCK EXCEPTION release slices: the tree's lock,
+/// or the existing floating release candidate policy where no lock is present.
+#[must_use]
+pub fn stock_toolchain(lock: Option<&TrustLock>) -> &str {
+    lock.map_or("stable", |lock| lock.stock_toolchain.as_str())
+}
+
 /// A lock found on the walk up from a directory ([`find`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Found {
@@ -512,27 +519,58 @@ pub fn locked_within_keep(build_dir: &Path, now: std::time::SystemTime) -> bool 
         .is_ok_and(|at| now.duration_since(at).map_or(true, |age| age < LOCKED_KEEP))
 }
 
-/// The `commit-hash` the `trustc` in `bin` answers to `-vV`, or `None` when it does not answer
-/// one within the probe bound.
-#[must_use]
-pub fn compiler_commit(bin: &Path) -> Option<String> {
+/// Why a compiler's identity could not be established.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompilerCommitError {
+    /// The process could not supply a successful, complete UTF-8 reply.
+    Probe(String),
+    /// A successful reply did not name exactly one valid 40-hex commit hash.
+    MissingCommitHash,
+}
+
+impl std::fmt::Display for CompilerCommitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Probe(why) => write!(f, "compiler identity probe failed: {why}"),
+            Self::MissingCommitHash => {
+                f.write_str("successful -vV reply does not name exactly one valid commit-hash")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CompilerCommitError {}
+
+/// The `commit-hash` the `trustc` in `bin` answers to `-vV`.
+///
+/// # Errors
+/// The probe fails or its successful reply does not name exactly one valid commit hash.
+pub fn compiler_commit(bin: &Path) -> Result<String, CompilerCommitError> {
     compiler_commit_of(&bin.join(tool_file("trustc")))
 }
 
 /// The commit-hash the compiler at `rustc` answers `-vV` with (any rustc-like driver).
-#[must_use]
-pub fn compiler_commit_of(rustc: &Path) -> Option<String> {
-    let text = crate::discovery::bounded_stdout(rustc, &["-vV"], crate::discovery::probe_bound())?;
-    commit_hash_line(&text)
+///
+/// # Errors
+/// The process cannot supply a successful, complete UTF-8 reply within the probe's
+/// bound, or that reply does not name exactly one valid commit hash.
+pub fn compiler_commit_of(rustc: &Path) -> Result<String, CompilerCommitError> {
+    let text = crate::discovery::bounded_stdout(rustc, &["-vV"], crate::discovery::probe_bound())
+        .map_err(CompilerCommitError::Probe)?;
+    commit_hash_line(&text).ok_or(CompilerCommitError::MissingCommitHash)
 }
 
-/// The 40-hex `commit-hash:` of a compiler's `-vV` text.
+/// The single 40-hex `commit-hash:` of a compiler's `-vV` text; duplicate fields are ambiguous.
 #[must_use]
 pub fn commit_hash_line(text: &str) -> Option<String> {
-    text.lines()
-        .find_map(|l| l.strip_prefix("commit-hash: "))
-        .map(|c| c.trim().to_string())
-        .filter(|c| is_lower_hex(c, 40))
+    let mut fields = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("commit-hash:"));
+    let commit = fields.next()?.strip_prefix(' ')?.trim();
+    if fields.next().is_some() || !is_lower_hex(commit, 40) {
+        return None;
+    }
+    Some(commit.to_owned())
 }
 
 /// Where the build a lock names stands in an atpkg store.

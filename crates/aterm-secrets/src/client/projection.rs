@@ -223,11 +223,14 @@ impl Running {
 
     /// Take the runner's outcome, and its exit's descriptor with it once it has ended.
     fn last(&mut self) -> Last {
-        let last = Last::of(&mut self.child);
+        let result = crate::converge::RunnerResult::of(&mut self.child);
+        if result.identity_complete {
+            self.due.identity_completed();
+        }
         if self.child.is_none() {
             self.exit = None;
         }
-        last
+        result.last
     }
 }
 

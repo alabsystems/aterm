@@ -82,7 +82,15 @@ aterm ctl @self await sys 'tab<0.5c' for=10s timeout=600000         # this tab h
 aterm ctl @self await sys 'free>=room' timeout=600000               # waits while aterm frees unused build caches
 aterm ctl @self await sys job=a40977 done,stuck timeout=600000     # one job ends or sticks
 aterm ctl @self await sys jobs.stuck=0 timeout=600000              # nothing in this tab is stuck
+aterm ctl @self await sys spotlight!=indexing for=60s timeout=600000  # Spotlight rests before you measure
 ```
+
+`spotlight` is indexing while Spotlight's whole family is at or over 200 millicores of reported
+CPU growth or 5 MB/s of reads, whatever the volumes read; under both bars it is off where every
+local volume reads indexing disabled, and idle otherwise. So wait with `spotlight!=indexing`,
+which holds under both bars on any Mac (`spotlight=idle` never holds where every volume is
+off). It takes `=` and `!=` with a comma list. `sys` prints its line: the state, the family's
+reported CPU, reads and memory, and each volume's indexing.
 
 Quote terms with `<` or `>`. It answers `OK sys …` with the matching reading, or `OK timeout`
 (exit 124) once `timeout=` passes (30 s by default, 600 s at most): loop on 124. A term you

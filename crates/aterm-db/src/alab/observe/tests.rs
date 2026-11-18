@@ -646,7 +646,7 @@ fn a_login_whose_only_address_row_is_retired_is_born_without_it() {
     assert_eq!(
         crate::typed::check::refused(
             crate::att::REGISTRY.table,
-            &[first.changes.clone()],
+            std::slice::from_ref(&first.changes),
             &view,
             crate::alab::seeds::compiled,
         ),

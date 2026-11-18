@@ -828,13 +828,16 @@ fn configured_final_targets_follow_cargo_precedence_without_guessing() {
             true,
         ),
     ];
+    // The root of the scratch's filesystem, where an include `..` walks past (`/` on Unix, the
+    // scratch's drive on Windows, where `/y.toml` names that drive's root too).
+    let top = scratch.path().ancestors().last().unwrap();
     for (text, legacy_text, files, expected, overridable) in rows {
         let files: BTreeMap<PathBuf, String> = files
             .iter()
             .map(|&(name, text)| (dot.join(name), text.to_owned()))
             .chain([
-                (PathBuf::from("/x.toml"), rel.clone()),
-                (PathBuf::from("/y.toml"), named("/abs/out")),
+                (top.join("x.toml"), rel.clone()),
+                (top.join("y.toml"), named("/abs/out")),
             ])
             .collect();
         let read = |path: &Path| {
@@ -2389,6 +2392,10 @@ fn targo_runs_the_line_its_aliases_expand_to() {
         miri("a")
     );
     let nextest_in_t = format!("--unverified nextest run --target-dir {} x", miri("t"));
+    let configured_in_t = format!(
+        "--unverified run --target-dir {} demo --config a.toml",
+        miri("t")
+    );
     for (typed, runs) in [
         ("--unverified b -m x", "build --release -m x"),
         // A nested alias's line keeps the typed globals alone: the `-v` the outer alias puts
@@ -2465,7 +2472,7 @@ fn targo_runs_the_line_its_aliases_expand_to() {
         ),
         (
             "miri run --target-dir t demo --config a.toml",
-            "--unverified run --target-dir t/miri demo --config a.toml",
+            configured_in_t.as_str(),
         ),
         ("miri run demo --config", "--unverified run demo --config"),
         ("-v miri t -q", "run -q -- -q"),
@@ -2732,10 +2739,14 @@ fn miri_hands_back_its_metadata_target_and_says_where_it_sets_up() {
             call(true, false, None),
         ),
     ];
+    // A row spells the `miri` `cargo-miri` pushes onto the directory (`get_target_dir`) after a
+    // `/`; the line holds the host's separator there, as `targo_runs_the_line_its_aliases_expand_to`
+    // spells it.
+    let host = |line: &str| line.replace("/miri", &format!("{}miri", std::path::MAIN_SEPARATOR));
     for (typed, env, metadata_target, runs, does) in rows {
         assert_eq!(
             read(typed, env, metadata_target),
-            (runs.map(str::to_owned), does),
+            (runs.map(host), does),
             "{typed} {env:?}"
         );
     }

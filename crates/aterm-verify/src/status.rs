@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 
 use crate::event_log::{CheckRow, Finished, Judged};
 
+#[path = "status_survivors.rs"]
+mod survivors;
+
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 use crate::event_log::MAX_RECORD_BYTES;
 const COMPILER_STAGE_ROWS: usize = 64;
@@ -130,6 +133,8 @@ pub struct Observed {
     pub compiler_message_records: usize,
     /// Valid observations for stage keys not retained because the row cap was reached.
     pub compiler_omitted_records: usize,
+    /// Bounded saved sweep observations, never a fresh census or cleanup authority.
+    process_survivors: survivors::Rows,
     /// Number of complete parsed terminal records in the file.
     pub terminal_records: usize,
     /// Whether one terminal list matches all observed rows; not run attribution.
@@ -173,6 +178,7 @@ pub(crate) fn supported_progress_payload(
 }
 
 fn observe_one(text: &str) -> Observed {
+    let mut process_survivors = survivors::Rows::default();
     let mut checks = BTreeMap::<String, ObservedCheck>::new();
     let mut cases = BTreeMap::<(String, Option<String>), ObservedCase>::new();
     let mut long_cases = BTreeMap::<(String, String), ObservedLongCase>::new();
@@ -201,6 +207,14 @@ fn observe_one(text: &str) -> Observed {
         };
         let value = record.value;
         match value["event"].as_str() {
+            Some("process-survivor") => {
+                let supported = line.strip_prefix("verify-event: ").is_some_and(|json| {
+                    process_survivors.observe(json, record.attribution.map(|binding| binding.id))
+                });
+                if !supported {
+                    unprojected += 1;
+                }
+            }
             Some("test-phase-ended") => {
                 let Some(end) = line
                     .strip_prefix("verify-event: ")
@@ -371,6 +385,7 @@ fn observe_one(text: &str) -> Observed {
         compiler_progress: compiler.into_values().collect(),
         compiler_message_records,
         compiler_omitted_records,
+        process_survivors,
         terminal_records: terminals.len(),
         terminal_consistency,
         malformed_complete_records: malformed,
@@ -489,6 +504,12 @@ impl Observed {
                     "observed_message_records":row.observed_message_records,
                     "provisional":true,"sample_complete":false,"latest":row.latest.json()})
             }).collect::<Vec<_>>(),
+            "process_survivor_observations_complete":false,
+            "process_survivor_scope":survivors::SCOPE,
+            "process_survivor_row_cap":survivors::ROW_CAP,
+            "process_survivor_records":self.process_survivors.records,
+            "process_survivor_omitted_records":self.process_survivors.omitted_records,
+            "process_survivors":self.process_survivors.json(),
             "early_cases": self.early_cases.iter().map(|case| {
                 let test = crate::report::clip_json(&case.test, crate::report::EVENT_ROW_BYTES);
                 let name = case.case.as_ref().map(|name| crate::report::clip_json(name, crate::report::EVENT_ROW_BYTES));
@@ -554,6 +575,7 @@ impl Observed {
         self.render_long_cases(&mut out, "");
         self.render_phase_ends(&mut out, "");
         self.render_compiler(&mut out, "");
+        self.process_survivors.render(&mut out, "");
         out.push_str(&format!("Terminal records: {}; consistency: {}.\nMalformed complete records: {}; unprojected events: {}; trailing partial: {}.\n",
             self.terminal_records, self.terminal_consistency, self.malformed_complete_records,
             self.unprojected_records, self.trailing_partial));
@@ -586,6 +608,7 @@ impl Observed {
             run.observed.render_long_cases(&mut out, "  ");
             run.observed.render_phase_ends(&mut out, "  ");
             run.observed.render_compiler(&mut out, "  ");
+            run.observed.process_survivors.render(&mut out, "  ");
         }
         out
     }
@@ -751,3 +774,7 @@ pub fn run(args: &[String], cwd: &Path) -> i32 {
 #[cfg(test)]
 #[path = "status_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "status_survivors_tests.rs"]
+mod survivor_tests;

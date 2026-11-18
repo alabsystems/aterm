@@ -365,6 +365,52 @@ impl Via {
     }
 }
 
+/// One readable active process from the current census, never a cached coalition lead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryMember {
+    /// Its original pid.
+    pub pid: u32,
+    /// Its original kernel start record, where read.
+    pub start: Option<u64>,
+    /// Its original kernel pid version, where read.
+    pub version: Option<i32>,
+    /// Its original birth, unix ms, where read.
+    pub birth_ms: Option<i64>,
+    /// When its counters were read, on the sample's clock, where read.
+    pub at_ns: Option<u64>,
+    /// Its name from that same process row; empty remains unread.
+    pub name: String,
+    /// This process's own readable footprint in bytes, not the coalition's charge or a
+    /// disjoint physical-RAM share.
+    pub footprint: u64,
+}
+
+/// Bounded observed readable memory members; a partial census cannot prove the global top.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryMembers {
+    /// At most three members, by decreasing own footprint then increasing pid.
+    pub top: Vec<MemoryMember>,
+    /// Distinct observed pids assigned here, including excluded and ambiguous rows.
+    pub observed: u32,
+    /// Unambiguous known-active rows with a readable footprint, zero included.
+    pub readable: u32,
+    /// Unambiguous known-active rows whose footprint was unread.
+    pub unread: u32,
+    /// Unambiguous zombie or unknown-state rows, excluded from the memory ranking.
+    pub excluded: u32,
+    /// Distinct pids observed more than once, including conflicting coalition assignments.
+    pub ambiguous: u32,
+    /// Active tasks absent from the unambiguous known-active census; unavailable when the
+    /// coalition's active-task counters cannot be subtracted.
+    pub missing: Option<u64>,
+    /// Whether the current process census was absent or stopped short. Unread coalition
+    /// records outside this row do not invalidate its observed process members.
+    pub truncated: bool,
+    /// Full sweep, valid matching active-task count, no unread footprint, unknown state or
+    /// duplicate pid. Known zombies alone do not make the active census incomplete.
+    pub complete: bool,
+}
+
 /// One listed coalition over the window.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CoalRow {
@@ -395,6 +441,8 @@ pub struct CoalRow {
     pub read_bps: u64,
     /// Its live members' footprint now, bytes, where read.
     pub footprint: Option<u64>,
+    /// Current observed readable process footprints and their census coverage.
+    pub memory_members: MemoryMembers,
     /// A complete current active census proves every live member is app-owned. Footprint
     /// is instantaneous, so this proof is independent of the CPU window's earlier owners.
     pub footprint_aterm: bool,

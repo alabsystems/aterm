@@ -1,12 +1,12 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-time: spec recovery from its 8 unit tests
+# aterm-time: spec recovery from its 9 unit tests
 
-Source: `crates/aterm-time` (read only). Every live `#[test]` (`src/lib.rs` 1 and
-`src/shim.rs` 7, for 8 in all) and the code each one reaches are mapped below.
+Source: `crates/aterm-time` (read only). Every live `#[test]` (`src/lib.rs` 2 and
+`src/shim.rs` 7, for 9 in all) and the code each one reaches are mapped below.
 
-Result: **9 specs**, covering **8 tests**. **0 remaining non-spec tests** (§4).
+Result: **10 specs**, covering **9 tests**. **0 remaining non-spec tests** (§4).
 
 ## 0. Notation used in the statements
 
@@ -23,6 +23,9 @@ Result: **9 specs**, covering **8 tests**. **0 remaining non-spec tests** (§4).
 - `now_w` = one read of the platform wall clock: `std::time::SystemTime::now` natively, and `Sshim`
   over `Date.now()` on `wasm32-unknown-unknown`. Effect model: each call of `since_epoch` performs
   exactly one `now_w` read, and the accessors are stated per read.
+- `reads_t` = the count of `now_w` reads that `since_epoch`, `unix_secs` and `unix_millis` made on
+  thread `t`, the value `raw_reads()` returns on `t`. It is a per-thread cell, so another thread's
+  reads never change it, and a direct `SystemTime::now()` is not in it.
 - **Gap labels.** Numbers are rows of the gap table in
   `docs/TRUST-LANE.md` (Blocking gaps).
   Gap 0 (a seal that publishes Clean rows) blocks every spec and is not repeated per row. Two
@@ -50,6 +53,7 @@ time-instant-shift	contract	shim::Instant::{checked_add,checked_sub}, <shim::Ins
 time-systime-duration-since	contract	shim::SystemTime::duration_since, shim::SystemTimeError::duration, <shim::SystemTimeError as Display>::fmt, shim::UNIX_EPOCH, shim::SystemTime::UNIX_EPOCH	∀ s, t: SystemTime: s.duration_since(t) = (s.0 ≥ t.0 ? Ok(s.0 − t.0) : Err(e) with e.duration() = t.0 − s.0 > 0), and it never panics. UNIX_EPOCH.0 = D::ZERO and SystemTime::UNIX_EPOCH = UNIX_EPOCH, so s.duration_since(UNIX_EPOCH) = Ok(s.0). ∀ e: SystemTimeError: e.to_string() = "second time provided was later than self" (std's message, the parity contract that callers may log). Corollary: s = t ⇒ t.duration_since(s) = Ok(D::ZERO).	shim::system_time_reports_backwards_steps	EASY-MEDIUM: a Result return built with a const Option match over checked_sub and saturating_sub, &self, consts, and a Display impl through write! into a Formatter (the String content needs gap 1).	1, 2, 3, 4, 6, 12
 time-systime-shift	contract	shim::SystemTime::{checked_add,checked_sub}, <shim::SystemTime as Add/Sub/AddAssign/SubAssign<Duration>>	time-instant-shift with Sshim for Ishim: ∀ s: SystemTime, d: D: checked_add is Some(Sshim(s.0 + d)) iff the Duration does not overflow, and None otherwise. checked_sub is Some(Sshim(s.0 − d)) iff d ≤ s.0, and None otherwise, so UNIX_EPOCH.checked_sub(d) = None for d > 0. `+`/`−` equal the unwrapped checked forms and panic exactly when those are None. `+=`/`−=` equal `+`/`−`. s.checked_add(d) = Some(u) ⇒ u − d = s.	shim::system_time_arithmetic_round_trips	as time-instant-shift	1, 2, 3, 4, 6, 12
 time-epoch-accessors	contract (effectful)	duration_to_millis_saturating, since_epoch, since_epoch_at, unix_secs, unix_secs_at, unix_millis, unix_millis_at	Pure per-reading core: duration_to_millis_saturating(d) = min(d.as_secs()·1000 + d.subsec_nanos()/10^6, u64::MAX); since_epoch_at(w) = (w ≥ UNIX_EPOCH ? Some(w − UNIX_EPOCH) : None); unix_secs_at(w) = since_epoch_at(w).map(as_secs); unix_millis_at(w) = since_epoch_at(w).map(duration_to_millis_saturating). Effect model: each of since_epoch(), unix_secs(), unix_millis() does one now_w read with value w and returns the corresponding *_at(w). None of them panics. So for reads w0 ≤ w ≤ w1, each accessor lies in [w0 − E, w1 − E] in its unit.	lib::the_epoch_accessors_read_the_wall_clock	MEDIUM: a platform clock effect with two arms (std re-export natively, the shim on wasm), Result::ok, Option::map, and const u64 saturating_mul/saturating_add over Duration::as_secs and subsec_nanos. The pure duration_to_millis_saturating and *_at(w) helpers can be proved first without effects.	1, 3, 4, 8, 12, 13
+time-raw-read-count	contract (effectful)	raw_reads, since_epoch, unix_secs, unix_millis, since_epoch_at, unix_secs_at, unix_millis_at, duration_to_millis_saturating	On each thread t: reads_t starts at 0. Each call of since_epoch(), unix_secs() or unix_millis() on t sets reads_t' = reads_t + 1 (wrapping at u64::MAX), with its now_w read. raw_reads() on t returns reads_t and changes no count. The *_at conversions and duration_to_millis_saturating change no count. A call on another thread u ≠ t changes reads_u only.	lib::raw_reads_counts_each_wall_read_on_the_calling_thread	MEDIUM: a thread-local Cell<u64> effect (the `thread_local!` macro, LocalKey::with and a closure), a wrapping_add two-state update, and the platform clock effect of time-epoch-accessors.	1, 2, 3, 4, 8, 12, 13
 ```
 
 ## 2. Test → spec map (TSV)
@@ -66,6 +70,7 @@ src/shim.rs	instant_arithmetic_round_trips_and_checks	time-instant-shift	time-in
 src/shim.rs	system_time_reports_backwards_steps	time-systime-duration-since	time-from-js-millis, time-conv-exact
 src/shim.rs	system_time_arithmetic_round_trips	time-systime-shift	time-from-js-millis
 src/lib.rs	the_epoch_accessors_read_the_wall_clock	time-epoch-accessors	
+src/lib.rs	raw_reads_counts_each_wall_read_on_the_calling_thread	time-raw-read-count	time-epoch-accessors
 ```
 
 ## 4. Tests that are not spec samples

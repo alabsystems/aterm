@@ -2579,6 +2579,100 @@ fn base_ai_accounts_syncs_codex_without_an_unassigned_claude_login() {
     ));
 }
 
+/// `base.ai.accounts`' Claude Code probe ends with the renewal of the next row due, typed by the
+/// account's word (its key, written here from its address, as no lab slugs it), never the row's
+/// label or its address, so the step it offers is one `accounts renew` takes.
+/// NEGATIVE CONTROL: with the hint formatting the row's label again, this fails on `next:
+/// `aterm harness accounts renew m16-2`` (2026-11-16, by hand, then restored).
+#[cfg(target_os = "macos")]
+#[test]
+fn the_claude_probe_names_the_next_renewal_by_the_accounts_word() {
+    use aterm_agent::harness::cli::Env;
+    use aterm_converge::Probe;
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-doctor-next-")
+        .suffix(".noindex")
+        .tempdir()
+        .expect("a scratch directory");
+    let root = dir.path().canonicalize().unwrap();
+    let (home, config, state) = (root.join("home"), root.join("config"), root.join("state"));
+    let due = root.join("logins").join("m16-2");
+    for d in [&home, &config, &state, &due] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    aterm_uds::atomic_file::write(
+        &config.join("aterm.toml"),
+        b"[fleet]\nmachine = \"m16\"\n",
+        0o600,
+    )
+    .unwrap();
+    let dir_value = aterm_toml::Value::from(due.to_str().unwrap()).to_string();
+    std::fs::write(
+        config.join("accounts.toml"),
+        format!(
+            "[[account]]\nlabel = \"m16\"\nclass = \"dedicated\"\nemail = \
+             \"claude-one@example.com\"\n\n[[account]]\nlabel = \"m16-2\"\nclass = \"shared\"\n\
+             dir = {dir_value}\nemail = \"claude-two@example.com\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        config.join("fleet-accounts.toml"),
+        "opt_in = \"named\"\n\n[[account]]\nlabel = \"m16\"\nmachines = [\"m16\"]\n\
+         email = \"claude-one@example.com\"\n\n[[account]]\nlabel = \"m16-2\"\n\
+         machines = [\"m16\"]\nemail = \"claude-two@example.com\"\n",
+    )
+    .unwrap();
+    let env = Env {
+        state,
+        aterm_state: None,
+        cwd: home.clone(),
+        home: Some(home.clone()),
+        claude_dir: Some(home.join(".claude")),
+        claude_config_unusable: None,
+        claude_profile: Some(home.join(".claude.json")),
+        claude_custom_oauth: false,
+        claude_session: None,
+        claude_pid: None,
+        codex_thread: None,
+        agy_conversation: None,
+        codex_home: None,
+        xdg_config_home: None,
+        codex_login: None,
+        now: 1_792_660_000,
+        tz_s: 0,
+        sid: String::new(),
+        sock: None,
+        config: Some(config.join("aterm.toml")),
+        claude_tmp: None,
+        claude_running: None,
+    };
+    {
+        use aterm_agent::harness::{accounts, accounts_sync};
+        let roster = config.join("accounts.toml");
+        let read = accounts::Roster::load(&roster);
+        assert!(read.as_ref().is_ok_and(|r| r.rows.len() == 2), "{read:?}");
+        assert!(
+            accounts_sync::configured_source(Some(&config.join("aterm.toml")), Some(&roster))
+                .is_some(),
+            "the fleet file opts in by name"
+        );
+        assert!(!accounts_sync::needs_init_accounts_sync(
+            &home, &env.state, &roster, env.now
+        ));
+    }
+    let probe = super::ai_accounts_claude_probe(&env);
+    let Probe::Ok { now } = &probe else {
+        panic!("the fixture's Claude Code pool is synced: {probe:?}");
+    };
+    let key = aterm_db::typed::keys::account_pk("claude", "claude-two@example.com").unwrap();
+    assert!(
+        now.contains(&format!("; next: `aterm harness accounts renew {key}`")),
+        "{now}"
+    );
+    assert!(!now.contains("m16-2") && !now.contains('@'), "{now}");
+}
+
 /// `base.ai.accounts` names each other CLI's pool this machine keeps after Claude Code's
 /// (`…; other CLIs: codex 1, kimi 1`), stands on those pools alone where Claude Code has no
 /// source, and is a change where Codex's pool, which syncs by default, has a row of this

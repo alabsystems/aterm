@@ -17,6 +17,34 @@ use std::{io, path::Path};
 #[must_use = "keep the actual guard until all source-cache users have settled"]
 pub struct SourceCacheGuard(imp::Held);
 
+/// Exclusive custody of both existing Cargo cache protocol locks, in Cargo's
+/// mutation-then-download order. Retain it throughout source-cache reclamation.
+/// This excludes cooperating readers and downloads; it does not authorize a
+/// pathname deletion or protect against arbitrary manual namespace changes.
+#[derive(Debug)]
+#[must_use = "retain both Cargo locks until source-cache reclamation has settled"]
+pub struct SourceCacheReclaimGuard(imp::ReclaimHeld);
+
+impl SourceCacheReclaimGuard {
+    /// Acquire both existing protocol locks without waiting or creating files.
+    /// Missing, unsafe, unsupported or contended locks refuse reclamation.
+    ///
+    /// # Errors
+    /// As [`SourceCacheGuard::try_acquire`], or either existing lock is absent
+    /// or held incompatibly. A partial acquisition releases its mutate lock.
+    pub fn try_acquire(cargo_home: &Path) -> io::Result<Self> {
+        imp::acquire_reclaim(cargo_home).map(Self)
+    }
+
+    /// Observe that the original home and both names still identify our locks.
+    ///
+    /// # Errors
+    /// A foreign process, changed identity, unsafe lock or failed observation.
+    pub fn check_current(&self) -> io::Result<()> {
+        self.0.check_current()
+    }
+}
+
 impl SourceCacheGuard {
     /// Acquire the exact existing Cargo protocol's shared mutate lock without waiting.
     /// The explicit absolute Cargo home must already exist. A missing lock file is
@@ -80,6 +108,43 @@ mod imp {
         directory: File,
         original: PathBuf,
         resolved: PathBuf,
+    }
+
+    #[derive(Debug)]
+    pub(super) struct ReclaimHeld {
+        mutate: Held,
+        download: File,
+    }
+
+    impl ReclaimHeld {
+        pub(super) fn check_current(&self) -> io::Result<()> {
+            check_download(&self.mutate, &self.download)
+        }
+    }
+
+    fn check_download(mutate: &Held, download: &File) -> io::Result<()> {
+        mutate.check_current()?;
+        let held = download.metadata()?;
+        let named = std::fs::symlink_metadata(mutate.resolved.join(".package-cache"))?;
+        valid_lock(&held)?;
+        valid_lock(&named)?;
+        if identity(&held) != identity(&named) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "original Cargo download lock identity changed",
+            ));
+        }
+        Ok(())
+    }
+
+    impl Drop for ReclaimHeld {
+        fn drop(&mut self) {
+            // Release in reverse protocol order. A foreign fork copy may only
+            // close its descriptors, never unlock the original parent's OFDs.
+            if self.mutate.creator == std::process::id() {
+                let _ = self.download.unlock();
+            }
+        }
     }
 
     fn identity(metadata: &Metadata) -> (u64, u64) {
@@ -196,6 +261,48 @@ mod imp {
         })
     }
 
+    fn exclusive_lock(file: &File) -> io::Result<()> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the strict Cargo reclamation guard's nonblocking original protocol acquisition; its creator releases by LOCK_UN"
+        )]
+        let result = file.try_lock();
+        result.map_err(|error| match error {
+            TryLockError::WouldBlock => io::ErrorKind::WouldBlock.into(),
+            TryLockError::Error(error) => error,
+        })
+    }
+
+    pub(super) fn acquire_reclaim(cargo_home: &Path) -> io::Result<ReclaimHeld> {
+        let mutate = acquire_mode(
+            cargo_home,
+            None,
+            supported_filesystem,
+            exclusive_lock,
+            false,
+        )?;
+        // SAFETY: live retained directory and static NUL-terminated name;
+        // O_NOFOLLOW refuses a replacement link and no file is created.
+        let fd = unsafe {
+            libc::openat(
+                mutate.directory.as_raw_fd(),
+                c".package-cache".as_ptr(),
+                libc::O_RDWR | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful openat returned this uniquely owned descriptor.
+        let download = unsafe { File::from_raw_fd(fd) };
+        supported_filesystem(&download)?;
+        check_download(&mutate, &download)?;
+        exclusive_lock(&download)?;
+        let held = ReclaimHeld { mutate, download };
+        held.check_current()?;
+        Ok(held)
+    }
+
     pub(super) fn acquire_with(
         cargo_home: &Path,
         filesystem: impl FnMut(&File) -> io::Result<()>,
@@ -207,8 +314,18 @@ mod imp {
     pub(super) fn acquire_with_original(
         cargo_home: &Path,
         original: Option<BorrowedFd<'_>>,
+        filesystem: impl FnMut(&File) -> io::Result<()>,
+        lock: impl FnOnce(&File) -> io::Result<()>,
+    ) -> io::Result<Held> {
+        acquire_mode(cargo_home, original, filesystem, lock, true)
+    }
+
+    fn acquire_mode(
+        cargo_home: &Path,
+        original: Option<BorrowedFd<'_>>,
         mut filesystem: impl FnMut(&File) -> io::Result<()>,
         lock: impl FnOnce(&File) -> io::Result<()>,
+        create: bool,
     ) -> io::Result<Held> {
         if !cargo_home.is_absolute() {
             return Err(io::Error::new(
@@ -257,7 +374,7 @@ mod imp {
                 directory.as_raw_fd(),
                 c".package-cache-mutate".as_ptr(),
                 libc::O_RDWR
-                    | libc::O_CREAT
+                    | (if create { libc::O_CREAT } else { 0 })
                     | libc::O_NOFOLLOW
                     | libc::O_NONBLOCK
                     | libc::O_CLOEXEC,
@@ -292,6 +409,15 @@ mod imp {
 
     #[derive(Debug)]
     pub(super) struct Held(Infallible);
+
+    pub(super) type ReclaimHeld = Held;
+
+    pub(super) fn acquire_reclaim(_: &Path) -> io::Result<ReclaimHeld> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "strict Cargo source-cache reclamation is unavailable on this platform",
+        ))
+    }
 
     pub(super) fn acquire(_: &Path) -> io::Result<Held> {
         Err(io::Error::new(

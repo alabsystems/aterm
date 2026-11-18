@@ -357,6 +357,7 @@ fn hold_to_end(op: &Operation, session: &Weak<crate::SessionCtx>) {
                         &ctx,
                         kept.connection,
                         crate::metrics::now_us(),
+                        crate::control::reexec_grace_us(),
                     )
                 {
                     crate::presence::post_meta_changed(kept.local);

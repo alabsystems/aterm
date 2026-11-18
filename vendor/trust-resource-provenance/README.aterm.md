@@ -17,3 +17,8 @@ The native signing module is imported from Trust `f11e1d3defbfce3c0accc50f1b4167
 It captures actual socket credentials and checks caller-selected requirements;
 it provides no independent approved Host/cohort or installation policy.
 Keeper owns asynchronous completion and its original trustd deadlines.
+
+The optional committed-Git reader moved unchanged into the separate higher
+`vendor/trust-committed-source` crate. Provenance no longer carries a Git feature
+or edge; native consumers retain the same passive observation beside their own
+original semantic owner. Existing base and native facade adaptations remain.

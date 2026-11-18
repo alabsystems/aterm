@@ -59,6 +59,7 @@ struct Read {
     pool: Option<Pool>,
     claims: Result<Option<(View, Book)>, String>,
     journal: Journal,
+    lab: Option<Lab>,
 }
 
 impl Read {
@@ -74,6 +75,7 @@ impl Read {
             pool: None,
             claims: Ok(None),
             journal: Journal::Off,
+            lab: None,
         }
     }
 
@@ -89,6 +91,7 @@ impl Read {
         build(&Inputs {
             cli: self.cli,
             roster: &self.roster,
+            lab: self.lab.as_ref(),
             state: &self.state,
             enrolled: &self.enrolled,
             signing_in: self.signing_in,
@@ -110,6 +113,63 @@ impl Read {
     fn card(&self) -> AccountCard {
         self.card_with(HistoryIn::NotRead)
     }
+}
+
+/// A CARD'S WORD IS THE ONE `accounts history` TAKES. A roster row's card carries the word a
+/// step names its account by: its key where no lab slugs it, its slug where one does, never its
+/// label. Each parses as `accounts history <word>` and resolves, over the same roster and lab,
+/// to the card's row, which is what the Account menu's "Older days" step runs. An outside login
+/// and a row with no address carry none. Negative control: a word made from the row's label
+/// (what the menu typed before) fails the first assertion: `left: Some("alpha")`.
+#[test]
+fn a_cards_word_is_the_one_history_takes() {
+    use crate::harness::account_names::{Candidates, resolve};
+    use crate::harness::cli::{self, AccountsCmd, Cmd};
+    let address = "alpha.m20.1@example.test";
+    let pk = aterm_db::typed::keys::account_pk("claude", address).expect("a key");
+    let slugged = Lab {
+        names: [(
+            pk.clone(),
+            aterm_file::AccountNames {
+                realm: "claude".to_owned(),
+                slug: "claude-alpha-m20".to_owned(),
+                name: Some(format!("claude {address}")),
+                email: Some(address.to_owned()),
+                login: Some(address.to_owned()),
+                live: true,
+            },
+        )]
+        .into(),
+        ..Lab::default()
+    };
+    for (lab, want) in [(None, pk.as_str()), (Some(slugged), "claude-alpha-m20")] {
+        let read = Read { lab, ..Read::new() };
+        let card = read.card();
+        let word = card.word.as_ref().map(Word::as_str);
+        assert_eq!(word, Some(want));
+        let word = word.unwrap_or_default();
+        let argv: Vec<String> = ["accounts", "history", word]
+            .iter()
+            .map(|w| (*w).to_owned())
+            .collect();
+        match cli::parse(&argv) {
+            Ok((Cmd::Accounts(AccountsCmd::History { name, .. }), _)) => {
+                assert_eq!(name.as_deref(), Some(word));
+            }
+            other => panic!("`accounts history {word}` parses as {other:?}"),
+        }
+        let candidates = Candidates {
+            roster: &read.roster.rows,
+            lab: read.lab.as_ref(),
+            ..Candidates::default()
+        };
+        let named = resolve(Cli::Claude, word, &candidates).unwrap_or_else(|why| panic!("{why}"));
+        assert_eq!(named.row.map(|row| row.label.as_str()), Some("alpha"));
+    }
+    assert_eq!(Read::outside().card().word, None, "an outside login");
+    let mut bare = Read::new();
+    bare.roster.rows[0].email = None;
+    assert_eq!(bare.card().word, None, "a row with no address");
 }
 
 /// A CARD SAYS `signing in` BY THE RULE LINE E READS: the card of `alpha`, whose login was never
@@ -715,6 +775,7 @@ fn the_cards_clock_spans_a_change_of_offset_weeks_away() {
     let card = build(&Inputs {
         cli: read.cli,
         roster: &read.roster,
+        lab: None,
         state: &read.state,
         enrolled: &read.enrolled,
         signing_in: None,
@@ -1390,12 +1451,16 @@ fn turns_sweep(
 /// `ok`, `ending` from a week before the end and `ended` at it; a login signed out here that runs
 /// on its vault token by the upkeep's reading reads in use until that reading is an hour old
 /// ([`accounts::TOKENS_HERE_FRESH_S`]) and signed out after, on a host where a launch starts on
-/// a token; a login not made here never turns.
+/// a token, and one whose reading a window's holder vouched for reads in use until its token
+/// ends, which it names as its one turn; a login not made here never turns.
 ///
 /// NEGATIVE CONTROLS (run 2026-11-14): with `forecast_turns` naming the end alone, the forecast
 /// sweep fails where `Ok` turns `Ending` (`a forecast end: read at … named Some(<the end>)`);
 /// with `on_token_turns` leaving out the reading's age, the on-token sweep fails where `InUse`
 /// turns `SignedOut` (`a login on its token: read at … named Some(<the token's end>)`).
+/// NEGATIVE CONTROL (run 2026-11-16): with `on_token_turns` naming a vouched reading's age as
+/// well, the vouched reading's turn is its age-out (`a vouched reading neither comes to stand nor
+/// ages out`: left `Some(NOW + 3001)`, right `Some(NOW + 2 * H)`).
 #[test]
 fn a_login_half_turns_no_sooner_than_its_read_named() {
     let end = NOW + 10 * D;
@@ -1423,6 +1488,7 @@ fn a_login_half_turns_no_sooner_than_its_read_named() {
     on_token.tokens_here = Some(accounts::TokensHere {
         read_at: NOW - 600,
         ends: [("alpha".to_owned(), NOW + 2 * H)].into(),
+        vouched: false,
     });
     let read = |t: i64| {
         (
@@ -1435,6 +1501,27 @@ fn a_login_half_turns_no_sooner_than_its_read_named() {
         changes,
         usize::from(crate::harness::token_route::LAUNCHES_ON_TOKEN),
         "in use until the reading is an hour old, where a launch starts on a token"
+    );
+    let mut vouched = on_token.clone();
+    if let Some(read) = vouched.tokens_here.as_mut() {
+        read.vouched = true;
+    }
+    let read = |t: i64| {
+        (
+            LoginHalf::of_row(&alpha, &logins, &vouched, true, t),
+            LoginHalf::turns_after(&alpha, &logins, &vouched, true, t),
+        )
+    };
+    let changes = turns_sweep("a login on a vouched token", (NOW, NOW + 3 * H), read);
+    assert_eq!(
+        changes,
+        usize::from(crate::harness::token_route::LAUNCHES_ON_TOKEN),
+        "in use until the token ends, where a launch starts on a token"
+    );
+    assert_eq!(
+        LoginHalf::turns_after(&alpha, &logins, &vouched, true, NOW),
+        crate::harness::token_route::LAUNCHES_ON_TOKEN.then_some(NOW + 2 * H),
+        "a vouched reading neither comes to stand nor ages out: its one turn is the token's end"
     );
     assert_eq!(
         LoginHalf::turns_after(&alpha, &logins, &on_token, false, NOW),
